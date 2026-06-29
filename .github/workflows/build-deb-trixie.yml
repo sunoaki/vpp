@@ -38,7 +38,9 @@ jobs:
       - name: Compute short SHA
         id: vars
         shell: bash
-        run: echo "short_sha=$(git rev-parse --short=7 HEAD)" >> $GITHUB_OUTPUT
+        run: |
+          git config --global --add safe.directory "$PWD"
+          echo "short_sha=$(git rev-parse --short=7 HEAD)" >> $GITHUB_OUTPUT
 
       - name: Restore apt cache
         uses: actions/cache/restore@v4
@@ -50,7 +52,7 @@ jobs:
 
       - name: Install VPP build dependencies
         run: |
-          sed -i 's/^\s*git config commit\.template/&-/' Makefile
+          sed -i '/^\s*git config commit\.template/s/^\(\s*\)/\1-/' Makefile
           make UNATTENDED=yes install-dep
 
       - name: Save apt cache
