@@ -1,0 +1,106 @@
+name: Build VPP DEB for Debian 13 (Trixie)
+
+on:
+  push:
+    branches: [fix/*]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish as GitHub Release"
+        type: boolean
+        default: false
+      tag:
+        description: "Release tag (if publishing)"
+        type: string
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:trixie
+    env:
+      CCACHE_COMPRESS: "true"
+      CCACHE_MAXSIZE: 2G
+    steps:
+      - name: Install base tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq sudo make git
+
+      - name: Clone repository
+        run: |
+          git clone --depth 1 --branch "$GITHUB_REF_NAME" \
+            "https://github.com/$GITHUB_REPOSITORY.git" .
+
+      - name: Compute short SHA
+        id: vars
+        shell: bash
+        run: echo "short_sha=$(git rev-parse --short=7 HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /var/cache/apt
+          key: apt-debian13-${{ runner.arch }}
+          restore-keys: |
+            apt-debian13-
+
+      - name: Install VPP build dependencies
+        run: |
+          sed -i '496s/./&-/' Makefile
+          make UNATTENDED=yes install-dep
+
+      - name: Save apt cache
+        uses: actions/cache/save@v4
+        with:
+          path: /var/cache/apt
+          key: apt-debian13-${{ runner.arch }}
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: build-root/.ccache
+          key: ccache-debian13-${{ runner.arch }}-${{ github.ref_name }}
+          restore-keys: |
+            ccache-debian13-${{ runner.arch }}-
+
+      - name: Build VPP DEB packages
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git fetch --tags --force 2>/dev/null || true
+          if ! git describe --tags --long --match 'v*' 2>/dev/null; then
+            echo "v26.10-0-g$(git rev-parse --short HEAD)" > src/scripts/.version
+          fi
+          ccache -z
+          export VPP_EXTRA_CMAKE_ARGS="\
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          make pkg-deb
+          ccache -s
+
+      - name: Save ccache
+        uses: actions/cache/save@v4
+        with:
+          path: build-root/.ccache
+          key: ccache-debian13-${{ runner.arch }}-${{ github.ref_name }}
+
+      - name: Upload DEB artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpp-debian13-trixie
+          path: build-root/*.deb
+
+      - name: Publish Release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build-root/*.deb
+          tag_name: ${{ inputs.tag || format('vpp-trixie-{0}', github.run_number) }}
+          name: "VPP ${{ steps.vars.outputs.short_sha }} for Debian 13"
+          body: |
+            VPP build from commit ${{ github.sha }}
+            - Branch: ${{ github.ref_name }}
+            - Build date: ${{ github.event.repository.updated_at }}
+          draft: false
+          prerelease: true
