@@ -2,7 +2,7 @@ name: Build VPP DEB for Debian 13 (Trixie)
 
 on:
   push:
-    branches: [fix/*]
+    branches: [master]
   workflow_dispatch:
     inputs:
       release:
@@ -17,6 +17,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     container:
       image: debian:trixie
     env:
@@ -48,7 +50,7 @@ jobs:
 
       - name: Install VPP build dependencies
         run: |
-          sed -i '496s/./&-/' Makefile
+          sed -i 's/^\s*git config commit\.template/&-/' Makefile
           make UNATTENDED=yes install-dep
 
       - name: Save apt cache
@@ -70,7 +72,7 @@ jobs:
           git config --global --add safe.directory "$PWD"
           git fetch --tags --force 2>/dev/null || true
           if ! git describe --tags --long --match 'v*' 2>/dev/null; then
-            echo "v26.10-0-g$(git rev-parse --short HEAD)" > src/scripts/.version
+            echo "0.0.0-0-g$(git rev-parse --short=7 HEAD)" > src/scripts/.version
           fi
           ccache -z
           export VPP_EXTRA_CMAKE_ARGS="\
@@ -101,6 +103,6 @@ jobs:
           body: |
             VPP build from commit ${{ github.sha }}
             - Branch: ${{ github.ref_name }}
-            - Build date: ${{ github.event.repository.updated_at }}
+            - Build date: ${{ github.event.head_commit.timestamp }}
           draft: false
           prerelease: true
