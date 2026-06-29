@@ -105,7 +105,7 @@ adj_l2_rewrite_inline (vlib_main_t * vm,
 		p0->current_length += rw_len0;
 		tx_sw_if_index0 = adj0[0].rewrite_header.sw_if_index;
 
-		if (is_midchain)
+		if (is_midchain && adj0->sub_type.midchain.fixup_func)
 		{
 		    adj0->sub_type.midchain.fixup_func(
                         vm, adj0, p0,
