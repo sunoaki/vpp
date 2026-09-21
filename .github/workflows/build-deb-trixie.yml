@@ -28,14 +28,6 @@ jobs:
       - name: Disable APT cache cleanup
         run: rm -f /etc/apt/apt.conf.d/docker-clean
 
-      - name: Restore apt archive cache
-        uses: actions/cache/restore@v4
-        with:
-          path: /var/cache/apt/archives
-          key: apt-debian13-${{ runner.arch }}-${{ github.run_id }}
-          restore-keys: |
-            apt-debian13-${{ runner.arch }}-
-
       - name: Install base tools
         run: |
           apt-get update -qq
@@ -45,6 +37,26 @@ jobs:
         run: |
           git clone --depth 1 --branch "$GITHUB_REF_NAME" \
             "https://github.com/$GITHUB_REPOSITORY.git" .
+          # The branch can move between the event and this clone, so check out
+          # the commit the run is for instead of whatever the branch points at
+          # now; otherwise the debs and their version string would name a
+          # different commit than the run and the release body do.
+          git config --global --add safe.directory "$PWD"
+          if [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]; then
+            git fetch --no-tags --depth 1 origin "$GITHUB_SHA"
+            git checkout --detach FETCH_HEAD
+          fi
+
+      # The key is derived from the files that decide which packages get
+      # downloaded, so it must be hashed after the clone: before it the
+      # expression has nothing to hash and resolves to an empty string.
+      - name: Restore apt archive cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-debian13-${{ runner.arch }}-${{ hashFiles('build/external/packages/*.mk') }}
+          restore-keys: |
+            apt-debian13-${{ runner.arch }}-
 
       - name: Compute short SHA
         id: vars
@@ -63,21 +75,26 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: /var/cache/apt/archives
-          key: apt-debian13-${{ runner.arch }}-${{ github.run_id }}
+          key: apt-debian13-${{ runner.arch }}-${{ hashFiles('build/external/packages/*.mk') }}
 
       - name: Restore ccache
         uses: actions/cache/restore@v4
         with:
           path: build-root/.ccache
-          key: ccache-debian13-${{ runner.arch }}-${{ github.ref_name }}
+          key: ccache-debian13-${{ runner.arch }}-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
+            ccache-debian13-${{ runner.arch }}-${{ github.ref_name }}-
             ccache-debian13-${{ runner.arch }}-
 
       - name: Build VPP DEB packages
         run: |
           git config --global --add safe.directory "$PWD"
           git fetch --tags --force 2>/dev/null || true
-          if ! git describe --tags --long --match 'v*' 2>/dev/null; then
+          # Only a VPP release tag (vYY.MM...) should win over the synthesised
+          # version.  A bare 'v*' also matches this workflow's own release
+          # tags (vpp-trixie-<n>), which would leave .version unwritten and
+          # send src/scripts/version down its own git describe path.
+          if ! git describe --tags --long --match 'v[0-9]*' 2>/dev/null; then
             # No matching tag in this repo, so synthesise one.  The build
             # identifier must vary per commit, otherwise every build of this
             # branch produces the same version string and apt skips packages
@@ -92,7 +109,11 @@ jobs:
             #
             # Use the commit timestamp rather than git rev-list --count:
             # this job clones with --depth 1, where the count is always 1.
-            echo "0.0.0-release+$(git log -1 --format=%ct)-g$(git rev-parse --short=7 HEAD)" \
+            # The hash is appended without a separator: Debian compares the
+            # part after "+" as digits followed by letters, so two commits
+            # made in the same second would otherwise be ordered by their
+            # hash instead of by commit order.
+            echo "0.0.0-release+$(git log -1 --format=%ct%h)" \
               > src/scripts/.version
           fi
           ccache -z
@@ -106,7 +127,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: build-root/.ccache
-          key: ccache-debian13-${{ runner.arch }}-${{ github.ref_name }}
+          key: ccache-debian13-${{ runner.arch }}-${{ github.ref_name }}-${{ github.run_id }}
 
       - name: Upload DEB artifacts
         uses: actions/upload-artifact@v4
