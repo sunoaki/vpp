@@ -824,6 +824,14 @@ memif_device_input_zc_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       if (PREDICT_FALSE (!memif_zc_rx_packet_valid (
 	    ring, cur_slot, n_slots, mask, buffer_length, &packet_slots)))
 	{
+	  u16 slot_i;
+
+	  /* These descriptors never reach the graph and the refill below
+	     overwrites the ring's copy of their buffer indices, so return the
+	     buffers here. */
+	  for (slot_i = 0; slot_i < packet_slots; slot_i++)
+	    vlib_buffer_free_one (vm, mq->buffers[(cur_slot + slot_i) & mask]);
+
 	  cur_slot += packet_slots;
 	  n_slots -= packet_slots;
 	  vlib_error_count (vm, node->node_index, MEMIF_INPUT_ERROR_BAD_DESC,
