@@ -57,6 +57,8 @@ jobs:
         run: |
           sed -i '/^\s*git config commit\.template/s/^\(\s*\)/\1-/' Makefile
           make UNATTENDED=yes install-dep
+          # temporary: the srtp plugin is only built when libsrtp2 is present
+          apt-get install -y -qq libsrtp2-dev
 
       - name: Save apt archive cache
         if: always()
