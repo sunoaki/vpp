@@ -813,6 +813,17 @@ memif_device_input_zc_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       goto done;
     }
 
+  /* ring->tail is written by the peer: only the slots that were published to
+   * it hold a valid buffer index in mq->buffers[] */
+  head = __atomic_load_n (&ring->head, __ATOMIC_ACQUIRE);
+  if (PREDICT_FALSE (n_slots > (u16) (head - cur_slot)))
+    {
+      vlib_error_count (vm, node->node_index, MEMIF_INPUT_ERROR_BAD_DESC, 1);
+      n_slots = head - cur_slot;
+      if (n_slots == 0)
+	goto refill;
+    }
+
   /* process ring slots */
   vec_validate_aligned (ptd->buffers, MEMIF_RX_VECTOR_SZ,
 			CLIB_CACHE_LINE_BYTES);
