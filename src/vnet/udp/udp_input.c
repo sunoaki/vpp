@@ -322,10 +322,14 @@ udp46_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 						   s0->thread_index);
 		  ASSERT (session_index_from_handle (osh) == uc0->c_s_index);
 		  /*
-		   * Ask session layer for a new session.
+		   * Ask session layer for a new session.  If the fifos cannot
+		   * be attached the migration is deferred: s0 keeps pointing at
+		   * the session owned by the other thread, which is the one that
+		   * must be notified below.
 		   */
-		  session_dgram_connect_notify (&uc0->connection, osh, &s0);
-		  queue_event = 0;
+		  if (session_dgram_connect_notify (&uc0->connection, osh,
+						    &s0) == 0)
+		    queue_event = 0;
 		}
 	      else
 		s0->session_state = SESSION_STATE_READY;
