@@ -389,7 +389,8 @@ ssvm_server_init_private (ssvm_private_t * ssvm)
   if (heap == 0)
     {
       clib_unix_warning ("heap alloc");
-      return -1;
+      clib_mem_vm_unmap (sh);
+      return SSVM_API_ERROR_CREATE_FAILURE;
     }
 
   rnd_size = clib_mem_get_heap_free_space (heap);
