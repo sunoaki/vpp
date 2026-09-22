@@ -58,7 +58,7 @@ vl_msg_api_tx_trace_enabled (api_main_t * am)
 /*
  * vl_msg_api_trace
  */
-static void
+void
 vl_msg_api_trace_with_size (api_main_t *am, vl_api_trace_t *tp, void *msg,
 			    uword msg_len)
 {
