@@ -751,9 +751,8 @@ void (*vl_mem_api_fuzz_hook) (u16, void *);
 
 /* This is only to be called from a vlib/vnet app */
 static void
-vl_mem_api_handler_with_vm_node (api_main_t *am, svm_region_t *vlib_rp,
-				 void *the_msg, vlib_main_t *vm,
-				 vlib_node_runtime_t *node, u8 is_private,
+vl_mem_api_handler_with_vm_node (api_main_t *am, svm_region_t *vlib_rp, void *the_msg,
+				 vlib_main_t *vm, vlib_node_runtime_t *node, u8 is_private,
 				 uword msg_len)
 {
   u16 id = clib_net_to_host_u16 (*((u16 *) the_msg));
@@ -889,7 +888,7 @@ vl_mem_api_handler_with_vm_node (api_main_t *am, svm_region_t *vlib_rp,
  * read outside the region.  Returns 0 and stores the length on success.
  */
 static int
-vl_mem_api_msg_len (svm_region_t * vlib_rp, uword mp, uword * msg_len)
+vl_mem_api_msg_len (svm_region_t *vlib_rp, uword mp, uword *msg_len)
 {
   uword region_start = (uword) vlib_rp->virtual_base;
   uword region_end = region_start + vlib_rp->virtual_size;
@@ -908,9 +907,8 @@ vl_mem_api_msg_len (svm_region_t * vlib_rp, uword mp, uword * msg_len)
 }
 
 static inline int
-void_mem_api_handle_msg_i (api_main_t * am, svm_region_t * vlib_rp,
-			   vlib_main_t * vm, vlib_node_runtime_t * node,
-			   u8 is_private)
+void_mem_api_handle_msg_i (api_main_t *am, svm_region_t *vlib_rp, vlib_main_t *vm,
+			   vlib_node_runtime_t *node, u8 is_private)
 {
   svm_queue_t *q;
   uword mp;
@@ -928,8 +926,7 @@ void_mem_api_handle_msg_i (api_main_t * am, svm_region_t * vlib_rp,
 	}
 
       VL_MSG_API_UNPOISON ((void *) mp);
-      vl_mem_api_handler_with_vm_node (am, vlib_rp, (void *) mp, vm, node,
-				       is_private, msg_len);
+      vl_mem_api_handler_with_vm_node (am, vlib_rp, (void *) mp, vm, node, is_private, msg_len);
       return 0;
     }
   return -1;
@@ -985,8 +982,8 @@ vl_mem_api_handle_rpc (vlib_main_t * vm, vlib_node_runtime_t * node)
 	      clib_warning ("dropping RPC message outside the region (0x%lx)", mp);
 	      continue;
 	    }
-	  vl_mem_api_handler_with_vm_node (am, am->vlib_rp, (void *) mp, vm,
-					   node, 0 /* is_private */, msg_len);
+	  vl_mem_api_handler_with_vm_node (am, am->vlib_rp, (void *) mp, vm, node,
+					   0 /* is_private */, msg_len);
 	}
       vl_msg_api_barrier_release ();
     }
