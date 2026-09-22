@@ -52,7 +52,8 @@ jobs:
       - name: Install VPP checkstyle dependencies
         run: |
           git config --global --add safe.directory "$PWD"
-          sed -i '/^\s*git config commit\.template/s/^\(\s*\)/\1-/' Makefile
+          # crcchecker.py refuses to run when a tracked file is modified, so
+          # this step must not rewrite the Makefile.
           make UNATTENDED=yes install-dep
 
       - name: Check the feature list
@@ -160,6 +161,19 @@ jobs:
           restore-keys: |
             ccache-debug-debian13-${{ runner.arch }}-${{ github.ref_name }}-
             ccache-debug-debian13-${{ runner.arch }}-
+
+      # src/scripts/version calls git describe without --tags, and origin
+      # (sunoaki/vpp) has no v* tags, so the version is empty and the CMake
+      # configure aborts with "string sub-command REPLACE requires at least
+      # four arguments". Synthesise a version in the same format the DEB
+      # workflow uses, whose ordering is already thought through, whenever no
+      # tag is reachable.
+      - name: Provide a version when origin has no tag
+        run: |
+          if ! git describe --tags --long --match 'v[0-9]*' 2>/dev/null; then
+            echo "0.0.0-release+$(git log -1 --format=%ct).$(git rev-list --count HEAD)-g$(git rev-parse --short=7 HEAD)" \
+              > src/scripts/.version
+          fi
 
       - name: Build VPP debug
         run: |
