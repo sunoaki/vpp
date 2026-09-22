@@ -6,11 +6,6 @@ on:
     branches: [master]
     types: [opened, synchronize, reopened]
   workflow_dispatch:
-  # TEMPORARY: a plain push to a ci/* branch runs this workflow so it can be
-  # brought up without opening a pull request, and is removed in the final
-  # commit of that effort.
-  push:
-    branches: ["ci/**"]
 
 # One run per ref: a new push to the same branch cancels the previous run.
 concurrency:
@@ -129,6 +124,7 @@ jobs:
           echo "hash=$(git hash-object Makefile)" >> "$GITHUB_OUTPUT"
 
       - name: Restore apt archive cache
+        id: apt-cache
         uses: actions/cache/restore@v4
         with:
           path: /var/cache/apt/archives
@@ -141,8 +137,11 @@ jobs:
           sed -i '/^\s*git config commit\.template/s/^\(\s*\)/\1-/' Makefile
           make UNATTENDED=yes install-dep
 
+      # Saving is skipped when the exact key was restored: that entry already
+      # holds what this run would store, and asking to save a key that exists
+      # fails the step with "Unable to reserve cache".
       - name: Save apt archive cache
-        if: always()
+        if: steps.apt-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: /var/cache/apt/archives
@@ -154,6 +153,7 @@ jobs:
       # and the prefix in restore-keys still lends a run the newest entry of
       # another commit on the same ref.
       - name: Restore ccache
+        id: ccache
         uses: actions/cache/restore@v4
         with:
           path: build-root/.ccache
@@ -186,6 +186,7 @@ jobs:
           ccache -s
 
       - name: Save ccache
+        if: steps.ccache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: build-root/.ccache
