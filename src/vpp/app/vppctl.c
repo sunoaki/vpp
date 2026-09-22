@@ -112,20 +112,23 @@ process_input (int sock_fd, unsigned char *rx_buf, int rx_buf_len,
     {
       if (rx_buf[i] == IAC)
 	{
+	  /* a truncated IAC negotiation needs 2 bytes past i; don't overrun */
+	  if (i + 2 >= rx_buf_len)
+	    break;
 	  if (rx_buf[i + 1] == SB)
 	    {
 	      char opt = rx_buf[i + 2];
 	      i += 3;
 #if DEBUG
-	      if (rx_buf[i] != IAC)
+	      if (i < rx_buf_len && rx_buf[i] != IAC)
 		{
 		  fprintf (stderr, "SB ");
 		}
-	      while (rx_buf[i] != IAC && i < rx_buf_len)
+	      while (i < rx_buf_len && rx_buf[i] != IAC)
 		fprintf (stderr, "%02x ", rx_buf[i++]);
 	      fprintf (stderr, "\n");
 #else
-	      while (rx_buf[i] != IAC && i < rx_buf_len)
+	      while (i < rx_buf_len && rx_buf[i] != IAC)
 		{
 		  i++;
 		}
