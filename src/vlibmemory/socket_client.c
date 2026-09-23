@@ -111,6 +111,12 @@ vl_socket_client_read_internal (socket_client_main_t * scm, int wait)
 
       mbp = (msgbuf_t *) (scm->socket_rx_buffer);
       data_len = ntohl (mbp->data_len);
+      if (data_len > (64 << 20) || data_len > ~0u - sizeof (*mbp))
+	{
+	  clib_warning ("socket_client: oversized message %u", data_len);
+	  vec_set_len (scm->socket_rx_buffer, 0);
+	  return -1;
+	}
       current_rx_index = vec_len (scm->socket_rx_buffer);
       vec_validate (scm->socket_rx_buffer, current_rx_index + data_len);
       mbp = (msgbuf_t *) (scm->socket_rx_buffer);
