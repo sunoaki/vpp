@@ -221,6 +221,7 @@ fib_entry_src_interface_deactivate (fib_entry_src_t *src,
     {
 	cover = fib_entry_get(src->u.interface.fesi_cover);
 	fib_entry_cover_untrack(cover, src->u.interface.fesi_sibling);
+	fib_attached_export_covered_removed (cover, fib_entry_get_index (fib_entry));
 
 	src->u.interface.fesi_cover = FIB_NODE_INDEX_INVALID;
 	src->u.interface.fesi_sibling = ~0;
