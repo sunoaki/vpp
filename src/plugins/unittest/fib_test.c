@@ -5718,6 +5718,113 @@ fib_test_ae (void)
     FIB_TEST((FIB_NODE_INDEX_INVALID != fei), "local imported");
     FIB_TEST(fib_entry_is_sourced(fei, FIB_SOURCE_AE), "local has AE source");
 
+    {
+        fib_node_index_t local_fei = fib_table_lookup_exact_match(fib_index, &local_pfx);
+        const u32 local_locks = fib_entry_get(local_fei)->fe_node.fn_locks;
+        const u32 local_entries = fib_entry_pool_size();
+        const u32 local_path_lists = fib_path_list_pool_size();
+        const dpo_id_t *local_bucket, *import_bucket;
+        fib_entry_src_t *local_src;
+        dpo_id_t interposer = DPO_INVALID;
+        fib_mpls_label_t *labels = NULL, label = {
+            .fml_value = 99,
+        };
+
+        vec_add1(labels, label);
+        mpls_label_dpo_create(labels, MPLS_EOS, DPO_PROTO_IP4,
+                              MPLS_LABEL_DPO_FLAG_NONE,
+                              punt_dpo_get(DPO_PROTO_MPLS), &interposer);
+
+        for (u32 cycle = 0; cycle < 2; cycle++)
+        {
+            fib_table_entry_special_dpo_add(fib_index, &local_pfx,
+                                            FIB_SOURCE_SPECIAL,
+                                            FIB_ENTRY_FLAG_INTERPOSE, &interposer);
+            FIB_TEST((FIB_SOURCE_SPECIAL == fib_entry_get(local_fei)->fe_srcs[0].fes_src),
+                     "local interposer wins cycle %u", cycle);
+            local_src = fib_entry_src_find(fib_entry_get(local_fei), FIB_SOURCE_INTERFACE);
+            FIB_TEST((local_src && (local_src->fes_flags & FIB_ENTRY_SRC_FLAG_CONTRIBUTING)),
+                     "local interface contributes under interposer cycle %u", cycle);
+            fei = fib_table_lookup_exact_match(import_fib_index1, &local_pfx);
+            FIB_TEST((FIB_NODE_INDEX_INVALID != fei),
+                     "interposed local imported cycle %u", cycle);
+            FIB_TEST(fib_entry_is_sourced(fei, FIB_SOURCE_AE),
+                     "interposed local has AE source cycle %u", cycle);
+            dpo = fib_entry_contribute_ip_forwarding(local_fei);
+            local_bucket = load_balance_get_bucket(dpo->dpoi_index, 0);
+            FIB_TEST((mpls_label_dpo_get_type(MPLS_LABEL_DPO_FLAG_NONE) == local_bucket->dpoi_type),
+                     "local forwards through label interposer cycle %u", cycle);
+            FIB_TEST((DPO_RECEIVE == mpls_label_dpo_get(local_bucket->dpoi_index)->mld_dpo.dpoi_type),
+                     "local interposer retains receive forwarding cycle %u", cycle);
+            dpo = fib_entry_contribute_ip_forwarding(fei);
+            import_bucket = load_balance_get_bucket(dpo->dpoi_index, 0);
+            FIB_TEST((0 == dpo_cmp(local_bucket, import_bucket)),
+                     "import uses installed interposed forwarding cycle %u", cycle);
+            FIB_TEST((local_locks + 1 == fib_entry_get(local_fei)->fe_node.fn_locks),
+                     "interposed local has one additional source lock cycle %u", cycle);
+
+            fib_table_entry_special_remove(fib_index, &local_pfx, FIB_SOURCE_SPECIAL);
+            FIB_TEST((FIB_SOURCE_INTERFACE == fib_entry_get(local_fei)->fe_srcs[0].fes_src),
+                     "local interface wins after interposer removal cycle %u", cycle);
+            fei = fib_table_lookup_exact_match(import_fib_index1, &local_pfx);
+            FIB_TEST((FIB_NODE_INDEX_INVALID != fei),
+                     "local import restored after interposer removal cycle %u", cycle);
+            FIB_TEST(fib_entry_is_sourced(fei, FIB_SOURCE_AE),
+                     "restored local has AE source cycle %u", cycle);
+            dpo = fib_entry_contribute_ip_forwarding(local_fei);
+            local_bucket = load_balance_get_bucket(dpo->dpoi_index, 0);
+            FIB_TEST((DPO_RECEIVE == local_bucket->dpoi_type),
+                     "local receive restored cycle %u", cycle);
+            dpo = fib_entry_contribute_ip_forwarding(fei);
+            import_bucket = load_balance_get_bucket(dpo->dpoi_index, 0);
+            FIB_TEST((0 == dpo_cmp(local_bucket, import_bucket)),
+                     "import uses restored receive forwarding cycle %u", cycle);
+            FIB_TEST((local_locks == fib_entry_get(local_fei)->fe_node.fn_locks),
+                     "local import locks balanced cycle %u", cycle);
+            FIB_TEST((local_entries == fib_entry_pool_size()),
+                     "interposer leaves no FIB entries cycle %u", cycle);
+            FIB_TEST((local_path_lists == fib_path_list_pool_size()),
+                     "interposer leaves no path lists cycle %u", cycle);
+        }
+        dpo_reset(&interposer);
+        vec_free(labels);
+
+        fib_table_entry_delete(fib_index, &local_pfx, FIB_SOURCE_INTERFACE);
+        FIB_TEST((FIB_NODE_INDEX_INVALID == fib_table_lookup_exact_match(fib_index, &local_pfx)),
+                 "local source withdrawn after interposer cycles");
+        FIB_TEST((FIB_NODE_INDEX_INVALID == fib_table_lookup_exact_match(import_fib_index1, &local_pfx)),
+                 "local AE withdrawn after interposer cycles");
+        FIB_TEST((local_entries - 2 == fib_entry_pool_size()),
+                 "local withdrawal releases original and imported entries");
+        FIB_TEST((FIB_ENTRY_FLAG_IMPORT & fib_entry_get_flags(import_fei)),
+                 "attached importer survives local withdrawal");
+        local_pfx.fp_len = 24;
+        fei = fib_table_lookup_exact_match(fib_index, &local_pfx);
+        FIB_TEST((FIB_NODE_INDEX_INVALID != fei), "connected cover survives local withdrawal");
+        FIB_TEST((FIB_ENTRY_FLAG_ATTACHED & fib_entry_get_flags(fei)),
+                 "connected cover remains attached");
+        local_pfx.fp_len = 32;
+        local_fei = fib_table_entry_update_one_path(fib_index, &local_pfx,
+                                                    FIB_SOURCE_INTERFACE,
+                                                    FIB_ENTRY_FLAG_CONNECTED | FIB_ENTRY_FLAG_LOCAL,
+                                                    DPO_PROTO_IP4, NULL,
+                                                    tm->hw[0]->sw_if_index, ~0, 1, NULL,
+                                                    FIB_ROUTE_PATH_FLAG_NONE);
+        fei = fib_table_lookup_exact_match(import_fib_index1, &local_pfx);
+        FIB_TEST((FIB_NODE_INDEX_INVALID != fei), "local import restored after source re-add");
+        FIB_TEST(fib_entry_is_sourced(fei, FIB_SOURCE_AE), "re-added local has AE source");
+        dpo = fib_entry_contribute_ip_forwarding(local_fei);
+        local_bucket = load_balance_get_bucket(dpo->dpoi_index, 0);
+        FIB_TEST((DPO_RECEIVE == local_bucket->dpoi_type), "re-added local receives");
+        dpo = fib_entry_contribute_ip_forwarding(fei);
+        import_bucket = load_balance_get_bucket(dpo->dpoi_index, 0);
+        FIB_TEST((0 == dpo_cmp(local_bucket, import_bucket)), "re-added local forwarding imported");
+        FIB_TEST((local_locks == fib_entry_get(local_fei)->fe_node.fn_locks),
+                 "re-added local locks restored");
+        FIB_TEST((local_entries == fib_entry_pool_size()), "local re-add restores FIB entry count");
+        FIB_TEST((local_path_lists == fib_path_list_pool_size()), "local re-add restores path list count");
+    }
+
     /*
      * Add another adj-fin in the export table. Expect this
      * to get magically exported;
