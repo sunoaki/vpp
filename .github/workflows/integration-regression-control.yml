@@ -763,6 +763,10 @@ jobs:
                   for _ in range(8):
                       count = len(self.handles)
                       table = processes()
+                      for owned_key in self.handles:
+                          snapshot = table.get(owned_key[0])
+                          if snapshot is not None:
+                              self.observe(owned_key, snapshot, "discover_snapshot")
                       for pid, identity in table.items():
                           key = (pid, identity[1])
                           if self.blocked(key):
@@ -1483,7 +1487,9 @@ jobs:
           def identity_fixtures():
               from unittest.mock import patch
               owned = OwnedProcesses()
+              owned.candidate(300, (os.getpid(), "old", "S"), {})
               owned.handles[(300, "old")] = (30, 31)
+              owned.resolve((300, "old"), "bound")
               sent = []
               with patch.object(signal, "pidfd_send_signal", side_effect=lambda fd, sig: sent.append((fd, sig))), \
                    patch.object(os, "kill", side_effect=AssertionError("Numeric signal forbidden")), \
@@ -1492,7 +1498,9 @@ jobs:
                   owned.signal(signal.SIGKILL)
               require(sent == [(31, signal.SIGTERM), (31, signal.SIGKILL)], "PID replacement redirected original identity signal")
               tables = [{300: (1, "replacement", "S"), 201: (os.getpid(), "new-birth", "S")}]
+              owned.candidate(201, (os.getpid(), "old-birth", "S"), {})
               owned.handles[(201, "old-birth")] = (20, 21)
+              owned.resolve((201, "old-birth"), "bound")
               acquired = []
               def bind(pid, identity):
                   acquired.append((pid, identity[1]))
@@ -1617,6 +1625,10 @@ jobs:
           def scheduling_fixtures():
               from unittest.mock import patch
               owner = OwnedProcesses()
+              original = {9: (os.getpid(), "90", "S"), 8: (os.getpid(), "80", "S"), 7: (8, "11", "S")}
+              for pid, identity in original.items():
+                  owner.candidate(pid, identity, original)
+                  owner.resolve((pid, identity[1]), "bound")
               owner.handles = {(9, "90"): (90, 91), (8, "80"): (80, 81), (7, "11"): (10, 11)}
               table = {8: (os.getpid(), "80", "S"), 7: (8, "22", "S")}
               exited, signals = {91, 11}, []
@@ -1638,8 +1650,12 @@ jobs:
                    patch.object(signal, "pidfd_send_signal", side_effect=send), \
                    patch.object(os, "kill", side_effect=AssertionError("Numeric signal forbidden")), \
                    patch.object(os, "killpg", side_effect=AssertionError("Group signal forbidden")):
-                  require(owner.cleanup(9) and not table and (7, "22") in owner.handles and
-                          any(fd == 71 for fd, _ in signals), "S/R transition lost owned reused child")
+                  require(not owner.cleanup(9) and not table and (7, "22") in owner.handles and
+                          any(fd == 71 for fd, _ in signals), "S/R transition lost separately owned new birth")
+                  record = owner.acquisitions[(7, "11")]
+                  require(record["reused"] and (7, "11") in owner.unresolved and
+                          record["birth_mismatch"]["stage"] == "discover_snapshot",
+                          "Signalled replacement erased observed old-birth mismatch")
               owner = OwnedProcesses()
               owner.handles[(9, "90")] = (90, 91)
               with patch.dict(globals(), processes=lambda: {7: (os.getpid(), "22", "S")}), \
@@ -1825,6 +1841,65 @@ jobs:
                           "Fresh self reads were cached")
               save("parent-identity-fixtures.json", dict(status="PASS", boundaries=4,
                    sticky_paths=["observe", "resolve", "bind", "discover", "absence", "cleanup"], fresh_self_reads=3))
+              discovery_snapshot_fixtures()
+
+          def discovery_snapshot_fixtures():
+              from unittest.mock import patch
+              for boundary in ("discover", "cleanup", "distinct_birth"):
+                  owner = OwnedProcesses()
+                  key = (500, "old-parent")
+                  original = (os.getpid(), key[1], "S")
+                  replacement = (os.getpid() if boundary == "distinct_birth" else 1, "replacement", "S")
+                  owner.candidate(500, original, {})
+                  owner.handles[key] = (50, 51)
+                  owner.resolve(key, "bound")
+                  clock, sent, closed = [0.0], [], []
+                  with patch.dict(globals(), processes=lambda: {500: replacement}), \
+                       patch.object(owner, "exited", return_value=True), \
+                       patch.object(owner, "identity", return_value=replacement), \
+                       patch.object(os, "open", return_value=60), patch.object(os, "pidfd_open", return_value=61), \
+                       patch.object(os, "close", side_effect=closed.append), patch.object(os, "waitid", return_value=None), \
+                       patch.object(signal, "pidfd_send_signal", side_effect=lambda fd, sig: sent.append((fd, sig))), \
+                       patch.object(os, "kill", side_effect=AssertionError("Numeric signal forbidden")), \
+                       patch.object(os, "killpg", side_effect=AssertionError("Group signal forbidden")), \
+                       patch.object(time, "monotonic", side_effect=lambda: clock[0]), \
+                       patch.object(time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+                      if boundary == "cleanup":
+                          require(not owner.cleanup(500), "Standalone snapshot mismatch produced false cleanup")
+                      else:
+                          owner.discover()
+                          require(not sent and not closed, "Discovery signalled or closed published handles")
+                      record = owner.acquisitions[key]
+                      witness = dict(record.get("birth_mismatch", {}))
+                      require(record["reused"] and key in owner.unresolved and record["status"] == "pending" and
+                              witness == dict(stage="discover_snapshot", expected=key[1], actual=replacement),
+                              "Standalone discovery lost bound identity mismatch")
+                      if boundary == "distinct_birth":
+                          new_key = (500, replacement[1])
+                          require(owner.handles.get(new_key) == (60, 61) and new_key not in owner.unresolved and
+                                  owner.acquisitions[new_key]["status"] == "bound",
+                                  "Sticky old birth blocked separately proven new birth")
+                      else:
+                          require(set(owner.acquisitions) == {key} and set(owner.handles) == {key},
+                                  "Unattributable replacement acquired authority")
+                      owner.observe(key, (1, "later", "R"), "later_snapshot")
+                      owner.observe(key, original, "later_original")
+                      with patch.object(os, "open", side_effect=FileNotFoundError(2, "later absent")):
+                          owner.reconcile({})
+                          owner.reconcile({})
+                      require(not owner.resolve(key, "bound") and not owner.resolve(key, "vanished") and
+                              not owner.bind(500, original), "Snapshot mismatch bypassed sticky guards")
+                      owner.discover()
+                      if boundary != "cleanup":
+                          require(not owner.cleanup(500), "Sticky discovery mismatch produced false cleanup")
+                      require(record["birth_mismatch"] == witness and record["reused"] and key in owner.unresolved,
+                              "Later discovery or cleanup replaced first snapshot witness")
+                  descriptors = [50, 51, 60, 61] if boundary == "distinct_birth" else [50, 51]
+                  require(sorted(closed) == descriptors and (51, signal.SIGKILL) in sent and
+                          all(fd in ({51, 61} if boundary == "distinct_birth" else {51}) for fd, _ in sent),
+                          "Snapshot cleanup changed proven pidfd signalling or descriptor ownership")
+              save("discovery-snapshot-fixtures.json", dict(status="PASS", boundaries=3,
+                   first_witness="discover_snapshot", distinct_birth_bound=True, cleanup_complete=False))
 
           def ownership_fixtures():
               from unittest.mock import patch
