@@ -434,16 +434,24 @@ jobs:
                       table[pid] = identity
               return table
 
-          def descendants(tracked, baseline):
+          def descendants(tracked, baseline, unresolved):
               table = process_table()
               changed = True
               while changed:
                   changed = False
                   for pid, (parent, birth) in table.items():
+                      owned_parent = (parent in tracked and parent not in baseline and
+                                      parent in table and tracked[parent] == table[parent][1])
                       if pid in tracked or pid in baseline:
+                          previous = tracked.get(pid, baseline.get(pid))
+                          if birth != previous and owned_parent:
+                              if (pid, birth) not in unresolved and len(unresolved) >= 2048:
+                                  raise RuntimeError("Unresolved PID identity evidence limit exceeded")
+                              unresolved.setdefault((pid, birth), {
+                                  "pid": pid, "birth": birth, "previous_birth": previous,
+                                  "parent": parent, "parent_birth": tracked[parent]})
                           continue
-                      if parent == os.getpid() or (parent in tracked and parent not in baseline and
-                                                  parent in table and tracked[parent] == table[parent][1]):
+                      if parent == os.getpid() or owned_parent:
                           tracked[pid] = birth
                           changed = True
               return {pid for pid, birth in tracked.items()
@@ -484,13 +492,13 @@ jobs:
                   record_root_exit(process, reaped)
               return process.returncode
 
-          def cleanup(process, tracked, baseline):
+          def cleanup(process, tracked, baseline, unresolved):
               result = {"signals": [], "reaped": [], "survivors": []}
               deadline = time.monotonic() + 5
               for sig, seconds in ((signal.SIGTERM, 1), (signal.SIGKILL, 3)):
                   stage_end = min(deadline, time.monotonic() + seconds)
                   while True:
-                      live = descendants(tracked, baseline)
+                      live = descendants(tracked, baseline, unresolved)
                       identities = [(pid, tracked[pid]) for pid in sorted(live)]
                       for pid, birth in identities:
                           sent, reaped = inspect_process(pid, birth, sig)
@@ -499,14 +507,18 @@ jobs:
                           if reaped is not None:
                               result["reaped"].append([reaped.si_pid, birth, reaped.si_status])
                               record_root_exit(process, reaped)
-                      if not descendants(tracked, baseline) or time.monotonic() >= stage_end:
+                      if not descendants(tracked, baseline, unresolved) or time.monotonic() >= stage_end:
                           break
                       time.sleep(0.02)
               if process is not None and process.returncode is None:
                   poll_root(process, tracked)
                   if process.returncode is None:
                       result["survivors"].append(process.pid)
-              result["survivors"] = sorted(set(result["survivors"]) | descendants(tracked, baseline))
+              result["survivors"] = sorted(set(result["survivors"]) |
+                                           descendants(tracked, baseline, unresolved))
+              result["unresolved_identities"] = list(unresolved.values())
+              if unresolved:
+                  result["error"] = "Proven owned PID reuse remains unresolved"
               return result
 
           def command(label, args, env=None, seconds=900, evidence=False):
@@ -521,7 +533,7 @@ jobs:
               result_path = directory / "result.json"
               result_path.write_text(json.dumps(result, indent=2))
               (directory / "console.log").touch()
-              tail, process, tracked = bytearray(), None, {}
+              tail, process, tracked, unresolved = bytearray(), None, {}, {}
               baseline = {pid: birth for pid, (_, birth) in process_table().items()}
               poller = selectors.DefaultSelector()
               handlers = {}
@@ -538,7 +550,7 @@ jobs:
                       raise TimeoutError("Command budget exhausted before spawn")
                   process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                              env=env, start_new_session=True)
-                  descendants(tracked, baseline)
+                  descendants(tracked, baseline, unresolved)
                   result["pid"] = process.pid
                   result["pid_starttime"] = tracked.get(process.pid)
                   result_path.write_text(json.dumps(result, indent=2))
@@ -546,7 +558,7 @@ jobs:
                   poller.register(process.stdout, selectors.EVENT_READ)
                   with (directory / "console.log").open("w+b") as stream:
                       while poller.get_map() or poll_root(process, tracked) is None:
-                          descendants(tracked, baseline)
+                          descendants(tracked, baseline, unresolved)
                           remaining = deadline - time.monotonic()
                           if remaining <= 0:
                               raise TimeoutError("Absolute command deadline exceeded")
@@ -565,7 +577,7 @@ jobs:
                               stream.truncate()
                               stream.flush()
                       result["rc"] = process.returncode
-                  if descendants(tracked, baseline):
+                  if descendants(tracked, baseline, unresolved):
                       raise RuntimeError("Command left descendant processes after completion")
                   result["outcome"] = "success" if result["rc"] == 0 else "nonzero"
               except BaseException as error:
@@ -577,9 +589,12 @@ jobs:
                   for sig in handlers:
                       signal.signal(sig, signal.SIG_IGN)
                   try:
-                      result["cleanup"] = cleanup(process, tracked, baseline)
+                      result["cleanup"] = cleanup(process, tracked, baseline, unresolved)
                   except BaseException as error:
                       result["cleanup"] = {"error": repr(error), "survivors": sorted(tracked)}
+                  result["cleanup"]["unresolved_identities"] = list(unresolved.values())
+                  if unresolved:
+                      result["cleanup"].setdefault("error", "Proven owned PID reuse remains unresolved")
                   if process is not None:
                       result["rc"] = process.returncode
                   try:
