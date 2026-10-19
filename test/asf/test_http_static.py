@@ -281,7 +281,8 @@ else:
             print(json.dumps({"status": response.status,
                               "body": body.decode(),
                               "cache": response.getheader("Cache-Control")}), flush=True)
-        except (OSError, http.client.HTTPException) as error:
+        except (ConnectionResetError, BrokenPipeError,
+                http.client.IncompleteRead, http.client.RemoteDisconnected) as error:
             print(json.dumps({"closed": type(error).__name__}), flush=True)
     request()
 for command in sys.stdin:
@@ -296,7 +297,8 @@ for command in sys.stdin:
                     raise http.client.IncompleteRead(b"", remaining)
                 remaining -= len(data)
             print(json.dumps({"drained": True}), flush=True)
-        except (OSError, http.client.HTTPException) as error:
+        except (ConnectionResetError, BrokenPipeError,
+                http.client.IncompleteRead, http.client.RemoteDisconnected) as error:
             print(json.dumps({"closed": type(error).__name__}), flush=True)
     else:
         request()
@@ -343,25 +345,46 @@ connection.close()
         return json.loads(line)
 
     def _refused(self, port):
+        script = """
+import errno, socket, sys
+try:
+    connection = socket.create_connection(("10.10.1.2", int(sys.argv[1])), timeout=3)
+except OSError as error:
+    if error.errno != errno.ECONNREFUSED:
+        raise
+    print("ECONNREFUSED")
+else:
+    connection.close()
+    raise RuntimeError("listener still accepts TCP connections")
+"""
         process = subprocess.run(
             [
                 "ip",
                 "netns",
                 "exec",
                 self.ns_name,
-                "curl",
-                "--noproxy",
-                "*",
-                "--connect-timeout",
-                "2",
-                "--max-time",
-                "3",
-                f"http://10.10.1.2:{port}/version.json",
+                sys.executable,
+                "-c",
+                script,
+                str(port),
             ],
             capture_output=True,
             timeout=10,
         )
-        self.assertNotEqual(process.returncode, 0, process.stdout)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(process.stdout.strip(), b"ECONNREFUSED")
+
+    def _assert_closed(self, response):
+        self.assertIn(
+            response.get("closed"),
+            (
+                "ConnectionResetError",
+                "BrokenPipeError",
+                "IncompleteRead",
+                "RemoteDisconnected",
+            ),
+            response,
+        )
 
     def _empty_default(self):
         reply = self.vapi.http_static_get()
@@ -453,7 +476,7 @@ connection.close()
                 )
                 active = self._client(8082)
                 self.assertEqual(self._response(active)["status"], 200)
-                self.assertIn("closed", self._response(pending, "drain"))
+                self._assert_closed(self._response(pending, "drain"))
                 self._stop_client(pending)
                 self._stop_client(active)
                 self.vapi.cli("http static listener del uri http://10.10.1.2:8082")
@@ -506,7 +529,7 @@ connection.close()
                     protocol in ("tls", "https")
                     and "tlsopenssl" in config.excluded_plugins
                 ):
-                    continue
+                    self.fail("TLS identity coverage requires tlsopenssl")
                 uri = f"{protocol}://10.10.1.2:8085"
                 for repeat in range(2):
                     self.vapi.cli(

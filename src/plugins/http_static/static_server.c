@@ -1164,6 +1164,8 @@ typedef struct
   u32 pending_threads;
 } hss_destroy_ctx_t;
 
+static hss_destroy_ctx_t ***hss_pending_destroys;
+
 static void
 hss_detach_rpc (void *arg)
 {
@@ -1178,9 +1180,8 @@ hss_detach_rpc (void *arg)
 }
 
 static void
-hss_destroy_sessions_rpc (void *arg)
+hss_destroy_sessions (hss_destroy_ctx_t *ctx)
 {
-  hss_destroy_ctx_t *ctx = arg;
   clib_thread_index_t thread_index = vlib_get_thread_index ();
   hss_session_t *hs;
   session_t *s;
@@ -1201,6 +1202,28 @@ hss_destroy_sessions_rpc (void *arg)
   if (clib_atomic_sub_fetch (&ctx->pending_threads, 1) == 0)
     vlib_rpc_call_main_thread (hss_detach_rpc, (u8 *) &ctx, sizeof (ctx));
 }
+
+static uword
+hss_destroy_node_fn (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  hss_destroy_ctx_t **pending;
+  hss_destroy_ctx_t **ctx;
+
+  if (vm->thread_index >= vec_len (hss_pending_destroys))
+    return 0;
+  pending = hss_pending_destroys[vm->thread_index];
+  vec_foreach (ctx, pending)
+    hss_destroy_sessions (*ctx);
+  vec_reset_length (pending);
+  return 0;
+}
+
+VLIB_REGISTER_NODE (hss_destroy_node, static) = {
+  .function = hss_destroy_node_fn,
+  .name = "http-static-destroy",
+  .type = VLIB_NODE_TYPE_INPUT,
+  .state = VLIB_NODE_STATE_INTERRUPT,
+};
 
 int
 hss_destroy (vlib_main_t *vm)
@@ -1237,9 +1260,14 @@ hss_destroy (vlib_main_t *vm)
   hsm->app_index = ~0;
   hsm->is_init = 0;
 
+  /* The barrier serializes publication with worker consumption and vector growth. */
+  vec_validate (hss_pending_destroys, vec_len (hsm->sessions) - 1);
   for (i = 1; i < vec_len (hsm->sessions); i++)
-    session_send_rpc_evt_to_thread_force (i, hss_destroy_sessions_rpc, ctx);
-  hss_destroy_sessions_rpc (ctx);
+    {
+      vec_add1 (hss_pending_destroys[i], ctx);
+      vlib_node_set_interrupt_pending (vlib_get_main_by_index (i), hss_destroy_node.index);
+    }
+  hss_destroy_sessions (ctx);
   return 0;
 }
 
