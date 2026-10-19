@@ -4,6 +4,10 @@ import unittest
 import subprocess
 import tempfile
 import os
+import json
+import select
+import sys
+import time
 from vpp_qemu_utils import (
     create_host_interface,
     delete_all_host_interfaces,
@@ -254,6 +258,307 @@ class TestHttpStaticCli(VppAsfTestCase):
             capture_output=True,
         )
         self.assertNotIn(b"Hello world2", process.stdout)
+
+    def _client(self, port, path="/version.json", secure=False, pending=False):
+        script = """
+import http.client, json, socket, ssl, sys
+port, path, secure, pending = json.loads(sys.argv[1])
+connection = (http.client.HTTPSConnection(
+    "10.10.1.2", port, timeout=5, context=ssl._create_unverified_context())
+    if secure else http.client.HTTPConnection("10.10.1.2", port, timeout=5))
+if pending:
+    connection.connect()
+    connection.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    connection.request("GET", path)
+    response = connection.getresponse()
+    print(json.dumps({"status": response.status}), flush=True)
+else:
+    def request():
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
+            body = response.read()
+            print(json.dumps({"status": response.status,
+                              "body": body.decode(),
+                              "cache": response.getheader("Cache-Control")}), flush=True)
+        except (OSError, http.client.HTTPException) as error:
+            print(json.dumps({"closed": type(error).__name__}), flush=True)
+    request()
+for command in sys.stdin:
+    if command.strip() == "close":
+        break
+    if pending:
+        try:
+            remaining = response.length
+            while remaining:
+                data = response.read(min(65536, remaining))
+                if not data:
+                    raise http.client.IncompleteRead(b"", remaining)
+                remaining -= len(data)
+            print(json.dumps({"drained": True}), flush=True)
+        except (OSError, http.client.HTTPException) as error:
+            print(json.dumps({"closed": type(error).__name__}), flush=True)
+    else:
+        request()
+connection.close()
+"""
+        client = subprocess.Popen(
+            [
+                "ip",
+                "netns",
+                "exec",
+                self.ns_name,
+                sys.executable,
+                "-u",
+                "-c",
+                script,
+                json.dumps([port, path, secure, pending]),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(self._stop_client, client)
+        return client
+
+    @staticmethod
+    def _stop_client(client):
+        if client.poll() is None:
+            client.terminate()
+        try:
+            client.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            client.kill()
+            client.communicate(timeout=10)
+
+    def _response(self, client, command=None):
+        if command:
+            client.stdin.write(command + "\n")
+            client.stdin.flush()
+        ready, _, _ = select.select([client.stdout], [], [], 15)
+        self.assertTrue(ready, "persistent client timed out")
+        line = client.stdout.readline()
+        self.assertTrue(line, f"persistent client exited: {client.poll()}")
+        return json.loads(line)
+
+    def _refused(self, port):
+        process = subprocess.run(
+            [
+                "ip",
+                "netns",
+                "exec",
+                self.ns_name,
+                "curl",
+                "--noproxy",
+                "*",
+                "--connect-timeout",
+                "2",
+                "--max-time",
+                "3",
+                f"http://10.10.1.2:{port}/version.json",
+            ],
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertNotEqual(process.returncode, 0, process.stdout)
+
+    def _empty_default(self):
+        reply = self.vapi.http_static_get()
+        self.assertEqual(reply.www_root, "")
+        self.assertEqual(reply.uri, "")
+        for field in (
+            "fifo_size",
+            "cache_size_limit",
+            "max_age",
+            "keepalive_timeout",
+            "max_body_size",
+            "rx_buff_thresh",
+        ):
+            self.assertEqual(getattr(reply, field), 0, field)
+
+    def _wait_released(self):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            sessions = self.vapi.cli("show http static server sessions")
+            listeners = self.vapi.cli("show http static server listeners")
+            if "path " not in sessions and "listener " not in listeners:
+                return
+            time.sleep(0.05)
+        self.fail(f"HSS ownership retained: {sessions}\n{listeners}")
+
+    def test_http_static_listener_delete_reuse(self):
+        """Accepted sessions retain their listener through delete and readd."""
+        self.vapi.cli("http static server")
+        self.addCleanup(self.vapi.cli, "http static server disable")
+        uri = "http://10.10.1.2:8080"
+        self.vapi.cli(f"http static listener add uri {uri} url-handlers")
+        client = self._client(8080)
+        first = self._response(client)
+        self.assertEqual(first["status"], 200)
+        self.vapi.cli(f"http static listener del uri {uri}")
+        self._refused(8080)
+        self.assertEqual(self._response(client, "next")["body"], first["body"])
+        self.vapi.cli(f"http static listener add uri {uri} www-root /tmp")
+        self.assertEqual(self._response(client, "next")["body"], first["body"])
+        replacement = self._client(8080)
+        self.assertEqual(self._response(replacement)["status"], 404)
+        self._stop_client(client)
+        self._stop_client(replacement)
+        self.vapi.cli(f"http static listener del uri {uri}")
+        self._wait_released()
+
+    def test_http_static_cached_listener_retirement(self):
+        """Persistent cached responses release the original cache ownership."""
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "file.txt"), "w") as output:
+                output.write("original listener")
+            self.vapi.cli("http static server")
+            self.addCleanup(self.vapi.cli, "http static server disable")
+            uri = "http://10.10.1.2:8081"
+            self.vapi.cli(
+                f"http static listener add uri {uri} www-root {root} max-age 123"
+            )
+            client = self._client(8081, "/file.txt")
+            self.assertEqual(self._response(client)["body"], "original listener")
+            self.vapi.cli(f"http static listener del uri {uri}")
+            self.vapi.cli(
+                f"http static listener add uri {uri} www-root {root} max-age 456"
+            )
+            old = self._response(client, "next")
+            self.assertEqual(old["body"], "original listener")
+            self.assertEqual(old["cache"], "max-age=123")
+            replacement = self._client(8081, "/file.txt")
+            self.assertEqual(self._response(replacement)["cache"], "max-age=456")
+            self._stop_client(client)
+            self._stop_client(replacement)
+            self.vapi.cli(f"http static listener del uri {uri}")
+            self._wait_released()
+
+    def test_http_static_destroy_ownership(self):
+        """Disable cleans pending pointer responses before immediate re-enable."""
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "large.txt"), "wb") as output:
+                output.write(b"x" * (8 << 20))
+            self.addCleanup(self.vapi.cli, "http static server disable")
+            for iteration in range(3):
+                self.vapi.cli(
+                    f"http static server uri http://10.10.1.2:8082 www-root {root}"
+                )
+                pending = self._client(8082, "/large.txt", pending=True)
+                self.assertEqual(self._response(pending)["status"], 200)
+                self.vapi.cli("http static server disable")
+                self.vapi.cli(
+                    "http static server uri http://10.10.1.2:8082 url-handlers"
+                )
+                active = self._client(8082)
+                self.assertEqual(self._response(active)["status"], 200)
+                self.assertIn("closed", self._response(pending, "drain"))
+                self._stop_client(pending)
+                self._stop_client(active)
+                self.vapi.cli("http static listener del uri http://10.10.1.2:8082")
+                self._wait_released()
+                self.vapi.cli("http static server disable")
+
+    def test_http_static_default_get_states(self):
+        """Get reports only the live default listener, including URL-only roots."""
+        self._empty_default()
+        self.vapi.cli("http static server")
+        self.addCleanup(self.vapi.cli, "http static server disable")
+        self._empty_default()
+        for config in ("www-root /tmp", "url-handlers"):
+            self.vapi.cli(
+                f"http static listener add uri http://10.10.1.2:8083 {config}"
+            )
+            self._empty_default()
+            self.vapi.cli("http static listener del uri http://10.10.1.2:8083")
+        self.vapi.cli("http static server disable")
+        self.vapi.cli("http static server uri tcp://10.10.1.2:8083 url-handlers")
+        reply = self.vapi.http_static_get()
+        self.assertEqual(reply.www_root, "")
+        self.assertEqual(reply.uri, "http://10.10.1.2:8083")
+        self.vapi.cli("http static listener del uri tcp://10.10.1.2:8083")
+        self._empty_default()
+        self.vapi.cli("http static server disable")
+        self.vapi.cli(
+            "http static server uri http://10.10.1.2:8083 www-root /tmp cache-size 2m"
+        )
+        self.vapi.cli("http static listener add uri http://10.10.1.2:8084 url-handlers")
+        reply = self.vapi.http_static_get()
+        self.assertEqual(reply.www_root, "/tmp")
+        self.assertEqual(reply.cache_size_limit, 2 << 20)
+        self.vapi.cli("http static listener del uri http://10.10.1.2:8083")
+        self._empty_default()
+        self.vapi.cli("http static listener del uri http://10.10.1.2:8084")
+        self.vapi.cli("http static listener add uri http://10.10.1.2:8083 url-handlers")
+        self._empty_default()
+        self.vapi.cli("http static server disable")
+        self.vapi.cli("http static server uri http://10.10.1.2:8083 www-root /tmp")
+        self.assertEqual(self.vapi.http_static_get().www_root, "/tmp")
+
+    def test_http_static_listener_uri_identity(self):
+        """Same parsed URI deletes TCP/HTTP and secure listeners after readd."""
+        self.vapi.cli("http static server")
+        self.addCleanup(self.vapi.cli, "http static server disable")
+        for protocol in ("tcp", "http", "tls", "https"):
+            with self.subTest(protocol=protocol):
+                if (
+                    protocol in ("tls", "https")
+                    and "tlsopenssl" in config.excluded_plugins
+                ):
+                    continue
+                uri = f"{protocol}://10.10.1.2:8085"
+                for repeat in range(2):
+                    self.vapi.cli(
+                        f"http static listener add uri {uri} url-handlers http1-only"
+                    )
+                    client = self._client(8085, secure=protocol in ("tls", "https"))
+                    self.assertEqual(self._response(client)["status"], 200)
+                    self._stop_client(client)
+                    self.vapi.cli(f"http static listener del uri {uri}")
+                    self._refused(8085)
+
+    def test_http_static_listener_ipv6_identity(self):
+        """IPv6 identities survive parsing, normalization and repeated add/delete."""
+        self.vapi.cli("http static server")
+        self.addCleanup(self.vapi.cli, "http static server disable")
+        for protocol in ("tcp", "http"):
+            uri = f"{protocol}://[::]:8086"
+            for repeat in range(2):
+                self.vapi.cli(f"http static listener add uri {uri} url-handlers")
+                self.assertIn(
+                    "8086", self.vapi.cli("show http static server listeners")
+                )
+                self.vapi.cli(f"http static listener del uri {uri}")
+                self._wait_released()
+        self.vapi.cli("http static server disable")
+        self.vapi.cli("http static server uri tcp://[::]:8086 url-handlers")
+        self.assertEqual(self.vapi.http_static_get().uri, "http://[::]:8086")
+        self.vapi.cli("http static listener del uri tcp://[::]:8086")
+        self._empty_default()
+
+    @unittest.skipIf("quic" in config.excluded_plugins, "QUIC plugin is excluded")
+    def test_http_static_listener_http3_identity(self):
+        """The original QUIC URI deletes the actual HTTP3 lower listener."""
+        self.vapi.cli("http static server")
+        self.addCleanup(self.vapi.cli, "http static server disable")
+        uri = "quic://10.10.1.2:8087"
+        command = "show session listeners quic verbose 2"
+        original = self.vapi.cli(command).count("[Q]")
+        for repeat in range(2):
+            self.vapi.cli(f"http static listener add uri {uri} url-handlers http3")
+            listeners = self.vapi.cli(command)
+            self.assertEqual(listeners.count("[Q]"), original + 1, listeners)
+            self.assertIn("h3", listeners)
+            self.vapi.cli(f"http static listener del uri {uri} http3")
+            self._wait_released()
+            self.assertEqual(self.vapi.cli(command).count("[Q]"), original)
+
+
+class TestHttpStaticCliWorker(TestHttpStaticCli):
+    """Exercise HSS listener ownership with a worker thread."""
+
+    vpp_worker_count = 1
 
 
 if __name__ == "__main__":

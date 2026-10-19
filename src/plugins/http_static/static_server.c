@@ -25,6 +25,30 @@ hss_main_t hss_main;
 static int file_handler_discard_body (hss_session_t *hs, session_t *ts);
 static int url_handler_read_body (hss_session_t *hs, session_t *ts);
 
+static void
+hss_listener_free_rpc (void *arg)
+{
+  u32 l_index = *(u32 *) arg;
+  hss_listener_t *l = hss_listener_get (l_index);
+
+  ASSERT (vlib_thread_is_main_w_barrier ());
+  ASSERT (l && l->retiring && l->ref_count == 0);
+  if (l->www_root)
+    hss_cache_free (&l->cache);
+  vec_free (l->www_root);
+  vec_free (l->max_age_formatted);
+  pool_put (hss_main.listeners, l);
+}
+
+static void
+hss_listener_release (u32 l_index)
+{
+  hss_listener_t *l = hss_listener_get (l_index);
+
+  if (clib_atomic_sub_fetch (&l->ref_count, 1) == 0)
+    vlib_rpc_call_main_thread (hss_listener_free_rpc, (u8 *) &l_index, sizeof (l_index));
+}
+
 static int
 hss_add_header (hss_session_t *hs, http_header_name_t name, const char *value,
 		uword value_len)
@@ -89,7 +113,7 @@ __clib_export hss_session_t *
 hss_session_get (clib_thread_index_t thread_index, u32 hs_index)
 {
   hss_main_t *hsm = &hss_main;
-  if (pool_is_free_index (hsm->sessions[thread_index], hs_index))
+  if (hs_index == (u32) ~0 || pool_is_free_index (hsm->sessions[thread_index], hs_index))
     return 0;
   return pool_elt_at_index (hsm->sessions[thread_index], hs_index);
 }
@@ -118,7 +142,7 @@ hss_session_disconnect_transport (hss_session_t *hs)
 {
   vnet_disconnect_args_t _a = { 0 }, *a = &_a;
   a->handle = hs->vpp_session_handle;
-  a->app_index = hss_main.app_index;
+  a->app_index = hs->app_index;
   vnet_disconnect_session (a);
 }
 
@@ -649,15 +673,23 @@ hss_ts_rx_callback (session_t *ts)
   int rv;
 
   hs = hss_session_get (ts->thread_index, ts->opaque);
+  if (!hs)
+    return 0;
   if (hs->left_recv != 0)
     {
       ASSERT (hs->read_body_handler);
       return hs->read_body_handler (hs, ts);
     }
 
+  if (hs->cache_pool_index != ~0)
+    {
+      hss_cache_detach_entry (&hss_listener_get (hs->listener_index)->cache, hs->cache_pool_index);
+      hs->cache_pool_index = ~0;
+    }
   if (hs->free_data)
     vec_free (hs->data);
-
+  hs->free_data = 0;
+  vec_free (hs->path);
   hs->data = 0;
   hs->data_len = 0;
   vec_free (hs->target_path);
@@ -801,6 +833,8 @@ hss_ts_accept_callback (session_t *ts)
   else
     ls = listen_session_get_from_handle (ts->listener_handle);
   hs->listener_index = ls->opaque;
+  hs->app_index = app_worker_get (ts->app_wrk_index)->app_index;
+  clib_atomic_add_fetch (&hss_listener_get (hs->listener_index)->ref_count, 1);
   hs->use_ptr_thresh = hss_listener_get (hs->listener_index)->use_ptr_thresh;
 
   /* The application sets a threshold for it's fifo to get notified when
@@ -822,23 +856,16 @@ hss_ts_accept_callback (session_t *ts)
 static void
 hss_ts_disconnect_callback (session_t *ts)
 {
-  hss_main_t *hsm = &hss_main;
-  vnet_disconnect_args_t _a = { 0 }, *a = &_a;
+  hss_session_t *hs = hss_session_get (ts->thread_index, ts->opaque);
 
-  a->handle = session_handle (ts);
-  a->app_index = hsm->app_index;
-  vnet_disconnect_session (a);
+  if (hs)
+    hss_session_disconnect_transport (hs);
 }
 
 static void
 hss_ts_reset_callback (session_t *ts)
 {
-  hss_main_t *hsm = &hss_main;
-  vnet_disconnect_args_t _a = { 0 }, *a = &_a;
-
-  a->handle = session_handle (ts);
-  a->app_index = hsm->app_index;
-  vnet_disconnect_session (a);
+  hss_ts_disconnect_callback (ts);
 }
 
 static int
@@ -862,37 +889,36 @@ hss_del_segment_callback (u32 client_index, u64 segment_handle)
 }
 
 static void
+hss_session_cleanup (hss_session_t *hs)
+{
+  u32 l_index = hs->listener_index;
+
+  if (hs->cache_pool_index != ~0)
+    hss_cache_detach_entry (&hss_listener_get (l_index)->cache, hs->cache_pool_index);
+  if (hs->free_data)
+    vec_free (hs->data);
+  vec_free (hs->headers_buf);
+  vec_free (hs->path);
+  vec_free (hs->authority);
+  vec_free (hs->target_path);
+  vec_free (hs->target_query);
+  vec_free (hs->rx_buff);
+  hss_session_free (hs);
+  hss_listener_release (l_index);
+}
+
+static void
 hss_ts_cleanup (session_t *s, session_cleanup_ntf_t ntf)
 {
   hss_session_t *hs;
 
   if (ntf == SESSION_CLEANUP_TRANSPORT)
     return;
-
   hs = hss_session_get (s->thread_index, s->opaque);
   if (!hs)
     return;
-
-  if (hs->cache_pool_index != ~0)
-    {
-      hss_listener_t *l = hss_listener_get (hs->listener_index);
-      if (l)
-	hss_cache_detach_entry (&l->cache, hs->cache_pool_index);
-      hs->cache_pool_index = ~0;
-    }
-
-  if (hs->free_data)
-    vec_free (hs->data);
-  hs->data = 0;
-  hs->data_offset = 0;
-  hs->free_data = 0;
-  vec_free (hs->headers_buf);
-  vec_free (hs->path);
-  vec_free (hs->authority);
-  vec_free (hs->target_path);
-  vec_free (hs->target_query);
-
-  hss_session_free (hs);
+  s->opaque = ~0;
+  hss_session_cleanup (hs);
 }
 
 static session_cb_vft_t hss_cb_vft = {
@@ -923,7 +949,7 @@ hss_attach ()
     segment_size = hsm->private_segment_size;
 
   a->api_client_index = ~0;
-  a->name = format (0, "http_static_server");
+  a->name = format (0, "http_static_server_%u", hsm->app_generation++);
   a->session_cb_vft = &hss_cb_vft;
   a->options = options;
   a->options[APP_OPTIONS_SEGMENT_SIZE] = segment_size;
@@ -980,8 +1006,8 @@ hss_listen (hss_listener_t *l, session_handle_t *lh)
 
   need_crypto = hss_transport_needs_crypto (&l->sep);
 
-  l->sep.transport_proto = TRANSPORT_PROTO_HTTP;
   clib_memcpy (&a->sep_ext, &l->sep, sizeof (l->sep));
+  a->sep_ext.transport_proto = TRANSPORT_PROTO_HTTP;
 
   ext_cfg = session_endpoint_add_ext_cfg (
     &a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_HTTP, sizeof (http_cfg));
@@ -1028,6 +1054,7 @@ hss_listener_add (hss_listener_t *l_cfg)
   hss_listener_t *l;
   session_t *ls;
 
+  ASSERT (vlib_thread_is_main_w_barrier ());
   if (hss_listen (l_cfg, &lh))
     {
       clib_warning ("failed to start listening");
@@ -1038,6 +1065,10 @@ hss_listener_add (hss_listener_t *l_cfg)
   *l = *l_cfg;
   l->l_index = l - hsm->listeners;
   l->session_handle = lh;
+  l->ref_count = 1;
+  l->retiring = 0;
+  l_cfg->l_index = l->l_index;
+  l_cfg->www_root = 0;
 
   al = app_listener_get_w_handle (lh);
   ls = app_listener_get_session (al);
@@ -1049,7 +1080,6 @@ hss_listener_add (hss_listener_t *l_cfg)
     hss_url_handlers_init (hsm);
 
   l->max_age_formatted = format (0, "max-age=%d", l->max_age);
-
   return 0;
 }
 
@@ -1059,10 +1089,12 @@ hss_listener_del (hss_listener_t *l_cfg)
   hss_main_t *hsm = &hss_main;
   hss_listener_t *l;
   u8 found = 0;
+  int rv;
 
+  ASSERT (vlib_thread_is_main_w_barrier ());
   pool_foreach (l, hsm->listeners)
     {
-      if (clib_memcmp (&l_cfg->sep, &l->sep, sizeof (l_cfg->sep)) == 0)
+      if (!l->retiring && clib_memcmp (&l_cfg->sep, &l->sep, sizeof (l_cfg->sep)) == 0)
 	{
 	  found = 1;
 	  break;
@@ -1072,26 +1104,24 @@ hss_listener_del (hss_listener_t *l_cfg)
   if (!found)
     return -1;
 
-  vnet_unlisten_args_t args = { .handle = l->session_handle, hsm->app_index };
+  vnet_unlisten_args_t args = { .handle = l->session_handle, .app_index = hsm->app_index };
+  if ((rv = vnet_unlisten (&args)))
+    return rv;
 
-  if (l->www_root)
-    hss_cache_free (&l->cache);
-
-  vec_free (l->www_root);
-  vec_free (l->max_age_formatted);
-  pool_put (hsm->listeners, l);
-
-  return vnet_unlisten (&args);
+  l->retiring = 1;
+  if (hsm->default_listener_index == l->l_index)
+    hsm->default_listener_index = ~0;
+  hss_listener_release (l->l_index);
+  return 0;
 }
 
 int
 hss_create (vlib_main_t *vm)
 {
-  vlib_thread_main_t *vtm = vlib_get_thread_main ();
   hss_main_t *hsm = &hss_main;
   u32 num_threads;
 
-  num_threads = 1 /* main thread */  + vtm->n_threads;
+  num_threads = 1 + vlib_num_workers ();
   vec_validate (hsm->sessions, num_threads - 1);
 
   /* Make sure session layer is enabled */
@@ -1106,10 +1136,20 @@ hss_create (vlib_main_t *vm)
       return -1;
     }
 
-  if (hsm->have_default_listener && hss_listener_add (&hsm->default_listener))
+  hsm->default_listener_index = ~0;
+  if (hsm->have_default_listener)
     {
-      clib_warning ("failed to start listening");
-      return -1;
+      if (hss_listener_add (&hsm->default_listener))
+	{
+	  vnet_app_detach_args_t da = { .app_index = hsm->app_index, .api_client_index = ~0 };
+	  vnet_application_detach (&da);
+	  vnet_app_del_cert_key_pair (hsm->ckpair_index);
+	  hsm->app_index = ~0;
+	  hsm->have_default_listener = 0;
+	  clib_warning ("failed to start listening");
+	  return -1;
+	}
+      hsm->default_listener_index = hsm->default_listener.l_index;
     }
 
   hsm->is_init = 1;
@@ -1117,19 +1157,68 @@ hss_create (vlib_main_t *vm)
   return 0;
 }
 
+typedef struct
+{
+  u32 app_index;
+  u32 ckpair_index;
+  u32 pending_threads;
+} hss_destroy_ctx_t;
+
+static void
+hss_detach_rpc (void *arg)
+{
+  hss_destroy_ctx_t *ctx = *(hss_destroy_ctx_t **) arg;
+  vnet_app_detach_args_t da = { .app_index = ctx->app_index, .api_client_index = ~0 };
+
+  ASSERT (vlib_thread_is_main_w_barrier ());
+  if (vnet_application_detach (&da))
+    clib_warning ("failed to detach http_static app %u", ctx->app_index);
+  vnet_app_del_cert_key_pair (ctx->ckpair_index);
+  clib_mem_free (ctx);
+}
+
+static void
+hss_destroy_sessions_rpc (void *arg)
+{
+  hss_destroy_ctx_t *ctx = arg;
+  clib_thread_index_t thread_index = vlib_get_thread_index ();
+  hss_session_t *hs;
+  session_t *s;
+
+  pool_foreach (hs, hss_main.sessions[thread_index])
+    {
+      if (hs->app_index != ctx->app_index)
+	continue;
+      s = session_get_from_handle (hs->vpp_session_handle);
+      s->opaque = ~0;
+      session_reset (s);
+      /* A queued reset does not stop HTTP from reading response pointers. */
+      if (s->session_state < SESSION_STATE_TRANSPORT_CLOSED)
+	transport_reset (session_get_transport_proto (s), s->connection_index, thread_index);
+      hss_session_cleanup (hs);
+    }
+
+  if (clib_atomic_sub_fetch (&ctx->pending_threads, 1) == 0)
+    vlib_rpc_call_main_thread (hss_detach_rpc, (u8 *) &ctx, sizeof (ctx));
+}
+
 int
 hss_destroy (vlib_main_t *vm)
 {
   hss_main_t *hsm = &hss_main;
+  hss_destroy_ctx_t *ctx;
   hss_listener_t *l;
+  u32 i;
   int ret;
 
+  ASSERT (vlib_thread_is_main_w_barrier ());
   if (!hsm->is_init)
     return 0;
 
-  while (pool_elts (hsm->listeners))
+  pool_foreach (l, hsm->listeners)
     {
-      l = pool_elt_at_index (hsm->listeners, pool_get_first_index (hsm->listeners));
+      if (l->retiring)
+	continue;
       ret = hss_listener_del (l);
       if (ret != 0)
 	{
@@ -1138,20 +1227,19 @@ hss_destroy (vlib_main_t *vm)
 	}
     }
 
+  ctx = clib_mem_alloc (sizeof (*ctx));
+  *ctx = (hss_destroy_ctx_t) { .app_index = hsm->app_index,
+			     .ckpair_index = hsm->ckpair_index,
+			     .pending_threads = vec_len (hsm->sessions) };
   clib_memset (&hsm->default_listener, 0, sizeof (hsm->default_listener));
+  hsm->default_listener_index = ~0;
   hsm->have_default_listener = 0;
-
-  vnet_app_detach_args_t _da = {}, *da = &_da;
-  da->app_index = hsm->app_index;
-  if (vnet_application_detach (da))
-    {
-      clib_warning ("failed to detach http_static app");
-      return -1;
-    }
   hsm->app_index = ~0;
   hsm->is_init = 0;
-  vnet_app_del_cert_key_pair (hsm->ckpair_index);
 
+  for (i = 1; i < vec_len (hsm->sessions); i++)
+    session_send_rpc_evt_to_thread_force (i, hss_destroy_sessions_rpc, ctx);
+  hss_destroy_sessions_rpc (ctx);
   return 0;
 }
 
@@ -1169,7 +1257,12 @@ hss_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   /* Get a line of input. */
   if (!unformat_user (input, unformat_line_input, line_input))
-    goto no_input;
+    {
+      if (hsm->app_index != (u32) ~0)
+	return clib_error_return (0, "http static server already initialized...");
+      clib_memset (l, 0, sizeof (*l));
+      goto no_input;
+    }
 
   if (unformat (line_input, "disable"))
     {
@@ -1186,6 +1279,8 @@ hss_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
       return clib_error_return (0, "http static server already initialized...");
     }
 
+  clib_memset (l, 0, sizeof (*l));
+  hsm->have_default_listener = 0;
   hsm->prealloc_fifos = 0;
   hsm->private_segment_size = 0;
   hsm->fifo_size = 0;
@@ -1439,6 +1534,7 @@ hss_add_del_listener_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
 done:
 
+  vec_free (l->www_root);
   vec_free (uri);
   return error;
 }
@@ -1449,7 +1545,9 @@ done:
  * @cliexpar
  * Add a static http server listener. The listener can be used to
  * serve static files from the www-root directory or to handle
- * requests using url handlers.
+ * requests using url handlers. Deleting a listener stops new connections;
+ * accepted sessions retain its configuration until they close. Disabling the
+ * server terminates accepted sessions and releases their listener resources.
  * @clistart
  * http static listener www-root /tmp/www uri tcp://0.0.0.0/80 cache-size 2m
  * @cliend
@@ -1486,10 +1584,10 @@ format_hss_listener (u8 *s, va_list *args)
   int __clib_unused verbose = va_arg (*args, int);
 
   s = format (
-    s, "listener %d, uri %U:%u, www-root %s, cache-size %U url-handlers %d",
+    s, "listener %d, uri %U:%u, www-root %s, cache-size %U url-handlers %d retiring %d",
     l->l_index, format_ip46_address, &l->sep.ip, l->sep.is_ip4,
-    clib_net_to_host_u16 (l->sep.port), l->www_root, format_memory_size,
-    l->cache_size, l->enable_url_handlers);
+    clib_net_to_host_u16 (l->sep.port), l->www_root ? (char *) l->www_root : "",
+    format_memory_size, l->cache_size, l->enable_url_handlers, l->retiring);
   return s;
 }
 
@@ -1643,6 +1741,7 @@ hss_main_init (vlib_main_t *vm)
   hss_main_t *hsm = &hss_main;
 
   hsm->app_index = ~0;
+  hsm->default_listener_index = ~0;
   hsm->vlib_main = vm;
 
   /* Set up file extension to mime type index map */
