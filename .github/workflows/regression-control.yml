@@ -41,14 +41,16 @@ jobs:
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       FIB_SHA: 564b0e46466adca2acb55acea5f3cc9f25562338
       GRE_SHA: 7213fd05cc7ec99403ac31d029ad272425cb35d5
-      CONTROL_DIR: ${{ runner.temp }}/regression-control
-      EVIDENCE_DIR: ${{ runner.temp }}/regression-evidence
       GIT_CONFIG_COUNT: "1"
       GIT_CONFIG_KEY_0: safe.directory
       GIT_CONFIG_VALUE_0: ${{ github.workspace }}
     steps:
       - name: Install base tools
         run: |
+          set -euo pipefail
+          printf 'CONTROL_DIR=%s/regression-control\nEVIDENCE_DIR=%s/regression-evidence\n' \
+            "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/regression-control" "$RUNNER_TEMP/regression-evidence"
           rm -f /etc/apt/apt.conf.d/docker-clean
           apt-get update -qq
           apt-get install -y -qq sudo make git bash iproute2 python3
