@@ -812,6 +812,8 @@ jobs:
                       synthetic = f"test_http_static.{cls}.test_http_static_pending_accept_identity"
                       start = next(event for event in starts if event["test"] == synthetic)
                       stop = next(event for event in stops if event["test"] == synthetic)
+                      require(stop["pid"] == start["pid"] and start["seq"] < stop["seq"],
+                              "Synthetic test lifecycle crosses processes or is out of order")
                       replies = [event for event in events if event["kind"] == "cli_reply" and
                                  event["pid"] == start["pid"] and start["seq"] < event["seq"] < stop["seq"] and
                                  event["command"] == "test http static pending accept"]
