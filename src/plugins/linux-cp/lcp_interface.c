@@ -229,6 +229,16 @@ lcp_itf_set_adjs (lcp_itf_pair_t *lip)
   lip->lip_rewrite_len = adj->rewrite_header.data_bytes;
 }
 
+static int
+lcp_itf_pair_matches (const lcp_itf_pair_t *lip, u8 *name,
+		      lip_host_type_t type, u8 *ns)
+{
+  return lip->lip_host_type == type &&
+	 clib_strcmp ((char *) lip->lip_host_name, (char *) name) == 0 &&
+	 clib_strcmp (lip->lip_namespace ? (char *) lip->lip_namespace : "",
+		      ns ? (char *) ns : "") == 0;
+}
+
 int
 lcp_itf_pair_add (u32 host_sw_if_index, u32 phy_sw_if_index, u8 *host_name,
 		  u32 host_index, lip_host_type_t host_type, u8 *ns)
@@ -245,7 +255,18 @@ lcp_itf_pair_add (u32 host_sw_if_index, u32 phy_sw_if_index, u8 *host_name,
   lipi = lcp_itf_pair_find_by_phy (phy_sw_if_index);
 
   if (lipi != INDEX_INVALID)
-    return VNET_API_ERROR_VALUE_EXIST;
+    {
+      lip = lcp_itf_pair_get (lipi);
+      if ((lip->lip_flags & LIP_FLAG_STALE) &&
+	  lip->lip_host_sw_if_index == host_sw_if_index &&
+	  lip->lip_vif_index == host_index &&
+	  lcp_itf_pair_matches (lip, host_name, host_type, ns))
+	{
+	  lip->lip_flags &= ~LIP_FLAG_STALE;
+	  return 0;
+	}
+      return VNET_API_ERROR_VALUE_EXIST;
+    }
 
   LCP_ITF_PAIR_INFO ("add: host:%U phy:%U, host_if:%v vif:%d ns:%s",
 		     format_vnet_sw_if_index_name, vnet_get_main (),
@@ -257,6 +278,7 @@ lcp_itf_pair_add (u32 host_sw_if_index, u32 phy_sw_if_index, u8 *host_name,
    * Create a new pair.
    */
   pool_get (lcp_itf_pair_pool, lip);
+  lip->lip_flags = 0;
 
   lipi = lip - lcp_itf_pair_pool;
 
@@ -351,19 +373,29 @@ lcp_itf_pair_add (u32 host_sw_if_index, u32 phy_sw_if_index, u8 *host_name,
 static clib_error_t *
 lcp_netlink_add_link_vlan (int parent, u32 vlan, u16 proto, const char *name)
 {
-  struct rtnl_link *link;
+  struct rtnl_link *link = NULL;
   struct nl_sock *sk;
+  clib_error_t *error = NULL;
   int err;
 
   sk = nl_socket_alloc ();
+  if (!sk)
+    {
+      error = clib_error_return (NULL, "Unable to allocate socket");
+      goto done;
+    }
   if ((err = nl_connect (sk, NETLINK_ROUTE)) < 0)
     {
-      LCP_ITF_PAIR_ERR ("netlink_add_link_vlan: connect error: %s",
-			nl_geterror (err));
-      return clib_error_return (NULL, "Unable to connect socket: %d", err);
+      error = clib_error_return (NULL, "Unable to connect socket: %d", err);
+      goto done;
     }
 
   link = rtnl_link_vlan_alloc ();
+  if (!link)
+    {
+      error = clib_error_return (NULL, "Unable to allocate VLAN link");
+      goto done;
+    }
 
   rtnl_link_set_link (link, parent);
   rtnl_link_set_name (link, name);
@@ -371,39 +403,53 @@ lcp_netlink_add_link_vlan (int parent, u32 vlan, u16 proto, const char *name)
   rtnl_link_vlan_set_protocol (link, htons (proto));
 
   if ((err = rtnl_link_add (sk, link, NLM_F_CREATE)) < 0)
-    {
-      LCP_ITF_PAIR_ERR ("netlink_add_link_vlan: link add error: %s",
-			nl_geterror (err));
-      return clib_error_return (NULL, "Unable to add link %s: %d", name, err);
-    }
+    error = clib_error_return (NULL, "Unable to add link %s: %d", name, err);
 
-  rtnl_link_put (link);
-  nl_close (sk);
-
-  return NULL;
+done:
+  if (link)
+    rtnl_link_put (link);
+  if (sk)
+    nl_socket_free (sk);
+  return error;
 }
 
 static clib_error_t *
 lcp_netlink_del_link (const char *name)
 {
-  struct rtnl_link *link;
+  struct rtnl_link *link = NULL;
   struct nl_sock *sk;
+  clib_error_t *error = NULL;
   int err;
 
   sk = nl_socket_alloc ();
+  if (!sk)
+    {
+      error = clib_error_return (NULL, "Unable to allocate socket");
+      goto done;
+    }
   if ((err = nl_connect (sk, NETLINK_ROUTE)) < 0)
-    return clib_error_return (NULL, "Unable to connect socket: %d", err);
+    {
+      error = clib_error_return (NULL, "Unable to connect socket: %d", err);
+      goto done;
+    }
 
   link = rtnl_link_alloc ();
+  if (!link)
+    {
+      error = clib_error_return (NULL, "Unable to allocate link");
+      goto done;
+    }
   rtnl_link_set_name (link, name);
 
   if ((err = rtnl_link_delete (sk, link)) < 0)
-    return clib_error_return (NULL, "Unable to del link %s: %d", name, err);
+    error = clib_error_return (NULL, "Unable to del link %s: %d", name, err);
 
-  rtnl_link_put (link);
-  nl_close (sk);
-
-  return NULL;
+done:
+  if (link)
+    rtnl_link_put (link);
+  if (sk)
+    nl_socket_free (sk);
+  return error;
 }
 
 int
@@ -500,7 +546,12 @@ lcp_itf_pair_delete_by_index (index_t lipi)
 	    clib_setns (vif_ns_fd);
 	}
 
-      lcp_netlink_del_link ((const char *) host_name);
+      clib_error_t *error = lcp_netlink_del_link ((const char *) host_name);
+      if (error)
+	{
+	  LCP_ITF_PAIR_ERR ("pair_delete: %U", format_clib_error, error);
+	  clib_error_free (error);
+	}
       if (vif_ns_fd != -1)
 	close (vif_ns_fd);
 
@@ -576,12 +627,14 @@ lcp_itf_pair_config (vlib_main_t *vm, unformat_input_t *input)
       if (unformat (input, "default netns %v", &default_ns))
 	{
 	  vec_add1 (default_ns, 0);
-	  if (lcp_set_default_ns (default_ns) < 0)
+	  int rv = lcp_set_default_ns (default_ns);
+	  if (rv < 0)
 	    {
-	      return clib_error_return (0,
-					"linux-cp default namespace must"
-					" be less than %d characters",
-					LCP_NS_LEN);
+	      clib_error_t *error = clib_error_return (
+		0, "linux-cp default namespace '%s': %U", default_ns,
+		format_vnet_api_errno, rv);
+	      vec_free (default_ns);
+	      return error;
 	    }
 	}
       else if (unformat (input, "lcp-auto-subint"))
@@ -815,10 +868,22 @@ lcp_itf_pair_create (u32 phy_sw_if_index, u8 *host_if_name,
   const lcp_itf_pair_t *lip;
   index_t lipi;
 
+  if (ns == NULL || ns[0] == 0)
+    ns = lcp_get_default_ns ();
+
   lipi = lcp_itf_pair_find_by_phy (phy_sw_if_index);
 
   if (lipi != INDEX_INVALID)
     {
+      lcp_itf_pair_t *existing = lcp_itf_pair_get (lipi);
+      if ((existing->lip_flags & LIP_FLAG_STALE) &&
+	  lcp_itf_pair_matches (existing, host_if_name, host_if_type, ns))
+	{
+	  existing->lip_flags &= ~LIP_FLAG_STALE;
+	  if (host_sw_if_indexp)
+	    *host_sw_if_indexp = existing->lip_host_sw_if_index;
+	  return 0;
+	}
       LCP_ITF_PAIR_ERR ("pair_create: already created");
       return VNET_API_ERROR_VALUE_EXIST;
     }
@@ -854,13 +919,6 @@ lcp_itf_pair_create (u32 phy_sw_if_index, u8 *host_if_name,
 	"pair_create: don't create TAP for non-eth interface; use tun");
       return VNET_API_ERROR_INVALID_ARGUMENT;
     }
-
-  /*
-   * Use interface-specific netns if supplied.
-   * Otherwise, use netns if defined, otherwise use the OS default.
-   */
-  if (ns == 0 || ns[0] == 0)
-    ns = lcp_get_default_ns ();
 
   /* sub interfaces do not need a tap created */
   if (vnet_sw_interface_is_sub (vnm, phy_sw_if_index))
@@ -1016,7 +1074,11 @@ lcp_itf_pair_create (u32 phy_sw_if_index, u8 *host_if_name,
 	close (ns_fd);
 
       if (err)
-	return VNET_API_ERROR_INVALID_ARGUMENT;
+	{
+	  LCP_ITF_PAIR_ERR ("pair_create: %U", format_clib_error, err);
+	  clib_error_free (err);
+	  return VNET_API_ERROR_INVALID_ARGUMENT;
+	}
     }
   else
     {

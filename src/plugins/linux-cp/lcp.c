@@ -46,29 +46,31 @@ int
 lcp_set_default_ns (u8 *ns)
 {
   lcp_main_t *lcpm = &lcp_main;
-  char *p;
-  int len;
-  u8 *s;
+  int len, fd = -1;
+  u8 *name = NULL, *path;
 
-  p = (char *) ns;
-  len = clib_strnlen (p, LCP_NS_LEN);
-  if (len >= LCP_NS_LEN)
-    return -1;
-
-  if (!p || *p == 0)
+  if (ns && ns[0])
     {
-      lcpm->default_namespace = NULL;
-      if (lcpm->default_ns_fd >= 0)
-	close (lcpm->default_ns_fd);
-      lcpm->default_ns_fd = -1;
-      return 0;
+      len = clib_strnlen ((char *) ns, LCP_NS_LEN);
+      if (len >= LCP_NS_LEN)
+	return VNET_API_ERROR_INVALID_ARGUMENT;
+
+      vec_validate_init_c_string (name, ns, len);
+      path = format (0, "/var/run/netns/%s%c", (char *) name, 0);
+      fd = open ((char *) path, O_RDONLY);
+      vec_free (path);
+      if (fd < 0)
+	{
+	  vec_free (name);
+	  return VNET_API_ERROR_SYSCALL_ERROR_1;
+	}
     }
 
-  vec_validate_init_c_string (lcpm->default_namespace, p,
-			      clib_strnlen (p, LCP_NS_LEN));
-  s = format (0, "/var/run/netns/%s%c", (char *) lcpm->default_namespace, 0);
-  lcpm->default_ns_fd = open ((char *) s, O_RDONLY);
-  vec_free (s);
+  if (lcpm->default_ns_fd >= 0)
+    close (lcpm->default_ns_fd);
+  vec_free (lcpm->default_namespace);
+  lcpm->default_namespace = name;
+  lcpm->default_ns_fd = fd;
 
   return 0;
 }
