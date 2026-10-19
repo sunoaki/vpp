@@ -76,8 +76,11 @@ jobs:
           mkdir -p "$tools" "$evidence"
           printf 'TOOLS=%s\nEVIDENCE=%s\nWORK_DEADLINE=%s\n' \
             "$tools" "$evidence" "$(( $(date +%s) + 6600 ))" >> "$GITHUB_ENV"
-          printf '{"workflow":"%s","case":"%s","run":"%s","attempt":"%s","job":"%s","status":"bootstrap"}\n' \
+          printf '{"workflow":"%s","case":"%s","run":"%s","attempt":"%s","job":"%s","status":"bootstrap","expected_tree":"293b103fb64948865d788a7abc0d585b2c235f3a","scoped_files":22,"required_methods":24}\n' \
             "$WORKFLOW_SHA" "$CASE" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_JOB" > "$evidence/bootstrap.json"
+          for phase in prepare dependencies feature-list c-style api-style c-formatter python-style python-pin mutate build binaries environment tests finalize; do
+            printf '{"action":"%s","status":"NOT_RUN","rc":null}\n' "$phase" > "$evidence/phase-$phase.json"
+          done
           rm -f /etc/apt/apt.conf.d/docker-clean
           rc=0
           timeout --signal=TERM --kill-after=5s 300s bash -euo pipefail -c \
@@ -144,7 +147,9 @@ jobs:
                           if error:
                               record.update(exception=error[0].__name__, traceback="".join(traceback.format_exception(*error)))
                       if name == "addSubTest":
-                          record["params"] = dict(args[0].params)
+                          subtest = args[0]
+                          record.update(parent_test=test.id(), subtest_id=subtest.id(),
+                                        subtest_description=str(subtest), params=dict(subtest.params))
                       if name == "addSkip":
                           record["reason"] = str(args[0])
                       emit(name, **record)
@@ -305,8 +310,13 @@ jobs:
           def sha(data):
               return hashlib.sha256(data).hexdigest()
 
+          def publish(target, value):
+              temporary = target.with_name(target.name + f".{os.getpid()}.pending")
+              temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+              os.replace(temporary, target)
+
           def save(name, value):
-              (OUT / name).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+              publish(OUT / name, value)
 
           def function(data, name):
               token = b"\n" + name.encode() + b" ("
@@ -498,50 +508,100 @@ jobs:
                       continue
               return result
 
-          def descendants(table, root):
-              selected = {root}
-              while True:
-                  more = {pid for pid, (parent, _, _) in table.items() if parent in selected}
-                  if more <= selected:
-                      return selected - {root}
-                  selected |= more
+          class OwnedProcesses:
+              def __init__(self):
+                  self.handles = {}
+                  self.observed = []
 
-          def reap():
-              while True:
+              @staticmethod
+              def identity(directory):
+                  descriptor = os.open("stat", os.O_RDONLY, dir_fd=directory)
                   try:
-                      pid, _ = os.waitpid(-1, os.WNOHANG)
-                      if pid == 0:
-                          return
-                  except ChildProcessError:
-                      return
+                      data = os.read(descriptor, 8192).decode()
+                  finally:
+                      os.close(descriptor)
+                  fields = data[data.rfind(")") + 2:].split()
+                  return int(fields[1]), fields[19], fields[0]
 
-          def cleanup(process, known):
-              table = processes()
-              known.update({pid: table[pid][1] for pid in descendants(table, os.getpid()) if pid in table})
-              for sig in (signal.SIGTERM, signal.SIGKILL):
+              @staticmethod
+              def exited(handle):
+                  with selectors.DefaultSelector() as poller:
+                      poller.register(handle[1], selectors.EVENT_READ)
+                      return bool(poller.select(0))
+
+              def bind(self, pid, expected):
+                  directory = descriptor = None
                   try:
-                      os.killpg(process.pid, sig)
-                  except ProcessLookupError:
-                      pass
-                  stop = time.monotonic() + 2
-                  while time.monotonic() < stop:
-                      table = processes()
-                      known.update({pid: table[pid][1] for pid in descendants(table, os.getpid()) if pid in table})
-                      live = [pid for pid, start in known.items() if pid in table and table[pid][1] == start and table[pid][2] != "Z"]
-                      for pid in live:
-                          try:
-                              os.kill(pid, sig)
-                          except ProcessLookupError:
-                              pass
-                      process.poll()
-                      reap()
-                      if not live:
+                      directory = os.open(f"/proc/{pid}", os.O_RDONLY | os.O_DIRECTORY)
+                      before = self.identity(directory)
+                      if before != expected:
+                          return False
+                      descriptor = os.pidfd_open(pid)
+                      after = self.identity(directory)
+                      if after[:2] != before[:2]:
+                          return False
+                      parent = before[0]
+                      ancestors = [(key, handle) for key, handle in self.handles.items() if key[0] == parent]
+                      owned = parent == os.getpid() or any(
+                          not self.exited(handle) and self.identity(handle[0])[1] == key[1]
+                          for key, handle in ancestors)
+                      if not owned or self.identity(directory)[:2] != before[:2]:
+                          return False
+                      if parent != os.getpid() and not any(not self.exited(handle) for _, handle in ancestors):
+                          return False
+                      key = (pid, before[1])
+                      if key not in self.handles:
+                          self.handles[key] = (directory, descriptor)
+                          self.observed.append(dict(pid=pid, birth=before[1], parent=parent))
+                          directory = descriptor = None
+                      return True
+                  except (ProcessLookupError, FileNotFoundError):
+                      return False
+                  finally:
+                      for fd in (directory, descriptor):
+                          if fd is not None:
+                              os.close(fd)
+
+              def discover(self):
+                  for _ in range(8):
+                      count = len(self.handles)
+                      for pid, identity in processes().items():
+                          if (pid, identity[1]) not in self.handles:
+                              self.bind(pid, identity)
+                      if len(self.handles) == count:
                           break
-                      time.sleep(0.03)
-              process.poll()
-              reap()
-              table = processes()
-              return not any(pid in table and table[pid][1] == start and table[pid][2] != "Z" for pid, start in known.items())
+
+              def signal(self, sig):
+                  for handle in self.handles.values():
+                      try:
+                          signal.pidfd_send_signal(handle[1], sig)
+                      except ProcessLookupError:
+                          pass
+
+              def cleanup(self, root):
+                  try:
+                      for sig in (signal.SIGTERM, signal.SIGKILL):
+                          stop = time.monotonic() + 2
+                          while time.monotonic() < stop:
+                              self.discover()
+                              self.signal(sig)
+                              for (pid, _), handle in self.handles.items():
+                                  if pid == root:
+                                      continue
+                                  try:
+                                      os.waitid(os.P_PIDFD, handle[1], os.WEXITED | os.WNOHANG)
+                                  except ChildProcessError:
+                                      pass
+                              if all(self.exited(handle) for handle in self.handles.values()):
+                                  self.discover()
+                                  if all(self.exited(handle) for handle in self.handles.values()):
+                                      return True
+                              time.sleep(0.03)
+                      return False
+                  finally:
+                      for handle in self.handles.values():
+                          for fd in handle:
+                              os.close(fd)
 
           def command(label, args, environment=None, limit=1200):
               directory = OUT / label
@@ -552,7 +612,7 @@ jobs:
                             deadline=float(os.environ["WORK_DEADLINE"]), allowed_seconds=seconds)
               target = directory / "result.json"
               target.write_text(json.dumps(result, indent=2))
-              tail, records, known = bytearray(), [], {}
+              tail, records, owned = bytearray(), [], OwnedProcesses()
               process = None
               require(ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0, "Cannot become child subreaper")
               try:
@@ -560,15 +620,16 @@ jobs:
                   process = subprocess.Popen(args, env=environment, stdout=subprocess.PIPE,
                                              stderr=subprocess.STDOUT, start_new_session=True)
                   result["pid"] = process.pid
+                  require(owned.bind(process.pid, processes()[process.pid]), "Root identity unavailable")
+                  root = next(handle for key, handle in owned.handles.items() if key[0] == process.pid)
                   deadline = time.monotonic() + seconds
                   os.set_blocking(process.stdout.fileno(), False)
                   buffer = b""
                   with selectors.DefaultSelector() as poller, (directory / "console.log").open("w+b") as stream:
                       poller.register(process.stdout, selectors.EVENT_READ)
-                      while poller.get_map() or process.poll() is None:
+                      while poller.get_map() or not owned.exited(root):
                           require(time.monotonic() < deadline, "Command deadline exhausted")
-                          table = processes()
-                          known.update({pid: table[pid][1] for pid in descendants(table, os.getpid()) if pid in table})
+                          owned.discover()
                           for key, _ in poller.select(min(0.2, max(0, deadline - time.monotonic()))):
                               try:
                                   chunk = os.read(key.fd, 65536)
@@ -595,17 +656,26 @@ jobs:
                       if buffer and INFRA.search(buffer.decode(errors="replace")):
                           records.append(buffer.decode(errors="replace"))
               except BaseException as error:
-                  result.update(rc=124 if isinstance(error, AssertionError) else 125, status="execution_error", error=str(error))
+                  result.update(status="execution_error", error=str(error))
                   raise
               finally:
                   if process is not None:
-                      result["cleanup_complete"] = cleanup(process, known)
-                      process.stdout.close()
+                      try:
+                          result["cleanup_complete"] = owned.cleanup(process.pid)
+                          if process.returncode is None:
+                              try:
+                                  result["cleanup_rc"] = process.wait(timeout=0.1)
+                              except subprocess.TimeoutExpired:
+                                  result["cleanup_complete"] = False
+                      except BaseException as error:
+                          result.update(cleanup_complete=False, cleanup_error=str(error))
+                      finally:
+                          process.stdout.close()
                       if not result["cleanup_complete"]:
-                          result.update(rc=125, status="cleanup_incomplete")
+                          result["status"] = "cleanup_incomplete"
                   result.update(end=time.time(), console_bytes=len(tail), infrastructure=records,
-                                observed_processes=known)
-                  target.write_text(json.dumps(result, indent=2) + "\n")
+                                observed_processes=owned.observed)
+                  publish(target, result)
               require(result["status"] == "completed" and result["cleanup_complete"], "Incomplete command/cleanup")
               print(f"{label}: rc={result['rc']}; {directory}", flush=True)
               return result["rc"], tail.decode(errors="replace")
@@ -685,7 +755,25 @@ jobs:
                           count += 1
               (destination / "index.json").write_text(json.dumps(report, indent=2) + "\n")
 
-          def common(events, console, rc, logs, callbacks):
+          def worker_contract():
+              source = content(TREE, "test/test_ipsec_esp.py")
+              classes = {node.name: node for node in ast.parse(source).body if isinstance(node, ast.ClassDef)}
+              def count(name):
+                  node = classes.get(name)
+                  if node is None:
+                      return 0
+                  for item in node.body:
+                      if isinstance(item, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "vpp_worker_count" for target in item.targets):
+                          return ast.literal_eval(item.value)
+                  if any(isinstance(base, ast.Name) and base.id == "RunTestIpsecEspAll" for base in node.bases) and (ast.get_docstring(node) or "").split()[0] == "async":
+                      return 2
+                  return max((count(base.id) for base in node.bases if isinstance(base, ast.Name)), default=0)
+              return {"test_ipsec_esp." + name: count(name) for name in classes}
+
+          RunEvidence = collections.namedtuple("RunEvidence", "events console rc logs callbacks")
+
+          def common(evidence):
+              events, console, rc, logs, callbacks = evidence
               traces = "\n".join(e.get("traceback", "") for e in events)
               require(not INFRA.search(console + logs + traces), "Caught dead-VPP, infrastructure, timeout, crash or skip evidence")
               require(rc in (0, 2), f"Unexpected command exit {rc}")
@@ -699,8 +787,10 @@ jobs:
               require(starts and collections.Counter(e["test"] for e in starts) == collections.Counter(e["test"] for e in stops), "Incomplete test lifecycle")
               require(len({e["test"] for e in starts}) == len(starts), "Duplicate tests/retries")
               require(not any(e["kind"] in ("addSkip", "addExpectedFailure", "addUnexpectedSuccess") for e in events), "Skipped/substituted result")
+              workers = worker_contract()
               for event in starts:
-                  require(event["netns"] is False and event["workers"] == 0 and not event["excluded"], "Required namespace/plugin/worker configuration changed")
+                  cls = event["test"].rsplit(".", 1)[0]
+                  require(event["netns"] is False and event["workers"] == workers.get(cls, 0) and not event["excluded"], "Required namespace/plugin/worker configuration changed")
                   require(event["cmdline"], "Missing real VPP command line")
               completed = [event for event in events if event["kind"] == "completed" and event["tests"]]
               require(sum(e["tests"] for e in completed) == len(starts), "Missing ordinary runner completion")
@@ -709,8 +799,9 @@ jobs:
               actual_callbacks = CALLBACK.findall("\n".join(record["text"] for record in callbacks))
               return starts, completed, actual_callbacks
 
-          def positive(suite, events, console, rc, logs, callbacks):
-              starts, completed, actual = common(events, console, rc, logs, callbacks)
+          def positive(suite, evidence):
+              events, console, rc, logs, callbacks = evidence
+              starts, completed, actual = common(evidence)
               require(rc == 0 and all(not e["errors"] and not e["failures"] for e in completed), "Fixed test command failed")
               successes = [e["test"] for e in events if e["kind"] == "addSuccess"]
               expected = collections.Counter(e["test"] for e in starts)
@@ -722,23 +813,8 @@ jobs:
               require(not re.search(r"\bFAIL:[0-9]+:", logs), "C unit test assertion failed")
               return successes
 
-          def negative(name, events, console, rc, logs, callbacks):
-              starts, completed, actual = common(events, console, rc, logs, callbacks)
-              entry, _ = recipe(name)
-              identity = "test_" + entry["selector"]
-              require([e["test"] for e in starts] == [identity], "Wrong negative selector")
-              require(rc == 2 and sum(e["errors"] + e["failures"] for e in completed) >= 1, "Missing ordinary negative completion")
-              failures = [e for e in events if e["kind"] in ("addFailure", "addError", "addSubTest") and e.get("exception")]
-              require(failures and not any(e["kind"] == "addSuccess" for e in events), "Restored source unexpectedly passed")
-              require(all(e["test"] == identity for e in failures), "Failure belongs to another test")
-              first = failures[0]
-              trace = first.get("traceback", "")
-              helpers = [e for e in events if e["kind"] == "helper"]
-              joined = "\n".join(str(e) for e in helpers)
-              require(actual and all(kind in ("addFailure", "addError") for kind, _, _ in actual) or first["kind"] == "addSubTest", "Missing negative raw result callback")
-              expected_type = "UnexpectedApiReturnValueError" if name in ("lifecycle-failure", "lifecycle-refresh", "gre-config") else "AssertionError"
-              require(all(e["exception"] == expected_type for e in failures), "Unexpected secondary exception or teardown error")
-              witnesses = {
+          def failure_witnesses():
+              return {
                   "router-add": ('self.assertIn(f"refs:{expected} ", output)', "refs:1", "refs:2"),
                   "router-delete": ('self.assertIn(f"refs:{expected} ", output)', "refs:1", "absent fib:"),
                   "router-sweep": ('self.assertIn(f"refs:{expected} ", output)', "refs:1", "refs:2"),
@@ -755,10 +831,54 @@ jobs:
                   "tunnel-df": ("self.assertEqual(checksum(header[:header_len]), 0)", "49151 != 0"),
                   "gre-config": ("test_gre_teib.py\", line 147", "self.make_tunnel(is_ip6, key)", "-79"),
                   "gre-ingress": ("self.assertEqual(owner.get_rx_stats() - before, len(packets))", "0 != 3")}
-              require(all(token in trace for token in witnesses[name]), f"Wrong intended failure witness for {name}: {trace}")
-              if name in ("lifecycle-fd", "lifecycle-vlan-add", "lifecycle-vlan-delete"):
-                  values = re.search(r"AssertionError: ([0-9]+) != ([0-9]+)", trace)
-                  require(values and int(values[1]) == int(values[2]) + 1, "FD witness is not exactly one retained descriptor")
+
+          def negative(name, evidence):
+              events, console, rc, logs, callbacks = evidence
+              starts, completed, actual = common(evidence)
+              entry, _ = recipe(name)
+              identity = "test_" + entry["selector"]
+              require([e["test"] for e in starts] == [identity], "Wrong negative selector")
+              require(rc == 2 and sum(e["errors"] + e["failures"] for e in completed) >= 1, "Missing ordinary negative completion")
+              failures = [e for e in events if e["kind"] in ("addFailure", "addError", "addSubTest") and e.get("exception")]
+              require(failures and not any(e["kind"] == "addSuccess" for e in events), "Restored source unexpectedly passed")
+              require(all(e["test"] == identity for e in failures), "Failure belongs to another test")
+              first = failures[0]
+              trace = first.get("traceback", "")
+              helpers = [e for e in events if e["kind"] == "helper"]
+              joined = "\n".join(str(e) for e in helpers)
+              require(actual and all(kind in ("addFailure", "addError") for kind, _, _ in actual) or first["kind"] == "addSubTest", "Missing negative raw result callback")
+              expected_type = "UnexpectedApiReturnValueError" if name in ("lifecycle-failure", "lifecycle-refresh", "gre-config") else "AssertionError"
+              require(all(e["exception"] == expected_type for e in failures), "Unexpected secondary exception or teardown error")
+              witnesses = failure_witnesses()
+              require(sum(e["errors"] for e in completed) == sum(e["exception"] != "AssertionError" for e in failures) and
+                      sum(e["failures"] for e in completed) == sum(e["exception"] == "AssertionError" for e in failures), "Observer/runner failure counts differ")
+              repeated = name in ("lifecycle-refresh", "tunnel-df", "gre-config", "gre-ingress")
+              require(repeated or len(failures) == 1, "Unexpected additional ordinary failure")
+              seen_subtests = set()
+              for failure in failures:
+                  failure_trace = failure.get("traceback", "")
+                  require(all(token in failure_trace for token in witnesses[name]), f"Wrong intended failure witness for {name}: {failure_trace}")
+                  require(not re.search(r"in (?:tearDown|tearDownClass|doCleanups|doClassCleanups)\b", failure_trace), "Cleanup failed after intended failure")
+                  if repeated:
+                      require(failure["kind"] == "addSubTest" and failure.get("parent_test") == identity and failure.get("subtest_id", "").startswith(identity + " "), "Missing actual subtest identity")
+                      require(failure["subtest_id"] not in seen_subtests, "Duplicate failing subtest")
+                      seen_subtests.add(failure["subtest_id"])
+                      params = failure.get("params", {})
+                      if name == "lifecycle-refresh":
+                          require(set(params) == {"version", "host_type"} and params["version"] in (1, 2, 3) and params["host_type"] in (0, 1), "Unknown lifecycle refresh case")
+                      elif name.startswith("gre-"):
+                          require(set(params) == {"key", "p2p_first"} and params["key"] in (0, 0x12345678) and type(params["p2p_first"]) is bool and
+                                  (name != "gre-config" or params["p2p_first"] is False), "Unknown GRE failure case")
+                      else:
+                          require(set(params) == {"tun_flags", "inner_df", "inner_tos", "payload_size"} and params["inner_df"] == 1 and
+                                  (params["tun_flags"], params["inner_tos"]) in ((1, 0), (1, 0xAB), (13, 0xAB)) and
+                                  params["payload_size"] in (0, 1, 54, 511), "Unknown checksum failure case")
+                  if name in ("lifecycle-fd", "lifecycle-vlan-add", "lifecycle-vlan-delete"):
+                      values = re.search(r"AssertionError: ([0-9]+) != ([0-9]+)", failure_trace)
+                      require(values and int(values[1]) == int(values[2]) + 1, "FD witness is not exactly one retained descriptor")
+              ordinary = [e for e in failures if e["kind"] != "addSubTest"]
+              require(collections.Counter(actual) == collections.Counter(
+                  (e["kind"], *identity.split(".")[-2:]) for e in ordinary), "Raw framework failure callbacks differ")
               if name.startswith("router-"):
                   require("test lcp router" in joined, "No real router CLI state")
                   if name == "router-add":
@@ -806,10 +926,10 @@ jobs:
               result = json.loads((directory / "result.json").read_text())
               require(not result["infrastructure"], "Caught infrastructure exception in full console")
               if suite:
-                  successes = positive(suite, events, console, rc, logs, records["callbacks"])
+                  successes = positive(suite, RunEvidence(events, console, rc, logs, records["callbacks"]))
                   acceptance = dict(status="PASS", case=CASE, suite=suite, successes=successes, required=ready(suite))
               else:
-                  identity = negative(CASE, events, console, rc, logs, records["callbacks"])
+                  identity = negative(CASE, RunEvidence(events, console, rc, logs, records["callbacks"]))
                   acceptance = dict(status="PASS", case=CASE, intended_failure=identity, paired_fixed=identity.split(".")[0].removeprefix("test_"))
               acceptance.update(integration_tree=TREE, built_tree=manifest["built_tree"], workflow_sha=os.environ["WORKFLOW_SHA"],
                                 run=os.environ["GITHUB_RUN_ID"], attempt=os.environ["GITHUB_RUN_ATTEMPT"], pending=GAPS)
@@ -851,7 +971,7 @@ jobs:
                         dict(kind="completed", pid=1, tests=1, errors=0, failures=0, skips=0, expected=0, unexpected=0)]
               callbacks = [dict(text="--- addSuccess() TestGRE.test_example(doc) called")]
               console = "Ran 1 test in 0.1s\nOK\n"
-              positive("gre", events, console, 0, "", callbacks)
+              positive("gre", RunEvidence(events, console, 0, "", callbacks))
               bad_events = [events[:-1], events + [events[3]], events[:3] + events[4:]]
               for index, key, value in ((2, "netns", True), (2, "excluded", ["gre"]),
                                          (3, "kind", "addSkip"), (3, "kind", "addError"),
@@ -861,7 +981,7 @@ jobs:
                   bad_events.append(bad)
               for bad in bad_events:
                   try:
-                      positive("gre", bad, console, 0, "", callbacks)
+                      positive("gre", RunEvidence(bad, console, 0, "", callbacks))
                   except AssertionError:
                       pass
                   else:
@@ -869,15 +989,12 @@ jobs:
               for marker in ("VppTransportSocketIOError", "VppDiedError", "Vpp dead", "VPP subprocess died unexpectedly", "timed out", "SIGSEGV", "not enough cpus"):
                   require(INFRA.search(marker), f"Infrastructure filter misses {marker}")
                   try:
-                      positive("gre", events, console, 0, marker, callbacks)
+                      positive("gre", RunEvidence(events, console, 0, marker, callbacks))
                   except AssertionError:
                       pass
                   else:
                       raise AssertionError("Classifier accepted caught infrastructure")
-              classifier_tree = ast.parse(Path(__file__).read_text())
-              negative_node = next(node for node in classifier_tree.body if isinstance(node, ast.FunctionDef) and node.name == "negative")
-              witness_node = next(node.value for node in negative_node.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "witnesses" for target in node.targets))
-              witness_map = ast.literal_eval(witness_node)
+              witness_map = failure_witnesses()
               for name in cases:
                   entry, _ = recipe(name)
                   identity = "test_" + entry["selector"]
@@ -885,7 +1002,9 @@ jobs:
                   trace = "\n".join(witness_map[name])
                   if name in ("lifecycle-fd", "lifecycle-vlan-add", "lifecycle-vlan-delete"):
                       trace += "\nAssertionError: 7 != 6"
-                  params = dict(key=0, p2p_first=name == "gre-ingress", tun_flags=1, inner_df=1, inner_tos=0, payload_size=0)
+                  params = (dict(key=0, p2p_first=name == "gre-ingress") if name.startswith("gre-") else
+                            dict(version=1, host_type=0) if name == "lifecycle-refresh" else
+                            dict(tun_flags=1, inner_df=1, inner_tos=0, payload_size=0))
                   helpers = [dict(function="cli", command="test lcp router", value="synchronizing lcp create loop1"),
                              dict(function="poll_for", description="changed gateway preference 100 in VPP", actual="True", expected="True"),
                              dict(function="poll_for", description="owner receives 198.18.10.1/24", actual="True", expected="True"),
@@ -899,23 +1018,36 @@ jobs:
                   sample = [dict(kind="loaded", pid=1), dict(kind="selected", pid=1, test=identity),
                             dict(kind="startTest", pid=1, test=identity, netns=False, workers=0, excluded=[], cmdline=["vpp"]),
                             *[dict(kind="helper", pid=1, test=identity, **value) for value in helpers],
-                            dict(kind="addSubTest", pid=1, test=identity, exception=error_type, traceback=trace, params=params),
+                            dict(kind="addSubTest", pid=1, test=identity, parent_test=identity,
+                                 subtest_id=identity + " (fixture)", subtest_description=identity + " (fixture)",
+                                 exception=error_type, traceback=trace, params=params),
                             dict(kind="stopTest", pid=1, test=identity),
                             dict(kind="completed", pid=1, tests=1, errors=int(error_type != "AssertionError"), failures=int(error_type == "AssertionError"), skips=0, expected=0, unexpected=0)]
                   console_negative = "Ran 1 test in 0.1s\nFAILED (failures=1)\n"
-                  negative(name, sample, console_negative, 2, "", [])
+                  negative(name, RunEvidence(sample, console_negative, 2, "", []))
                   failure_index = next(i for i, event in enumerate(sample) if event["kind"] == "addSubTest")
+                  bad = copy.deepcopy(sample)
+                  extra = dict(bad[failure_index], kind="addFailure", traceback="in tearDown\nAssertionError: unrelated teardown")
+                  bad.insert(-2, extra)
+                  bad[-1]["failures"] += 1
+                  try:
+                      negative(name, RunEvidence(bad, console_negative, 2, "", []))
+                  except AssertionError:
+                      pass
+                  else:
+                      raise AssertionError(f"Accepted secondary teardown failure {name}")
                   for key, value in (("exception", "VppTransportSocketIOError"), ("traceback", "unrelated assertion")):
                       bad = copy.deepcopy(sample)
                       bad[failure_index][key] = value
                       try:
-                          negative(name, bad, console_negative, 2, "", [])
+                          negative(name, RunEvidence(bad, console_negative, 2, "", []))
                       except AssertionError:
                           pass
                       else:
                           raise AssertionError(f"Accepted unrelated negative {name}")
               observer_fixtures()
               process_fixtures()
+              deadline_fixtures()
               save("classifier-fixtures.json", dict(status="PASS", runtime="synthetic unittest/processes only"))
               print("Pure recipe/blob/roundtrip, classifier, observer and descendant fixtures passed")
 
@@ -933,14 +1065,22 @@ jobs:
               def test_failure(self): self.assertEqual(1, 0, "real failure")
               def test_error(self): raise ValueError("real error")
               def test_subtest(self):
-                  with self.subTest(value=3): self.assertEqual(3, 4)
+                  for label in ("first label", "second label"):
+                      with self.subTest(label, value=3): self.assertEqual(3, 4)
+                  with self.subTest("outer label", outer=7):
+                      with self.subTest("nested label", value=3): self.assertEqual(3, 4)
           result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.defaultTestLoader.loadTestsFromTestCase(Example))
-          assert result.testsRun == 4 and len(result.failures) == 2 and len(result.errors) == 1
+          assert result.testsRun == 4 and len(result.failures) == 4 and len(result.errors) == 1
           '''
                   subprocess.run([sys.executable, "-c", code], env=environment, check=True, timeout=10)
                   events = [json.loads(line) for item in path.glob("events.*.jsonl") for line in item.read_text().splitlines()]
                   counts = collections.Counter(e["kind"] for e in events)
-                  require(counts["startTest"] == counts["stopTest"] == 4 and counts["addSuccess"] == counts["addFailure"] == counts["addError"] == counts["addSubTest"] == 1, "Observer changed real callbacks")
+                  require(counts["startTest"] == counts["stopTest"] == 4 and counts["addSuccess"] == counts["addFailure"] == counts["addError"] == 1 and counts["addSubTest"] == 3, "Observer changed real callbacks")
+                  subtests = [e for e in events if e["kind"] == "addSubTest"]
+                  require(len({e["subtest_id"] for e in subtests}) == 3 and subtests[0]["params"] == subtests[1]["params"] and
+                          "first label" in subtests[0]["subtest_id"] and "second label" in subtests[1]["subtest_id"] and
+                          subtests[2]["params"] == dict(outer=7, value=3) and "nested label" in subtests[2]["subtest_description"] and
+                          all(e["parent_test"] == e["test"] for e in subtests), "Observer lost subtest identity/labels/nesting")
                   require(any("ValueError: real error" in e.get("traceback", "") for e in events), "Observer lost real exception")
 
           def process_fixtures():
@@ -948,6 +1088,9 @@ jobs:
               os.environ["WORK_DEADLINE"] = str(time.time() + 30)
               code = 'import os,time; child=os.fork(); (os.setsid(),time.sleep(20)) if child == 0 else None'
               try:
+                  rc, _ = command("fixture-normal", [sys.executable, "-c", "print('normal completion')"], limit=2)
+                  require(rc == 0, "Normal command failed")
+                  identity_fixtures()
                   rc, _ = command("fixture-setsid", [sys.executable, "-c", code], limit=0.5)
               except AssertionError:
                   result = json.loads((OUT / "fixture-setsid/result.json").read_text())
@@ -960,6 +1103,74 @@ jobs:
                   else:
                       os.environ["WORK_DEADLINE"] = old
 
+          def deadline_fixtures():
+              from unittest.mock import patch
+              previous = os.environ["WORK_DEADLINE"]
+              phase_path = OUT / "phase-binaries.json"
+              prior_phase = phase_path.read_bytes() if phase_path.exists() else None
+              timer = signal.getitimer(signal.ITIMER_REAL)
+              started = time.monotonic()
+              path = OUT / "fixture-publication.json"
+              original = dict(status="running", rc=None)
+              publish(path, original)
+              with patch.object(Path, "write_text", side_effect=TimeoutError("interrupted publication")):
+                  try:
+                      publish(path, dict(status="completed", rc=0))
+                  except TimeoutError:
+                      pass
+              require(json.loads(path.read_text()) == original, "Interrupted publication damaged prior result")
+              try:
+                  os.environ["WORK_DEADLINE"] = str(time.time() + 0.05)
+                  with patch.dict(globals(), binaries=lambda: time.sleep(0.5)):
+                      try:
+                          phase("binaries", [])
+                      except TimeoutError:
+                          pass
+                      else:
+                          raise AssertionError("Postprocessing exceeded phase deadline")
+                  value = json.loads((OUT / "phase-binaries.json").read_text())
+                  require(value["status"] == "FAIL" and value["rc"] is None, "Deadline invented successful phase/exit status")
+              finally:
+                  os.environ["WORK_DEADLINE"] = previous
+                  if prior_phase is None:
+                      phase_path.unlink(missing_ok=True)
+                  else:
+                      phase_path.write_bytes(prior_phase)
+                  if timer[0]:
+                      signal.setitimer(signal.ITIMER_REAL, max(0.001, timer[0] - time.monotonic() + started), timer[1])
+
+          def identity_fixtures():
+              from unittest.mock import patch
+              owned = OwnedProcesses()
+              owned.handles[(300, "old")] = (30, 31)
+              sent = []
+              with patch.object(signal, "pidfd_send_signal", side_effect=lambda fd, sig: sent.append((fd, sig))), \
+                   patch.object(os, "kill", side_effect=AssertionError("Numeric signal forbidden")), \
+                   patch.object(os, "killpg", side_effect=AssertionError("Group signal forbidden")):
+                  owned.signal(signal.SIGTERM)
+                  owned.signal(signal.SIGKILL)
+              require(sent == [(31, signal.SIGTERM), (31, signal.SIGKILL)], "PID replacement redirected original identity signal")
+              tables = [{300: (1, "replacement", "S"), 201: (os.getpid(), "new-birth", "S")}]
+              owned.handles[(201, "old-birth")] = (20, 21)
+              acquired = []
+              def bind(pid, identity):
+                  acquired.append((pid, identity[1]))
+                  return False
+              with patch.dict(globals(), processes=lambda: tables[0]), patch.object(owned, "bind", side_effect=bind):
+                  owned.discover()
+              require((201, "new-birth") in acquired and (300, "replacement") in acquired, "Numeric tracking hid changed birth")
+              for identities in (((os.getpid(), "old", "S"), (os.getpid(), "new", "S")),):
+                  candidate = OwnedProcesses()
+                  with patch.object(os, "open", return_value=40), patch.object(os, "pidfd_open", return_value=41), \
+                       patch.object(os, "close"), patch.object(candidate, "identity", side_effect=identities):
+                      require(not candidate.bind(400, identities[0]) and not candidate.handles, "Open-time replacement acquired wrong identity")
+              candidate = OwnedProcesses()
+              candidate.handles[(500, "old-parent")] = (50, 51)
+              with patch.object(os, "open", return_value=60), patch.object(os, "pidfd_open", return_value=61), \
+                   patch.object(os, "close"), patch.object(candidate, "identity", side_effect=[(500, "child", "S")] * 2 + [(1, "new-parent", "S")]), \
+                   patch.object(candidate, "exited", return_value=False):
+                  require(not candidate.bind(600, (500, "child", "S")), "Replaced ancestor established false ownership")
+
           def finalize():
               diagnostics(OUT / "final-diagnostics")
               for path in TOOLS.glob("*.py"):
@@ -967,11 +1178,16 @@ jobs:
               save("evidence-index.json", {str(p.relative_to(OUT)): dict(bytes=p.stat().st_size, sha256=sha(p.read_bytes()))
                                           for p in OUT.rglob("*") if p.is_file() and not p.is_symlink()})
 
-          if __name__ == "__main__":
-              action = sys.argv[1]
-              status = dict(action=action, start=time.time(), status="running")
+          def phase(action, arguments):
+              status = dict(action=action, start=time.time(), status="running", rc=None)
               save(f"phase-{action}.json", status)
+              def expired(signum, frame):
+                  raise TimeoutError("Phase work deadline exhausted, including postprocessing")
+              previous = signal.signal(signal.SIGALRM, expired)
+              budget = 75 if action == "finalize" else float(os.environ["WORK_DEADLINE"]) - time.time()
               try:
+                  require(budget > 0, "Shared phase deadline exhausted")
+                  signal.setitimer(signal.ITIMER_REAL, budget)
                   if action == "prepare": prepare()
                   elif action == "mutate": mutate()
                   elif action == "tests": tests()
@@ -979,15 +1195,33 @@ jobs:
                   elif action == "finalize": finalize()
                   elif action == "fixtures": fixtures()
                   else:
-                      rc, _ = command(action, sys.argv[2:], limit=2400 if action == "build" else 1500)
+                      rc, _ = command(action, arguments, limit=2400 if action == "build" else 1500)
+                      status["rc"] = rc
                       require(rc == 0, f"{action} command failed: {rc}")
                   status["status"] = "PASS"
               except BaseException as error:
                   status.update(status="FAIL", error=str(error))
                   raise
               finally:
+                  signal.setitimer(signal.ITIMER_REAL, 0)
+                  signal.signal(signal.SIGALRM, previous)
                   status["end"] = time.time()
                   save(f"phase-{action}.json", status)
+                  if action == "finalize":
+                      observations = []
+                      for path in OUT.glob("phase-*.json"):
+                          try:
+                              value = json.loads(path.read_text())
+                          except (OSError, ValueError) as error:
+                              observations.append(dict(path=path.name, status="UNKNOWN", error=str(error)))
+                              continue
+                          if value["status"] in ("NOT_RUN", "running"):
+                              observations.append(dict(path=path.name, status=value["status"], rc=None,
+                                                       reason="Earlier phase failed or job interrupted; raw record retained"))
+                      save("phase-observations.json", observations)
+
+          if __name__ == "__main__":
+              phase(sys.argv[1], sys.argv[2:])
           PY
           python3 "$TOOLS/control.py" prepare
 
@@ -1039,7 +1273,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 "$TOOLS/control.py" environment bash -euo pipefail -c '
-            python3 -c "import os; print(sorted(os.sched_getaffinity(0))); assert len(os.sched_getaffinity(0)) >= 2"
+            python3 -c "import os,pathlib; cpus=sorted(os.sched_getaffinity(0)); roots=[pathlib.Path(f\"/sys/devices/system/cpu/cpu{cpu}/topology\") for cpu in cpus]; cores={(p.joinpath(\"physical_package_id\").read_text().strip(),p.joinpath(\"core_id\").read_text().strip()) for p in roots}; required=3 if os.environ[\"CASE\"] == \"fixed-ipsec_esp\" else 2; print(dict(cpus=cpus,physical_cores=sorted(cores),required=required)); assert len(cores) >= required"
             mountpoint /dev/shm
             test "$(df -B1 --output=size /dev/shm | tail -n 1)" -ge 2147483648
             ns="integration-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
