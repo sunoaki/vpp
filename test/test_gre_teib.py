@@ -63,7 +63,13 @@ class TestGreTeib(VppTestCase):
             actual = details[0].tunnel
             self.assertEqual(actual.sw_if_index, tunnel.sw_if_index)
             self.assertEqual(str(actual.src), tunnel.t_src)
-            self.assertEqual(str(actual.dst), tunnel.t_dst)
+            expected_dst = tunnel.t_dst
+            if (
+                tunnel.t_mode == VppEnum.vl_api_tunnel_mode_t.TUNNEL_API_MODE_MP
+                and expected_dst == "::"
+            ):
+                expected_dst = "0.0.0.0"
+            self.assertEqual(str(actual.dst), expected_dst)
             self.assertEqual(actual.mode, tunnel.t_mode)
             self.assertEqual(actual.type, tunnel.t_type)
             self.assertEqual(actual.key, tunnel.t_gre_key)
