@@ -2437,6 +2437,38 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
             f"absent fib:{CLIB_U32_MAX} mfib:{CLIB_U32_MAX}",
         )
 
+    def _router_sources(self, proto, table, prefix, expected, forwarding=None):
+        output = self._router(f"{proto} table {table} entry {prefix}")
+        lines = output.splitlines()
+        for source, refs in zip(("static", "dynamic", "permanent"), expected):
+            self.assertIn(f"{source}:{int(refs != 0)} refs:{refs}", lines, output)
+        if forwarding is not None:
+            self.assertIn(f"forwarding:{forwarding}", lines, output)
+
+    def _router_broadcast_priority(self, table, dynamic):
+        base = f"ip4 table {table}"
+        prefix = "255.255.255.255/32"
+        self._router_sources("ip4", table, prefix, (0, 0, 1), "receive")
+        self._router(f"{base} add {prefix} proto 186 drop")
+        self._router_refs("ip4", table, 2)
+        self._router_sources("ip4", table, prefix, (0, 1, 1), "receive")
+        self._router(f"{base} add {prefix} proto 4 drop")
+        self._router_refs("ip4", table, 3)
+        self._router_sources("ip4", table, prefix, (1, 1, 1), "drop")
+        self._router(f"{base} del {prefix} proto 4 drop")
+        self._router_refs("ip4", table, 2)
+        self._router_sources("ip4", table, prefix, (0, 1, 1), "receive")
+        self._router(f"{base} del {prefix} proto 186 drop")
+        self._router_refs("ip4", table, 1)
+        self._router_sources("ip4", table, prefix, (0, 0, 1), "receive")
+        for protocol in (4, 186):
+            self._router(f"{base} add {prefix} proto {protocol} drop")
+            self._router("begin")
+            self._router(f"{base} add {dynamic}")
+            self._router("end")
+            self._router_refs("ip4", table, 1)
+            self._router_sources("ip4", table, prefix, (0, 0, 1), "receive")
+
     def test_router_source_ownership(self):
         """Repeated updates and stale sweeps release each IP source owner"""
         for proto, prefix, table in (
@@ -2450,42 +2482,46 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
             try:
                 self._router(f"{base} add {route}")
                 self._router_refs(proto, table, 1)
+                self._router_sources(proto, table, prefix, (1, 0, 0))
                 self._router(f"{base} del {prefix} proto 186 drop")
                 self._router_refs(proto, table, 1)
+                self._router_sources(proto, table, prefix, (1, 0, 0))
                 for _ in range(3):
                     self._router(f"{base} replace {route}")
                     self._router(f"{base} add {route}")
                     self._router_refs(proto, table, 1)
+                    self._router_sources(proto, table, prefix, (1, 0, 0))
                 self._router(f"{base} add {dynamic}")
                 self._router_refs(proto, table, 2)
+                self._router_sources(proto, table, prefix, (1, 1, 0))
                 for _ in range(2):
                     self._router("begin")
                     self._router(f"{base} add {route}")
                     self._router(f"{base} add {dynamic}")
                     self._router("end")
                     self._router_refs(proto, table, 2)
+                    self._router_sources(proto, table, prefix, (1, 1, 0))
                 self._router("begin")
                 self._router(f"{base} add {dynamic}")
                 self._router("end")
                 self._router_refs(proto, table, 1)
+                self._router_sources(proto, table, prefix, (0, 1, 0))
                 if proto == "ip4":
-                    for protocol in (4, 186):
-                        self._router(
-                            f"{base} add 255.255.255.255/32 proto {protocol} drop"
-                        )
-                        self._router_refs(proto, table, 2)
-                        self._router("begin")
-                        self._router(f"{base} add {dynamic}")
-                        self._router("end")
-                        self._router_refs(proto, table, 1)
+                    self._router_broadcast_priority(table, dynamic)
                 self._router("begin")
                 self._router("end")
                 self._router_absent(proto, table)
                 self._router(f"{base} add {route}")
                 self._router_refs(proto, table, 1)
+                self._router_sources(proto, table, prefix, (1, 0, 0))
                 self._router(f"{base} del {route}")
                 self._router_absent(proto, table)
             finally:
+                if proto == "ip4":
+                    for protocol in (4, 186):
+                        self._router(
+                            f"{base} del 255.255.255.255/32 proto {protocol} drop"
+                        )
                 self._router(f"{base} del {route}")
                 self._router(f"{base} del {dynamic}")
 
@@ -2554,6 +2590,8 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
         try:
             self._router(f"{base} add {route}")
             self._router_refs("mpls", 1091, 2)
+            for eos in (0, 1):
+                self._router_sources("mpls", 1091, f"18801 eos {eos}", (1, 0, 0))
             entries = [
                 entry.mr_route
                 for entry in self.vapi.mpls_route_dump(1091)
@@ -2569,12 +2607,18 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
                 self._router(f"{base} replace {route}")
                 self._router(f"{base} add {route}")
                 self._router_refs("mpls", 1091, 2)
+                for eos in (0, 1):
+                    self._router_sources("mpls", 1091, f"18801 eos {eos}", (1, 0, 0))
             self._router(f"{base} add {dynamic}")
             self._router_refs("mpls", 1091, 4)
+            for eos in (0, 1):
+                self._router_sources("mpls", 1091, f"18801 eos {eos}", (1, 1, 0))
             self._router("begin")
             self._router(f"{base} add {dynamic}")
             self._router("end")
             self._router_refs("mpls", 1091, 2)
+            for eos in (0, 1):
+                self._router_sources("mpls", 1091, f"18801 eos {eos}", (0, 1, 0))
             self._router(f"{base} del {dynamic}")
             self._router_absent("mpls", 1091)
             self._router(f"{base} add {route}")
@@ -2585,60 +2629,114 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
             self._router(f"{base} del {route}")
             self._router(f"{base} del {dynamic}")
 
+    def _router_linux_path(self, proto, table, prefix, gateway, protocol):
+        def paths():
+            return [
+                (
+                    path.sw_if_index,
+                    path.type,
+                    path.preference,
+                    str(path.nh.address.ip6 if proto == "ip6" else path.nh.address.ip4),
+                )
+                for entry in self.vapi.ip_route_dump(table, proto == "ip6")
+                if str(entry.route.prefix) == prefix
+                for path in entry.route.paths
+            ]
+
+        self.poll_for(
+            f"{prefix} via {gateway} preference 100 in VPP",
+            paths,
+            [
+                (
+                    self.lo_interfaces[0].sw_if_index,
+                    FibPathType.FIB_PATH_TYPE_NORMAL,
+                    100,
+                    gateway,
+                )
+            ],
+        )
+        self._router_refs(proto, table, 1)
+        self._router_sources(
+            proto, table, prefix, (1, 0, 0) if protocol == 4 else (0, 1, 0)
+        )
+
     def test_router_linux_replace_replay(self):
-        """Linux replace and recovery replay retain one source owner"""
-        for family, proto, prefix, table in (
-            ("-4", "ip4", "198.18.92.0/24", 1092),
-            ("-6", "ip6", "2001:db8:93::/64", 1093),
+        """Changing Linux gateways and recovery replay retain one source owner"""
+        set_interface_up(self.ns_name, "hloop0")
+        for family, proto, prefix, table, address, gateways in (
+            (
+                "-4",
+                "ip4",
+                "198.18.92.0/24",
+                1092,
+                "192.0.2.254/24",
+                ("192.0.2.1", "192.0.2.2", "192.0.2.3"),
+            ),
+            (
+                "-6",
+                "ip6",
+                "2001:db8:93::/64",
+                1093,
+                "2001:db8:ffff::fe/64",
+                ("2001:db8:ffff::1", "2001:db8:ffff::2", "2001:db8:ffff::3"),
+            ),
         ):
-            for protocol in (4, 186):
-                command = ["ip", "-n", self.ns_name, family, "route"]
-                try:
-                    for _ in range(3):
+            add_namespace_address(self.ns_name, "hloop0", address)
+            try:
+                for protocol in (4, 186):
+                    command = ["ip", "-n", self.ns_name, family, "route"]
+                    try:
+                        for gateway in gateways:
+                            subprocess.run(
+                                command
+                                + [
+                                    "replace",
+                                    prefix,
+                                    "via",
+                                    gateway,
+                                    "dev",
+                                    "hloop0",
+                                    "onlink",
+                                    "table",
+                                    str(table),
+                                    "proto",
+                                    str(protocol),
+                                    "metric",
+                                    "100",
+                                ],
+                                check=True,
+                                capture_output=True,
+                            )
+                            self._router_linux_path(
+                                proto, table, prefix, gateway, protocol
+                            )
+                        for _ in range(2):
+                            stats = self._netlink_stats()
+                            self._invoke_netlink_error_callback()
+                            self._check_recovery(
+                                self._netlink_count(stats, "synchronization attempts"),
+                                self._netlink_count(stats, "synchronization completed"),
+                                "route replay ownership",
+                            )
+                            self._router_linux_path(
+                                proto, table, prefix, gateways[-1], protocol
+                            )
+                    finally:
                         subprocess.run(
-                            command
-                            + [
-                                "replace",
-                                "blackhole",
-                                prefix,
-                                "table",
-                                str(table),
-                                "proto",
-                                str(protocol),
-                                "metric",
-                                "100",
-                            ],
+                            command + ["flush", "table", str(table)],
                             check=True,
                             capture_output=True,
                         )
                         self.poll_for(
-                            "Linux route ownership",
+                            "Linux route table released",
                             lambda: self._router(
                                 f"{proto} table {table} state"
                             ).split()[0],
-                            "refs:1",
+                            "absent",
                         )
-                    for _ in range(2):
-                        stats = self._netlink_stats()
-                        self._invoke_netlink_error_callback()
-                        self._check_recovery(
-                            self._netlink_count(stats, "synchronization attempts"),
-                            self._netlink_count(stats, "synchronization completed"),
-                            "route replay ownership",
-                        )
-                        self._router_refs(proto, table, 1)
-                finally:
-                    subprocess.run(
-                        command + ["flush", "table", str(table)],
-                        check=True,
-                        capture_output=True,
-                    )
-                    self.poll_for(
-                        "Linux route table released",
-                        lambda: self._router(f"{proto} table {table} state").split()[0],
-                        "absent",
-                    )
-                self._router_absent(proto, table)
+                    self._router_absent(proto, table)
+            finally:
+                del_namespace_address(self.ns_name, "hloop0", address)
 
     def test_router_bound_table_sweep(self):
         """Sweep releases routes while pair binding preserves table lifetime"""

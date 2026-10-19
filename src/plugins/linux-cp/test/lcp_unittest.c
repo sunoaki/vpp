@@ -14,6 +14,7 @@
 #include <vlib/unix/plugin.h>
 #include <vnet/fib/fib_entry_src.h>
 #include <vnet/fib/fib_table.h>
+#include <vnet/dpo/load_balance.h>
 #include <vnet/mfib/mfib_table.h>
 #include <netlink/route/nexthop.h>
 #include <linux/mpls.h>
@@ -204,6 +205,55 @@ lcp_router_test_state (vlib_main_t *vm, fib_protocol_t proto, lcp_router_table_s
 }
 
 static clib_error_t *
+lcp_router_test_entry (vlib_main_t *vm, unformat_input_t *input, fib_protocol_t proto,
+		       const lcp_router_table_state_t *state)
+{
+  fib_prefix_t prefix = { .fp_proto = proto };
+  u32 length, eos;
+  if (proto == FIB_PROTOCOL_MPLS)
+    {
+      if (!unformat (input, "%u eos %u", &prefix.fp_label, &eos) || eos > 1)
+	return clib_error_return (0, "expected label and eos 0 or 1");
+      prefix.fp_len = 21;
+      prefix.fp_eos = eos;
+      prefix.fp_payload_proto = eos ? DPO_PROTO_IP4 : DPO_PROTO_MPLS;
+    }
+  else
+    {
+      if (!(proto == FIB_PROTOCOL_IP4 ?
+	      unformat (input, "%U/%u", unformat_ip4_address, &prefix.fp_addr.ip4, &length) :
+	      unformat (input, "%U/%u", unformat_ip6_address, &prefix.fp_addr.ip6, &length)) ||
+	  length > (proto == FIB_PROTOCOL_IP4 ? 32 : 128))
+	return clib_error_return (0, "expected prefix");
+      prefix.fp_len = length;
+    }
+  u32 entry = fib_table_lookup_exact_match (state->fib_index, &prefix);
+  const char *names[] = { "static", "dynamic", "permanent" };
+  for (u32 ii = 0; ii < ARRAY_LEN (state->sources); ii++)
+    {
+      fib_entry_src_t *source = entry == ~0 ? NULL :
+	fib_entry_src_find (fib_entry_get (entry), state->sources[ii]);
+      vlib_cli_output (vm, "%s:%u refs:%u", names[ii], source != NULL,
+		       source ? source->fes_ref_count : 0);
+    }
+  if (proto != FIB_PROTOCOL_MPLS)
+    {
+      const char *forwarding = "none";
+      if (entry != ~0)
+	{
+	  const dpo_id_t *dpo = fib_entry_contribute_ip_forwarding (entry);
+	  if (dpo->dpoi_type == DPO_LOAD_BALANCE &&
+	      load_balance_n_buckets (dpo->dpoi_index) == 1)
+	    dpo = load_balance_get_bucket (dpo->dpoi_index, 0);
+	  forwarding = dpo->dpoi_type == DPO_RECEIVE ? "receive" :
+		       dpo->dpoi_type == DPO_DROP ? "drop" : "other";
+	}
+      vlib_cli_output (vm, "forwarding:%s", forwarding);
+    }
+  return 0;
+}
+
+static clib_error_t *
 lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 {
   const nl_vft_t *vft = vlib_get_plugin_symbol ("linux_nl_plugin.so", "lcp_router_vft");
@@ -248,6 +298,12 @@ lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
       else
 	lcp_router_test_state (vm, proto, &state);
       return 0;
+    }
+  if (unformat (input, "entry"))
+    {
+      if (!get_state (table, proto, &state))
+	return clib_error_return (0, "router table absent");
+      return lcp_router_test_entry (vm, input, proto, &state);
     }
   if (unformat (input, "del"))
     is_del = 1;
@@ -324,7 +380,8 @@ lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
 
 VLIB_CLI_COMMAND (test_lcp_router_command, static) = {
   .path = "test lcp router",
-  .short_help = "test lcp router begin|end|<ip4|ip6|mpls> table <id> state|add|replace|del ...",
+  .short_help = "test lcp router begin|end|<ip4|ip6|mpls> table <id> "
+		"state|entry|add|replace|del ...",
   .function = lcp_router_test_cmd,
 };
 
