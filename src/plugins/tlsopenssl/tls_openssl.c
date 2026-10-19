@@ -518,6 +518,9 @@ openssl_test_dtls_report (clib_error_t *error, openssl_test_dtls_record_t *recor
 			  const openssl_test_dtls_stage_t *final, const clib_mem_usage_t *before,
 			  const clib_mem_usage_t *after)
 {
+  u8 identity_changed = baseline->heap_address != final->heap_address ||
+			baseline->intercept != final->intercept;
+
   control->math_valid = 1;
   error = clib_error_return (
     error,
@@ -561,6 +564,11 @@ openssl_test_dtls_report (clib_error_t *error, openssl_test_dtls_record_t *recor
 						  control->record->stage[0].usage.bytes_used);
 	}
       error = openssl_test_dtls_record_error (error, control);
+      for (u32 stage = 0; stage < 8; stage++)
+	if ((control->record->stage_valid & (1 << stage)) &&
+	    (control->record->stage[stage].heap_address != baseline->heap_address ||
+	     control->record->stage[stage].intercept != baseline->intercept))
+	  identity_changed = 1;
     }
   error = openssl_test_dtls_cache_error (error, control, records);
   error = clib_error_return (error, "[DTLS-STAGE] inside last-S7-to-after");
@@ -577,6 +585,8 @@ openssl_test_dtls_report (clib_error_t *error, openssl_test_dtls_record_t *recor
     error = clib_error_return (
       error, "[DTLS-STAGE] aggregate observed %ld inside-stage-gap-sum %ld equal %u",
       control->observed, control->sum, control->observed == control->sum);
+  if (identity_changed)
+    error = clib_error_return (error, "[DTLS-STAGE] aggregate bookkeeping heap/intercept changed");
   if (control->completed_records != 64 ||
       baseline->heap_address != records[0].stage[7].heap_address ||
       baseline->intercept != records[0].stage[7].intercept ||
