@@ -43,7 +43,10 @@ jobs:
         timeout-minutes: 6
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/m44-tools" "$RUNNER_TEMP/m44-evidence"
+          mkdir -p "$RUNNER_TEMP/m44-tools"
+          mkdir "$RUNNER_TEMP/m44-evidence"
+          mkdir "$RUNNER_TEMP/m44-evidence/raw-acquisition"
+          printf '{"bytes":0,"files":0}\n' > "$RUNNER_TEMP/m44-evidence/raw-acquisition/budget"
           printf 'TOOLS=%s\nEVIDENCE=%s\nWORK_DEADLINE=%s\n' \
             "$RUNNER_TEMP/m44-tools" "$RUNNER_TEMP/m44-evidence" "$(( $(date +%s) + 6600 ))" >> "$GITHUB_ENV"
           printf '{"workflow":"%s","case":"%s","run":"%s","attempt":"%s","job":"%s"}\n' \
@@ -596,60 +599,162 @@ jobs:
               require(events, 'Observer missing')
               return events
 
-          def collect(directory, roots=None, strict=True):
-              directory.mkdir(parents=True, exist_ok=True)
-              used = sum(path.stat().st_size for path in OUT.rglob('*') if path.is_file() and not path.is_symlink())
-              remaining, count, records, combined = max(0, 256 * 1024 * 1024 - used), 0, [], []
-              candidates, problems = [], []
-              roots = roots if roots is not None else [*sorted(Path('/tmp').glob('vpp-unittest-*')), Path('build-root/test-logs')]
-              for root in roots:
-                  if root.is_symlink() or not root.is_dir():
-                      problems.append(f'Missing or unsafe root: {root}')
-                      continue
-                  if strict:
-                      for name in ('log.txt', 'vpp_stdout.txt', 'vpp_stderr.txt'):
-                          if not (root / name).is_file() or (root / name).is_symlink():
-                              problems.append(f'Missing critical log: {root / name}')
-                  for folder, subdirs, names in os.walk(root, followlinks=False):
-                      subdirs[:] = sorted(name for name in subdirs if not (Path(folder) / name).is_symlink())
-                      for name in sorted(names):
-                          path = Path(folder) / name
-                          if not stat.S_ISREG(path.lstat().st_mode):
-                              continue
-                          if name.startswith('core'):
-                              problems.append(f'Core evidence: {path}')
-                              continue
-                          if path.suffix in ('.txt', '.log', '.pcap', '.pcapng') or name.startswith('api_post_mortem.'):
-                              critical = name in ('log.txt', 'vpp_stderr.txt', 'vpp_stdout.txt')
-                              candidates.append((not critical, str(path), path, critical))
-              incomplete = []
-              for _, _, path, critical in sorted(candidates):
-                  size = path.stat().st_size
-                  length = min(size, 32 * 1024 * 1024)
-                  if size > length or count >= 2000 or length > remaining:
-                      incomplete.append(str(path))
-                      records.append(dict(path=str(path), status='OMITTED', bytes=size, critical=critical))
-                      if critical:
-                          problems.append(f'Critical evidence omitted: {path}')
-                      continue
-                  data = path.read_bytes()
-                  target = f'{count:04d}{path.suffix or ".bin"}'
-                  (directory / target).write_bytes(data)
-                  records.append(dict(path=str(path), target=target, bytes=len(data), sha256=sha(data), critical=critical))
-                  remaining -= len(data)
-                  count += 1
-                  if critical:
-                      text = data.decode(errors='replace')
-                      if path.name == 'log.txt':
-                          combined.append('\n'.join(line for line in text.splitlines() if CALLBACK.search(line) or INFRA.search(line)))
+          class RawAcquisition:
+              def __enter__(self):
+                  import fcntl
+                  self.directory = os.open(OUT / 'raw-acquisition', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                  self.descriptor = None
+                  try:
+                      self.descriptor = os.open('budget', os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.directory)
+                      metadata = os.fstat(self.descriptor)
+                      require(stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 128, 'Unsafe acquisition state')
+                      fcntl.flock(self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                      try:
+                          os.stat('pending', dir_fd=self.directory, follow_symlinks=False)
+                      except FileNotFoundError:
+                          pass
                       else:
-                          combined.append(text)
-              save(str(directory.relative_to(OUT) / 'index.json'), dict(schema=1, strict=strict,
-                   status='COMPLETE' if not problems and not incomplete else 'INCOMPLETE', roots=list(map(str, roots)),
-                   result_sha256=collection_json(directory.parent / 'result.json')[1] if strict else None,
-                   files=records, incomplete=incomplete, problems=problems,
-                   limits=dict(total=256 * 1024 * 1024, file=32 * 1024 * 1024, count=2000)))
-              require(not strict or not problems, '; '.join(problems))
+                          raise AssertionError('Interrupted acquisition reservation')
+                      self.used = json.loads(os.read(self.descriptor, 129))
+                      require(isinstance(self.used, dict) and set(self.used) == {'bytes', 'files'} and
+                              all(type(value) is int for value in self.used.values()) and
+                              0 <= self.used['bytes'] <= 256 * 1024 * 1024 and 0 <= self.used['files'] <= 2000,
+                              'Invalid acquisition state')
+                      self.ready = True
+                      return self
+                  except BaseException:
+                      if self.descriptor is not None:
+                          os.close(self.descriptor)
+                      os.close(self.directory)
+                      raise
+
+              def __exit__(self, *exception):
+                  os.close(self.descriptor)
+                  os.close(self.directory)
+
+              def reserve(self, length):
+                  require(self.ready, 'Acquisition reservation previously failed')
+                  require(0 <= length <= 32 * 1024 * 1024 and self.used['files'] < 2000 and
+                          self.used['bytes'] + length <= 256 * 1024 * 1024, 'Raw acquisition capacity exhausted')
+                  self.ready = False
+                  marker = os.open('pending', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.directory)
+                  os.close(marker)
+                  os.fsync(self.directory)
+                  self.used['bytes'] += length
+                  self.used['files'] += 1
+                  data = json.dumps(self.used, sort_keys=True).encode()
+                  os.lseek(self.descriptor, 0, os.SEEK_SET)
+                  require(os.write(self.descriptor, data) == len(data), 'Short acquisition reservation write')
+                  os.ftruncate(self.descriptor, len(data))
+                  os.fsync(self.descriptor)
+                  os.unlink('pending', dir_fd=self.directory)
+                  os.fsync(self.directory)
+                  self.ready = True
+
+          def raw_identity(metadata):
+              return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+          def raw_source(path):
+              directory = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+              try:
+                  parts = path.absolute().parts[1:]
+                  require(parts and '..' not in parts, 'Unsafe raw source path')
+                  for part in parts[:-1]:
+                      child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                      os.close(directory)
+                      directory = child
+                  return os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+              finally:
+                  os.close(directory)
+
+          def acquire_raw(path, target, acquisition):
+              before = path.lstat()
+              require(stat.S_ISREG(before.st_mode), 'Raw source is not a regular file')
+              descriptor = raw_source(path)
+              with os.fdopen(descriptor, 'rb', buffering=0) as source:
+                  metadata = os.fstat(source.fileno())
+                  require(stat.S_ISREG(metadata.st_mode) and raw_identity(before) == raw_identity(metadata), 'Raw source changed before open')
+                  acquisition.reserve(metadata.st_size)
+                  digest, length, text = hashlib.sha256(), 0, bytearray()
+                  with target.open('xb', buffering=0) as destination:
+                      while length < metadata.st_size:
+                          data = source.read(min(1024 * 1024, metadata.st_size - length))
+                          require(data, 'Raw source truncated')
+                          require(destination.write(data) == len(data), 'Short raw evidence write')
+                          length += len(data)
+                          digest.update(data)
+                          if path.name in ('log.txt', 'vpp_stderr.txt', 'vpp_stdout.txt'):
+                              text.extend(data)
+                      require(raw_identity(os.fstat(source.fileno())) == raw_identity(metadata) and
+                              raw_identity(path.lstat()) == raw_identity(metadata), 'Raw source changed during acquisition')
+                  return dict(bytes=length, sha256=digest.hexdigest()), text.decode(errors='replace')
+
+          def collect(directory, roots=None, strict=True):
+              directory.mkdir(parents=True, exist_ok=False)
+              records, combined, problems, incomplete = [], [], [], []
+              roots = roots if roots is not None else [*sorted(Path('/tmp').glob('vpp-unittest-*')), Path('build-root/test-logs')]
+              try:
+                  with RawAcquisition() as acquisition:
+                      require(acquisition.used['files'] < 2000, 'Raw acquisition file capacity exhausted')
+                      candidates = []
+                      for root in roots:
+                          if root.is_symlink() or not root.is_dir():
+                              problems.append(f'Missing or unsafe root: {root}')
+                              continue
+                          if strict:
+                              for name in ('log.txt', 'vpp_stdout.txt', 'vpp_stderr.txt'):
+                                  if not (root / name).is_file() or (root / name).is_symlink():
+                                      problems.append(f'Missing critical log: {root / name}')
+                          discovery_full = False
+                          for folder, subdirs, names in os.walk(root, followlinks=False):
+                              subdirs[:] = sorted(name for name in subdirs if not (Path(folder) / name).is_symlink())
+                              for name in sorted(names, key=lambda value: (value not in ('log.txt', 'vpp_stderr.txt', 'vpp_stdout.txt'), value)):
+                                  path = Path(folder) / name
+                                  if name.startswith('core'):
+                                      problems.append(f'Core evidence: {path}')
+                                      continue
+                                  if path.suffix in ('.txt', '.log', '.pcap', '.pcapng') or name.startswith('api_post_mortem.'):
+                                      if len(candidates) == 2000:
+                                          problems.append(f'Raw discovery capacity exhausted at: {path}')
+                                          incomplete.append(str(path))
+                                          discovery_full = True
+                                          break
+                                      critical = name in ('log.txt', 'vpp_stderr.txt', 'vpp_stdout.txt')
+                                      candidates.append((not critical, str(path), path, critical))
+                              if discovery_full:
+                                  break
+                          if discovery_full:
+                              break
+                      for _, _, path, critical in sorted(candidates):
+                          target = f'{len(records):04d}{path.suffix or ".bin"}'
+                          record = dict(path=str(path), target=target, critical=critical)
+                          try:
+                              values, text = acquire_raw(path, directory / target, acquisition)
+                              record.update(values)
+                              if critical:
+                                  combined.append('\n'.join(line for line in text.splitlines() if CALLBACK.search(line) or INFRA.search(line))
+                                                  if path.name == 'log.txt' else text)
+                          except BaseException as error:
+                              record.update(status='OMITTED', error=str(error))
+                              incomplete.append(str(path))
+                              records.append(record)
+                              if not isinstance(error, (OSError, AssertionError, ValueError)):
+                                  raise
+                              if critical:
+                                  problems.append(f'Critical evidence omitted: {path}')
+                              continue
+                          records.append(record)
+              except BaseException as error:
+                  problems.append(f'Raw acquisition incomplete: {error}')
+                  if not isinstance(error, (OSError, AssertionError, ValueError)):
+                      raise
+              finally:
+                  save(str(directory.relative_to(OUT) / 'index.json'), dict(schema=1, strict=strict,
+                       status='COMPLETE' if not problems and not incomplete else 'INCOMPLETE', roots=list(map(str, roots)),
+                       result_sha256=collection_json(directory.parent / 'result.json')[1] if strict else None,
+                       files=records, incomplete=incomplete, problems=problems,
+                       limits=dict(total=256 * 1024 * 1024, file=32 * 1024 * 1024, count=2000)))
+              require(not strict or not (problems or incomplete), '; '.join(problems + incomplete))
               return '\n'.join(combined)
 
           def collection_json(path):
