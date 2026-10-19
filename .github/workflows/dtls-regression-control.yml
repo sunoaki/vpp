@@ -331,6 +331,53 @@ jobs:
               finally:
                   os.close(handle)
 
+          def completion_process(pid, birth):
+              path = Path(f"/proc/{pid}")
+              with (path / "stat").open("rb") as stream:
+                  raw = stream.read(4096)
+              fields = raw.rsplit(b")", 1)[1].split()
+              require(int(fields[19]) == birth, "Completion diagnostic process identity changed")
+              with (path / "cmdline").open("rb") as stream:
+                  cmdline = stream.read(4096)
+              require(process_table().get(pid, (None, None))[1] == birth,
+                      "Completion diagnostic identity changed while reading")
+              return {"pid": pid, "birth": birth, "parent": int(fields[1]),
+                      "state": fields[0].decode(errors="replace"),
+                      "comm": raw.split(b"(", 1)[1].rsplit(b")", 1)[0][:256].decode(errors="replace"),
+                      "cmdline": cmdline.replace(b"\0", b" ").decode(errors="replace")}
+
+          def reap_completed_descendants(root_pid, tracked, baseline, deadline):
+              report = {"processes": [], "unresolved": [], "remaining": []}
+              identities = [(pid, tracked[pid]) for pid in sorted(descendants(tracked, baseline) - {root_pid})]
+              require(len(identities) <= 128, "Too many descendants for bounded completion evidence")
+              for pid, birth in identities:
+                  record = {"pid": pid, "birth": birth, "waitid": None}
+                  report["processes"].append(record)
+                  handle = None
+                  try:
+                      require(time.monotonic() < deadline, "Completion inspection deadline exceeded")
+                      handle = os.pidfd_open(pid, 0)
+                      require(process_table().get(pid, (None, None))[1] == birth,
+                              "Completion pidfd process identity changed")
+                      record.update(completion_process(pid, birth))
+                      reaped = os.waitid(os.P_PIDFD, handle, os.WEXITED | os.WNOHANG)
+                      if reaped is None:
+                          record["status"] = "live-or-unresolved"
+                          report["unresolved"].append(pid)
+                      else:
+                          record["waitid"] = {"pid": reaped.si_pid, "status": reaped.si_status,
+                                              "code": reaped.si_code}
+                          require(reaped.si_pid == pid, "Completion waitid returned a different process")
+                          record["status"] = "reaped"
+                  except (OSError, AssertionError, ValueError, IndexError) as error:
+                      record.update(status="unresolved", error={"type": type(error).__name__, "message": str(error)})
+                      report["unresolved"].append(pid)
+                  finally:
+                      if handle is not None:
+                          os.close(handle)
+              report["remaining"] = sorted(descendants(tracked, baseline) - {root_pid})
+              return report
+
           def cleanup(process, tracked, baseline):
               result = {"signals": [], "reaped": [], "survivors": []}
               deadline = time.monotonic() + 5
@@ -602,8 +649,9 @@ jobs:
                                   stream, tail, diagnostic_window, chunk, result)
                               caught_transport |= result.get("caught_transport", False)
                   result["rc"] = process.wait(timeout=max(0.01, deadline - time.monotonic()))
-                  require(not (descendants(tracked, baseline) - {process.pid}),
-                          "Command left descendant processes after completion")
+                  result["completion"] = reap_completed_descendants(process.pid, tracked, baseline, deadline)
+                  require(not result["completion"]["unresolved"] and not result["completion"]["remaining"],
+                          "Command left live or unresolved descendant processes after completion")
                   result["outcome"] = "success" if result["rc"] == 0 else "nonzero"
               except BaseException as error:
                   result["outcome"] = "timeout" if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)) else "exception"
@@ -1287,6 +1335,59 @@ jobs:
                   require(sent == [((300, 50), int(signal.SIGTERM))], "Signal escaped held identity")
               print("Mock identity replacements: rediscovery and pidfd-only signaling passed; zero real signals")
 
+          def completion_identity_fixtures():
+              from unittest import mock
+              module = sys.modules[__name__]
+              identities = {701: 10}
+              table = {701: (os.getpid(), 10)}
+              with mock.patch.object(module, "descendants", return_value={701}), \
+                   mock.patch.object(module, "process_table", side_effect=lambda: dict(table)), \
+                   mock.patch.object(module, "completion_process", return_value={"state": "Z"}), \
+                   mock.patch.object(os, "pidfd_open", return_value=901), mock.patch.object(os, "close"), \
+                   mock.patch.object(signal, "pidfd_send_signal", side_effect=AssertionError("Completion must not signal")), \
+                   mock.patch.object(os, "waitid") as wait:
+                  table[701] = (999, 11)
+                  report = reap_completed_descendants(700, identities, {}, time.monotonic() + 1)
+                  require(report["unresolved"] == [701] and not wait.called, "Reaped replacement identity")
+                  table[701] = (os.getpid(), 10)
+                  wait.side_effect = ChildProcessError("not an adopted child")
+                  report = reap_completed_descendants(700, identities, {}, time.monotonic() + 1)
+                  require(report["unresolved"] == [701], "Ignored unresolved child ownership")
+                  wait.reset_mock()
+                  report = reap_completed_descendants(700, identities, {}, time.monotonic() - 1)
+                  require(report["unresolved"] == [701] and not wait.called, "Completion exceeded deadline")
+              print("Completion identity replacement, nonchild and deadline guards passed without real signals")
+
+          def completion_fixtures():
+              output = Path(os.environ["EVIDENCE_DIR"])
+              exited = ("import os,time;child=os.fork();os._exit(0) if child==0 else None;"
+                        "os.waitid(os.P_PID,child,os.WEXITED|os.WNOWAIT);print(child,flush=True);time.sleep(.2)")
+              for number in range(2):
+                  directory, rc, _ = command(f"completion-exited-{number}", [sys.executable, "-c", exited], seconds=3)
+                  result = json.loads((directory / "result.json").read_bytes())
+                  records = result["completion"]["processes"]
+                  require(rc == 0 and result["outcome"] == "success" and not result["cleanup"]["signals"]
+                          and len(records) == 1 and records[0]["state"] == "Z" and records[0]["status"] == "reaped"
+                          and records[0]["waitid"]["code"] == os.CLD_EXITED and records[0]["waitid"]["status"] == 0,
+                          "Exited owned child was not reaped without signaling")
+              live = ("import os,time;child=os.fork();"
+                      "os.close(1) if child==0 else None;os.close(2) if child==0 else None;"
+                      "time.sleep(60) if child==0 else time.sleep(.2)")
+              try:
+                  command("completion-live", [sys.executable, "-c", live], seconds=3)
+              except RuntimeError:
+                  pass
+              else:
+                  raise AssertionError("Accepted live child after root completion")
+              result = json.loads((output / "completion-live/result.json").read_bytes())
+              require(result["rc"] == 0 and result["outcome"] == "exception" and result["completion"]["unresolved"]
+                      and not result["cleanup"]["survivors"], "Cleanup masked live child failure")
+              for rc in (0, 7):
+                  _, observed, _ = command(f"completion-rc-{rc}", [sys.executable, "-c", f"raise SystemExit({rc})"], seconds=2)
+                  require(observed == rc, "Completion reaping changed root exit status")
+              completion_identity_fixtures()
+              print("Completed children reaped without signals; live descendants rejected; root rc0/7 preserved")
+
           def runner_fixtures():
               from unittest import mock
               identity_fixtures()
@@ -1373,6 +1474,7 @@ jobs:
                   runner_fixtures()
                   nested_deadline_fixtures()
                   publication_fixtures()
+                  completion_fixtures()
               else:
                   _, rc, _ = command(action, sys.argv[2:])
                   raise SystemExit(rc)
