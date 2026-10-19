@@ -969,7 +969,7 @@ jobs:
             test -z "$(git status --porcelain -uno)"
             CHECKSTYLE_COMMIT="$commit" python3 "$TOOLS/control.py" "style-$commit" make checkstyle
             python3 "$TOOLS/control.py" "api-$commit" make checkstyle-api
-            python3 "$TOOLS/control.py" "message-$commit" extras/scripts/check_commit_msg.sh
+            python3 "$TOOLS/control.py" "message-$commit" bash extras/scripts/check_commit_msg.sh
           done
           git checkout --detach "$CANDIDATE_SHA"
           python3 "$TOOLS/control.py" pinned-python make checkstyle-python
