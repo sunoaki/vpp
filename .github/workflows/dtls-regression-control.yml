@@ -1607,7 +1607,7 @@ jobs:
             git checkout --quiet --detach "$commit"
             python3 "$CONTROL_DIR/control.py" "style-$commit" make checkstyle
             python3 "$CONTROL_DIR/control.py" "api-$commit" make checkstyle-api
-            python3 "$CONTROL_DIR/control.py" "message-$commit" extras/scripts/check_commit_msg.sh
+            python3 "$CONTROL_DIR/control.py" "message-$commit" bash extras/scripts/check_commit_msg.sh
             test -z "$(git status --porcelain --untracked-files=all)"
           done
           git checkout --quiet --detach "$CANDIDATE_SHA"
