@@ -131,6 +131,315 @@ openssl_ctx_get_w_thread (u32 ctx_index, u8 thread_index)
   return &(*ctx)->ctx;
 }
 
+typedef struct
+{
+  void *address;
+  uword length, capacity, storage_bytes, bitmap_bytes, indices_bytes;
+  u32 realloc_pending;
+} openssl_test_dtls_pool_t;
+
+typedef struct
+{
+  openssl_ctx_t *original, *detached, *attached;
+  uword original_bytes, detached_bytes, attached_bytes;
+  u32 original_index, attached_index;
+} openssl_test_dtls_attach_t;
+
+typedef struct
+{
+  void *heap;
+  openssl_ctx_t *cached;
+  uword heap_bytes, cached_bytes;
+  u32 cached_index;
+  u8 intercept;
+  openssl_test_dtls_pool_t contexts, sessions, half_open;
+} openssl_test_dtls_sample_t;
+
+static void
+openssl_test_dtls_pool_sample (void *pool, uword elt_size, openssl_test_dtls_pool_t *sample)
+{
+  pool_header_t *header;
+
+  clib_memset (sample, 0, sizeof (*sample));
+  sample->address = pool;
+  if (!pool)
+    return;
+  header = pool_header (pool);
+  sample->length = vec_len (pool);
+  sample->capacity = _vec_max_len (pool, elt_size);
+  sample->storage_bytes = clib_mem_size (vec_header (pool));
+  if (header->free_bitmap)
+    sample->bitmap_bytes = clib_mem_size (vec_header (header->free_bitmap));
+  if (header->free_indices)
+    sample->indices_bytes = clib_mem_size (vec_header (header->free_indices));
+  sample->realloc_pending = pool_realloc_flag (pool);
+}
+
+static void
+openssl_test_dtls_sample (openssl_ctx_t *cached, app_worker_t *app_wrk,
+			  openssl_test_dtls_sample_t *sample)
+{
+  clib_thread_index_t thread_index = vlib_get_thread_index ();
+  clib_mem_usage_t usage;
+
+  sample->heap = clib_mem_get_heap ();
+  clib_mem_get_heap_usage (sample->heap, &usage);
+  sample->heap_bytes = usage.bytes_used;
+  sample->intercept = clib_mem_main.alloc_free_intercept;
+  sample->cached = cached;
+  sample->cached_bytes = clib_mem_size (cached);
+  sample->cached_index = cached->openssl_ctx_index;
+  openssl_test_dtls_pool_sample (openssl_main.ctx_pool[thread_index], sizeof (openssl_ctx_t *),
+				 &sample->contexts);
+  openssl_test_dtls_pool_sample (session_main.wrk[thread_index].sessions, sizeof (session_t),
+				 &sample->sessions);
+  openssl_test_dtls_pool_sample (app_wrk->half_open_table, sizeof (app_wrk->half_open_table[0]),
+				 &sample->half_open);
+}
+
+static clib_error_t *
+openssl_test_dtls_pool_error (clib_error_t *error, const char *stage, const char *name,
+			      const openssl_test_dtls_pool_t *sample)
+{
+  return clib_error_return (error,
+			    "[DTLS-HEAP] %s %s pool %p len %lu capacity %lu storage %lu bitmap %lu "
+			    "indices %lu realloc %u",
+			    stage, name, sample->address, sample->length, sample->capacity,
+			    sample->storage_bytes, sample->bitmap_bytes, sample->indices_bytes,
+			    sample->realloc_pending);
+}
+
+static clib_error_t *
+openssl_test_dtls_sample_error (clib_error_t *error, const char *stage,
+				const openssl_test_dtls_sample_t *sample)
+{
+  error = clib_error_return (error,
+			     "[DTLS-HEAP] %s heap %p bytes %lu intercept %u "
+			     "cached %p slot %u size %lu",
+			     stage, sample->heap, sample->heap_bytes, sample->intercept,
+			     sample->cached, sample->cached_index, sample->cached_bytes);
+  error = openssl_test_dtls_pool_error (error, stage, "contexts", &sample->contexts);
+  error = openssl_test_dtls_pool_error (error, stage, "sessions", &sample->sessions);
+  return openssl_test_dtls_pool_error (error, stage, "half-open", &sample->half_open);
+}
+
+static clib_error_t *
+openssl_test_dtls_attach_error (clib_error_t *error, const char *stage,
+				const openssl_test_dtls_attach_t *sample)
+{
+  return clib_error_return (error,
+			    "[DTLS-HEAP] %s attach old %p slot %u size %lu detached %p size %lu "
+			    "attached %p slot %u size %lu",
+			    stage, sample->original, sample->original_index, sample->original_bytes,
+			    sample->detached, sample->detached_bytes, sample->attached,
+			    sample->attached_index, sample->attached_bytes);
+}
+
+static clib_error_t *
+openssl_test_dtls_migration (openssl_test_dtls_attach_t *diagnostic)
+{
+  clib_thread_index_t thread_index = vlib_get_thread_index ();
+  clib_mem_usage_t owned, migrated;
+  openssl_ctx_t *original, *copy;
+  tls_async_ctx_t async_ctx;
+  clib_error_t *error = 0;
+  SSL_CTX *ssl_ctx;
+  SSL *ssl;
+  u8 *hostname;
+  u32 ctx_index;
+
+  ssl_ctx = SSL_CTX_new (DTLS_client_method ());
+  if (!ssl_ctx)
+    return clib_error_return (0, "DTLS migration SSL context allocation failed");
+  ssl = SSL_new (ssl_ctx);
+  SSL_CTX_free (ssl_ctx);
+  if (!ssl)
+    return clib_error_return (0, "DTLS migration SSL allocation failed");
+  ctx_index = openssl_ctx_alloc ();
+  original = (openssl_ctx_t *) openssl_ctx_get (ctx_index);
+  original->ctx.srv_hostname = format (0, "migration.example.test%c", 0);
+  original->ctx.tls_session_handle = SESSION_INVALID_HANDLE;
+  original->ssl = ssl;
+  original->rbio = BIO_new_dtls (SESSION_INVALID_HANDLE);
+  original->wbio = BIO_new_dtls (SESSION_INVALID_HANDLE);
+  if (!original->rbio || !original->wbio)
+    {
+      BIO_free (original->rbio);
+      BIO_free (original->wbio);
+      openssl_ctx_free (&original->ctx);
+      return clib_error_return (0, "DTLS migration BIO allocation failed");
+    }
+  SSL_set_bio (ssl, original->rbio, original->wbio);
+  hostname = original->ctx.srv_hostname;
+  async_ctx = original->async_ctx;
+  copy = openssl_ctx_detach (&original->ctx);
+  diagnostic->original = original;
+  diagnostic->original_index = original->openssl_ctx_index;
+  diagnostic->original_bytes = clib_mem_size (original);
+  diagnostic->detached = copy;
+  diagnostic->detached_bytes = clib_mem_size (copy);
+  clib_mem_get_heap_usage (clib_mem_get_heap (), &owned);
+  original->ctx.flags |= TLS_CONN_F_MIGRATED;
+  openssl_ctx_free (&original->ctx);
+  clib_mem_get_heap_usage (clib_mem_get_heap (), &migrated);
+  if (owned.bytes_used != migrated.bytes_used || copy->ctx.srv_hostname != hostname ||
+      strcmp ((char *) hostname, "migration.example.test") || copy->ssl != ssl ||
+      copy->async_ctx.rd_evt_list != async_ctx.rd_evt_list ||
+      copy->async_ctx.wr_evt_list != async_ctx.wr_evt_list ||
+      copy->async_ctx.hs_evt_list != async_ctx.hs_evt_list)
+    error = clib_error_return (0, "DTLS migration released transferred resources");
+
+  ctx_index = openssl_ctx_attach (thread_index, copy);
+  copy = (openssl_ctx_t *) openssl_ctx_get (ctx_index);
+  diagnostic->attached = copy;
+  diagnostic->attached_index = ctx_index;
+  diagnostic->attached_bytes = clib_mem_size (copy);
+  if (copy->ctx.flags & TLS_CONN_F_MIGRATED)
+    error = clib_error_return (error, "DTLS destination inherited migrated flag");
+  openssl_ctx_free (&copy->ctx);
+  if (copy->ctx.srv_hostname || copy->async_ctx.rd_evt_list || copy->async_ctx.wr_evt_list ||
+      copy->async_ctx.hs_evt_list)
+    error = clib_error_return (error, "DTLS destination retained owned resources");
+  return error;
+}
+
+static clib_error_t *
+openssl_test_dtls_failures (vnet_connect_args_t *args)
+{
+  clib_thread_index_t thread_index = vlib_get_thread_index ();
+  transport_endpt_ext_cfg_t *ext;
+  clib_mem_usage_t before, after;
+  openssl_test_dtls_sample_t baseline, previous, current, final, first_before, first_after;
+  openssl_test_dtls_attach_t warmup_attach, last_attach, first_attach;
+  openssl_ctx_t *ctx;
+  clib_error_t *error;
+  u32 ctx_index, n_contexts, n_sessions, n_half_open;
+  u32 first_iteration = ~0;
+  app_worker_t *app_wrk;
+  int rv;
+
+  ext = session_endpoint_get_ext_cfg (&args->sep_ext, TRANSPORT_ENDPT_EXT_CFG_CRYPTO);
+  app_wrk = application_get_default_worker (application_get (args->app_index));
+  n_half_open = pool_elts (app_wrk->half_open_table);
+  n_sessions = pool_elts (session_main.wrk[thread_index].sessions);
+  n_contexts = pool_elts (openssl_main.ctx_pool[thread_index]);
+  ctx_index = openssl_ctx_alloc ();
+  ctx = (openssl_ctx_t *) openssl_ctx_get (ctx_index);
+  openssl_ctx_free (&ctx->ctx);
+
+  for (u32 iteration = 0; iteration < 72; iteration++)
+    {
+      if (iteration == 8)
+	clib_mem_get_heap_usage (clib_mem_get_heap (), &before);
+      args->sh = SESSION_INVALID_HANDLE;
+      rv = vnet_connect (args);
+      if (rv != SESSION_E_NOINTF && rv != SESSION_E_NOROUTE && rv != SESSION_E_NOIP)
+	return clib_error_return (0, "DTLS expected immediate route failure, got %d", rv);
+      if (args->sh != SESSION_INVALID_HANDLE ||
+	  pool_elts (openssl_main.ctx_pool[thread_index]) != n_contexts ||
+	  pool_elts (session_main.wrk[thread_index].sessions) != n_sessions ||
+	  pool_elts (app_wrk->half_open_table) != n_half_open)
+	return clib_error_return (0, "DTLS immediate failure retained connection state");
+      if (ctx->ctx.srv_hostname || ctx->ssl || ctx->async_ctx.rd_evt_list ||
+	  ctx->async_ctx.wr_evt_list || ctx->async_ctx.hs_evt_list)
+	{
+	  vec_free (ctx->ctx.srv_hostname);
+	  if (openssl_main.async)
+	    tls_async_evts_free_list (&ctx->ctx);
+	  return clib_error_return (0,
+				    "DTLS immediate failure retained hostname/async ownership "
+				    "(named %u, async %d, iteration %u)",
+				    ext->crypto.hostname[0] != 0, openssl_main.async, iteration);
+	}
+    }
+  clib_mem_get_heap_usage (clib_mem_get_heap (), &after);
+  if (before.bytes_used != after.bytes_used)
+    return clib_error_return (0, "DTLS failures grew heap from %lu to %lu (named %u, async %d)",
+			      before.bytes_used, after.bytes_used, ext->crypto.hostname[0] != 0,
+			      openssl_main.async);
+
+  if ((error = openssl_test_dtls_migration (&warmup_attach)))
+    return error;
+  clib_mem_get_heap_usage (clib_mem_get_heap (), &before);
+  openssl_test_dtls_sample (warmup_attach.attached, app_wrk, &baseline);
+  previous = baseline;
+  for (u32 iteration = 0; iteration < 64; iteration++)
+    {
+      if ((error = openssl_test_dtls_migration (&last_attach)))
+	return error;
+      openssl_test_dtls_sample (last_attach.attached, app_wrk, &current);
+      if (first_iteration == ~0 && current.heap_bytes != previous.heap_bytes)
+	{
+	  first_iteration = iteration;
+	  first_before = previous;
+	  first_after = current;
+	  first_attach = last_attach;
+	}
+      previous = current;
+    }
+  clib_mem_get_heap_usage (clib_mem_get_heap (), &after);
+  openssl_test_dtls_sample (last_attach.attached, app_wrk, &final);
+  if (before.bytes_used != after.bytes_used)
+    {
+      error = clib_error_return (0, "DTLS migration/disposal grew heap from %lu to %lu",
+				 before.bytes_used, after.bytes_used);
+      error = clib_error_return (error,
+				 "[DTLS-HEAP] named %u async %d thread %u first iteration %u "
+				 "(zero-based, ~0 means none) requested context size %lu "
+				 "main heap %p",
+				 ext->crypto.hostname[0] != 0, openssl_main.async, thread_index,
+				 first_iteration, (uword) sizeof (openssl_ctx_t),
+				 clib_mem_main.main_heap);
+      error = openssl_test_dtls_sample_error (error, "baseline", &baseline);
+      error = openssl_test_dtls_sample_error (error, "final", &final);
+      error = openssl_test_dtls_attach_error (error, "warmup", &warmup_attach);
+      error = openssl_test_dtls_attach_error (error, "last", &last_attach);
+      if (first_iteration != ~0)
+	{
+	  error = openssl_test_dtls_sample_error (error, "first-before", &first_before);
+	  error = openssl_test_dtls_sample_error (error, "first-after", &first_after);
+	  error = openssl_test_dtls_attach_error (error, "first", &first_attach);
+	}
+      return error;
+    }
+  return 0;
+}
+
+__clib_export clib_error_t *
+openssl_test_dtls_cleanup (vnet_connect_args_t *args)
+{
+  transport_endpt_ext_cfg_t *ext;
+  clib_error_t *error = 0;
+  int saved_async = openssl_main.async;
+
+  ASSERT (vlib_get_thread_index () == transport_cl_thread ());
+  for (u32 thread = 0; thread < vec_len (openssl_main.ctx_pool); thread++)
+    if (pool_elts (openssl_main.ctx_pool[thread]))
+      return clib_error_return (0, "DTLS cleanup test requires no active OpenSSL contexts");
+
+  ext = session_endpoint_add_ext_cfg (&args->sep_ext, TRANSPORT_ENDPT_EXT_CFG_CRYPTO,
+				      sizeof (transport_endpt_crypto_cfg_t));
+  ext->crypto.crypto_engine = CRYPTO_ENGINE_OPENSSL;
+  for (int async = 0; async <= 1; async++)
+    {
+      openssl_main.async = async;
+      for (int named = 0; named <= 1; named++)
+	{
+	  clib_memset (ext->crypto.hostname, 0, sizeof (ext->crypto.hostname));
+	  if (named)
+	    clib_memcpy (ext->crypto.hostname, "failure.example.test",
+			 sizeof ("failure.example.test"));
+	  if ((error = openssl_test_dtls_failures (args)))
+	    goto done;
+	}
+    }
+
+done:
+  openssl_main.async = saved_async;
+  session_endpoint_free_ext_cfgs (&args->sep_ext);
+  return error;
+}
+
 static u32
 openssl_listen_ctx_alloc (void)
 {
