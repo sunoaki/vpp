@@ -290,7 +290,7 @@ jobs:
               while changed:
                   changed = False
                   for pid, (parent, birth) in table.items():
-                      if pid in tracked or pid in baseline:
+                      if tracked.get(pid) == birth or baseline.get(pid) == birth:
                           continue
                       valid_parent = (parent in tracked and parent in table
                                       and table[parent][1] == tracked[parent])
@@ -300,6 +300,29 @@ jobs:
               return {pid for pid, birth in tracked.items()
                       if pid in table and table[pid][1] == birth}
 
+          def signal_process(pid, birth, sig, reap):
+              try:
+                  handle = os.pidfd_open(pid, 0)
+              except ProcessLookupError:
+                  return False, None
+              try:
+                  current = process_table().get(pid)
+                  if current is None or current[1] != birth:
+                      return False, None
+                  try:
+                      signal.pidfd_send_signal(handle, sig, None, 0)
+                  except ProcessLookupError:
+                      return False, None
+                  reaped = None
+                  if reap:
+                      try:
+                          reaped = os.waitid(os.P_PIDFD, handle, os.WEXITED | os.WNOHANG)
+                      except ChildProcessError:
+                          pass
+                  return True, reaped
+              finally:
+                  os.close(handle)
+
           def cleanup(process, tracked, baseline):
               result = {"signals": [], "reaped": [], "survivors": []}
               deadline = time.monotonic() + 5
@@ -307,26 +330,16 @@ jobs:
                   stage_end = min(deadline, time.monotonic() + budget)
                   while True:
                       live = descendants(tracked, baseline)
-                      if process is not None and process.poll() is None:
-                          try:
-                              os.killpg(process.pid, sig)
-                          except ProcessLookupError:
-                              pass
-                      for pid in sorted(live):
-                          try:
-                              os.kill(pid, sig)
+                      identities = [(pid, tracked[pid]) for pid in sorted(live)]
+                      if process is not None:
+                          process.poll()
+                      for pid, birth in identities:
+                          reap = process is None or pid != process.pid or process.returncode is not None
+                          sent, reaped = signal_process(pid, birth, sig, reap)
+                          if sent:
                               result["signals"].append([pid, int(sig)])
-                          except ProcessLookupError:
-                              pass
-                      for pid in sorted(live):
-                          if process is not None and pid == process.pid:
-                              continue
-                          try:
-                              reaped, status = os.waitpid(pid, os.WNOHANG)
-                              if reaped:
-                                  result["reaped"].append([reaped, status])
-                          except ChildProcessError:
-                              pass
+                          if reaped:
+                              result["reaped"].append([reaped.si_pid, reaped.si_status])
                       if not descendants(tracked, baseline) or time.monotonic() >= stage_end:
                           break
                       time.sleep(0.02)
@@ -352,7 +365,7 @@ jobs:
               tail, process, tracked = bytearray(), None, {}
               diagnostic_window = b""
               caught_transport = False
-              baseline = set(process_table())
+              baseline = {pid: birth for pid, (_, birth) in process_table().items()}
               poller = selectors.DefaultSelector()
               try:
                   require(ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0,
@@ -669,8 +682,58 @@ jobs:
                           "Observer changed actual CLI response")
               print("Delegated observer preserved actual success, failure, exception, and CLI reply")
 
+          def identity_fixtures():
+              from types import SimpleNamespace
+              from unittest import mock
+              module = sys.modules[__name__]
+              owner = os.getpid()
+              table = {201: (owner, 31), 202: (owner, 41), 203: (owner, 60)}
+              tracked = {202: 40}
+              baseline = {201: 30, 203: 60}
+              with mock.patch.object(module, "process_table", return_value=table):
+                  require(descendants(tracked, baseline) == {201, 202}, "Owned new identities excluded")
+                  require(tracked == {201: 31, 202: 41}, "Owned identity not rediscovered")
+              state = {300: (owner, 50)}
+              handles, sent = {}, []
+              def open_handle(pid, flags=0):
+                  handle = 900 + len(handles)
+                  handles[handle] = (pid, state[pid][1])
+                  return handle
+              def send(handle, sig, info=None, flags=0):
+                  sent.append((handles[handle], int(sig)))
+              def poll():
+                  state[300] = (999, 51)
+                  return 0
+              process = SimpleNamespace(pid=300, returncode=0, poll=poll, wait=lambda timeout: 0)
+              with mock.patch.object(module, "process_table", side_effect=lambda: dict(state)), \
+                   mock.patch.object(os, "pidfd_open", side_effect=open_handle), \
+                   mock.patch.object(signal, "pidfd_send_signal", side_effect=send), \
+                   mock.patch.object(os, "close"), \
+                   mock.patch.object(os, "kill", side_effect=AssertionError("Numeric kill forbidden")), \
+                   mock.patch.object(os, "killpg", side_effect=AssertionError("Group kill forbidden")):
+                  result = cleanup(process, {300: 50}, {})
+                  require(not sent and not result["survivors"], "Signalled post-reap replacement")
+                  state[300] = (owner, 50)
+                  def replace_after_open(pid, flags=0):
+                      handle = open_handle(pid, flags)
+                      state[pid] = (999, 51)
+                      return handle
+                  with mock.patch.object(os, "pidfd_open", side_effect=replace_after_open):
+                      require(signal_process(300, 50, signal.SIGTERM, False) == (False, None),
+                              "Accepted identity replacement during handle acquisition")
+                  require(not sent, "Replacement identity received a signal")
+                  state[300] = (owner, 50)
+                  def replace_before_send(handle, sig, info=None, flags=0):
+                      state[300] = (999, 51)
+                      send(handle, sig, info, flags)
+                  with mock.patch.object(signal, "pidfd_send_signal", side_effect=replace_before_send):
+                      require(signal_process(300, 50, signal.SIGTERM, False)[0], "Held identity not signalled")
+                  require(sent == [((300, 50), int(signal.SIGTERM))], "Signal escaped held identity")
+              print("Mock identity replacements: rediscovery and pidfd-only signaling passed; zero real signals")
+
           def runner_fixtures():
               from unittest import mock
+              identity_fixtures()
               prefix = "runner-fixture-"
               command(prefix + "success", [sys.executable, "-c", "print('complete')"], seconds=2)
               escaped = ("import os,signal,time; "
