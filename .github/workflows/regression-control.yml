@@ -238,7 +238,10 @@ jobs:
                               for callback, _, _ in callbacks), "Invalid result callback")
               require(not re.search(r"(?:^|\n)(?:ERROR|SKIP):|FAILED \([^\n]*errors=|"
                                     r"OK \(skipped=|SIGSEGV|segmentation fault|"
-                                    r"Core was generated|timed out|TimeoutError", console,
+                                    r"Core was generated|timed out|TimeoutError|"
+                                    r"VppTransportSocketIOError|VppDiedError|Vpp dead|"
+                                    r"VPP subprocess died unexpectedly|PUMP THREAD TIMEOUT",
+                                    console + logs + stderr,
                                     re.IGNORECASE), "Infrastructure error or skipped test")
               require(re.search(r"Ran [1-9][0-9]* tests? in ", console),
                       "Missing completed unittest summary")
@@ -437,14 +440,49 @@ jobs:
               while changed:
                   changed = False
                   for pid, (parent, birth) in table.items():
-                      if tracked.get(pid) == birth or baseline.get(pid) == birth:
+                      if pid in tracked or pid in baseline:
                           continue
-                      if parent == os.getpid() or (parent in tracked and parent in table and
-                                                  tracked[parent] == table[parent][1]):
+                      if parent == os.getpid() or (parent in tracked and parent not in baseline and
+                                                  parent in table and tracked[parent] == table[parent][1]):
                           tracked[pid] = birth
                           changed = True
               return {pid for pid, birth in tracked.items()
                       if pid in table and table[pid][1] == birth}
+
+          def inspect_process(pid, birth, sig=None):
+              try:
+                  descriptor = os.pidfd_open(pid)
+              except ProcessLookupError:
+                  return False, None
+              try:
+                  current = process_identity(pid)
+                  if current is None or current[1] != birth:
+                      return False, None
+                  sent = False
+                  if sig is not None:
+                      try:
+                          signal.pidfd_send_signal(descriptor, sig)
+                          sent = True
+                      except ProcessLookupError:
+                          pass
+                  try:
+                      reaped = os.waitid(os.P_PIDFD, descriptor, os.WEXITED | os.WNOHANG)
+                  except ChildProcessError:
+                      reaped = None
+                  return sent, reaped
+              finally:
+                  os.close(descriptor)
+
+          def record_root_exit(process, reaped):
+              if process is not None and reaped is not None and reaped.si_pid == process.pid:
+                  process.returncode = (reaped.si_status if reaped.si_code == os.CLD_EXITED
+                                        else -reaped.si_status)
+
+          def poll_root(process, tracked):
+              if process.returncode is None:
+                  _, reaped = inspect_process(process.pid, tracked.get(process.pid))
+                  record_root_exit(process, reaped)
+              return process.returncode
 
           def cleanup(process, tracked, baseline):
               result = {"signals": [], "reaped": [], "survivors": []}
@@ -453,39 +491,20 @@ jobs:
                   stage_end = min(deadline, time.monotonic() + seconds)
                   while True:
                       live = descendants(tracked, baseline)
-                      if process is not None:
-                          process.poll()
-                      for pid in sorted(live):
-                          try:
-                              descriptor = os.pidfd_open(pid)
-                          except ProcessLookupError:
-                              continue
-                          try:
-                              current = process_identity(pid)
-                              if current is not None and current[1] == tracked[pid]:
-                                  signal.pidfd_send_signal(descriptor, sig)
-                                  if len(result["signals"]) < 2048:
-                                      result["signals"].append([pid, tracked[pid], int(sig)])
-                          except ProcessLookupError:
-                              pass
-                          finally:
-                              os.close(descriptor)
-                      for pid in sorted(live):
-                          if process is not None and pid == process.pid:
-                              continue
-                          try:
-                              reaped, status = os.waitpid(pid, os.WNOHANG)
-                              if reaped:
-                                  result["reaped"].append([reaped, status])
-                          except ChildProcessError:
-                              pass
+                      identities = [(pid, tracked[pid]) for pid in sorted(live)]
+                      for pid, birth in identities:
+                          sent, reaped = inspect_process(pid, birth, sig)
+                          if sent and len(result["signals"]) < 2048:
+                              result["signals"].append([pid, birth, int(sig)])
+                          if reaped is not None:
+                              result["reaped"].append([reaped.si_pid, birth, reaped.si_status])
+                              record_root_exit(process, reaped)
                       if not descendants(tracked, baseline) or time.monotonic() >= stage_end:
                           break
                       time.sleep(0.02)
-              if process is not None:
-                  try:
-                      process.wait(timeout=max(0.01, deadline - time.monotonic()))
-                  except subprocess.TimeoutExpired:
+              if process is not None and process.returncode is None:
+                  poll_root(process, tracked)
+                  if process.returncode is None:
                       result["survivors"].append(process.pid)
               result["survivors"] = sorted(set(result["survivors"]) | descendants(tracked, baseline))
               return result
@@ -526,7 +545,7 @@ jobs:
                   os.set_blocking(process.stdout.fileno(), False)
                   poller.register(process.stdout, selectors.EVENT_READ)
                   with (directory / "console.log").open("w+b") as stream:
-                      while poller.get_map() or process.poll() is None:
+                      while poller.get_map() or poll_root(process, tracked) is None:
                           descendants(tracked, baseline)
                           remaining = deadline - time.monotonic()
                           if remaining <= 0:
@@ -545,7 +564,7 @@ jobs:
                               stream.write(tail)
                               stream.truncate()
                               stream.flush()
-                      result["rc"] = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+                      result["rc"] = process.returncode
                   if descendants(tracked, baseline):
                       raise RuntimeError("Command left descendant processes after completion")
                   result["outcome"] = "success" if result["rc"] == 0 else "nonzero"
@@ -668,14 +687,21 @@ jobs:
               provenance = [output / "manifest.json", directory / "result.json",
                             directory / "console.log", events_path]
               evidence = {"complete": True, "pattern": CALLBACK.pattern,
-                          "sources": sources, "records": records,
-                          "provenance": {str(path.relative_to(output)): {
-                              "bytes": path.stat().st_size,
-                              "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-                              for path in provenance}}
+                          "sources": sources, "records": records, "provenance": {}}
+              for path in provenance:
+                  key = str(path.relative_to(output))
+                  try:
+                      assert path.is_file() and not path.is_symlink(), "Missing or invalid provenance file"
+                      data = path.read_bytes()
+                      evidence["provenance"][key] = {
+                          "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+                  except (AssertionError, OSError) as error:
+                      evidence["complete"] = False
+                      evidence["provenance"][key] = {"missing": True, "error": str(error)[:1000]}
               encoded = (json.dumps(evidence, indent=2) + "\n").encode()
               assert len(encoded) <= 1024 * 1024, "Callback evidence limit exceeded"
               (directory / "callbacks.json").write_bytes(encoded)
+              assert evidence["complete"], "Incomplete callback provenance; retained available records"
               return logs
 
           def run_tests():
