@@ -201,11 +201,11 @@ jobs:
           import time
 
           BASE = '9ad393ec1cca66d600932ad69d128634a845e4f4'
-          TIP = '9cb95d6b4b67cf461ae314ac6dbffddfdfaef3ca'
-          TREE = '96491d860182c64cfb113bccf40d9c5de5fcab2f'
+          TIP = 'be9629d88fa4a97cc1e6e30e5e297dbdfce3cc84'
+          TREE = '1359b93e9f4435a642e90d89bf9d87fd64839fed'
           OLD = '6d5b381bf06ad3b0a839f864bf307b2aa08553eb'
           HISTORY = ['88b305a361fb6b5182156ea90c3714287861a391', '0f903d2c5967eddf811bf02d0a83d32868895eee',
-                     OLD, 'e84552bf087fb1e902b6b977d25c5958f6c7afc6', TIP]
+                     OLD, 'e84552bf087fb1e902b6b977d25c5958f6c7afc6', '9cb95d6b4b67cf461ae314ac6dbffddfdfaef3ca', TIP]
           WORKFLOW = '.github/workflows/m44-remote-validation.yml'
           FIB = 'src/plugins/unittest/fib_test.c'
           IP4 = 'test/test_ip4.py'
@@ -216,6 +216,8 @@ jobs:
                   INTERFACE: '6921f857bd3debf39e44140427a1aaddfc878d1a', EXPORT: '211f7e1d79840d457fae40828e04e7f0e84daa0a',
                   INTERPOSE: '51f80ed7789af867513ec9bed5b4b72e0be9f331',
                   'src/vnet/fib/fib_entry.c': 'c6739caf0e4583c68a477a05b5a0f2ef03c3c345',
+                  'src/vnet/fib/fib_entry.h': '83ba7b1e1710f78021458dfd192463ea4b1465e3',
+                  'src/vnet/fib/fib_node.h': '2828c429739f7bdedc1a69b56bd696968567ef78',
                   'src/vnet/fib/fib_entry_src.c': '4997d3104745e7fa2f005af6ef9da2e33706f3e1',
                   'src/vnet/fib/fib_entry_src.h': '468e86483580e55159dc14ee581fc7d5d45ebc97',
                   'test/requirements.txt': 'c0527dd70258d993915bd7fd360ce05837e8872d',
@@ -1127,7 +1129,7 @@ jobs:
         run: |
           export STEP_DEADLINE="$(( $(date +%s) + 1500 ))"
           python3 "$TOOLS/control.py" dependencies make UNATTENDED=yes install-dep
-      - name: Require all five history gates and pinned Python
+      - name: Require all six history gates and pinned Python
         timeout-minutes: 52
         run: |
           export STEP_DEADLINE="$(( $(date +%s) + 3060 ))"
