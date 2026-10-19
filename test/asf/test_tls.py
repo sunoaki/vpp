@@ -160,5 +160,32 @@ class TestTLS(VppAsfTestCase):
         ip_t10.remove_vpp_config()
 
 
+@unittest.skipIf(
+    "tlsopenssl" in config.excluded_plugins or "unittest" in config.excluded_plugins,
+    "Requires OpenSSL and session unit tests",
+)
+class TestDTLSCleanup(VppAsfTestCase):
+    """DTLS immediate failure and OpenSSL resource ownership."""
+
+    vpp_worker_count = 0
+
+    def test_dtls_cleanup(self):
+        """Named/unnamed DTLS failures and migration, async off/on, without QAT"""
+        self.vapi.session_enable_disable(is_enable=1)
+        try:
+            response = self.vapi.cli_return_response("test session dtls-cleanup")
+            self.assertEqual(response.retval, 0, response.reply)
+            self.assertIn("DTLS cleanup: 4 modes passed", response.reply)
+            self.assertIn("SUCCESS", response.reply)
+        finally:
+            self.vapi.session_enable_disable(is_enable=0)
+
+
+class TestDTLSCleanupWorker(TestDTLSCleanup):
+    """DTLS cleanup on the transport client worker."""
+
+    vpp_worker_count = 1
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=VppTestRunner)

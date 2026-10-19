@@ -13,6 +13,7 @@
 #include <sys/epoll.h>
 #include <vnet/session/session_rules_table.h>
 #include <unittest/session/test_session_helpers.h>
+#include <vlib/unix/plugin.h>
 
 #define SESSION_TEST_I(_cond, _comment, _args...)		\
 ({								\
@@ -3096,6 +3097,118 @@ session_test_reconn_while_closed (vlib_main_t *vm, unformat_input_t *input)
   return 0;
 }
 
+typedef struct
+{
+  vnet_connect_args_t connect_args;
+  clib_error_t *(*run) (vnet_connect_args_t *);
+  clib_error_t *error;
+  volatile u32 done;
+} session_dtls_test_t;
+
+static u32 session_dtls_connected_count;
+
+static int
+session_test_dtls_connected (u32 app_index, u32 opaque, session_t *s, session_error_t err)
+{
+  session_dtls_connected_count++;
+  return 0;
+}
+
+static void
+session_test_dtls_cleanup_rpc (void *arg)
+{
+  session_dtls_test_t *test = arg;
+
+  test->error = test->run (&test->connect_args);
+  clib_atomic_store_rel_n (&test->done, 1);
+}
+
+static int
+session_test_dtls_cleanup (vlib_main_t *vm)
+{
+  session_dtls_test_t test = {};
+  vnet_app_detach_args_t detach = { .api_client_index = ~0, .app_index = ~0 };
+  session_cb_vft_t callbacks = placeholder_session_cbs;
+  u64 options[APP_OPTIONS_N_OPTIONS] = {};
+  u32 table_id = 49152, fib_index;
+  int rv, result = 1;
+  u8 *namespace_id = format (0, "dtls-cleanup-test");
+  vnet_app_namespace_add_del_args_t ns = {
+    .ns_id = namespace_id,
+    .secret = 1234,
+    .sw_if_index = APP_NAMESPACE_INVALID_INDEX,
+    .ip6_fib_id = APP_NAMESPACE_INVALID_INDEX,
+    .is_add = 1,
+  };
+  vnet_app_attach_args_t attach = {
+    .api_client_index = ~0,
+    .options = options,
+    .namespace_id = namespace_id,
+    .session_cb_vft = &callbacks,
+    .name = format (0, "dtls-cleanup-test"),
+  };
+
+  test.run = vlib_get_plugin_symbol ("tlsopenssl_plugin.so", "openssl_test_dtls_cleanup");
+  if (!SESSION_TEST_I (test.run != 0, "OpenSSL DTLS cleanup test available"))
+    goto free_names;
+  while (fib_table_find (FIB_PROTOCOL_IP4, table_id) != ~0)
+    table_id++;
+  fib_index = fib_table_find_or_create_and_lock (FIB_PROTOCOL_IP4, table_id, FIB_SOURCE_API);
+  ns.ip4_fib_id = table_id;
+  rv = vnet_app_namespace_add_del (&ns);
+  if (!SESSION_TEST_I (rv == 0, "DTLS empty FIB namespace created: %d", rv))
+    goto unlock_fib;
+  options[APP_OPTIONS_FLAGS] = APP_OPTIONS_FLAGS_IS_BUILTIN | APP_OPTIONS_FLAGS_USE_GLOBAL_SCOPE;
+  options[APP_OPTIONS_NAMESPACE_SECRET] = ns.secret;
+  callbacks.session_connected_callback = session_test_dtls_connected;
+  rv = vnet_application_attach (&attach);
+  if (!SESSION_TEST_I (rv == 0, "DTLS test application attached: %d", rv))
+    goto cleanup_namespace;
+  detach.app_index = attach.app_index;
+  session_dtls_connected_count = 0;
+  test.connect_args.app_index = attach.app_index;
+  test.connect_args.sep_ext = (session_endpoint_cfg_t) SESSION_ENDPOINT_CFG_NULL;
+  test.connect_args.sep.is_ip4 = 1;
+  test.connect_args.sep.ip.ip4.as_u32 = clib_host_to_net_u32 (0xc6336401);
+  test.connect_args.sep.port = clib_host_to_net_u16 (4444);
+  test.connect_args.sep.transport_proto = TRANSPORT_PROTO_DTLS;
+
+  if (vlib_get_thread_index () == transport_cl_thread ())
+    session_test_dtls_cleanup_rpc (&test);
+  else
+    {
+      session_send_rpc_evt_to_thread (transport_cl_thread (), session_test_dtls_cleanup_rpc, &test);
+      vlib_worker_thread_barrier_release (vm);
+      while (!clib_atomic_load_acq_n (&test.done))
+	CLIB_PAUSE ();
+      vlib_worker_thread_barrier_sync (vm);
+    }
+  if (test.error)
+    {
+      vlib_cli_output (vm, "%U", format_clib_error, test.error);
+      clib_error_free (test.error);
+    }
+  else if (SESSION_TEST_I (session_dtls_connected_count == 0,
+			   "DTLS failures did not notify application"))
+    {
+      result = 0;
+      vlib_cli_output (vm, "DTLS cleanup: 4 modes passed on thread %u", transport_cl_thread ());
+    }
+  vnet_application_detach (&detach);
+
+cleanup_namespace:
+  ns.is_add = 0;
+  rv = vnet_app_namespace_add_del (&ns);
+  if (!SESSION_TEST_I (rv == 0, "DTLS test namespace removed: %d", rv))
+    result = 1;
+unlock_fib:
+  fib_table_unlock (fib_index, FIB_PROTOCOL_IP4, FIB_SOURCE_API);
+free_names:
+  vec_free (attach.name);
+  vec_free (namespace_id);
+  return result;
+}
+
 static clib_error_t *
 session_test (vlib_main_t * vm,
 	      unformat_input_t * input, vlib_cli_command_t * cmd_arg)
@@ -3132,6 +3245,8 @@ session_test (vlib_main_t * vm,
 	res = session_test_app_crypto (vm, input);
       else if (unformat (input, "pacer"))
 	res = session_test_pacer (vm, input);
+      else if (unformat (input, "dtls-cleanup"))
+	res = session_test_dtls_cleanup (vm);
       else if (unformat (input, "reconn-while-closed"))
 	res = session_test_reconn_while_closed (vm, input);
       else if (unformat (input, "all"))
