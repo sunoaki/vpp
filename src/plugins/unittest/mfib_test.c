@@ -303,7 +303,7 @@ mfib_test_entry_no_itf (fib_node_index_t fei,
 }
 
 static int
-mfib_test_zero_flags (u32 fib_index, const mfib_prefix_t *prefix, const ip46_address_t *neighbor)
+mfib_test_zero_flags_transitions (u32 fib_index, const mfib_prefix_t *prefix, fib_route_path_t path)
 {
   const mfib_itf_flags_t transitions[][2] = {
     { MFIB_ITF_FLAG_NONE, MFIB_ITF_FLAG_NONE },
@@ -311,25 +311,9 @@ mfib_test_zero_flags (u32 fib_index, const mfib_prefix_t *prefix, const ip46_add
     { MFIB_ITF_FLAG_ACCEPT, MFIB_ITF_FLAG_NONE },
     { MFIB_ITF_FLAG_NONE, MFIB_ITF_FLAG_FORWARD },
   };
-  fib_route_path_t path = {
-    .frp_proto = fib_proto_to_dpo (prefix->fp_proto),
-    .frp_sw_if_index = test_main.hw[0]->sw_if_index,
-    .frp_fib_index = ~0,
-    .frp_weight = 1,
-  };
-  fib_route_path_t other = path, *paths = NULL;
-  u32 n_entries = pool_elts (mfib_entry_pool);
-  u32 n_itfs = pool_elts (mfib_itf_pool);
-  u32 n_reps = pool_elts (replicate_pool);
-  u32 n_pls = fib_path_list_pool_size ();
   fib_node_index_t mfei;
   mfib_entry_src_t *source;
   int res = 0;
-
-  mfib_table_entry_path_update (fib_index, prefix, MFIB_SOURCE_API, MFIB_ENTRY_FLAG_NONE, &path);
-  mfib_table_entry_path_remove (fib_index, prefix, MFIB_SOURCE_API, &path);
-  MFIB_TEST (FIB_NODE_INDEX_INVALID == mfib_table_lookup_exact_match (fib_index, prefix),
-             "fresh zero flags route removed");
 
   for (u32 scenario = 0; scenario < ARRAY_LEN (transitions); scenario++)
     {
@@ -357,8 +341,18 @@ mfib_test_zero_flags (u32 fib_index, const mfib_prefix_t *prefix, const ip46_add
       MFIB_TEST (FIB_NODE_INDEX_INVALID == mfib_table_lookup_exact_match (fib_index, prefix),
                  "zero flags transition route removed");
     }
+  return res;
+}
 
-  path.frp_mitf_flags = MFIB_ITF_FLAG_NONE;
+static int
+mfib_test_zero_flags_shared_interface (u32 fib_index, const mfib_prefix_t *prefix,
+                                       fib_route_path_t path, const ip46_address_t *neighbor)
+{
+  fib_route_path_t other = path, *paths = NULL;
+  fib_node_index_t mfei;
+  mfib_entry_src_t *source;
+  int res = 0;
+
   other.frp_addr = *neighbor;
   other.frp_mitf_flags = MFIB_ITF_FLAG_FORWARD;
   for (u32 remove_zero_first = 0; remove_zero_first < 2; remove_zero_first++)
@@ -387,6 +381,17 @@ mfib_test_zero_flags (u32 fib_index, const mfib_prefix_t *prefix, const ip46_add
                  "shared interface route removed");
       vec_reset_length (paths);
     }
+  vec_free (paths);
+  return res;
+}
+
+static int
+mfib_test_zero_flags_batch (u32 fib_index, const mfib_prefix_t *prefix, fib_route_path_t path)
+{
+  fib_route_path_t other = path, *paths = NULL;
+  fib_node_index_t mfei;
+  mfib_entry_src_t *source;
+  int res = 0;
 
   other.frp_addr = zero_addr;
   other.frp_sw_if_index = test_main.hw[1]->sw_if_index;
@@ -408,6 +413,31 @@ mfib_test_zero_flags (u32 fib_index, const mfib_prefix_t *prefix, const ip46_add
   MFIB_TEST (FIB_NODE_INDEX_INVALID == mfib_table_lookup_exact_match (fib_index, prefix),
              "batch removal route removed");
   vec_free (paths);
+  return res;
+}
+
+static int
+mfib_test_zero_flags (u32 fib_index, const mfib_prefix_t *prefix, const ip46_address_t *neighbor)
+{
+  fib_route_path_t path = {
+    .frp_proto = fib_proto_to_dpo (prefix->fp_proto),
+    .frp_sw_if_index = test_main.hw[0]->sw_if_index,
+    .frp_fib_index = ~0,
+    .frp_weight = 1,
+  };
+  u32 n_entries = pool_elts (mfib_entry_pool);
+  u32 n_itfs = pool_elts (mfib_itf_pool);
+  u32 n_reps = pool_elts (replicate_pool);
+  u32 n_pls = fib_path_list_pool_size ();
+  int res = 0;
+
+  mfib_table_entry_path_update (fib_index, prefix, MFIB_SOURCE_API, MFIB_ENTRY_FLAG_NONE, &path);
+  mfib_table_entry_path_remove (fib_index, prefix, MFIB_SOURCE_API, &path);
+  MFIB_TEST (FIB_NODE_INDEX_INVALID == mfib_table_lookup_exact_match (fib_index, prefix),
+             "fresh zero flags route removed");
+  MFIB_TEST_NS (!mfib_test_zero_flags_transitions (fib_index, prefix, path));
+  MFIB_TEST_NS (!mfib_test_zero_flags_shared_interface (fib_index, prefix, path, neighbor));
+  MFIB_TEST_NS (!mfib_test_zero_flags_batch (fib_index, prefix, path));
 
   MFIB_TEST (n_entries == pool_elts (mfib_entry_pool), "zero flags entry pool restored");
   MFIB_TEST (n_itfs == pool_elts (mfib_itf_pool), "zero flags interface pool restored");

@@ -206,8 +206,6 @@ class TestIPMcast(VppTestCase):
     def mfib_zero_flags(self, is_ip6):
         flags = VppEnum.vl_api_mfib_itf_flags_t
         none = flags.MFIB_API_ITF_FLAG_NONE
-        forward = flags.MFIB_API_ITF_FLAG_FORWARD
-        accept = flags.MFIB_API_ITF_FLAG_ACCEPT
         proto = (
             FibPathProto.FIB_PATH_NH_PROTO_IP6
             if is_ip6
@@ -230,43 +228,48 @@ class TestIPMcast(VppTestCase):
                 paths,
             )
 
-        def check_paths(mroute, expected):
-            entries = [
-                entry.route
-                for entry in self.vapi.ip_mroute_dump(0, is_ip6)
-                if mroute.prefix == entry.route.prefix
-            ]
-            if not expected:
-                self.assertEqual(entries, [])
-                return
-            self.assertEqual(len(entries), 1)
-            self.assertEqual(entries[0].n_paths, len(expected))
-            interface_flags = {}
-            for expected_path in expected:
-                interface_flags[expected_path.nh_itf] = (
-                    interface_flags.get(expected_path.nh_itf, 0)
-                    | expected_path.nh_i_flags
-                )
-            self.assertCountEqual(
-                [
-                    (
-                        p.path.sw_if_index,
-                        p.itf_flags,
-                        str(p.path.nh.address.ip6 if is_ip6 else p.path.nh.address.ip4),
-                    )
-                    for p in entries[0].paths
-                ],
-                [
-                    (p.nh_itf, interface_flags[p.nh_itf], str(p.nh.addr))
-                    for p in expected
-                ],
-            )
-
         mroute = route([path(self.pg0, none)]).add_vpp_config()
-        check_paths(mroute, mroute.paths)
+        self.mfib_check_paths(mroute, mroute.paths)
         mroute.remove_vpp_config()
-        check_paths(mroute, [])
+        self.mfib_check_paths(mroute, [])
+        self.mfib_zero_flags_transitions(path, route)
+        self.mfib_zero_flags_shared_interface(path, route, is_ip6)
+        self.mfib_zero_flags_batch(path, route)
 
+    def mfib_check_paths(self, mroute, expected):
+        is_ip6 = mroute.prefix.version == 6
+        entries = [
+            entry.route
+            for entry in self.vapi.ip_mroute_dump(0, is_ip6)
+            if mroute.prefix == entry.route.prefix
+        ]
+        if not expected:
+            self.assertEqual(entries, [])
+            return
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].n_paths, len(expected))
+        interface_flags = {}
+        for expected_path in expected:
+            interface_flags[expected_path.nh_itf] = (
+                interface_flags.get(expected_path.nh_itf, 0) | expected_path.nh_i_flags
+            )
+        self.assertCountEqual(
+            [
+                (
+                    p.path.sw_if_index,
+                    p.itf_flags,
+                    str(p.path.nh.address.ip6 if is_ip6 else p.path.nh.address.ip4),
+                )
+                for p in entries[0].paths
+            ],
+            [(p.nh_itf, interface_flags[p.nh_itf], str(p.nh.addr)) for p in expected],
+        )
+
+    def mfib_zero_flags_transitions(self, path, route):
+        flags = VppEnum.vl_api_mfib_itf_flags_t
+        none = flags.MFIB_API_ITF_FLAG_NONE
+        forward = flags.MFIB_API_ITF_FLAG_FORWARD
+        accept = flags.MFIB_API_ITF_FLAG_ACCEPT
         for initial, updated in (
             (none, none),
             (forward, none),
@@ -275,20 +278,22 @@ class TestIPMcast(VppTestCase):
         ):
             with self.subTest(initial=initial, updated=updated):
                 mroute = route([path(self.pg0, initial)]).add_vpp_config()
-                check_paths(mroute, mroute.paths)
+                self.mfib_check_paths(mroute, mroute.paths)
                 for _ in range(2):
                     mroute.update_path_flags(self.pg0.sw_if_index, updated)
-                    check_paths(mroute, mroute.paths)
+                    self.mfib_check_paths(mroute, mroute.paths)
                 mroute.remove_vpp_config()
-                check_paths(mroute, [])
+                self.mfib_check_paths(mroute, [])
 
+    def mfib_zero_flags_shared_interface(self, path, route, is_ip6):
+        flags = VppEnum.vl_api_mfib_itf_flags_t
         neighbor = self.pg0.remote_ip6 if is_ip6 else self.pg0.remote_ip4
         for remove_zero_first in (True, False):
             with self.subTest(remove_zero_first=remove_zero_first):
-                zero_path = path(self.pg0, none)
-                forward_path = path(self.pg0, forward, neighbor)
+                zero_path = path(self.pg0, flags.MFIB_API_ITF_FLAG_NONE)
+                forward_path = path(self.pg0, flags.MFIB_API_ITF_FLAG_FORWARD, neighbor)
                 mroute = route([zero_path, forward_path]).add_vpp_config()
-                check_paths(mroute, mroute.paths)
+                self.mfib_check_paths(mroute, mroute.paths)
                 first, last = (
                     (zero_path, forward_path)
                     if remove_zero_first
@@ -300,24 +305,26 @@ class TestIPMcast(VppTestCase):
                     is_add=0,
                 )
                 self.assertEqual(reply.retval, 0)
-                check_paths(mroute, [last])
+                self.mfib_check_paths(mroute, [last])
                 mroute.remove_vpp_config()
-                check_paths(mroute, [])
+                self.mfib_check_paths(mroute, [])
 
-        zero_path = path(self.pg0, none)
-        accept_path = path(self.pg1, accept)
-        remaining_path = path(self.pg2, forward)
+    def mfib_zero_flags_batch(self, path, route):
+        flags = VppEnum.vl_api_mfib_itf_flags_t
+        zero_path = path(self.pg0, flags.MFIB_API_ITF_FLAG_NONE)
+        accept_path = path(self.pg1, flags.MFIB_API_ITF_FLAG_ACCEPT)
+        remaining_path = path(self.pg2, flags.MFIB_API_ITF_FLAG_FORWARD)
         mroute = route([zero_path, accept_path, remaining_path]).add_vpp_config()
-        check_paths(mroute, mroute.paths)
+        self.mfib_check_paths(mroute, mroute.paths)
         reply = self.vapi.ip_mroute_add_del(
             route=mroute.encode(paths=[zero_path.encode(), accept_path.encode()]),
             is_multipath=1,
             is_add=0,
         )
         self.assertEqual(reply.retval, 0)
-        check_paths(mroute, [remaining_path])
+        self.mfib_check_paths(mroute, [remaining_path])
         mroute.remove_vpp_config()
-        check_paths(mroute, [])
+        self.mfib_check_paths(mroute, [])
 
     def test_ip_mcast(self):
         """IP Multicast Replication"""
