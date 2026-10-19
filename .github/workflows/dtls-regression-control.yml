@@ -351,6 +351,33 @@ jobs:
               result["survivors"] = sorted(set(result["survivors"]) | descendants(tracked, baseline))
               return result
 
+          def record_interruptions(parent_status, parent_result):
+              if parent_result["cleanup"].get("exception") or parent_result["cleanup"]["survivors"]:
+                  return
+              output = Path(os.environ["EVIDENCE_DIR"])
+              reference = {"result": str(parent_status.relative_to(output)),
+                           "command_id": parent_result["command_id"]}
+              paths = sorted(output.glob("*/result.json"))
+              require(len(paths) <= 1000, "Too many command records for interruption attribution")
+              for path in paths:
+                  if path.is_symlink() or path.parent.is_symlink():
+                      continue
+                  require(path.stat().st_size <= 1024 * 1024, "Command record exceeds attribution limit")
+                  raw = path.read_bytes()
+                  child = json.loads(raw)
+                  if (reference not in child.get("ancestors", []) or child.get("outcome") != "running"
+                          or "end" in child or (path.parent / "interruption.json").exists()):
+                      continue
+                  interruption = {"outcome": "interrupted-by-parent", "observed_at": time.time(),
+                                  "parent": reference, "parent_outcome": parent_result["outcome"],
+                                  "raw_result": str(path.relative_to(output)),
+                                  "raw_result_sha256": hashlib.sha256(raw).hexdigest(),
+                                  "command_id": child["command_id"], "rc": None, "cleanup": None,
+                                  "unknowns": "Child exit status and child supervisor cleanup are unknown; "
+                                              "parent cleanup is recorded only in the referenced parent result."}
+                  with (path.parent / "interruption.json").open("x") as stream:
+                      stream.write(json.dumps(interruption, indent=2) + "\n")
+
           def command(label, args, env=None, seconds=300):
               directory = Path(os.environ["EVIDENCE_DIR"]) / label
               directory.mkdir()
@@ -358,8 +385,12 @@ jobs:
               limit = min(now + seconds, float(os.environ.get("DTLS_WORK_DEADLINE", now + seconds)),
                           float(os.environ.get("DTLS_PHASE_DEADLINE", now + seconds)))
               deadline = time.monotonic() + max(0, limit - now)
+              inherited = os.environ if env is None else env
+              ancestors = json.loads(inherited.get("DTLS_COMMAND_ANCESTORS", "[]"))
+              command_id = os.urandom(16).hex()
               result = {"command": args, "start": now, "deadline": limit, "rc": None,
-                        "outcome": "running", "exception": None, "cleanup": None}
+                        "outcome": "running", "exception": None, "cleanup": None,
+                        "command_id": command_id, "ancestors": ancestors}
               status = directory / "result.json"
               status.write_text(json.dumps(result, indent=2))
               tail, process, tracked = bytearray(), None, {}
@@ -372,7 +403,10 @@ jobs:
                           "Cannot become child subreaper")
                   if time.monotonic() >= deadline:
                       raise TimeoutError("Command budget exhausted before spawn")
-                  environment = dict(os.environ if env is None else env, DTLS_PHASE_DEADLINE=str(limit))
+                  reference = {"result": str(status.relative_to(Path(os.environ["EVIDENCE_DIR"]))),
+                               "command_id": command_id}
+                  environment = dict(inherited, DTLS_PHASE_DEADLINE=str(limit),
+                                     DTLS_COMMAND_ANCESTORS=json.dumps(ancestors + [reference]))
                   process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                              env=environment, start_new_session=True)
                   tracked[process.pid] = process_table().get(process.pid, (0, -1))[1]
@@ -425,6 +459,7 @@ jobs:
                           result["outcome"] = "transport-failure"
                       result["end"] = time.time()
                       status.write_text(json.dumps(result, indent=2))
+              record_interruptions(status, result)
               if result["outcome"] not in ("success", "nonzero"):
                   raise RuntimeError(f"{label}: {result['outcome']}; see {status}")
               return directory, result["rc"], tail.decode(errors="replace")
@@ -682,6 +717,58 @@ jobs:
                           "Observer changed actual CLI response")
               print("Delegated observer preserved actual success, failure, exception, and CLI reply")
 
+          def nested_deadline_fixtures():
+              output = Path(os.environ["EVIDENCE_DIR"])
+              control = str(Path(os.environ["CONTROL_DIR"]) / "control.py")
+              for number in range(2):
+                  name = f"deadline-proof-{number}"
+                  label = f"nested-proof-{number}"
+                  try:
+                      phase(name, 0.3, [sys.executable, control, label, sys.executable, "-c",
+                                       "import os,time;os.close(1);os.close(2);time.sleep(60)"])
+                  except RuntimeError:
+                      pass
+                  else:
+                      raise AssertionError("Nested deadline unexpectedly succeeded")
+                  parent_path = output / ("phase-" + name) / "result.json"
+                  parent = json.loads(parent_path.read_text())
+                  require(parent["outcome"] == "timeout" and not parent["cleanup"]["survivors"],
+                          "Nested deadline did not complete parent cleanup")
+                  child_path = output / label / "result.json"
+                  raw = child_path.read_bytes()
+                  child = json.loads(raw)
+                  if child["outcome"] == "running":
+                      interrupted = json.loads((child_path.parent / "interruption.json").read_text())
+                      require(interrupted["outcome"] == "interrupted-by-parent"
+                              and interrupted["parent"]["command_id"] == parent["command_id"]
+                              and interrupted["parent"]["result"] == str(parent_path.relative_to(output))
+                              and interrupted["observed_at"] >= parent["end"]
+                              and interrupted["raw_result_sha256"] == hashlib.sha256(raw).hexdigest()
+                              and interrupted["rc"] is None and interrupted["cleanup"] is None
+                              and interrupted["unknowns"] and child["rc"] is None
+                              and child["cleanup"] is None and "end" not in child,
+                              "Missing authoritative interruption evidence")
+                  else:
+                      require("end" in child and child["cleanup"] is not None,
+                              "Nested command has no terminal evidence")
+                  reference = {"result": str(parent_path.relative_to(output)),
+                               "command_id": parent["command_id"]}
+                  fixtures = {f"completed-proof-{number}": {"ancestors": [reference], "outcome": "success", "end": 1},
+                              f"unrelated-proof-{number}": {"ancestors": [], "outcome": "running"}}
+                  for fixture_name, record in fixtures.items():
+                      directory = output / fixture_name
+                      directory.mkdir()
+                      fixture_path = directory / "result.json"
+                      fixture_raw = (json.dumps(record) + "\n").encode()
+                      fixture_path.write_bytes(fixture_raw)
+                      record_interruptions(parent_path, parent)
+                      require(fixture_path.read_bytes() == fixture_raw
+                              and not (directory / "interruption.json").exists(),
+                              "Completed or unrelated evidence changed")
+                  record_interruptions(parent_path, parent)
+                  require(child_path.read_bytes() == raw, "Nested raw evidence was overwritten")
+              print("Actual nested deadlines preserve raw/unknown status with authoritative parent interruption")
+
           def identity_fixtures():
               from types import SimpleNamespace
               from unittest import mock
@@ -815,6 +902,7 @@ jobs:
                   fixtures()
                   observer_fixtures()
                   runner_fixtures()
+                  nested_deadline_fixtures()
               else:
                   _, rc, _ = command(action, sys.argv[2:])
                   raise SystemExit(rc)
