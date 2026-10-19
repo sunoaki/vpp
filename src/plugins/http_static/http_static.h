@@ -36,6 +36,7 @@ typedef struct hss_session_
   session_handle_t vpp_session_handle;
   /** Index of listener for which connection was accepted */
   u32 listener_index;
+  u32 app_index;
   u8 *target_path;
   u8 *target_query;
   u8 *authority;
@@ -167,6 +168,9 @@ typedef struct hss_listener_
   u32 l_index;
   /** Listener session handle */
   session_handle_t session_handle;
+  /** Active listener, queued accepts and accepted session references */
+  u32 ref_count;
+  u8 retiring;
   u8 flags;
 } hss_listener_t;
 
@@ -186,6 +190,7 @@ typedef struct
 
   /** Application index */
   u32 app_index;
+  u32 app_generation;
 
   /** Cert and key pair for tls */
   u32 ckpair_index;
@@ -201,6 +206,7 @@ typedef struct
 
   /** Listener configured with server, if any */
   hss_listener_t default_listener;
+  u32 default_listener_index;
   u8 have_default_listener;
   u8 is_init;
 
