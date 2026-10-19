@@ -298,6 +298,24 @@ jobs:
               ;;
           esac
           echo "tunnel_regression=${tunnel_regression}" >> "$GITHUB_OUTPUT"
+          mfib_regression=false
+          case $'\n'"${changed}"$'\n' in
+            *$'\n'src/vnet/mfib/mfib_entry.c$'\n'*)
+              if [ -f test/test_ip_mcast.py ]; then
+                mfib_regression=true
+              fi
+              ;;
+          esac
+          echo "mfib_regression=${mfib_regression}" >> "$GITHUB_OUTPUT"
+          export_regression=false
+          case $'\n'"${changed}"$'\n' in
+            *$'\n'src/vnet/fib/fib_entry_src_interface.c$'\n'*)
+              if [ -f test/test_ip4.py ]; then
+                export_regression=true
+              fi
+              ;;
+          esac
+          echo "export_regression=${export_regression}" >> "$GITHUB_OUTPUT"
 
       - name: Remount /dev/shm for the test harness
         uses: ./.github/actions/vpp-docker-runtime-setup
@@ -356,18 +374,36 @@ jobs:
           set -eu
           suites=(${{ steps.tests.outputs.suites }})
           for suite in "${suites[@]}"; do
-            if [ "${suite}" = linux_cp ]; then
-              for companion in linux_cp_lifecycle linux_cp_netlink; do
-                if [ -f "test/test_${companion}.py" ]; then
-                  suites+=("${companion}")
-                fi
-              done
-            fi
+            companions=()
+            case "${suite}" in
+              linux_cp) companions=(linux_cp_lifecycle linux_cp_netlink) ;;
+              gre) companions=(gre_teib) ;;
+            esac
+            for companion in "${companions[@]}"; do
+              if [ -f "test/test_${companion}.py" ]; then
+                case " ${suites[*]} " in
+                  *" ${companion} "*) ;;
+                  *) suites+=("${companion}") ;;
+                esac
+              fi
+            done
           done
           if [ '${{ steps.tests.outputs.tunnel_regression }}' = true ]; then
             case " ${suites[*]} " in
               *' ipsec_esp '*) ;;
               *) suites+=(ipsec_esp) ;;
+            esac
+          fi
+          if [ '${{ steps.tests.outputs.mfib_regression }}' = true ]; then
+            case " ${suites[*]} " in
+              *' ip_mcast '*) ;;
+              *) suites+=(ip_mcast) ;;
+            esac
+          fi
+          if [ '${{ steps.tests.outputs.export_regression }}' = true ]; then
+            case " ${suites[*]} " in
+              *' ip4 '*) ;;
+              *) suites+=(ip4) ;;
             esac
           fi
           for suite in "${suites[@]}"; do
@@ -392,10 +428,27 @@ jobs:
                 required_class=TestLinuxCPNetlinkSocketOwnership
                 required_methods=(test_pair_add_during_netlink_recovery)
                 ;;
+              gre_teib)
+                required_class=TestGreTeib
+                required_methods=(test_gre_teib_ipv4 test_gre_teib_ipv6 test_gre_teib_cross_mp)
+                ;;
               ipsec_esp)
                 if [ '${{ steps.tests.outputs.tunnel_regression }}' = true ]; then
                   required_class=TestIpsecEspTun
                   required_methods=(test_tun_df44)
+                fi
+                ;;
+              ip_mcast)
+                if [ '${{ steps.tests.outputs.mfib_regression }}' = true ]; then
+                  required_class=TestIPMcast
+                  required_methods=(test_mfib_zero_flags_ip4 test_mfib_zero_flags_ip6)
+                fi
+                ;;
+              ip4)
+                if [ '${{ steps.tests.outputs.export_regression }}' = true ]; then
+                  required_class=TestIPv4IfAddrRoute
+                  required_methods=(test_ipv4_local_export_withdraw_glean
+                                    test_ipv4_local_export_withdraw_non_glean)
                 fi
                 ;;
             esac
@@ -430,6 +483,13 @@ jobs:
               namespace_class = "TestLinuxCPNamespaceOwnership"
               verify_results(Path(f"/tmp/vpp-unittest-{namespace_class}/log.txt"),
                              namespace_class, ("test_equal_ifindex_namespace_delete",))
+          if sys.argv[2] == "TestLinuxCPNetlinkSocketOwnership":
+              dump_class = "TestLinuxCPNetlinkDumpCompletion"
+              verify_results(Path(f"/tmp/vpp-unittest-{dump_class}/log.txt"), dump_class,
+                             ("test_dump_completion_errors", "test_dump_completion_success"))
+          if sys.argv[2] == "TestIPMcast":
+              verify_results(Path("/tmp/vpp-unittest-TestMFIB/log.txt"),
+                             "TestMFIB", ("test_mfib",))
           PY
             fi
             # A later make test-debug resets /tmp/vpp-unittest-* and FAILED_DIR.
