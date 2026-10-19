@@ -34,7 +34,7 @@ jobs:
       run:
         shell: bash
     env:
-      CANDIDATE_SHA: b4c80425f766147c1e6412b013cbcd3892e53741
+      CANDIDATE_SHA: 9fc79ef8623e6f523c0010d96a21153c4a14cbf0
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       WORKFLOW_SHA: ${{ github.sha }}
       CONTROL_VARIANT: ${{ matrix.variant }}
