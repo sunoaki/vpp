@@ -371,10 +371,11 @@ jobs:
                       if len(self.handles) == before:
                           return
 
-              def cleanup(self, root):
+              def cleanup(self, process):
+                  started = time.monotonic()
                   try:
-                      for sig in (signal.SIGTERM, signal.SIGKILL):
-                          self.limit = time.monotonic() + 3
+                      for sig, seconds in ((signal.SIGTERM, 3), (signal.SIGKILL, 6)):
+                          self.limit = started + seconds
                           while time.monotonic() < self.limit:
                               for handle in self.handles.values():
                                   try:
@@ -386,14 +387,15 @@ jobs:
                               except (OSError, AssertionError) as error:
                                   self.errors.append(dict(error=str(error)))
                               for key, handle in self.handles.items():
-                                  if key[0] != root:
+                                  if key[0] != process.pid:
                                       try:
                                           os.waitid(os.P_PIDFD, handle[1], os.WEXITED | os.WNOHANG)
                                       except ChildProcessError:
                                           pass
-                              if all(self.exited(handle) for handle in self.handles.values()) and not self.pending:
+                              process.poll()
+                              if all(self.exited(handle) for handle in self.handles.values()) and not self.pending and process.returncode is not None:
                                   return not self.errors
-                              time.sleep(0.03)
+                              time.sleep(min(0.03, max(0, self.limit - time.monotonic())))
                       return False
                   finally:
                       for handle in self.handles.values():
@@ -406,9 +408,10 @@ jobs:
               allowed = min(limit, deadline() - time.time() - 12)
               result = dict(command=args, start=time.time(), rc=None, status='running', deadline=deadline(), allowed=allowed)
               save(f'{label}/result.json', result)
-              process, owned, tail, suspicious = None, OwnedProcesses(), bytearray(), []
-              require(ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0, 'Child subreaper unavailable')
+              process, owned, tail, suspicious = None, None, bytearray(), []
               try:
+                  owned = OwnedProcesses()
+                  require(ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0, 'Child subreaper unavailable')
                   require(allowed > 0, 'Work deadline exhausted')
                   process = subprocess.Popen(args, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
                   result['pid'] = process.pid
@@ -453,18 +456,25 @@ jobs:
                   result.update(status='execution_error', error=str(error))
                   raise
               finally:
-                  if process is not None:
-                      try:
-                          result['cleanup_complete'] = owned.cleanup(process.pid)
-                          if process.returncode is None:
-                              result['cleanup_rc'] = process.wait(timeout=0.2)
-                      except BaseException as error:
-                          result.update(cleanup_complete=False, cleanup_error=str(error))
-                      finally:
-                          process.stdout.close()
-                  result.update(end=time.time(), retained_console_bytes=len(tail), infrastructure=suspicious,
-                                processes=owned.records, pending=list(owned.pending.values()), ownership_errors=owned.errors)
-                  save(f'{label}/result.json', result)
+                  alarm_started = time.monotonic()
+                  phase_alarm = signal.setitimer(signal.ITIMER_REAL, 0)
+                  try:
+                      if process is not None:
+                          try:
+                              result['cleanup_complete'] = owned.cleanup(process)
+                              result['cleanup_rc'] = process.returncode
+                          except BaseException as error:
+                              result.update(cleanup_complete=False, cleanup_error=str(error))
+                          finally:
+                              process.stdout.close()
+                      result.update(end=time.time(), retained_console_bytes=len(tail), infrastructure=suspicious,
+                                    processes=owned.records if owned else [], pending=list(owned.pending.values()) if owned else [],
+                                    ownership_errors=owned.errors if owned else [])
+                      save(f'{label}/result.json', result)
+                  finally:
+                      elapsed = time.monotonic() - alarm_started
+                      if phase_alarm[0]:
+                          signal.setitimer(signal.ITIMER_REAL, max(0.001, phase_alarm[0] - elapsed), phase_alarm[1])
               require(result['status'] == 'completed' and result.get('cleanup_complete'), 'Command or cleanup incomplete')
               return result['rc'], tail.decode(errors='replace')
 
@@ -845,12 +855,42 @@ jobs:
               for path in TOOLS.glob('*.py'):
                   (OUT / path.name).write_bytes(path.read_bytes())
               try:
-                  if not list(OUT.glob('runtime-*/diagnostics/index.json')):
+                  suites = sorted(path for path in OUT.glob('runtime-*') if path.is_dir())
+                  retained, collected = set(), set()
+                  for index in OUT.glob('runtime-*/diagnostics/index.json'):
+                      try:
+                          value = json.loads(index.read_text())
+                          require(isinstance(value, dict) and isinstance(value.get('files'), list), 'Malformed collection index')
+                          for entry in value['files']:
+                              if entry.get('critical') and entry.get('target'):
+                                  retained.add(Path(entry['path']).parent)
+                          result = json.loads((index.parent.parent / 'result.json').read_text())
+                          if result.get('status') == 'completed' and not value.get('problems') and not value.get('incomplete'):
+                              collected.add(index.parent.parent)
+                      except (OSError, ValueError, TypeError, KeyError, AttributeError, AssertionError):
+                          pass
+                  for suite in suites:
+                      if suite in collected:
+                          continue
+                      roots = set()
+                      try:
+                          for event in events_from(suite):
+                              if event.get('kind') == 'startTest':
+                                  root = Path(event['tempdir'])
+                                  if root.parent == Path('/tmp') and root.name.startswith('vpp-unittest-'):
+                                      roots.add(root)
+                      except (OSError, ValueError, AssertionError, TypeError, KeyError):
+                          pass
+                      if not roots:
+                          roots = set(Path('/tmp').glob('vpp-unittest-*')) - retained
+                      save(str(suite.relative_to(OUT) / 'fallback.json'), dict(reason='Missing suite collection', roots=sorted(map(str, roots))))
+                      collect(suite / 'fallback-diagnostics', sorted(roots), strict=False)
+                  if not suites:
                       collect(OUT / 'final-diagnostics', strict=False)
               finally:
                   observations = []
                   for path in sorted(OUT.glob('phase-*.json')):
-                      if path.name == 'phase-finalize.json':
+                      if path.name in ('phase-finalize.json', 'phase-observations.json'):
                           continue
                       try:
                           value = json.loads(path.read_text())
@@ -886,8 +926,16 @@ jobs:
                       record['end'] = time.time()
                       save('phase-' + action + '.json', record)
                       if action == 'finalize':
-                          save('evidence-index.json', {str(path.relative_to(OUT)): dict(bytes=path.stat().st_size, sha256=sha(path.read_bytes()))
-                               for path in OUT.rglob('*') if path.is_file() and not path.is_symlink() and path.name != 'evidence-index.json' and not path.name.endswith('.pending')})
+                          try:
+                              save('evidence-index.json', {str(path.relative_to(OUT)): dict(bytes=path.stat().st_size, sha256=sha(path.read_bytes()))
+                                   for path in OUT.rglob('*') if path.is_file() and not path.is_symlink() and path.name != 'evidence-index.json' and not path.name.endswith('.pending')})
+                          except BaseException as error:
+                              record.update(status='FAIL', rc=None, index_error=str(error), end=time.time())
+                              try:
+                                  (OUT / 'evidence-index.json').unlink(missing_ok=True)
+                              finally:
+                                  save('phase-' + action + '.json', record)
+                              raise
                   finally:
                       signal.setitimer(signal.ITIMER_REAL, 0)
                       signal.signal(signal.SIGALRM, previous)
