@@ -76,7 +76,7 @@ jobs:
           mkdir -p "$tools" "$evidence"
           printf 'TOOLS=%s\nEVIDENCE=%s\nWORK_DEADLINE=%s\n' \
             "$tools" "$evidence" "$(( $(date +%s) + 6600 ))" >> "$GITHUB_ENV"
-          printf '{"workflow":"%s","case":"%s","run":"%s","attempt":"%s","job":"%s","status":"bootstrap","expected_tree":"293b103fb64948865d788a7abc0d585b2c235f3a","scoped_files":22,"required_methods":24}\n' \
+          printf '{"workflow":"%s","case":"%s","run":"%s","attempt":"%s","job":"%s","status":"bootstrap","expected_tree":"86cfc49495ff83e2869aca5d80177a6b112228ec","scoped_files":22,"required_methods":24}\n' \
             "$WORKFLOW_SHA" "$CASE" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_JOB" > "$evidence/bootstrap.json"
           for phase in prepare dependencies feature-list c-style api-style c-formatter python-style python-pin mutate build binaries environment tests finalize; do
             printf '{"action":"%s","status":"NOT_RUN","rc":null}\n' "$phase" > "$evidence/phase-$phase.json"
@@ -230,34 +230,34 @@ jobs:
 
           BASE = "630f876bc326eee05c23d517600b72e8d6a6ec83"
           INTEGRATION = "646bccb9f3f601c25e828f0155c97e910e7ac0be"
-          TREE = "293b103fb64948865d788a7abc0d585b2c235f3a"
+          TREE = "86cfc49495ff83e2869aca5d80177a6b112228ec"
           WORKFLOW = ".github/workflows/integration-regression-control.yml"
           INPUTS = [
-              ("M33", "712f93e232f759c0585491ccd5fa2b7fa12478e6", {
+              ("M33", "d15bb141b659828bf2118bc9c1345fed2b3f3d36", {
                   "src/plugins/linux-cp/lcp.rst": "0eafbd92ebf35abe6ab78f5cda9612c586e01aa9",
-                  "src/plugins/linux-cp/lcp_router.c": "cf352d6c35c5561695c57b235f9b54b16b78c4c8",
-                  "src/plugins/linux-cp/lcp_router.h": "5f1ec5dfe8b67f5d555dea4e277bc858a1f3616b",
-                  "src/plugins/linux-cp/test/lcp_unittest.c": "75aa2f0c3f307c4d159a334c0d39c5ef55b0c8e1",
-                  "test/test_linux_cp.py": "5fe4b23371398a5edacfe22c106cba677186e765"}),
-              ("M36", "48df11100f429a2174bb866c3abb33d2af66501f", {
+                  "src/plugins/linux-cp/lcp_router.c": "1b765aaf37148dd1d3de70063e42e37c5c478998",
+                  "src/plugins/linux-cp/lcp_router.h": "4ee3acd50e268747b70dc736d4f3d4effa49eb7a",
+                  "src/plugins/linux-cp/test/lcp_unittest.c": "114d6c27565468da8e828fcbffc95869a94819cb",
+                  "test/test_linux_cp.py": "33620a1d8541bb1207871b750cd878b17bdc934e"}),
+              ("M36", "5888791b2eeb6b0cb624ef579c5fe8945e9408d0", {
                   "src/plugins/linux-cp/lcp.api": "82135513fac65e72c10d53e9e0f8cb4daf3b0eb3",
                   "src/plugins/linux-cp/lcp.c": "90daafd78ca6229891a750faca0f660342991e1e",
-                  "src/plugins/linux-cp/lcp_interface.c": "1b9a5a789db8b7b1e103170cc438a1fd195019e5",
+                  "src/plugins/linux-cp/lcp_interface.c": "6d770e525c84345248e294a01d63ab937c00034a",
                   "src/plugins/linux-cp/lcp_interface.h": "5324731ebf68a3f78813b0a3143448041fb7672c",
                   "test/test_linux_cp_lifecycle.py": "cfcb2b404c8b64d7c06a869909c6f602feff8c9d"}),
-              ("M37", "0386481f791cc2a11a8afbb7d69881ae17826371", {
-                  "src/plugins/linux-cp/lcp_nl.c": "c51aeb54fc7cc2eb465059277e6f884a504fa37b",
+              ("M37", "a3027e2d53b2cd0def6cb88065ac23b492abad23", {
+                  "src/plugins/linux-cp/lcp_nl.c": "0d418e1d8733b0b66638f24fb2b0dc6ca404b28c",
                   "src/plugins/linux-cp/lcp_nl.h": "1e963053474c6f11d451c49a7d3c572c6b86e991",
                   "test/test_linux_cp_netlink.py": "1c03f2dd5e27de79e91c5f6fcc104979124b103d"}),
               ("M40", "815eaa339772c4c715ac0890fe2c2b136f694fe9", {
                   "src/vnet/tunnel/tunnel_dp.h": "468c628236393f184ab64736441fe1b7bbd40e36",
                   "test/test_ipsec_esp.py": "093794c2074bbdf66f9350308439e833a03dccc6"}),
-              ("M42", "8ae66e1d9f9deee0fbeec3ed1e910ab132b84785", {
+              ("M42", "245e223eb0130571ca953079f5a1631a5345b363", {
                   "src/plugins/gre/gre.h": "7ed347d0ff765c2eee2785838e855a3ad7703834",
-                  "src/plugins/gre/interface.c": "f9f52823ea322d776937d939f5d4d4e37666229b",
+                  "src/plugins/gre/interface.c": "f515e68b509f98f343a40a5d433a5ef8aaaf68ef",
                   "test/test_gre_teib.py": "fe80bb2566a62be3ba443a2995ba544bf4be1063"}),
-              ("M43", "3be7fb661fe0bdc82df628194433887b0326258a", {
-                  "src/plugins/unittest/mfib_test.c": "cb4c919427e6059b1cf8de6e14a990595e514e36",
+              ("M43", "694e5bca5e74d8594334c53e36459f88bcf5c2b1", {
+                  "src/plugins/unittest/mfib_test.c": "1609d5e9d62736799e3e57802a0a2483b7089903",
                   "src/vnet/mfib/mfib_entry.c": "66f8faf3543beae2666aad39f4961de4a1496f91",
                   "test/test_ip_mcast.py": "61e55c0622b90c560956507f278d9538175a8195"}),
               ("M39", "2e8b1e68964c8473ec13149d111be12ffa20dfba", {
@@ -418,15 +418,15 @@ jobs:
               nl = "src/plugins/linux-cp/lcp_nl.c"
               gre = "src/plugins/gre/interface.c"
               records = {
-                  "router-add": (router, "lcp_router_route_add", "921ea99820e1599a0b1d4559750895637b851fd1", "linux_cp.TestLinuxCPNetlinkRecovery.test_router_linux_replace_replay"),
-                  "router-delete": (router, "lcp_router_route_del", "d1aea3dcd92e0cf84a6f3694e588ff437b736260", "linux_cp.TestLinuxCPNetlinkRecovery.test_router_partial_delete_ownership"),
-                  "router-sweep": (router, "lcp_router_route_sync_end", "d1e793a5131a6a4d1dbd2b998081e1999bf597ec", "linux_cp.TestLinuxCPNetlinkRecovery.test_router_bound_table_sweep"),
-                  "router-permanent": (router, "lcp_router_table_add_del_special_routes", "c08f0413bc4ca4c24b8eef241c04576297625e3f", "linux_cp.TestLinuxCPNetlinkRecovery.test_router_broadcast_recovery"),
+                  "router-add": (router, "lcp_router_route_add", "5b05177dfd04cbf5f018a968b1b9ebe8e902de9c", "linux_cp.TestLinuxCPNetlinkRecovery.test_router_linux_replace_replay"),
+                  "router-delete": (router, "lcp_router_route_del", "573e14db071e9bcae115347532e16dbcad3c4648", "linux_cp.TestLinuxCPNetlinkRecovery.test_router_partial_delete_ownership"),
+                  "router-sweep": (router, "lcp_router_route_sync_end", "0b4a54b5ce18858b7e1846f9be6b11fc0fd2c608", "linux_cp.TestLinuxCPNetlinkRecovery.test_router_bound_table_sweep"),
+                  "router-permanent": (router, "lcp_router_table_add_del_special_routes", "86e3f8e628efe0ceaeec4a97be0d9f025eb0cc74", "linux_cp.TestLinuxCPNetlinkRecovery.test_router_broadcast_recovery"),
                   "lifecycle-failure": (setter, "lcp_set_default_ns", "016dadeb32d35e1ee8cf52d5ae30d69a8f088379", "linux_cp_lifecycle.TestLinuxCPLifecycle.test_default_namespace_failure"),
-                  "lifecycle-vlan-add": (interface, "lcp_netlink_add_link_vlan", "79b7c054551307b7c9f1f2e52eb799bedadf2d9e", "linux_cp_lifecycle.TestLinuxCPLifecycle.test_vlan_resources"),
-                  "lifecycle-vlan-delete": (interface, "lcp_netlink_del_link", "96bfa60b0267f1d7a636f61b204729aa86086923", "linux_cp_lifecycle.TestLinuxCPLifecycle.test_vlan_resources"),
-                  "gre-config": (gre, "gre_tunnel_db_find", "f84b6627d14708df6bd2735c14b6d3963bb361e3", "gre_teib.TestGreTeib.test_gre_teib_ipv4"),
-                  "gre-ingress": (gre, "gre_tunnel_db_add", "ed3989fb34afcb752a44e1c7a4fb71186eb8e259", "gre_teib.TestGreTeib.test_gre_teib_ipv4")}
+                  "lifecycle-vlan-add": (interface, "lcp_netlink_add_link_vlan", "29bf90b6df1003c871bb4db8369ce7c761a5b09b", "linux_cp_lifecycle.TestLinuxCPLifecycle.test_vlan_resources"),
+                  "lifecycle-vlan-delete": (interface, "lcp_netlink_del_link", "257216236be34803b2ce75963f13698d955d3767", "linux_cp_lifecycle.TestLinuxCPLifecycle.test_vlan_resources"),
+                  "gre-config": (gre, "gre_tunnel_db_find", "97c0d115972105645cf124b5ff8ea7fe0a1df0cc", "gre_teib.TestGreTeib.test_gre_teib_ipv4"),
+                  "gre-ingress": (gre, "gre_tunnel_db_add", "54c02ccad20ffd3d0102721c431a308041551bf5", "gre_teib.TestGreTeib.test_gre_teib_ipv4")}
               if name in records:
                   path, fn, after, selector = records[name]
                   before = content(TREE, path)
@@ -439,10 +439,10 @@ jobs:
                       steps = [(b"  if (lcpm->default_ns_fd >= 0)\n    close (lcpm->default_ns_fd);\n  vec_free (lcpm->default_namespace);", b"  vec_free (lcpm->default_namespace);")]
                       kind = "isolated-owner-regression"
                   elif name == "lifecycle-flags":
-                      path, after, selector = interface, "81148d26145e5fd4ed23a0e42fd5ed9f8a8acc69", "linux_cp_lifecycle.TestLinuxCPLifecycle.test_pair_flags_pool_reuse"
+                      path, after, selector = interface, "08875ad819d268aae7817eeda9c6b6bc33633895", "linux_cp_lifecycle.TestLinuxCPLifecycle.test_pair_flags_pool_reuse"
                       steps = [(b"  pool_get (lcp_itf_pair_pool, lip);\n  lip->lip_flags = 0;", b"  pool_get (lcp_itf_pair_pool, lip);")]
                   elif name == "lifecycle-refresh":
-                      path, after, selector = interface, "4d269fa926616f9953c2e89853ae9d34d41b94e9", "linux_cp_lifecycle.TestLinuxCPLifecycle.test_pair_replace_resend"
+                      path, after, selector = interface, "13a10a5b6a6dfbeff556bfc497d32d4658166bda", "linux_cp_lifecycle.TestLinuxCPLifecycle.test_pair_replace_resend"
                       steps = []
                       for ref in (TREE, BASE):
                           body = function(content(ref, path), "lcp_itf_pair_create")
@@ -450,13 +450,13 @@ jobs:
                           steps.append(body[start:body.index(b"\n    }", start) + 6])
                       steps = [tuple(steps)]
                   elif name == "lifecycle-namespace":
-                      path, after, selector = interface, "fc05accd60c0e161af615e6874a053030238109e", "linux_cp_lifecycle.TestLinuxCPNamespaceOwnership.test_equal_ifindex_namespace_delete"
+                      path, after, selector = interface, "8f3d5970c8fb502eef25e011f83f974504749c2f", "linux_cp_lifecycle.TestLinuxCPNamespaceOwnership.test_equal_ifindex_namespace_delete"
                       steps = [(b"  if (lcp_itf_pair_find_by_vif (lip->lip_vif_index) == lipi)\n    hash_unset (lip_db_by_vif, lip->lip_vif_index);", b"  hash_unset (lip_db_by_vif, lip->lip_vif_index);")]
                   elif name == "netlink-pair":
-                      path, after, selector = nl, "49ba5277830f1a50f6f05e1769df98e42b775aae", "linux_cp_netlink.TestLinuxCPNetlinkSocketOwnership.test_pair_add_during_netlink_recovery"
+                      path, after, selector = nl, "11a05311ea57b2989bdb40f495a31d7fe4280561", "linux_cp_netlink.TestLinuxCPNetlinkSocketOwnership.test_pair_add_during_netlink_recovery"
                       steps = [(b"lcp_nl_pair_add_cb (lcp_itf_pair_t *pair)\n{\n  nl_main_t *nm = &nl_main;\n\n  if (nm->nl_status == NL_STATUS_SYNC)\n    return;\n\n  if (!nm->sk_route)", b"lcp_nl_pair_add_cb (lcp_itf_pair_t *pair)\n{\n  nl_main_t *nm = &nl_main;\n\n  if (!nm->sk_route)")]
                   elif name == "netlink-dump":
-                      path, after, selector = nl, "686f9309ff4a3d4eeca7e6920efd1feda6ccf643", "linux_cp_netlink.TestLinuxCPNetlinkDumpCompletion.test_dump_completion_errors"
+                      path, after, selector = nl, "2877ceb3d2c2cf57d06fc08270d99a0af18b5906", "linux_cp_netlink.TestLinuxCPNetlinkDumpCompletion.test_dump_completion_errors"
                       steps = [(b"  while (nlmsg_ok (hdr, n_bytes))\n    {\n      if (hdr->nlmsg_flags & NLM_F_DUMP_INTR)\n\t{\n\t  err = -NLE_DUMP_INTR;\n\t  goto out;\n\t}\n\n      nlmsg_free (msg);", b"  while (nlmsg_ok (hdr, n_bytes))\n    {\n      nlmsg_free (msg);")]
                       original = content(TREE, path)
                       start = original.index(b"      if (hdr->nlmsg_type == NLMSG_DONE)\n")
@@ -1053,9 +1053,9 @@ jobs:
 
           def failure_witnesses():
               return {
-                  "router-add": ('self.assertIn(f"refs:{expected} ", output)', "refs:1", "refs:2"),
-                  "router-delete": ('self.assertIn(f"refs:{expected} ", output)', "refs:1", "absent fib:"),
-                  "router-sweep": ('self.assertIn(f"refs:{expected} ", output)', "refs:1", "refs:2"),
+                  "router-add": ('self.assertRegex(lines[0], rf"^refs:{expected} fib:[0-9]+ mfib:[0-9]+$", output)', "refs:1", "refs:2"),
+                  "router-delete": ('self.assertRegex(lines[0], rf"^refs:{expected} fib:[0-9]+ mfib:[0-9]+$", output)', "refs:1", "absent fib:"),
+                  "router-sweep": ('self.assertRegex(lines[0], rf"^refs:{expected} fib:[0-9]+ mfib:[0-9]+$", output)', "refs:1", "refs:2"),
                   "router-permanent": ('self.assertIn("broadcast refs:1 local:1"', "broadcast refs:1 local:1", "broadcast refs:0 local:0"),
                   "lifecycle-fd": ("test_linux_cp_lifecycle.py\", line 100", "AssertionError"),
                   "lifecycle-failure": ("lcp_default_ns_set", "got 0", "assert_known_api_retval"),
@@ -2297,7 +2297,7 @@ jobs:
           import sys
 
           root = Path(os.environ['RESULT_ROOT'])
-          expected_tree = '293b103fb64948865d788a7abc0d585b2c235f3a'
+          expected_tree = '86cfc49495ff83e2869aca5d80177a6b112228ec'
           fixed = ['linux_cp', 'linux_cp_lifecycle', 'linux_cp_netlink', 'ipsec_esp', 'gre', 'gre_teib', 'ip_mcast']
           negatives = ['router-add', 'router-delete', 'router-sweep', 'router-permanent', 'lifecycle-fd',
                        'lifecycle-failure', 'lifecycle-refresh', 'lifecycle-flags', 'lifecycle-vlan-add',
