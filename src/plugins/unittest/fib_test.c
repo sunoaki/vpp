@@ -5866,6 +5866,80 @@ fib_test_ae (void)
             FIB_TEST((local_path_lists == fib_path_list_pool_size()),
                      "interposer leaves no path lists cycle %u", cycle);
         }
+        fib_prefix_t first_local_pfx = local_pfx;
+        first_local_pfx.fp_addr.ip4.as_u32 = clib_host_to_net_u32(0x0a0a0a14);
+        fib_node_index_t first_local_fei =
+            fib_table_entry_special_dpo_add(fib_index, &first_local_pfx,
+                                            FIB_SOURCE_SPECIAL, FIB_ENTRY_FLAG_INTERPOSE,
+                                            &interposer);
+        FIB_TEST(!fib_entry_is_sourced(first_local_fei, FIB_SOURCE_INTERFACE),
+                 "first-export host initially has no interface source");
+        FIB_TEST((FIB_NODE_INDEX_INVALID ==
+                  fib_table_lookup_exact_match(import_fib_index1, &first_local_pfx)),
+                 "interposer without interface has no local export");
+        fib_entry_t *entry_pool = fib_entry_get(first_local_fei) - first_local_fei;
+        const u32 filler_limit = pool_free_elts(entry_pool);
+        fib_prefix_t filler_pfx = {
+            .fp_proto = FIB_PROTOCOL_IP4,
+            .fp_len = 32,
+        };
+        FIB_TEST((filler_limit < (1 << 12)), "first-export filler count is bounded");
+        FIB_TEST(((uword) filler_limit * sizeof(*entry_pool) <= (1 << 20)),
+                 "first-export filler entry storage is bounded");
+        for (u32 filler = 0; filler < filler_limit; filler++)
+        {
+            filler_pfx.fp_addr.ip4.as_u32 = clib_host_to_net_u32(0xc6120000 + filler);
+            FIB_TEST((FIB_NODE_INDEX_INVALID == fib_table_lookup_exact_match(fib_index, &filler_pfx)),
+                     "first-export filler prefix is unused");
+            fib_table_entry_special_add(fib_index, &filler_pfx, FIB_SOURCE_API, FIB_ENTRY_FLAG_DROP);
+        }
+        entry_pool = fib_entry_get(first_local_fei) - first_local_fei;
+        FIB_TEST((0 == vec_len(pool_header(entry_pool)->free_indices)),
+                 "first export has no reusable entry slots");
+        FIB_TEST(pool_get_will_expand(entry_pool), "first export must grow the entry pool");
+        const u32 old_pool_length = vec_len(entry_pool);
+        const uword old_local_address = pointer_to_uword(fib_entry_get(first_local_fei));
+        fib_table_entry_update_one_path(fib_index, &first_local_pfx, FIB_SOURCE_INTERFACE,
+                                        FIB_ENTRY_FLAG_CONNECTED | FIB_ENTRY_FLAG_LOCAL,
+                                        DPO_PROTO_IP4, NULL, tm->hw[0]->sw_if_index,
+                                        ~0, 1, NULL, FIB_ROUTE_PATH_FLAG_NONE);
+        entry_pool = fib_entry_get(first_local_fei) - first_local_fei;
+        fformat(stderr, "first-export entry pool: length %u -> %u, moved %u\n",
+                old_pool_length, vec_len(entry_pool),
+                old_local_address != pointer_to_uword(fib_entry_get(first_local_fei)));
+        FIB_TEST((old_pool_length < vec_len(entry_pool)), "first local export grows the entry pool");
+        FIB_TEST((FIB_SOURCE_SPECIAL == fib_entry_get_best_source(first_local_fei)),
+                 "existing interposer still wins after first interface source");
+        local_src = fib_entry_src_find(fib_entry_get(first_local_fei), FIB_SOURCE_INTERFACE);
+        FIB_TEST((local_src && (local_src->fes_flags & FIB_ENTRY_SRC_FLAG_CONTRIBUTING)),
+                 "first interface source contributes under existing interposer");
+        fei = fib_table_lookup_exact_match(import_fib_index1, &first_local_pfx);
+        FIB_TEST((FIB_NODE_INDEX_INVALID != fei), "first interface source creates AE after pool growth");
+        FIB_TEST(fib_entry_is_sourced(fei, FIB_SOURCE_AE), "first export has AE source");
+        dpo = fib_entry_contribute_ip_forwarding(first_local_fei);
+        local_bucket = load_balance_get_bucket(dpo->dpoi_index, 0);
+        FIB_TEST((mpls_label_dpo_get_type(MPLS_LABEL_DPO_FLAG_NONE) == local_bucket->dpoi_type),
+                 "first local forwards through interposer");
+        FIB_TEST((DPO_RECEIVE == mpls_label_dpo_get(local_bucket->dpoi_index)->mld_dpo.dpoi_type),
+                 "first local interposer retains receive forwarding");
+        dpo = fib_entry_contribute_ip_forwarding(fei);
+        import_bucket = load_balance_get_bucket(dpo->dpoi_index, 0);
+        FIB_TEST((0 == dpo_cmp(local_bucket, import_bucket)),
+                 "first export retains installed forwarding after pool growth");
+        for (u32 filler = 0; filler < filler_limit; filler++)
+        {
+            filler_pfx.fp_addr.ip4.as_u32 = clib_host_to_net_u32(0xc6120000 + filler);
+            fib_table_entry_special_remove(fib_index, &filler_pfx, FIB_SOURCE_API);
+        }
+        fib_table_entry_delete(fib_index, &first_local_pfx, FIB_SOURCE_INTERFACE);
+        FIB_TEST((FIB_NODE_INDEX_INVALID ==
+                  fib_table_lookup_exact_match(import_fib_index1, &first_local_pfx)),
+                 "first interface withdrawal removes first export");
+        fib_table_entry_special_remove(fib_index, &first_local_pfx, FIB_SOURCE_SPECIAL);
+        FIB_TEST((local_locks == fib_entry_get(local_fei)->fe_node.fn_locks),
+                 "first-export fixture preserves original local locks");
+        FIB_TEST((local_entries == fib_entry_pool_size()), "first-export entry pool balanced");
+        FIB_TEST((local_path_lists == fib_path_list_pool_size()), "first-export path lists balanced");
         dpo_reset(&interposer);
         vec_free(labels);
 

@@ -977,6 +977,8 @@ fib_entry_src_inherit (const fib_entry_t *cover,
 {
     CLIB_UNUSED(fib_source_t source);
     const fib_entry_src_t *src;
+    fib_node_index_t cover_index = fib_entry_get_index(cover);
+    fib_node_index_t covered_index = fib_entry_get_index(covered);
 
     FOR_EACH_SRC_ADDED(cover, src, source,
     ({
@@ -984,6 +986,8 @@ fib_entry_src_inherit (const fib_entry_t *cover,
             (src->fes_flags & FIB_ENTRY_SRC_FLAG_INHERITED))
         {
             fib_entry_src_covered_inherit_add_i(covered, src);
+            cover = fib_entry_get(cover_index);
+            covered = fib_entry_get(covered_index);
         }
     }))
 }
