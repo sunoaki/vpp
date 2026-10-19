@@ -85,7 +85,56 @@ jobs:
           cat > "$TOOLS/evidence_schema.py" <<'PY'
           import hashlib
           import json
+          import re
           from pathlib import PurePosixPath
+
+          FATAL = re.compile(r"\bSIG(?:SEGV|ABRT|BUS|ILL|FPE)\b|segmentation fault|"
+                             r"\bAborted\b|\bBus error\b|core was generated", re.I)
+
+          def result_path(value):
+              return (identity(value) and not PurePosixPath(value).is_absolute() and
+                      ".." not in PurePosixPath(value).parts and value.endswith("/result.json"))
+
+          def ownership(raw):
+              value = json.loads(raw)
+              check(isinstance(value, dict), "Ownership must be an object")
+              check(set(value) == {"identity", "result", "ancestors", "parents"}, "Invalid ownership fields")
+              check(isinstance(value["identity"], str) and
+                    re.fullmatch(r"[0-9a-f]{32}", value["identity"]) is not None, "Invalid random identity")
+              check(result_path(value["result"]), "Invalid owned result path")
+              check(isinstance(value["ancestors"], list) and all(identity(item) for item in value["ancestors"]),
+                    "Invalid ownership ancestors")
+              check(isinstance(value["parents"], list) and len(value["parents"]) == len(value["ancestors"]),
+                    "Invalid ownership parents")
+              for item, ancestor in zip(value["parents"], value["ancestors"]):
+                  check(isinstance(item, dict) and set(item) == {"identity", "result"} and
+                        item["identity"] == ancestor and result_path(item["result"]), "Invalid parent ownership")
+              return value
+
+          def initial_interruption(raw, owner_raw, expected_result):
+              owner = ownership(owner_raw)
+              value = json.loads(raw)
+              check(isinstance(value, dict) and set(value) == {"status", "rc", "cleanup_complete", "spawn",
+                    "observed_at", "parent", "parent_identity", "ownership", "ownership_sha256",
+                    "raw_result", "raw_sha256", "temporary", "reason"}, "Invalid initial interruption fields")
+              check(value["status"] == "interrupted_before_result" and owner["result"] == expected_result,
+                    "Initial interruption result mismatch")
+              check(all(value[key] is None for key in ("rc", "cleanup_complete", "spawn", "raw_result", "raw_sha256")),
+                    "Initial command unknowns must remain null")
+              check({"result": value["parent"], "identity": value["parent_identity"]} in owner["parents"],
+                    "Initial interruption is not attributable")
+              check(value["ownership"] == str(PurePosixPath(expected_result).with_name("ownership.json")) and
+                    value["ownership_sha256"] == hashlib.sha256(owner_raw).hexdigest(), "Ownership hash/path mismatch")
+              check(type(value["observed_at"]) in (int, float) and 0 <= value["observed_at"] <= 1e20 and
+                    identity(value["reason"]), "Invalid initial interruption metadata")
+              check(isinstance(value["temporary"], list), "Invalid temporary evidence")
+              for item in value["temporary"]:
+                  check(isinstance(item, dict) and set(item) == {"path", "sha256"} and identity(item["path"]) and
+                        PurePosixPath(item["path"]).parent == PurePosixPath(expected_result).parent and
+                        PurePosixPath(item["path"]).name.startswith(".result.json.") and
+                        isinstance(item["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is not None,
+                        "Invalid temporary path/hash")
+              return value
 
           COMMAND_STATUSES = {"running", "completed", "work_budget_exhausted", "work_budget_timeout",
                               "command_timeout", "cleanup_timeout", "execution_error", "cleanup_error"}
@@ -328,6 +377,7 @@ jobs:
           def capture(process, deadline, stream):
               tail = bytearray()
               timed_out = False
+              previous, fatal = "", None
               os.set_blocking(process.stdout.fileno(), False)
               with selectors.DefaultSelector() as selector:
                   selector.register(process.stdout, selectors.EVENT_READ)
@@ -343,12 +393,19 @@ jobs:
                           if not chunk:
                               selector.unregister(key.fd)
                               continue
+                          text = previous + chunk.decode(errors="replace")
+                          match = evidence_schema.FATAL.search(text)
+                          if match and fatal is None:
+                              fatal = text[max(0, match.start() - 80):match.end() + 80]
+                          previous = text[-256:]
                           tail.extend(chunk)
                           del tail[:-8 * 1024 * 1024]
                           stream.seek(0)
                           stream.write(tail)
                           stream.truncate()
                           stream.flush()
+              if fatal is not None:
+                  publish(Path(stream.name).with_name("fatal-diagnostic.json"), dict(witness=fatal))
               return tail, timed_out
 
           def children():
@@ -402,14 +459,20 @@ jobs:
                   960 if label == "tests" else 900 if label == "runtime" else
                   120 if label in ("environment", "fixtures") else 600)
               seconds = min(phase_seconds, max(0, work_deadline - started))
-              identity = f"{os.getpid()}-{time.time_ns()}"
+              identity = os.urandom(16).hex()
               ancestors = json.loads(os.environ.get("HSS_COMMAND_ANCESTORS", "[]"))
+              parents = json.loads(os.environ.get("HSS_COMMAND_PARENTS", "[]"))
+              result_path = directory / "result.json"
+              owner = dict(identity=identity, result=str(result_path.relative_to(OUT)), ancestors=ancestors, parents=parents)
+              evidence_schema.ownership(json.dumps(owner))
+              with (directory / "ownership.json").open("x") as stream:
+                  stream.write(json.dumps(owner, sort_keys=True) + "\n")
               result = dict(command=args, cwd=str(ROOT), start=started, rc=None, status="running",
                             command_limit_seconds=phase_seconds, work_deadline=work_deadline,
                             allowed_seconds=seconds, identity=identity, ancestors=ancestors)
               child_env = dict(os.environ if env is None else env,
-                               HSS_COMMAND_ANCESTORS=json.dumps(ancestors + [identity]))
-              result_path = directory / "result.json"
+                               HSS_COMMAND_ANCESTORS=json.dumps(ancestors + [identity]),
+                               HSS_COMMAND_PARENTS=json.dumps(parents + [dict(identity=identity, result=owner["result"])]))
               publish(result_path, result)
               tail = bytearray()
               process = None
@@ -462,7 +525,44 @@ jobs:
 
           def record_interruptions(parent, parent_path):
               count = 0
+              for owner_path in OUT.glob("*/ownership.json"):
+                  path = owner_path.with_name("result.json")
+                  sidecar = owner_path.with_name("interruption.json")
+                  if sidecar.exists() or path.exists():
+                      continue
+                  count += 1
+                  require(count <= 1000, "Too many ownership records")
+                  owner_raw = b""
+                  try:
+                      require(not owner_path.is_symlink() and owner_path.stat().st_size <= 1024 * 1024,
+                              "Invalid ownership file")
+                      owner_raw = owner_path.read_bytes()
+                      owner = evidence_schema.ownership(owner_raw)
+                      require(owner["result"] == str(path.relative_to(OUT)), "Ownership result path mismatch")
+                  except (ValueError, UnicodeDecodeError, OSError, AssertionError) as error:
+                      save(str(owner_path.parent.relative_to(OUT) / "invalid-ownership.json"),
+                           evidence_schema.invalid(owner_path.relative_to(OUT), owner_raw, error))
+                      continue
+                  reference = dict(identity=parent["identity"], result=str(parent_path.relative_to(OUT)))
+                  if reference not in owner["parents"]:
+                      continue
+                  try:
+                      temporary = []
+                      for item in owner_path.parent.glob(".result.json.*.tmp"):
+                          require(len(temporary) < 10 and not item.is_symlink() and item.stat().st_size <= 1024 * 1024,
+                                  f"Invalid temporary result evidence: {item.relative_to(OUT)}")
+                          temporary.append(dict(path=str(item.relative_to(OUT)), sha256=digest(item)))
+                      save(str(sidecar.relative_to(OUT)), dict(status="interrupted_before_result", rc=None,
+                           cleanup_complete=None, spawn=None, observed_at=time.time(), parent=reference["result"],
+                           parent_identity=reference["identity"], ownership=str(owner_path.relative_to(OUT)),
+                           ownership_sha256=hashlib.sha256(owner_raw).hexdigest(), raw_result=None, raw_sha256=None,
+                           temporary=temporary, reason="No published result; child spawn, exit and local cleanup unknown"))
+                  except (ValueError, UnicodeDecodeError, OSError, AssertionError) as error:
+                      save(str(owner_path.parent.relative_to(OUT) / "invalid-ownership.json"),
+                           evidence_schema.invalid(owner_path.relative_to(OUT), owner_raw, error))
               for path in OUT.glob("*/result.json"):
+                  if path.with_name("interruption.json").exists():
+                      continue
                   count += 1
                   require(count <= 1000, "Too many command records")
                   require(not path.is_symlink() and path.stat().st_size <= 1024 * 1024,
@@ -644,6 +744,8 @@ jobs:
                       for method in methods["TestHttpStaticCli" if cls in CLASSES else cls]]
 
           def validate(events, console, rc, expected, variant, logs):
+              require(evidence_schema.FATAL.search("\n".join((console, logs, json.dumps(events)))) is None,
+                      "Fatal process diagnostic evidence")
               forbidden = ("addError", "addSkip", "addExpectedFailure", "addUnexpectedSuccess")
               require(not any(event["kind"] in forbidden for event in events), "Error/skip/expected failure callback")
               require(not re.search(r"SIGSEGV|segmentation fault|core was generated|timed out|TimeoutError|"
@@ -764,6 +866,7 @@ jobs:
               try:
                   runtime = json.loads((OUT / "runtime/result.json").read_text())
                   require(runtime["status"] == "completed", "Runtime command timed out or exceeded work budget")
+                  require(not (OUT / "runtime/fatal-diagnostic.json").exists(), "Fatal diagnostic found before log tail")
                   validate(events, console, rc, expected, VARIANT, logs)
               except Exception as error:
                   save("acceptance.json", dict(status="FAIL", error=str(error), expected=expected))
@@ -956,6 +1059,16 @@ jobs:
                           raw = interruption.read_bytes()
                           checked = evidence_schema.interruption(raw, child, child_raw)
                           phases[name] = dict(raw_result=str(found.relative_to(root)), **checked)
+                  except (ValueError, UnicodeDecodeError, OSError) as error:
+                      phases[name] = evidence_schema.invalid(failed_path.relative_to(root), raw, error)
+              elif (root / name / "interruption.json").is_file():
+                  sidecar = root / name / "interruption.json"
+                  raw, failed_path = b"", sidecar
+                  try:
+                      raw = sidecar.read_bytes()
+                      owner_path = sidecar.with_name("ownership.json")
+                      owner_raw = owner_path.read_bytes()
+                      phases[name] = evidence_schema.initial_interruption(raw, owner_raw, f"{name}/result.json")
                   except (ValueError, UnicodeDecodeError, OSError) as error:
                       phases[name] = evidence_schema.invalid(failed_path.relative_to(root), raw, error)
               elif name in outcomes:
