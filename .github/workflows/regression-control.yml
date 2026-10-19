@@ -22,6 +22,9 @@ jobs:
       matrix:
         feature: [fib, gre]
         variant: [fixed, restored]
+        include:
+          - feature: fib
+            variant: special-update
     container:
       image: debian:trixie
       options: >-
@@ -162,14 +165,16 @@ jobs:
                           "Expected completed assertion-only failure summary")
                   require(not actual, "Restored exact method unexpectedly succeeded")
               if feature == "fib":
-                  if variant == "restored":
+                  if variant in ("restored", "special-update"):
                       require(callbacks == [("addFailure", "TestFIB", "test_fib")],
                               f"Unexpected FIB outcomes: {callbacks}")
+                      marker = ("FAIL:5807: special update purges import delegate"
+                                if variant == "special-update" else
+                                "FAIL:5700: incremental add creates import delegate")
                       markers = re.findall(r"(?m)^FAIL:[0-9]+: [^\n]*", stderr)
-                      require(markers and markers[0] ==
-                              "FAIL:5700: incremental add creates import delegate",
+                      require(markers and markers[0] == marker,
                               f"Wrong first FIB assertion: {markers[:1]}")
-                      require(markers.count("FAIL:5700: incremental add creates import delegate") == 1,
+                      require(markers.count(marker) == 1,
                               "Missing or duplicate intended FIB assertion")
                       require("self.assertNotIn(\"Failed\", error)" in logs and
                               "AssertionError:" in logs and "FIB Unit Test Failed" in logs,
@@ -298,6 +303,33 @@ jobs:
           def blob(ref, path):
               return git("rev-parse", f"{ref}:{path}")
 
+          def special_update_parts(data):
+              signature = b"void\nfib_entry_special_update ("
+              assert data.count(signature) == 1, "Missing or ambiguous special-update function"
+              start = data.index(signature)
+              end = data.index(b"\n}\n", start) + 3
+              return data[:start], data[start:end], data[end:]
+
+          def selective_source(candidate_bytes, frozen_bytes):
+              prefix, function, suffix = special_update_parts(candidate_bytes)
+              old_function = special_update_parts(frozen_bytes)[1]
+              assert function != old_function, "Special-update control has no source difference"
+              restored = prefix + old_function + suffix
+              assert special_update_parts(restored) == (prefix, old_function, suffix)
+              return restored
+
+          def verify_selective_source():
+              assert feature == "fib" and variant == "special-update"
+              candidate_bytes = subprocess.check_output(["git", "show", f"{candidate}:{source}"])
+              frozen_bytes = subprocess.check_output(["git", "show", f"{frozen}:{source}"])
+              expected = selective_source(candidate_bytes, frozen_bytes)
+              assert Path(source).read_bytes() == expected, "Selective source bytes differ"
+              headers = ["src/vnet/fib/fib_entry.h", "src/vnet/fib/fib_entry_delegate.h"]
+              for path in tests + headers:
+                  original = subprocess.check_output(["git", "show", f"{candidate}:{path}"])
+                  assert Path(path).read_bytes() == original, f"Candidate invariant failed: {path}"
+              return candidate_bytes, frozen_bytes, expected, headers
+
           def command(label, args, env=None):
               directory = output / label
               directory.mkdir()
@@ -352,9 +384,27 @@ jobs:
                   with Path(source).open("wb") as stream:
                       subprocess.run(["git", "show", f"{frozen}:{source}"], stdout=stream, check=True)
               expected_source = blob(frozen if variant == "restored" else candidate, source)
+              if variant == "special-update":
+                  assert feature == "fib"
+                  candidate_bytes = subprocess.check_output(["git", "show", f"{candidate}:{source}"])
+                  frozen_bytes = subprocess.check_output(["git", "show", f"{frozen}:{source}"])
+                  assert Path(source).read_bytes() == candidate_bytes
+                  Path(source).write_bytes(selective_source(candidate_bytes, frozen_bytes))
+                  candidate_bytes, frozen_bytes, restored, headers = verify_selective_source()
+                  expected_source = git("hash-object", source)
+                  manifest["expected_failure"] = "FAIL:5807: special update purges import delegate"
+                  manifest["selective_restore"] = {
+                      "function": "fib_entry_special_update",
+                      "candidate_function_sha256": hashlib.sha256(
+                          special_update_parts(candidate_bytes)[1]).hexdigest(),
+                      "frozen_function_sha256": hashlib.sha256(
+                          special_update_parts(frozen_bytes)[1]).hexdigest(),
+                      "outside_function_sha256": [hashlib.sha256(part).hexdigest()
+                                                  for part in special_update_parts(restored)[::2]],
+                      "candidate_headers": {path: blob(candidate, path) for path in headers}}
               assert git("hash-object", source) == expected_source
               changed = git("diff", "--name-only").splitlines()
-              assert changed == ([source] if variant == "restored" else [])
+              assert changed == ([source] if variant in ("restored", "special-update") else [])
               for path in tests:
                   current = git("hash-object", path)
                   assert current == blob(candidate, path)
@@ -375,6 +425,8 @@ jobs:
           def run_tests():
               assert git("hash-object", source) == (output / "expected-source").read_text()
               assert all(git("hash-object", path) == blob(candidate, path) for path in tests)
+              if variant == "special-update":
+                  verify_selective_source()
               module = Path(tests[-1])
               tree = ast.parse(module.read_text())
               all_methods = [(cls.name, method.name) for cls in tree.body
