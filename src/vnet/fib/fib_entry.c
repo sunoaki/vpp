@@ -844,6 +844,7 @@ fib_entry_special_add (fib_node_index_t fib_entry_index,
 
     fib_entry = fib_entry_src_action_add(fib_entry, source, flags, dpo);
     fib_entry_source_change_w_flags(fib_entry, best_source, bflags, source);
+    fib_entry = fib_entry_get(fib_entry_index);
     FIB_ENTRY_DBG(fib_entry, "special-add:%U", format_fib_source, source);
 }
 
@@ -863,6 +864,7 @@ fib_entry_special_update (fib_node_index_t fib_entry_index,
 
     fib_entry = fib_entry_src_action_update(fib_entry, source, flags, dpo);
     fib_entry_source_change_w_flags(fib_entry, best_source, bflags, source);
+    fib_entry = fib_entry_get(fib_entry_index);
 
     FIB_ENTRY_DBG(fib_entry, "special-updated:%U", format_fib_source, source);
 }
@@ -889,6 +891,7 @@ fib_entry_path_add (fib_node_index_t fib_entry_index,
     fib_entry = fib_entry_src_action_path_add(fib_entry, source, flags, rpaths);
 
     fib_entry_source_change_w_flags(fib_entry, best_source, bflags, source);
+    fib_entry = fib_entry_get(fib_entry_index);
 
     FIB_ENTRY_DBG(fib_entry, "path add:%U", format_fib_source, source);
 }
@@ -1211,6 +1214,7 @@ fib_entry_update (fib_node_index_t fib_entry_index,
                                                paths);
 
     fib_entry_source_change_w_flags(fib_entry, best_source, bflags, source);
+    fib_entry = fib_entry_get(fib_entry_index);
     FIB_ENTRY_DBG(fib_entry, "update");
 }
 
