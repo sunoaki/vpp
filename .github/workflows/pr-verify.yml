@@ -607,6 +607,28 @@ jobs:
               print(f"Verified {method}: addSuccess")
           PY
             fi
+            # A later make test-debug resets /tmp/vpp-unittest-* and FAILED_DIR.
+            python3 - "${suite}" <<'PY'
+          import os
+          from pathlib import Path
+          import sys
+
+          failed = Path("/tmp/vpp-failed-unittests")
+          history = Path(os.environ["RUNNER_TEMP"]) / "vpp-test-history" / sys.argv[1]
+          if failed.is_dir() and not failed.is_symlink():
+              for link in sorted(failed.iterdir()):
+                  if not link.is_symlink():
+                      continue
+                  source = link.resolve()
+                  if not source.is_dir():
+                      continue
+                  if source.parent != Path("/tmp") or not source.name.startswith("vpp-unittest-"):
+                      sys.exit(f"::error::Unsafe failed test directory: {link} -> {source}")
+                  history.mkdir(parents=True, exist_ok=True)
+                  destination = history / source.name
+                  source.rename(destination)
+                  print(f"Preserved earlier-suite failure: {source} -> {destination}")
+          PY
           done
 
       - name: Verify complete ESP evidence
@@ -751,7 +773,8 @@ jobs:
                       report.append(f"LINK {link} -> {target}")
                       failed_names.add(Path(target).name)
           test_dirs.sort(key=lambda path: (path.name not in failed_names, path.name))
-          roots = [failed, *test_dirs, Path("build-root/test-logs").absolute()]
+          history = Path(os.environ["RUNNER_TEMP"]) / "vpp-test-history"
+          roots = [failed, *test_dirs, history, Path("build-root/test-logs").absolute()]
           candidates = []
           for root in roots:
               if root.is_symlink() or not root.is_dir():
