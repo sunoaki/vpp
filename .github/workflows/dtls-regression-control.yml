@@ -282,18 +282,23 @@ jobs:
                   count += 1
               (destination / "collection.txt").write_text("\n".join(report) + "\n")
 
-          def process_table():
+          def process_table(errors=None, tracked=None):
               table = {}
-              for path in Path("/proc").glob("[0-9]*/stat"):
+              paths = set(Path("/proc").glob("[0-9]*/stat"))
+              if tracked is not None:
+                  paths.update(Path(f"/proc/{pid}/stat") for pid in tracked)
+              for path in sorted(paths):
+                  pid = int(path.parent.name)
                   try:
                       fields = path.read_text().rsplit(")", 1)[1].split()
-                      table[int(path.parent.name)] = (int(fields[1]), int(fields[19]))
-                  except (OSError, ValueError, IndexError):
-                      continue
+                      table[pid] = (int(fields[1]), int(fields[19]))
+                  except (OSError, ValueError, IndexError) as error:
+                      if errors is not None and not isinstance(error, (FileNotFoundError, ProcessLookupError)):
+                          errors[pid] = {"type": type(error).__name__, "message": str(error)[:1000]}
               return table
 
-          def descendants(tracked, baseline):
-              table = process_table()
+          def descendants(tracked, baseline, discovery_errors=None):
+              table = process_table() if discovery_errors is None else process_table(discovery_errors, tracked)
               changed = True
               while changed:
                   changed = False
@@ -346,20 +351,43 @@ jobs:
                       "comm": raw.split(b"(", 1)[1].rsplit(b")", 1)[0][:256].decode(errors="replace"),
                       "cmdline": cmdline.replace(b"\0", b" ").decode(errors="replace")}
 
+          def completion_descendants(root_pid, tracked, baseline, report, stage):
+              errors = {}
+              live = descendants(tracked, baseline, errors) - {root_pid}
+              relevant = sorted(pid for pid in errors if pid in tracked and pid != root_pid)
+              require(len(relevant) <= 128, "Too many discovery errors for bounded completion evidence")
+              for pid in relevant:
+                  report["discovery_errors"].append(dict(pid=pid, birth=tracked[pid], stage=stage, error=errors[pid]))
+                  if pid not in report["unresolved"]:
+                      report["unresolved"].append(pid)
+              return live
+
+          def completion_deadline(report, deadline, stage):
+              if time.monotonic() >= deadline:
+                  report["deadline_exceeded"] = report["deadline_exceeded"] or stage
+              return not report["deadline_exceeded"]
+
           def reap_completed_descendants(root_pid, tracked, baseline, deadline):
-              report = {"processes": [], "unresolved": [], "remaining": []}
-              identities = [(pid, tracked[pid]) for pid in sorted(descendants(tracked, baseline) - {root_pid})]
+              report = {"processes": [], "unresolved": [], "remaining": [],
+                        "discovery_errors": [], "deadline_exceeded": None}
+              if not completion_deadline(report, deadline, "entry"):
+                  return report
+              live = completion_descendants(root_pid, tracked, baseline, report, "initial")
+              identities = [(pid, tracked[pid]) for pid in sorted(live)]
               require(len(identities) <= 128, "Too many descendants for bounded completion evidence")
               for pid, birth in identities:
+                  if not completion_deadline(report, deadline, "before-inspection"):
+                      break
                   record = {"pid": pid, "birth": birth, "waitid": None}
                   report["processes"].append(record)
                   handle = None
                   try:
-                      require(time.monotonic() < deadline, "Completion inspection deadline exceeded")
                       handle = os.pidfd_open(pid, 0)
                       require(process_table().get(pid, (None, None))[1] == birth,
                               "Completion pidfd process identity changed")
                       record.update(completion_process(pid, birth))
+                      if not completion_deadline(report, deadline, "after-inspection"):
+                          raise TimeoutError("Completion inspection deadline exceeded")
                       reaped = os.waitid(os.P_PIDFD, handle, os.WEXITED | os.WNOHANG)
                       if reaped is None:
                           record["status"] = "live-or-unresolved"
@@ -371,11 +399,14 @@ jobs:
                           record["status"] = "reaped"
                   except (OSError, AssertionError, ValueError, IndexError) as error:
                       record.update(status="unresolved", error={"type": type(error).__name__, "message": str(error)})
-                      report["unresolved"].append(pid)
+                      if pid not in report["unresolved"]:
+                          report["unresolved"].append(pid)
                   finally:
                       if handle is not None:
                           os.close(handle)
-              report["remaining"] = sorted(descendants(tracked, baseline) - {root_pid})
+                      completion_deadline(report, deadline, "after-wait")
+              report["remaining"] = sorted(completion_descendants(root_pid, tracked, baseline, report, "final"))
+              completion_deadline(report, deadline, "after-final-discovery")
               return report
 
           def cleanup(process, tracked, baseline):
@@ -650,6 +681,8 @@ jobs:
                               caught_transport |= result.get("caught_transport", False)
                   result["rc"] = process.wait(timeout=max(0.01, deadline - time.monotonic()))
                   result["completion"] = reap_completed_descendants(process.pid, tracked, baseline, deadline)
+                  if result["completion"]["deadline_exceeded"]:
+                      raise TimeoutError("Completion deadline exceeded: " + result["completion"]["deadline_exceeded"])
                   require(not result["completion"]["unresolved"] and not result["completion"]["remaining"],
                           "Command left live or unresolved descendant processes after completion")
                   result["outcome"] = "success" if result["rc"] == 0 else "nonzero"
@@ -1355,8 +1388,85 @@ jobs:
                   require(report["unresolved"] == [701], "Ignored unresolved child ownership")
                   wait.reset_mock()
                   report = reap_completed_descendants(700, identities, {}, time.monotonic() - 1)
-                  require(report["unresolved"] == [701] and not wait.called, "Completion exceeded deadline")
+                  require(report["deadline_exceeded"] == "entry" and not wait.called, "Completion exceeded deadline")
+              completion_discovery_fixtures()
+              completion_deadline_fixtures()
               print("Completion identity replacement, nonchild and deadline guards passed without real signals")
+
+          def completion_discovery_fixtures():
+              from unittest import mock
+              module = sys.modules[__name__]
+              path = Path("/proc/701/stat")
+              for error in (PermissionError("stat denied"), ValueError("invalid stat"),
+                            FileNotFoundError("gone"), ProcessLookupError("gone")):
+                  with mock.patch.object(Path, "glob", side_effect=lambda *args: iter([path])), \
+                       mock.patch.object(Path, "read_text", side_effect=error), \
+                       mock.patch.object(os, "pidfd_open", side_effect=AssertionError("Cannot open unread identity")), \
+                       mock.patch.object(os, "waitid", side_effect=AssertionError("Cannot wait unread identity")):
+                      report = reap_completed_descendants(700, {701: 10}, {}, time.monotonic() + 1)
+                      uncertain = not isinstance(error, (FileNotFoundError, ProcessLookupError))
+                      require(bool(report["unresolved"]) == uncertain
+                              and bool(report["discovery_errors"]) == uncertain,
+                              "Discovery read uncertainty became verified absence")
+                      if uncertain:
+                          require(all(record["pid"] == 701 and record["birth"] == 10
+                                      and record["error"]["type"] == type(error).__name__
+                                      for record in report["discovery_errors"]), "Missing discovery error identity")
+                      unrelated = reap_completed_descendants(700, {}, {}, time.monotonic() + 1)
+                      require(not unrelated["unresolved"] and not unrelated["discovery_errors"],
+                              "Unrelated unread identity authorized completion ownership")
+              raw = "701 (fixture) " + " ".join(["Z", str(os.getpid())] + ["0"] * 17 + ["10"])
+              with mock.patch.object(Path, "glob", side_effect=lambda *args: iter([path])), \
+                   mock.patch.object(Path, "read_text", side_effect=[raw, PermissionError("final stat denied")]), \
+                   mock.patch.object(os, "pidfd_open", side_effect=ProcessLookupError("gone after capture")):
+                  report = reap_completed_descendants(700, {701: 10}, {}, time.monotonic() + 1)
+                  require(report["unresolved"] == [701] and report["discovery_errors"][0]["stage"] == "final",
+                          "Final discovery uncertainty or captured disappearance was lost")
+              for error in (PermissionError("omitted unread identity"), FileNotFoundError("omitted absent identity")):
+                  with mock.patch.object(Path, "glob", return_value=[]), \
+                       mock.patch.object(Path, "read_text", side_effect=error):
+                      report = reap_completed_descendants(700, {701: 10}, {}, time.monotonic() + 1)
+                      require(bool(report["discovery_errors"]) == isinstance(error, PermissionError),
+                              "Omitted tracked identity was not directly verified")
+              print("Completion tracked read/parse errors retained; verified absence and unrelated errors excluded")
+
+          def completion_deadline_fixtures():
+              from types import SimpleNamespace
+              from unittest import mock
+              module = sys.modules[__name__]
+              for stage in ("entry", "after-inspection", "after-wait", "after-final-discovery"):
+                  clock = [12 if stage == "entry" else 10]
+                  scans = [0]
+                  def discover(*args):
+                      scans[0] += 1
+                      if scans[0] == 2:
+                          if stage == "after-final-discovery":
+                              clock[0] = 12
+                          return set()
+                      return {701}
+                  def inspect(*args):
+                      if stage == "after-inspection":
+                          clock[0] = 12
+                      return {"state": "Z"}
+                  def wait(*args):
+                      if stage == "after-wait":
+                          clock[0] = 12
+                      return SimpleNamespace(si_pid=701, si_status=0, si_code=os.CLD_EXITED)
+                  with mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]), \
+                       mock.patch.object(module, "descendants", side_effect=discover), \
+                       mock.patch.object(module, "process_table", return_value={701: (os.getpid(), 10)}), \
+                       mock.patch.object(module, "completion_process", side_effect=inspect), \
+                       mock.patch.object(os, "pidfd_open", return_value=901) as opened, \
+                       mock.patch.object(os, "close") as closed, mock.patch.object(os, "waitid", side_effect=wait) as waited, \
+                       mock.patch.object(signal, "pidfd_send_signal", side_effect=AssertionError("Completion must not signal")), \
+                       mock.patch.object(os, "kill", side_effect=AssertionError("Numeric signal forbidden")), \
+                       mock.patch.object(os, "killpg", side_effect=AssertionError("Group signal forbidden")):
+                      report = reap_completed_descendants(700, {} if stage == "entry" else {701: 10}, {}, 11)
+                      require(report["deadline_exceeded"] == stage and opened.call_count == closed.call_count,
+                              "Completion expiry omitted terminal evidence or leaked handle")
+                      require(waited.call_count == (0 if stage in ("entry", "after-inspection") else 1),
+                              "Expired completion waited or lost actual wait evidence")
+              print("Completion absolute deadline rejects empty entry and inspection/wait/final-discovery overrun")
 
           def completion_fixtures():
               output = Path(os.environ["EVIDENCE_DIR"])
