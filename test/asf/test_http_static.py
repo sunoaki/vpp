@@ -529,7 +529,9 @@ else:
                     protocol in ("tls", "https")
                     and "tlsopenssl" in config.excluded_plugins
                 ):
-                    self.fail("TLS identity coverage requires tlsopenssl")
+                    self.skipTest(
+                        f"{protocol} identity: tlsopenssl explicitly excluded"
+                    )
                 uri = f"{protocol}://10.10.1.2:8085"
                 for repeat in range(2):
                     self.vapi.cli(

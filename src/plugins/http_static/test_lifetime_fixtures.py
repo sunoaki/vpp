@@ -131,6 +131,65 @@ class TestClientWitnesses(unittest.TestCase):
             helper("_refused")(self, 8085)
         self.assertNotIn("curl", run.call_args.args[0])
 
+    def test_uri_identity_reports_explicit_tls_exclusions(self):
+        method = helper("test_http_static_listener_uri_identity")
+        for excluded in ([], ["tlsopenssl"]):
+            with self.subTest(excluded=excluded):
+                method.__globals__["config"] = types.SimpleNamespace(
+                    excluded_plugins=excluded
+                )
+                case_type = type(
+                    "IdentityFixture",
+                    (unittest.TestCase,),
+                    {method.__name__: method},
+                )
+                case = case_type(method.__name__)
+                case.vapi = types.SimpleNamespace(cli=unittest.mock.Mock())
+                case._client = unittest.mock.Mock(return_value=object())
+                case._response = unittest.mock.Mock(return_value={"status": 200})
+                case._stop_client = unittest.mock.Mock()
+                case._refused = unittest.mock.Mock()
+                result = unittest.TestResult()
+                case.run(result)
+                self.assertEqual(result.testsRun, 1)
+                self.assertEqual(result.failures, [])
+                self.assertEqual(result.errors, [])
+                if excluded:
+                    self.assertEqual(len(result.skipped), 2)
+                    for (subtest, reason), protocol in zip(
+                        result.skipped, ("tls", "https")
+                    ):
+                        self.assertIn(f"protocol='{protocol}'", str(subtest))
+                        self.assertEqual(
+                            reason,
+                            f"{protocol} identity: tlsopenssl explicitly excluded",
+                        )
+                else:
+                    self.assertEqual(result.skipped, [])
+                secure_calls = [
+                    call.kwargs["secure"] for call in case._client.call_args_list
+                ]
+                self.assertEqual(
+                    secure_calls, [False] * 4 + ([] if excluded else [True] * 4)
+                )
+                self.assertEqual(case._response.call_count, len(secure_calls))
+                self.assertEqual(case._refused.call_count, len(secure_calls))
+                commands = [call.args[0] for call in case.vapi.cli.call_args_list]
+                protocols = (
+                    ("tcp", "http") if excluded else ("tcp", "http", "tls", "https")
+                )
+                for protocol in protocols:
+                    uri = f"{protocol}://10.10.1.2:8085"
+                    self.assertEqual(
+                        commands.count(
+                            f"http static listener add uri {uri} url-handlers http1-only"
+                        ),
+                        2,
+                    )
+                    self.assertEqual(
+                        commands.count(f"http static listener del uri {uri}"), 2
+                    )
+
 
 class TestDestroyDispatchContract(unittest.TestCase):
     def test_source_uses_persistent_batches_and_cleanup_before_ack(self):
