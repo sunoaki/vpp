@@ -1,0 +1,498 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Temporary FIB and GRE regression controls
+
+on:
+  push:
+    branches: [feat/ci-regression-controls-ff47-october19]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regression-controls-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  control:
+    name: ${{ matrix.feature }} / ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [fib, gre]
+        variant: [fixed, restored]
+    container:
+      image: debian:trixie
+      options: >-
+        --shm-size=2g
+        --cap-add=SYS_ADMIN
+        --cap-add=NET_ADMIN
+        --security-opt=apparmor=unconfined
+        --device-cgroup-rule="c 10:200 rwm"
+        --device-cgroup-rule="c 10:238 rwm"
+    defaults:
+      run:
+        shell: bash
+    env:
+      FEATURE: ${{ matrix.feature }}
+      CONTROL_VARIANT: ${{ matrix.variant }}
+      WORKFLOW_SHA: ${{ github.sha }}
+      FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
+      FIB_SHA: 564b0e46466adca2acb55acea5f3cc9f25562338
+      GRE_SHA: 7213fd05cc7ec99403ac31d029ad272425cb35d5
+      CONTROL_DIR: ${{ runner.temp }}/regression-control
+      EVIDENCE_DIR: ${{ runner.temp }}/regression-evidence
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: ${{ github.workspace }}
+    steps:
+      - name: Install base tools
+        run: |
+          rm -f /etc/apt/apt.conf.d/docker-clean
+          apt-get update -qq
+          apt-get install -y -qq sudo make git bash iproute2 python3
+
+      - name: Check out the workflow commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Prepare immutable source and evidence tools
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$PWD"
+          mkdir -p "$CONTROL_DIR" "$EVIDENCE_DIR"
+          cp .github/workflows/regression-control.yml "$EVIDENCE_DIR/workflow.yml"
+          cat > "$CONTROL_DIR/sitecustomize.py" <<'PY'
+          import json
+          import os
+          import traceback
+          import unittest
+          from pathlib import Path
+
+          output = os.environ.get("CONTROL_EVENTS")
+          if output:
+              def emit(record):
+                  record["pid"] = os.getpid()
+                  path = Path(output)
+                  if path.exists() and path.stat().st_size > 4 * 1024 * 1024:
+                      raise RuntimeError("Observer exceeded 4 MiB event limit")
+                  with path.open("a") as stream:
+                      stream.write(json.dumps(record, sort_keys=True) + "\n")
+
+              original_subtest = unittest.TestResult.addSubTest
+              original_start = unittest.TestResult.startTest
+
+              def observe(self, test, subtest, err):
+                  emit({"kind": "subtest", "test": test.id(),
+                        "params": dict(subtest.params),
+                        "error": None if err is None else err[0].__name__,
+                        "traceback": "" if err is None else
+                        "".join(traceback.format_exception(*err))})
+                  return original_subtest(self, test, subtest, err)
+
+              def start(self, test):
+                  emit({"kind": "start", "test": test.id()})
+                  return original_start(self, test)
+
+              unittest.TestResult.addSubTest = observe
+              unittest.TestResult.startTest = start
+              emit({"kind": "loaded"})
+          PY
+          cat > "$CONTROL_DIR/validate.py" <<'PY'
+          import collections
+          import json
+          import re
+
+          METHODS = ["test_gre_header_copy_4o4", "test_gre_header_copy_6o4",
+                     "test_gre_header_copy_4o6", "test_gre_header_copy_6o6",
+                     "test_mgre_header_copy_with_key"]
+          CALLBACK = re.compile(r"--- (add\w+)\(\) ([\w]+)\.([\w]+)\(")
+
+          def require(condition, message):
+              if not condition:
+                  raise AssertionError(message)
+
+          def validate(feature, variant, selector, rc, console, logs, events, expected, stderr=""):
+              callbacks = CALLBACK.findall(logs)
+              require(callbacks or feature == "gre" and variant == "restored",
+                      "Missing framework result callbacks")
+              require(not any(callback in ("addError", "addSkip", "addExpectedFailure",
+                                           "addUnexpectedSuccess")
+                              for callback, _, _ in callbacks), "Invalid result callback")
+              require(not re.search(r"(?:^|\n)(?:ERROR|SKIP):|FAILED \([^\n]*errors=|"
+                                    r"OK \(skipped=|SIGSEGV|segmentation fault|"
+                                    r"Core was generated|timed out|TimeoutError", console,
+                                    re.IGNORECASE), "Infrastructure error or skipped test")
+              require(re.search(r"Ran [1-9][0-9]* tests? in ", console),
+                      "Missing completed unittest summary")
+              loaded = [event["pid"] for event in events if event["kind"] == "loaded"]
+              starts = [event for event in events if event["kind"] == "start"]
+              subtests = [event for event in events if event["kind"] == "subtest"]
+              require(loaded and len(set(loaded)) == len(loaded),
+                      "Missing or duplicate observer load records")
+              require(all(event["pid"] in loaded for event in starts + subtests),
+                      "Test process did not load observer")
+              require(collections.Counter(event["test"] for event in starts) ==
+                      collections.Counter(f"test_{feature}.{cls}.{method}" for cls, method in expected),
+                      "Missing, duplicate, or unexpected test starts")
+              require(all(any(start["pid"] == event["pid"] and start["test"] == event["test"]
+                              for start in starts) for event in subtests),
+                      "Subtest without observed test start")
+              actual = [(cls, method) for callback, cls, method in callbacks
+                        if callback == "addSuccess"]
+              if variant == "fixed":
+                  require(rc == 0, f"Fixed command failed: {rc}")
+                  require(collections.Counter(actual) == collections.Counter(expected),
+                          f"Missing/duplicate/unexpected successes: {actual}, expected {expected}")
+                  require(all(callback == "addSuccess" for callback, _, _ in callbacks),
+                          "Fixed run has a failure")
+                  require(not any(event["error"] for event in subtests),
+                          "Fixed run has a subtest failure")
+                  require(not re.search(r"\bFAIL:[0-9]+:", logs), "C assertion failed")
+              else:
+                  require(rc != 0, "Restored source unexpectedly passed")
+                  require(re.search(r"FAILED \(failures=[1-9][0-9]*\)", console),
+                          "Expected completed assertion-only failure summary")
+                  require(not actual, "Restored exact method unexpectedly succeeded")
+              if feature == "fib":
+                  if variant == "restored":
+                      require(callbacks == [("addFailure", "TestFIB", "test_fib")],
+                              f"Unexpected FIB outcomes: {callbacks}")
+                      markers = re.findall(r"(?m)^FAIL:[0-9]+: [^\n]*", stderr)
+                      require(markers and markers[0] ==
+                              "FAIL:5700: incremental add creates import delegate",
+                              f"Wrong first FIB assertion: {markers[:1]}")
+                      require(markers.count("FAIL:5700: incremental add creates import delegate") == 1,
+                              "Missing or duplicate intended FIB assertion")
+                      require("self.assertNotIn(\"Failed\", error)" in logs and
+                              "AssertionError:" in logs and "FIB Unit Test Failed" in logs,
+                              "FIB did not finish through unchanged Python assertion")
+                  return
+              selected = METHODS if selector == "gre" else [selector.rsplit(".", 1)[1]]
+              for method in selected:
+                  records = [event for event in subtests
+                             if event["test"] == f"test_gre.TestGRE.{method}"]
+                  require(records, f"No subtest evidence for {method}")
+                  identities = [(event["pid"], tuple(sorted(event["params"].items())))
+                                for event in records]
+                  require(len(set(identities)) == len(identities), "Duplicate subtest records")
+                  if variant == "fixed":
+                      if method == "test_mgre_header_copy_with_key":
+                          parameters = [{"count": count} for count in (1, 65)]
+                      else:
+                          combined = 77 if method.endswith("4o4") else (
+                              204 if method.endswith("6o6") else 76)
+                          parameters = []
+                          for key in (0, 268370692):
+                              for flags in (0, 4, 8, 64, combined):
+                                  parameters.append({"key": key, "flags": flags})
+                                  parameters.extend({"key": key, "flags": flags, "count": count}
+                                                    for count in (1, 65))
+                      require(collections.Counter(json.dumps(event["params"], sort_keys=True)
+                                                  for event in records) ==
+                              collections.Counter(json.dumps(params, sort_keys=True)
+                                                  for params in parameters),
+                              f"Incomplete parameter coverage for {method}")
+                  else:
+                      failures = [event for event in records if event["error"]]
+                      require(failures and all(event["error"] == "AssertionError"
+                                              for event in failures),
+                              "Restored GRE has non-assertion errors")
+                      require(all("verify_gre_header_copy" in event["traceback"]
+                                  for event in failures), "Unexpected GRE assertion location")
+                      require(not callbacks, f"Unexpected restored GRE callbacks: {callbacks}")
+                      first = failures[0]
+                      mgre = method == "test_mgre_header_copy_with_key"
+                      params = {"count": 1} if mgre else {
+                          "key": 268370692, "flags": 4, "count": 1}
+                      expression = "self.assertEqual(outer.tc, expected_tc)" if (
+                          method.endswith("4o6") or method.endswith("6o6")) else (
+                          "self.assertEqual(outer.tos, expected_tc)")
+                      values = "AssertionError: 255 != 21" if mgre else "AssertionError: 252 != 20"
+                      require(first["params"] == params and expression in first["traceback"]
+                              and values in first["traceback"],
+                              f"Wrong first packet assertion: {first}")
+          PY
+          cat > "$CONTROL_DIR/collect.py" <<'PY'
+          import os
+          import stat
+          from pathlib import Path
+
+          def collect(destination):
+              destination.mkdir(parents=True, exist_ok=True)
+              report = ["Limits per invocation: 24 MiB total, 2 MiB/file, 200 files; "
+                        "text tails retained; oversized binary files skipped; no symlinks."]
+              candidates = []
+              for root in [*sorted(Path("/tmp").glob("vpp-unittest-*")),
+                           Path("/tmp/vpp-failed-unittests"), Path("build-root/test-logs")]:
+                  if root.is_symlink() or not root.is_dir():
+                      continue
+                  for directory, subdirs, names in os.walk(root, followlinks=False):
+                      subdirs[:] = sorted(name for name in subdirs
+                                          if not (Path(directory) / name).is_symlink())
+                      for name in sorted(names):
+                          source = Path(directory) / name
+                          if source.suffix not in (".txt", ".log", ".pcap", ".pcapng"):
+                              continue
+                          if not stat.S_ISREG(source.lstat().st_mode):
+                              continue
+                          binary = source.suffix in (".pcap", ".pcapng")
+                          priority = 0 if name in ("log.txt", "vpp_stderr.txt") else 1
+                          candidates.append((binary, priority, source))
+              remaining = 24 * 1024 * 1024
+              count = 0
+              for binary, _, source in sorted(candidates):
+                  if count >= 200:
+                      report.append("Stopped at 200-file limit")
+                      break
+                  fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                  with os.fdopen(fd, "rb") as reader:
+                      info = os.fstat(reader.fileno())
+                      if not stat.S_ISREG(info.st_mode):
+                          continue
+                      size = info.st_size
+                      length = min(size, 2 * 1024 * 1024)
+                      if length > remaining or binary and size > length:
+                          if len(report) < 1000:
+                              report.append(f"SKIP {str(source)[:500]!r}: {size} bytes")
+                          continue
+                      target = destination / f"{count:04d}{source.suffix}"
+                      reader.seek(size - length)
+                      target.write_bytes(reader.read(length))
+                  report.append(f"{str(source)[:500]!r} -> {target.name}: {length}/{size} bytes")
+                  count += 1
+                  remaining -= length
+              (destination / "collection.txt").write_text("\n".join(report) + "\n")
+          PY
+          cat > "$CONTROL_DIR/run.py" <<'PY'
+          import ast
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          from pathlib import Path
+          from collect import collect
+          from validate import METHODS, validate
+
+          output = Path(os.environ["EVIDENCE_DIR"])
+          tools = Path(os.environ["CONTROL_DIR"])
+          feature, variant = os.environ["FEATURE"], os.environ["CONTROL_VARIANT"]
+          candidate = os.environ["FIB_SHA" if feature == "fib" else "GRE_SHA"]
+          frozen = os.environ["FROZEN_SHA"]
+          source = "src/vnet/fib/fib_entry.c" if feature == "fib" else "src/plugins/gre/gre.c"
+          tests = (["src/plugins/unittest/fib_test.c", "test/asf/test_fib.py"]
+                   if feature == "fib" else ["test/test_gre.py"])
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          def blob(ref, path):
+              return git("rev-parse", f"{ref}:{path}")
+
+          def command(label, args, env=None):
+              directory = output / label
+              directory.mkdir()
+              result = {"command": args, "start": time.time(), "rc": None}
+              result_path = directory / "result.json"
+              result_path.write_text(json.dumps(result, indent=2))
+              process = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, env=env)
+              tail = bytearray()
+              with (directory / "console.log").open("w+b") as stream:
+                  for chunk in iter(lambda: process.stdout.read1(65536), b""):
+                      print(chunk.decode(errors="replace"), end="", flush=True)
+                      tail.extend(chunk)
+                      if len(tail) > 8 * 1024 * 1024:
+                          del tail[:-8 * 1024 * 1024]
+                          stream.seek(0)
+                          stream.write(tail)
+                          stream.truncate()
+                      else:
+                          stream.write(chunk)
+                      stream.flush()
+              rc = process.wait()
+              result.update(rc=rc, end=time.time())
+              result_path.write_text(json.dumps(result, indent=2))
+              return directory, rc, tail.decode(errors="replace")
+
+          def prepare():
+              workflow_sha = os.environ["WORKFLOW_SHA"]
+              assert git("rev-parse", "HEAD") == workflow_sha
+              manifest = {"workflow_sha": workflow_sha, "candidate_sha": candidate,
+                          "frozen_sha": frozen, "feature": feature, "variant": variant,
+                          "candidate_tree": git("rev-parse", f"{candidate}^{{tree}}"),
+                          "workflow_blob": blob(workflow_sha, ".github/workflows/regression-control.yml"),
+                          "run_id": os.environ["GITHUB_RUN_ID"],
+                          "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                          "job": os.environ["GITHUB_JOB"], "tests": {},
+                          "run_url": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+                                     f"/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+                          "artifact_name": f"regression-{feature}-{variant}-"
+                                           f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
+                          "expected_failure": ("FAIL:5700: incremental add creates import delegate"
+                                               if feature == "fib" else
+                                               "key=268370692 flags=4 count=1: outer.tos/tc 252 != 20; "
+                                               "mGRE count=1: outer.tos 255 != 21"),
+                          "tool_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                                          for path in sorted(tools.glob("*.py"))}}
+              subprocess.run(["git", "checkout", "--detach", candidate], check=True)
+              assert not git("status", "--porcelain", "--untracked-files=all")
+              assert not Path("build-root/build-vpp_debug-native").exists()
+              assert not Path("build-root/install-vpp_debug-native").exists()
+              if variant == "restored":
+                  with Path(source).open("wb") as stream:
+                      subprocess.run(["git", "show", f"{frozen}:{source}"], stdout=stream, check=True)
+              expected_source = blob(frozen if variant == "restored" else candidate, source)
+              assert git("hash-object", source) == expected_source
+              changed = git("diff", "--name-only").splitlines()
+              assert changed == ([source] if variant == "restored" else [])
+              for path in tests:
+                  current = git("hash-object", path)
+                  assert current == blob(candidate, path)
+                  manifest["tests"][path] = current
+              manifest["source"] = {"path": source, "candidate_blob": blob(candidate, source),
+                                    "frozen_blob": blob(frozen, source), "built_blob": expected_source}
+              # A temporary index identifies the exact restored tree without changing HEAD.
+              index = tools / "tree-index"
+              index_env = dict(os.environ, GIT_INDEX_FILE=str(index))
+              subprocess.run(["git", "read-tree", candidate], env=index_env, check=True)
+              subprocess.run(["git", "add", source], env=index_env, check=True)
+              manifest["built_tree"] = subprocess.check_output(
+                  ["git", "write-tree"], env=index_env, text=True).strip()
+              (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+              (output / "restoration.diff").write_text(git("diff", "--", source) + "\n")
+              (output / "expected-source").write_text(expected_source)
+
+          def run_tests():
+              assert git("hash-object", source) == (output / "expected-source").read_text()
+              assert all(git("hash-object", path) == blob(candidate, path) for path in tests)
+              module = Path(tests[-1])
+              tree = ast.parse(module.read_text())
+              all_methods = [(cls.name, method.name) for cls in tree.body
+                             if isinstance(cls, ast.ClassDef) for method in cls.body
+                             if isinstance(method, ast.FunctionDef) and method.name.startswith("test_")]
+              exact = (["fib.TestFIB.test_fib"] if feature == "fib" else
+                       [f"gre.TestGRE.{method}" for method in METHODS])
+              selectors = ([feature] if variant == "fixed" else []) + exact
+              errors = []
+              for number, selector in enumerate(selectors):
+                  label = f"test-{number:02d}-{selector}"
+                  events_path = output / f"{label}-events.jsonl"
+                  environment = dict(os.environ, CONTROL_EVENTS=str(events_path),
+                                     PYTHONPATH=str(tools) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+                  args = ["make", "UNATTENDED=yes", "TEST_JOBS=1", "FORCE_FOREGROUND=1",
+                          "VPP_WORKER_COUNT=0", "RETRIES=0", "FAILFAST=0", "SKIP_TESTS=",
+                          "COREDUMP_SIZE=0", "DECODE_PCAPS=none", "RND_SEED=47", f"TEST={selector}",
+                          "test-debug"]
+                  directory, rc, console = command(label, args, environment)
+                  # Snapshot before the next make test-dep resets /tmp/vpp-unittest-*.
+                  collect(directory / "diagnostics")
+                  log_paths = sorted(Path("/tmp").glob("vpp-unittest-*/log.txt"))
+                  stderr_paths = sorted(Path("/tmp").glob("vpp-unittest-*/vpp_stderr.txt"))
+                  logs = "\n".join(path.read_text(errors="replace") for path in log_paths
+                                   if path.is_file() and not path.is_symlink())
+                  stderr = "\n".join(path.read_text(errors="replace") for path in stderr_paths
+                                     if path.is_file() and not path.is_symlink())
+                  expected = all_methods if selector == feature else [tuple(selector.split(".")[1:])]
+                  try:
+                      events = [json.loads(line) for line in events_path.read_text().splitlines()]
+                      validate(feature, variant, selector, rc, console, logs, events, expected, stderr)
+                  except (AssertionError, OSError, ValueError) as error:
+                      errors.append(f"{selector}: {error}")
+                      (directory / "validation.txt").write_text(f"FAIL: {error}\n")
+                  else:
+                      (directory / "validation.txt").write_text("PASS\n")
+              if errors:
+                  raise AssertionError("\n".join(errors))
+
+          if __name__ == "__main__":
+              import sys
+              if sys.argv[1] == "prepare":
+                  prepare()
+              elif sys.argv[1] == "tests":
+                  run_tests()
+              else:
+                  _, status, _ = command(sys.argv[1], sys.argv[2:])
+                  raise SystemExit(status)
+          PY
+          python3 "$CONTROL_DIR/run.py" prepare
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          python3 "$CONTROL_DIR/run.py" dependencies make UNATTENDED=yes install-dep
+
+      - name: Supply version if no release tag is reachable
+        run: |
+          set -euo pipefail
+          if ! git describe --long --match 'v[0-9]*' 2>/dev/null; then
+            echo "0.0.0-release+$(git log -1 --format=%ct).$(git rev-list --count HEAD)-g$(git rev-parse --short=7 HEAD)" \
+              > src/scripts/.version
+          fi
+          if [ -f src/scripts/.version ]; then
+            cp src/scripts/.version "$EVIDENCE_DIR/version.txt"
+          fi
+
+      - name: Build this variant independently
+        run: |
+          set -euo pipefail
+          python3 "$CONTROL_DIR/run.py" build make UNATTENDED=yes build
+
+      - name: Set up test runtime
+        uses: ./.github/actions/vpp-docker-runtime-setup
+        with:
+          WORKSPACE: ${{ github.workspace }}
+          SHM_SIZE: 2G
+          LOG_DIR: ${{ runner.temp }}/regression-evidence/runtime
+
+      - name: Run full fixed suites and exact assertion controls
+        run: |
+          set -euo pipefail
+          mountpoint /dev/shm
+          test "$(df -B1 --output=size /dev/shm | tail -n 1)" -ge 2147483648
+          python3 "$CONTROL_DIR/run.py" tests
+
+      - name: Retain final diagnostics and tool provenance
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          if [ -d "$CONTROL_DIR" ]; then
+            cp "$CONTROL_DIR/"*.py "$EVIDENCE_DIR/"
+          fi
+          if [ -f "$CONTROL_DIR/collect.py" ]; then
+            python3 - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, os.environ["CONTROL_DIR"])
+          from collect import collect
+          collect(Path(os.environ["EVIDENCE_DIR"]) / "final-diagnostics")
+          PY
+          fi
+
+      - name: Upload bounded control evidence
+        id: evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-${{ matrix.feature }}-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/regression-evidence/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 6
+
+      - name: Record artifact identity
+        if: always()
+        env:
+          ARTIFACT_ID: ${{ steps.evidence.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.evidence.outputs.artifact-url }}
+        run: |
+          printf 'Artifact ID: %s\nArtifact URL: %s\n' "$ARTIFACT_ID" "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
