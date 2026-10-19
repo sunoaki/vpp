@@ -47,12 +47,41 @@ jobs:
       GIT_CONFIG_VALUE_0: ${{ github.workspace }}
     steps:
       - name: Install base tools
+        id: bootstrap
         timeout-minutes: 6
         run: |
           set -euo pipefail
-          printf 'TOOLS=%s/hss-tools\nEVIDENCE=%s/hss-evidence\nWORK_DEADLINE=%s\n' \
-            "$RUNNER_TEMP" "$RUNNER_TEMP" "$(( $(date +%s) + 4800 ))" >> "$GITHUB_ENV"
-          mkdir -p "$RUNNER_TEMP/hss-tools" "$RUNNER_TEMP/hss-evidence"
+          export TOOLS="$RUNNER_TEMP/hss-tools" EVIDENCE="$RUNNER_TEMP/hss-evidence"
+          export WORK_DEADLINE="$(( $(date +%s) + 4800 ))"
+          mkdir -p "$TOOLS" "$EVIDENCE"
+          printf 'TOOLS=%s\nEVIDENCE=%s\nWORK_DEADLINE=%s\n' \
+            "$TOOLS" "$EVIDENCE" "$WORK_DEADLINE" >> "$GITHUB_ENV"
+          cat > "$EVIDENCE/manifest.json" <<JSON
+          {"workflow_sha":"$WORKFLOW_SHA","candidate_sha":"$CANDIDATE_SHA","frozen_sha":"$FROZEN_SHA",
+           "variant":"$VARIANT_NAME","run_id":"$GITHUB_RUN_ID","attempt":"$GITHUB_RUN_ATTEMPT",
+           "work_deadline":$WORK_DEADLINE,"status":"before_bootstrap",
+           "workflow_blob":null,"candidate_tree":null,"tools":null,
+           "unavailable_reason":"Bootstrap/checkout has not completed; hashes unavailable",
+           "source":{"path":"src/plugins/http_static/$(if [ "$VARIANT_NAME" = original-endpoint ]; then printf static_server.c; else printf http_static.c; fi)","candidate_blob":null,"frozen_blob":null},
+           "tests":{"test/asf/test_http_static.py":{"blob":null,"sha256":null},"src/plugins/http_static/test_lifetime_fixtures.py":{"blob":null,"sha256":null}}}
+          JSON
+          printf '%s\n' bootstrap checkout prepare dependencies feature-list pinned-python black-version \
+            fixture-python-style fixtures mutate fallback-version build binaries namespace environment runtime tests collect \
+            > "$EVIDENCE/planned-phases.txt"
+          for commit in 616ce15c0097bd129046531c0cfd21388613b265 27610f085ae248b73ce4d3a8d0a1c50f037ecea4 \
+            7238418f29a30398522a3f980094a5a8aa35ba49 bec8c9a5beefb18c1ffced34f68dc04eb5cd7138 \
+            aac52ac812709644cb539295b33c76cdef1f75e3; do
+            printf 'style-%s\napi-%s\nmessage-%s\n' "$commit" "$commit" "$commit" >> "$EVIDENCE/planned-phases.txt"
+          done
+          {
+            printf '{\n'
+            separator=''
+            while IFS= read -r phase; do
+              printf '%s"%s":{"status":"not_run","rc":null}' "$separator" "$phase"
+              separator=','
+            done < "$EVIDENCE/planned-phases.txt"
+            printf '\n}\n'
+          } > "$EVIDENCE/phase-status.json"
           rm -f /etc/apt/apt.conf.d/docker-clean
           rc=0
           timeout --signal=TERM --kill-after=5s 300s bash -euo pipefail -c \
@@ -60,11 +89,14 @@ jobs:
             > "$RUNNER_TEMP/hss-evidence/bootstrap.log" 2>&1 || rc=$?
           printf 'command=apt-get update/install\nlimit_seconds=300\nrc=%s\n' "$rc" \
             > "$RUNNER_TEMP/hss-evidence/bootstrap-status.txt"
+          printf '{"status":"completed","rc":%s,"limit_seconds":300}\n' "$rc" \
+            > "$EVIDENCE/bootstrap-result.json"
           tail -c 8388608 "$RUNNER_TEMP/hss-evidence/bootstrap.log" > "$RUNNER_TEMP/hss-evidence/bootstrap-tail.log"
           mv "$RUNNER_TEMP/hss-evidence/bootstrap-tail.log" "$RUNNER_TEMP/hss-evidence/bootstrap.log"
           exit "$rc"
 
       - name: Check out exact workflow
+        id: checkout
         timeout-minutes: 5
         uses: actions/checkout@v4
         with:
@@ -224,8 +256,13 @@ jobs:
           def digest(path):
               return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
+          def publish(path, value):
+              temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+              temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+              os.replace(temporary, path)
+
           def save(name, value):
-              (OUT / name).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+              publish(OUT / name, value)
 
           def capture(process, deadline, stream):
               tail = bytearray()
@@ -253,52 +290,44 @@ jobs:
                           stream.flush()
               return tail, timed_out
 
-          def descendants():
-              records = {}
-              for path in Path("/proc").glob("[0-9]*/stat"):
-                  try:
-                      fields = path.read_text().rsplit(") ", 1)[1].split()
-                      records[int(path.parent.name)] = (int(fields[1]), fields[19], fields[0])
-                  except (OSError, ValueError, IndexError):
-                      continue
-              owned = {os.getpid()}
-              while True:
-                  children = {pid for pid, (parent, _, _) in records.items() if parent in owned}
-                  if children <= owned:
-                      break
-                  owned.update(children)
-              return {pid: records[pid] for pid in owned if pid != os.getpid()}
+          def children():
+              path = Path(f"/proc/self/task/{os.getpid()}/children")
+              return [int(pid) for pid in path.read_text().split()]
 
-          def signal_descendants(sig):
-              for pid, (_, started, state) in descendants().items():
-                  if state == "Z":
-                      continue
-                  descriptor = None
-                  try:
-                      descriptor = os.pidfd_open(pid)
-                      fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
-                      if fields[19] == started:
-                          signal.pidfd_send_signal(descriptor, sig)
-                  except (ProcessLookupError, FileNotFoundError):
-                      pass
-                  finally:
-                      if descriptor is not None:
-                          os.close(descriptor)
+          def owned_child(pid):
+              descriptor = os.pidfd_open(pid)
+              try:
+                  fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+                  require(int(fields[1]) == os.getpid(), "Child ownership changed")
+                  os.waitid(os.P_PIDFD, descriptor, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                  return descriptor
+              except BaseException:
+                  os.close(descriptor)
+                  raise
 
           def cleanup(process, grace):
               for sig in (signal.SIGTERM, signal.SIGKILL):
                   stop = time.monotonic() + grace
                   while time.monotonic() < stop:
-                      signal_descendants(sig)
                       process.poll()
-                      for pid in descendants():
-                          if pid == process.pid:
-                              continue
+                      for pid in children():
+                          descriptor = None
                           try:
-                              os.waitpid(pid, os.WNOHANG)
-                          except ChildProcessError:
+                              descriptor = owned_child(pid)
+                              exited = os.waitid(os.P_PIDFD, descriptor,
+                                                 os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                              if exited is None:
+                                  signal.pidfd_send_signal(descriptor, sig)
+                              elif pid == process.pid and process.returncode is None:
+                                  process.poll()
+                              else:
+                                  os.waitid(os.P_PIDFD, descriptor, os.WEXITED | os.WNOHANG)
+                          except (ProcessLookupError, FileNotFoundError, ChildProcessError, AssertionError):
                               pass
-                      if not descendants():
+                          finally:
+                              if descriptor is not None:
+                                  os.close(descriptor)
+                      if not children():
                           return True
                       time.sleep(min(0.05, max(0, stop - time.monotonic())))
               return False
@@ -309,13 +338,18 @@ jobs:
               started = time.time()
               work_deadline = float(os.environ["WORK_DEADLINE"])
               phase_seconds = 1500 if label == "dependencies" else 2400 if label == "build" else (
-                  900 if label == "runtime" else 120 if label in ("environment", "fixtures") else 600)
+                  960 if label == "tests" else 900 if label == "runtime" else
+                  120 if label in ("environment", "fixtures") else 600)
               seconds = min(phase_seconds, max(0, work_deadline - started))
+              identity = f"{os.getpid()}-{time.time_ns()}"
+              ancestors = json.loads(os.environ.get("HSS_COMMAND_ANCESTORS", "[]"))
               result = dict(command=args, cwd=str(ROOT), start=started, rc=None, status="running",
                             command_limit_seconds=phase_seconds, work_deadline=work_deadline,
-                            allowed_seconds=seconds)
+                            allowed_seconds=seconds, identity=identity, ancestors=ancestors)
+              child_env = dict(os.environ if env is None else env,
+                               HSS_COMMAND_ANCESTORS=json.dumps(ancestors + [identity]))
               result_path = directory / "result.json"
-              result_path.write_text(json.dumps(result, indent=2) + "\n")
+              publish(result_path, result)
               tail = bytearray()
               process = None
               try:
@@ -328,9 +362,9 @@ jobs:
                               raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER failed")
                           deadline = time.monotonic() + seconds
                           process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                                     env=env, start_new_session=True)
+                                                     env=child_env, start_new_session=True)
                           result["pid"] = process.pid
-                          result_path.write_text(json.dumps(result, indent=2) + "\n")
+                          publish(result_path, result)
                           tail, timed_out = capture(process, deadline, stream)
                           result["cleanup_complete"] = cleanup(process, 2)
                           result.update(child_rc=process.returncode,
@@ -359,14 +393,45 @@ jobs:
                       result.update(rc=125, status="cleanup_error", error=str(error))
                   finally:
                       result.update(end=time.time(), retained_bytes=len(tail))
-                      result_path.write_text(json.dumps(result, indent=2) + "\n")
+                      publish(result_path, result)
+              if result.get("cleanup_complete") and result["status"] != "completed":
+                  record_interruptions(result, result_path)
               print(f"{label}: {result['status']}, rc={result['rc']}; raw log: {directory / 'console.log'}", flush=True)
               return result["rc"], tail.decode(errors="replace")
 
+          def record_interruptions(parent, parent_path):
+              count = 0
+              for path in OUT.glob("*/result.json"):
+                  count += 1
+                  require(count <= 1000, "Too many command records")
+                  require(not path.is_symlink() and path.stat().st_size <= 1024 * 1024,
+                          "Invalid command record")
+                  raw = path.read_bytes()
+                  try:
+                      child = json.loads(raw)
+                  except (json.JSONDecodeError, UnicodeDecodeError):
+                      save(str(path.parent.relative_to(OUT) / "invalid-result.json"), dict(
+                          status="invalid_record", raw_sha256=hashlib.sha256(raw).hexdigest(),
+                          parent=str(parent_path.relative_to(OUT)), rc=None))
+                      continue
+                  if parent["identity"] not in child.get("ancestors", []) or child.get("status") != "running":
+                      continue
+                  save(str(path.parent.relative_to(OUT) / "interruption.json"), dict(
+                      status="interrupted_by_parent", rc=None, cleanup_complete=None,
+                      observed_at=time.time(), parent=str(parent_path.relative_to(OUT)),
+                      parent_identity=parent["identity"], raw_sha256=hashlib.sha256(raw).hexdigest(),
+                      reason="Child exit status and local cleanup unknown; see parent cleanup result"))
+
           def prepare():
               workflow = os.environ["WORKFLOW_SHA"]
-              save("manifest.json", dict(workflow_sha=workflow, candidate_sha=CANDIDATE,
-                                         frozen_sha=FROZEN, variant=VARIANT, status="preparing"))
+              initial = json.loads((OUT / "manifest.json").read_text())
+              initial["status"] = "preparing"
+              save("manifest.json", initial)
+              planned = (OUT / "planned-phases.txt").read_text().splitlines()
+              commits = git("rev-list", "--reverse", "--no-merges", f"{FROZEN}..{CANDIDATE}").splitlines()
+              require([name for name in planned if name.startswith(("style-", "api-", "message-"))] ==
+                      [f"{kind}-{commit}" for commit in commits for kind in ("style", "api", "message")],
+                      "Planned commit checks differ from immutable history")
               manifest = dict(workflow_sha=workflow, candidate_sha=CANDIDATE, frozen_sha=FROZEN,
                               workflow_blob=git("rev-parse", f"{workflow}:.github/workflows/hss-regression-control.yml"),
                               candidate_tree=git("rev-parse", f"{CANDIDATE}^{{tree}}"), variant=VARIANT,
@@ -431,42 +496,84 @@ jobs:
               save("manifest.json", manifest)
               (OUT / "restoration.diff").write_text(git("diff", "--", SOURCE) + "\n")
 
+          def work_remaining():
+              seconds = float(os.environ["WORK_DEADLINE"]) - time.time()
+              if seconds <= 0:
+                  raise TimeoutError("Absolute work deadline exceeded")
+              return seconds
+
+          def bounded_paths(root, recursive=True, limit=4000):
+              pending, visited = [Path(root)], 0
+              while pending:
+                  work_remaining()
+                  with os.scandir(pending.pop()) as entries:
+                      for entry in entries:
+                          work_remaining()
+                          visited += 1
+                          require(visited <= limit, "Evidence traversal limit exceeded")
+                          if entry.is_symlink():
+                              continue
+                          if recursive and entry.is_dir(follow_symlinks=False):
+                              pending.append(Path(entry.path))
+                          elif entry.is_file(follow_symlinks=False):
+                              yield Path(entry.path)
+                          elif not recursive and entry.is_dir(follow_symlinks=False):
+                              yield Path(entry.path)
+
+          def runtime_roots():
+              return [path for path in bounded_paths("/tmp", recursive=False)
+                      if path.name.startswith("vpp-unittest-") and path.is_dir()]
+
+          def read_evidence(paths, limit=32 * 1024 * 1024):
+              data, remaining = [], limit
+              for path in paths:
+                  work_remaining()
+                  require(not path.is_symlink(), "Symlink evidence rejected")
+                  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                  with os.fdopen(fd, "rb") as stream:
+                      require(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), "Nonregular evidence")
+                      raw = stream.read(remaining + 1)
+                  require(len(raw) <= remaining, "Evidence input limit exceeded; refusing partial validation")
+                  remaining -= len(raw)
+                  data.append(raw.decode(errors="replace"))
+              work_remaining()
+              return "\n".join(data)
+
           def collect(destination):
               destination.mkdir(parents=True, exist_ok=True)
-              report, remaining, count = [], 32 * 1024 * 1024, 0
-              for root in sorted(Path("/tmp").glob("vpp-unittest-*")) + [Path("build-root/test-logs")]:
-                  if root.is_symlink() or not root.is_dir():
-                      continue
-                  for directory, subdirs, names in os.walk(root, followlinks=False):
-                      subdirs[:] = sorted(name for name in subdirs if not (Path(directory) / name).is_symlink())
-                      for name in sorted(names):
-                          source = Path(directory) / name
+              report, remaining, count, complete = [], 32 * 1024 * 1024, 0, False
+              try:
+                  roots = runtime_roots() + [Path("build-root/test-logs")]
+                  for root in roots:
+                      if root.is_symlink() or not root.is_dir():
+                          continue
+                      for source in bounded_paths(root):
+                          work_remaining()
+                          require(count < 300 and remaining > 0, "Diagnostic file/byte cap reached")
                           if source.suffix not in (".txt", ".log", ".pcap", ".pcapng"):
                               continue
-                          if count >= 300:
-                              continue
-                          try:
-                              if not stat.S_ISREG(source.lstat().st_mode):
+                          fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                          with os.fdopen(fd, "rb") as reader:
+                              info = os.fstat(reader.fileno())
+                              if not stat.S_ISREG(info.st_mode):
                                   continue
-                              fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-                              with os.fdopen(fd, "rb") as reader:
-                                  info = os.fstat(reader.fileno())
-                                  if not stat.S_ISREG(info.st_mode):
-                                      continue
-                                  length = min(info.st_size, 2 * 1024 * 1024)
-                                  if length > remaining or source.suffix in (".pcap", ".pcapng") and length < info.st_size:
-                                      continue
-                                  reader.seek(info.st_size - length)
-                                  target = destination / f"{count:04d}{source.suffix}"
-                                  target.write_bytes(reader.read(length))
-                          except OSError as error:
-                              if len(report) < 600:
-                                  report.append(f"SKIP {str(source)[:500]}: {error}")
-                              continue
-                          report.append(f"{source} -> {target.name}: {length}/{info.st_size}")
+                              length = min(info.st_size, 2 * 1024 * 1024)
+                              require(length <= remaining, "Diagnostic byte cap reached")
+                              require(source.suffix not in (".pcap", ".pcapng") or length == info.st_size,
+                                      "Packet capture exceeds whole-file limit")
+                              reader.seek(info.st_size - length)
+                              raw = reader.read(length)
+                              require(len(raw) == length, "Diagnostic file changed while reading")
+                              (destination / f"{count:04d}{source.suffix}").write_bytes(raw)
+                          report.append(f"{source}: {length}/{info.st_size}")
                           remaining -= length
                           count += 1
-              (destination / "collection.txt").write_text("Limits: 32 MiB; 2 MiB/file; 300 files; text tails; no symlinks.\n" + "\n".join(report))
+                  complete = True
+              finally:
+                  (destination / "collection.json").write_text(json.dumps(dict(
+                      complete=complete, files=count, bytes=32 * 1024 * 1024 - remaining,
+                      limits="4000 entries/root; 300 files; 32 MiB; 2 MiB/file; text tails",
+                      report=report), indent=2) + "\n")
 
           def expected_ids():
               tree = ast.parse(Path(TEST).read_text())
@@ -587,12 +694,13 @@ jobs:
                       "COREDUMP_SIZE=0", "DECODE_PCAPS=none", "RND_SEED=48", f"TEST={selector}", "test-debug"]
               rc, console = command("runtime", args, env)
               collect(OUT / "runtime" / "diagnostics")
-              events = [json.loads(line) for path in sorted(OUT.glob("events.*.jsonl"))
-                        for line in path.read_text().splitlines()]
-              paths = sorted(Path("/tmp").glob("vpp-unittest-*/log.txt"))
-              paths += sorted(Path("/tmp").glob("vpp-unittest-*/vpp_stderr.txt"))
-              logs = "\n".join(path.read_text(errors="replace") for path in paths
-                               if path.is_file() and not path.is_symlink())
+              event_paths = [path for path in bounded_paths(OUT, recursive=False)
+                             if path.name.startswith("events.") and path.suffix == ".jsonl"]
+              events = [json.loads(line) for line in read_evidence(event_paths).splitlines() if line]
+              paths = [root / name for root in runtime_roots() for name in ("log.txt", "vpp_stderr.txt")
+                       if (root / name).is_file()]
+              logs = read_evidence(paths)
+              work_remaining()
               try:
                   runtime = json.loads((OUT / "runtime/result.json").read_text())
                   require(runtime["status"] == "completed", "Runtime command timed out or exceeded work budget")
@@ -635,8 +743,14 @@ jobs:
               action = sys.argv[1]
               operations = {"prepare": prepare, "mutate": mutate, "tests": tests,
                             "binaries": binaries, "collect": lambda: collect(OUT / "final-diagnostics")}
-              if action in operations:
-                  action_result(action, operations[action])
+              if action.startswith("operation-"):
+                  name = action.removeprefix("operation-")
+                  action_result(name, operations[name])
+              elif action in operations:
+                  status, _ = command(action, [sys.executable, __file__, f"operation-{action}"])
+                  if action == "tests" and status != 0:
+                      save("acceptance.json", dict(status="FAIL", error=f"Whole runtime action failed: {status}"))
+                  raise SystemExit(status)
               else:
                   status, _ = command(action, sys.argv[2:])
                   raise SystemExit(status)
@@ -684,6 +798,7 @@ jobs:
         run: python3 "$TOOLS/control.py" mutate
 
       - name: Supply reproducible fallback version
+        id: version
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -700,6 +815,7 @@ jobs:
           python3 "$TOOLS/control.py" binaries
 
       - name: Prepare namespace runtime
+        id: namespace
         timeout-minutes: 3
         uses: ./.github/actions/vpp-docker-runtime-setup
         with:
@@ -733,6 +849,11 @@ jobs:
       - name: Always retain tools diagnostics and provenance
         if: always()
         timeout-minutes: 5
+        env:
+          BOOTSTRAP_OUTCOME: ${{ steps.bootstrap.outcome }}
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          VERSION_OUTCOME: ${{ steps.version.outcome }}
+          NAMESPACE_OUTCOME: ${{ steps.namespace.outcome }}
         run: |
           set -uo pipefail
           EVIDENCE="${EVIDENCE:-$RUNNER_TEMP/hss-evidence}"
@@ -754,16 +875,28 @@ jobs:
           from pathlib import Path
           root = Path(os.environ["EVIDENCE"])
           phases = {}
-          names = ("prepare", "dependencies", "feature-list", "pinned-python", "black-version",
-                   "fixture-python-style", "fixtures", "mutate", "build", "binaries", "environment",
-                   "runtime", "tests", "collect")
+          names = (root / "planned-phases.txt").read_text().splitlines()
+          outcomes = {"bootstrap": "BOOTSTRAP_OUTCOME", "checkout": "CHECKOUT_OUTCOME",
+                      "fallback-version": "VERSION_OUTCOME", "namespace": "NAMESPACE_OUTCOME"}
           for name in names:
-              paths = (root / f"{name}-result.json", root / name / "result.json")
+              paths = (root / name / "result.json", root / f"{name}-result.json")
               found = next((path for path in paths if path.is_file()), None)
-              phases[name] = json.loads(found.read_text()) if found else dict(
-                  status="not_run", rc=None, reason="No phase result; inspect earlier failed or cancelled step")
-          for path in sorted(root.glob("*/result.json")):
-              phases.setdefault(path.parent.name, json.loads(path.read_text()))
+              if found:
+                  try:
+                      phases[name] = json.loads(found.read_text())
+                      interruption = root / name / "interruption.json"
+                      if interruption.is_file():
+                          phases[name] = dict(raw_result=str(found.relative_to(root)),
+                                              **json.loads(interruption.read_text()))
+                  except (json.JSONDecodeError, UnicodeDecodeError, OSError) as error:
+                      phases[name] = dict(status="invalid_record", rc=None, error=str(error),
+                                          raw_result=str(found.relative_to(root)))
+              elif name in outcomes:
+                  outcome = os.environ.get(outcomes[name], "skipped")
+                  phases[name] = dict(status="not_run" if outcome == "skipped" else outcome,
+                                      rc=0 if outcome == "success" else None, action_outcome=outcome)
+              else:
+                  phases[name] = dict(status="not_run", rc=None, reason="No phase result; inspect earlier failure")
           (root / "phase-status.json").write_text(json.dumps(phases, indent=2) + "\n")
           files = {str(path.relative_to(root)): {"bytes": path.stat().st_size,
                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
