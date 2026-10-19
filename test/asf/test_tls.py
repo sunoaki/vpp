@@ -173,9 +173,10 @@ class TestDTLSCleanup(VppAsfTestCase):
         """Named/unnamed DTLS failures and migration, async off/on, without QAT"""
         self.vapi.session_enable_disable(is_enable=1)
         try:
-            output = self.vapi.cli("test session dtls-cleanup")
-            self.assertIn("DTLS cleanup: 4 modes passed", output)
-            self.assertIn("SUCCESS", output)
+            response = self.vapi.cli_return_response("test session dtls-cleanup")
+            self.assertEqual(response.retval, 0, response.reply)
+            self.assertIn("DTLS cleanup: 4 modes passed", response.reply)
+            self.assertIn("SUCCESS", response.reply)
         finally:
             self.vapi.session_enable_disable(is_enable=0)
 
