@@ -123,7 +123,7 @@ typedef walk_rc_t (*lcp_itf_pair_walk_cb_t) (index_t index, void *ctx);
 extern void lcp_itf_pair_walk (lcp_itf_pair_walk_cb_t cb, void *ctx);
 
 /**
- * Begin and End the replace process
+ * Mark existing pairs, retain matching adds, then delete unrefreshed pairs.
  */
 extern int lcp_itf_pair_replace_begin (void);
 extern int lcp_itf_pair_replace_end (void);

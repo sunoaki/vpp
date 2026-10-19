@@ -293,7 +293,13 @@ define lcp_sync_unnumbered_get_reply
   bool is_enable;
 };
 
-/** \brief Replace end/begin
+/** \brief Replace interface pairs
+ * Begin marks existing pairs for deletion. Resend each desired pair using an
+ * add request with the same host name, type and effective namespace. A matching
+ * marked pair is retained and its existing indices are returned; a second add
+ * after it has been retained reports a duplicate. New pairs are also retained.
+ * End deletes pairs that were not resent. Changing an existing pair's name,
+ * type or namespace requires explicit deletion and creation.
  */
 autoreply define lcp_itf_pair_replace_begin
 {
