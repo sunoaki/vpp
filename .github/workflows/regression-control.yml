@@ -132,7 +132,8 @@ jobs:
                       "Unexpected FIB negative selector")
               require(rc == 2 and callbacks == [("addError", "TestFIB", "test_fib")] and not subtests,
                       "Unexpected FIB negative result")
-              require(not re.search(r"SIGSEGV|segmentation fault|Core was generated|"
+              require(not re.search(r"SIG(?:SEGV|ABRT|BUS|ILL|FPE)|segmentation fault|"
+                                    r"\bAborted\b|\bBus error\b|Core was generated|"
                                     r"VppTransportSocketIOError|VppDiedError|Vpp dead|"
                                     r"VPP subprocess died unexpectedly|VPP died shortly after startup|"
                                     r"poll failed:|socket poll error:|PUMP THREAD TIMEOUT|"
@@ -237,8 +238,8 @@ jobs:
                                            "addUnexpectedSuccess")
                               for callback, _, _ in callbacks), "Invalid result callback")
               require(not re.search(r"(?:^|\n)(?:ERROR|SKIP):|FAILED \([^\n]*errors=|"
-                                    r"OK \(skipped=|SIGSEGV|segmentation fault|"
-                                    r"Core was generated|timed out|TimeoutError|"
+                                    r"OK \(skipped=|SIG(?:SEGV|ABRT|BUS|ILL|FPE)|segmentation fault|"
+                                    r"\bAborted\b|\bBus error\b|Core was generated|timed out|TimeoutError|"
                                     r"VppTransportSocketIOError|VppDiedError|Vpp dead|"
                                     r"VPP subprocess died unexpectedly|PUMP THREAD TIMEOUT",
                                     console + logs + stderr,
