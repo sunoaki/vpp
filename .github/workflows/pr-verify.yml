@@ -608,7 +608,13 @@ jobs:
               linux_cp)
                 required_class=TestLinuxCPNetlinkRecovery
                 required_methods=(test_netlink_poll_error_recovery
-                                  test_netlink_poll_error_invalid_fd)
+                                  test_netlink_poll_error_invalid_fd
+                                  test_router_source_ownership
+                                  test_router_partial_delete_ownership
+                                  test_router_mpls_ownership
+                                  test_router_linux_replace_replay
+                                  test_router_bound_table_sweep
+                                  test_router_broadcast_recovery)
                 ;;
               linux_cp_lifecycle)
                 required_class=TestLinuxCPLifecycle
