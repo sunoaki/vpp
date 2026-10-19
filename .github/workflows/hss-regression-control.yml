@@ -1,0 +1,590 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Temporary HSS runtime controls
+
+on:
+  push:
+    branches: [feat/hss-runtime-validation-ff48-october19]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hss-controls-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  control:
+    name: HSS / ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fixed, cache-limit, api-protocol]
+    # Independent Debian 13 builds, OpenSSL TLS/QUIC, two CPUs and namespace access.
+    # IPv6 and HTTP/3 checks establish control-plane identity only.
+    # These narrow API negatives do not cover lifecycle/reset/cleanup/ack mutations.
+    container:
+      image: debian:trixie
+      options: >-
+        --shm-size=2g
+        --cap-add=SYS_ADMIN
+        --cap-add=NET_ADMIN
+        --security-opt=apparmor=unconfined
+        --device-cgroup-rule="c 10:200 rwm"
+        --device-cgroup-rule="c 10:238 rwm"
+    defaults:
+      run:
+        shell: bash
+    env:
+      VARIANT_NAME: ${{ matrix.variant }}
+      WORKFLOW_SHA: ${{ github.sha }}
+      CANDIDATE_SHA: 7238418f29a30398522a3f980094a5a8aa35ba49
+      FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
+      CLANG_FORMAT_VER: "19"
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: ${{ github.workspace }}
+    steps:
+      - name: Install base tools
+        run: |
+          set -euo pipefail
+          printf 'TOOLS=%s/hss-tools\nEVIDENCE=%s/hss-evidence\n' "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/hss-tools" "$RUNNER_TEMP/hss-evidence"
+          rm -f /etc/apt/apt.conf.d/docker-clean
+          apt-get update -qq
+          apt-get install -y -qq sudo make git bash iproute2 python3 libssl-dev curl
+
+      - name: Check out exact workflow
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Prepare external evidence tools
+        run: |
+          set -euo pipefail
+          cp .github/workflows/hss-regression-control.yml "$EVIDENCE/workflow.yml"
+          cat > "$TOOLS/sitecustomize.py" <<'PY'
+          import json
+          import os
+          import sys
+          import threading
+          import traceback
+          import unittest
+          from pathlib import Path
+
+          target = os.environ.get("HSS_EVENTS")
+          if target:
+              sequence = 0
+              def emit(kind, **values):
+                  global sequence
+                  sequence += 1
+                  record = dict(kind=kind, pid=os.getpid(), seq=sequence, **values)
+                  path = Path(target + f".{os.getpid()}.jsonl")
+                  if path.exists() and path.stat().st_size > 4 * 1024 * 1024:
+                      raise RuntimeError("HSS observer exceeds 4 MiB/process")
+                  with path.open("a") as stream:
+                      stream.write(json.dumps(record, sort_keys=True) + "\n")
+
+              def identity(test):
+                  return test.id()
+
+              def wrap(name):
+                  original = getattr(unittest.TestResult, name)
+                  def observe(self, test, *args):
+                      error = args[-1] if name in ("addFailure", "addError", "addSubTest",
+                                                   "addExpectedFailure") else None
+                      record = {"test": identity(test)}
+                      if name == "startTest":
+                          module = sys.modules.get("config")
+                          config = getattr(module, "config", None)
+                          record.update(excluded=list(getattr(config, "excluded_plugins", [])),
+                                        netns_disabled=getattr(config, "skip_netns_tests", None),
+                                        vpp_cmdline=list(getattr(test.__class__, "vpp_cmdline", [])))
+                      if error:
+                          record.update(error=error[0].__name__,
+                                        traceback="".join(traceback.format_exception(*error)))
+                      if name == "addSubTest":
+                          record["params"] = dict(args[0].params)
+                      if name == "addSkip":
+                          record["reason"] = str(args[0])
+                      if name == "startTest":
+                          record["workers"] = getattr(test.__class__, "vpp_worker_count", 0)
+                      emit(name, **record)
+                      return original(self, test, *args)
+                  setattr(unittest.TestResult, name, observe)
+
+              for callback in ("startTest", "stopTest", "addSuccess", "addFailure", "addError",
+                               "addSkip", "addExpectedFailure", "addUnexpectedSuccess", "addSubTest"):
+                  wrap(callback)
+              original_run = unittest.TextTestRunner.run
+              def run(self, test):
+                  result = original_run(self, test)
+                  emit("completed", tests=result.testsRun, failures=len(result.failures),
+                       errors=len(result.errors), skips=len(result.skipped),
+                       expected=len(result.expectedFailures), unexpected=len(result.unexpectedSuccesses))
+                  return result
+              unittest.TextTestRunner.run = run
+
+              # Observe returns from unchanged real helpers; never replace their results.
+              def profile(frame, event, value):
+                  if event != "return":
+                      return
+                  filename, name = frame.f_code.co_filename, frame.f_code.co_name
+                  if filename.endswith("/test_http_static.py"):
+                      case = frame.f_locals.get("self")
+                      if not isinstance(case, unittest.TestCase):
+                          return
+                      record = {"test": case.id(), "helper": name}
+                      if name == "_client" and value is not None:
+                          record.update(port=frame.f_locals["port"], secure=frame.f_locals["secure"],
+                                        client=value.pid)
+                      elif name == "_response" and isinstance(value, dict):
+                          record.update(response=value, client=frame.f_locals["client"].pid)
+                      elif name == "_refused":
+                          process = frame.f_locals.get("process")
+                          if process is None:
+                              return
+                          record.update(port=frame.f_locals["port"], rc=process.returncode,
+                                        stdout=process.stdout.decode(errors="replace"),
+                                        stderr=process.stderr.decode(errors="replace"))
+                      else:
+                          return
+                      emit("helper", **record)
+                  elif filename.endswith("/vpp_papi_provider.py") and name == "cli" and isinstance(value, str):
+                      emit("cli", command=frame.f_locals["cli"], reply=value[:65536])
+              sys.setprofile(profile)
+              threading.setprofile(profile)
+              emit("loaded")
+          PY
+          cat > "$TOOLS/control.py" <<'PY'
+          import ast
+          import collections
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import subprocess
+          import sys
+          import time
+
+          ROOT = Path.cwd()
+          OUT = Path(os.environ["EVIDENCE"])
+          TOOLS = Path(os.environ["TOOLS"])
+          CANDIDATE = os.environ["CANDIDATE_SHA"]
+          FROZEN = os.environ["FROZEN_SHA"]
+          VARIANT = os.environ["VARIANT_NAME"]
+          SOURCE = "src/plugins/http_static/http_static.c"
+          TEST = "test/asf/test_http_static.py"
+          FIXTURE = "src/plugins/http_static/test_lifetime_fixtures.py"
+          CLASSES = ("TestHttpStaticCli", "TestHttpStaticCliWorker")
+          METHODS = ("listener_delete_reuse", "cached_listener_retirement", "destroy_ownership",
+                     "default_get_states", "listener_uri_identity", "listener_ipv6_identity",
+                     "listener_http3_identity")
+          METHODS = tuple("test_http_static_" + name for name in METHODS)
+          RECIPES = {
+              "cache-limit": ("rmp->cache_size_limit = htonl (l->cache.cache_limit);",
+                              "rmp->cache_size_limit = htonl (hsm->default_listener.cache.cache_limit);"),
+              "api-protocol": ('snprintf ((char *) rmp->uri, sizeof (rmp->uri), "http%s://%s:%d",\n'
+                               '                  l->flags & HSS_LISTENER_F_NEED_CRYPTO ? "s" : "", addr,',
+                               'snprintf ((char *) rmp->uri, sizeof (rmp->uri), "%s://%s:%d",\n'
+                               '                  tp_vfts[l->sep.transport_proto].transport_options.name, addr,')}
+
+          def require(condition, message):
+              if not condition:
+                  raise AssertionError(message)
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          def content(ref, path):
+              return subprocess.check_output(["git", "show", f"{ref}:{path}"])
+
+          def digest(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+          def save(name, value):
+              (OUT / name).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+          def command(label, args, env=None):
+              directory = OUT / label
+              directory.mkdir(exist_ok=True)
+              result = dict(command=args, cwd=str(ROOT), start=time.time(), rc=None)
+              result_path = directory / "result.json"
+              result_path.write_text(json.dumps(result, indent=2))
+              tail = bytearray()
+              process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+              with (directory / "console.log").open("w+b") as stream:
+                  for chunk in iter(lambda: process.stdout.read1(65536), b""):
+                      print(chunk.decode(errors="replace"), end="", flush=True)
+                      tail.extend(chunk)
+                      del tail[:-8 * 1024 * 1024]
+                      stream.seek(0)
+                      stream.write(tail)
+                      stream.truncate()
+                      stream.flush()
+              result.update(rc=process.wait(), end=time.time(), retained_bytes=len(tail))
+              result_path.write_text(json.dumps(result, indent=2) + "\n")
+              return result["rc"], tail.decode(errors="replace")
+
+          def prepare():
+              workflow = os.environ["WORKFLOW_SHA"]
+              require(git("rev-parse", "HEAD") == workflow, "Workflow SHA mismatch")
+              manifest = dict(workflow_sha=workflow, candidate_sha=CANDIDATE, frozen_sha=FROZEN,
+                              workflow_blob=git("rev-parse", f"{workflow}:.github/workflows/hss-regression-control.yml"),
+                              candidate_tree=git("rev-parse", f"{CANDIDATE}^{{tree}}"), variant=VARIANT,
+                              run_id=os.environ["GITHUB_RUN_ID"], attempt=os.environ["GITHUB_RUN_ATTEMPT"],
+                              artifact=f"hss-{VARIANT}-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
+                              run_url=f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+                              limits="8 MiB console/command; 4 MiB observer/process; diagnostics 32 MiB/300 files",
+                              uncovered_negative_controls=["premature listener/cache release/reuse", "omitted cleanup/ack",
+                                                           "deferred-only reset before pointer free", "original endpoint overwrite"],
+                              ipv6_http3_scope="control-plane identity and QUIC listener/ALPN; no IPv6 request or HTTP3 transfer")
+              subprocess.run(["git", "checkout", "--detach", CANDIDATE], check=True)
+              require(not git("status", "--porcelain"), "Candidate tree is dirty")
+              for path in ("build-root/build-vpp_debug-native", "build-root/install-vpp_debug-native", "build-root/test/venv"):
+                  require(not Path(path).exists(), f"Not an independent clean build: {path}")
+              manifest["tests"] = {path: dict(blob=git("rev-parse", f"{CANDIDATE}:{path}"), sha256=digest(path))
+                                   for path in (TEST, FIXTURE)}
+              save("manifest.json", manifest)
+
+          def mutate():
+              require(git("rev-parse", "HEAD") == CANDIDATE, "Candidate HEAD moved")
+              require(not git("diff", "--name-only"), "Tracked source changed before mutation")
+              original = Path(SOURCE).read_bytes()
+              if VARIANT != "fixed":
+                  old, new = RECIPES[VARIANT]
+                  # Whitespace comes from immutable source; preserve surrounding bytes exactly.
+                  if VARIANT == "api-protocol":
+                      expression = re.compile(rb'snprintf \(\(char \*\) rmp->uri, sizeof \(rmp->uri\), "http%s://%s:%d",\n[ \t]+l->flags & HSS_LISTENER_F_NEED_CRYPTO \? "s" : "", addr,')
+                      matches = list(expression.finditer(original))
+                      require(len(matches) == 1, "Ambiguous URI restoration hunk")
+                      old = matches[0].group().decode()
+                      indent = old.split("\n")[1].split("l->flags")[0]
+                      new = ('snprintf ((char *) rmp->uri, sizeof (rmp->uri), "%s://%s:%d",\n' +
+                             indent + 'tp_vfts[l->sep.transport_proto].transport_options.name, addr,')
+                  frozen = content(FROZEN, SOURCE).decode()
+                  witness = (new if VARIANT == "cache-limit" else
+                             "tp_vfts[hsm->default_listener.sep.transport_proto].transport_options.name")
+                  require(witness in frozen, "Restoration has no frozen-source provenance")
+                  require(original.count(old.encode()) == 1, "Ambiguous restoration hunk")
+                  Path(SOURCE).write_bytes(original.replace(old.encode(), new.encode(), 1))
+              require(git("diff", "--name-only").splitlines() == ([] if VARIANT == "fixed" else [SOURCE]),
+                      "Unexpected source mutation")
+              manifest = json.loads((OUT / "manifest.json").read_text())
+              for path, provenance in manifest["tests"].items():
+                  require(digest(path) == provenance["sha256"], f"Candidate test changed: {path}")
+              manifest["source"] = dict(path=SOURCE, candidate_blob=git("rev-parse", f"{CANDIDATE}:{SOURCE}"),
+                                        frozen_blob=git("rev-parse", f"{FROZEN}:{SOURCE}"), built_blob=git("hash-object", SOURCE))
+              index_env = dict(os.environ, GIT_INDEX_FILE=str(TOOLS / "build-index"))
+              subprocess.run(["git", "read-tree", CANDIDATE], env=index_env, check=True)
+              subprocess.run(["git", "add", SOURCE], env=index_env, check=True)
+              manifest["built_tree"] = subprocess.check_output(["git", "write-tree"], env=index_env, text=True).strip()
+              manifest["tools"] = {path.name: digest(path) for path in TOOLS.glob("*.py")}
+              save("manifest.json", manifest)
+              (OUT / "restoration.diff").write_text(git("diff", "--", SOURCE) + "\n")
+
+          def collect(destination):
+              destination.mkdir(parents=True, exist_ok=True)
+              report, remaining, count = [], 32 * 1024 * 1024, 0
+              for root in sorted(Path("/tmp").glob("vpp-unittest-*")) + [Path("build-root/test-logs")]:
+                  if root.is_symlink() or not root.is_dir():
+                      continue
+                  for directory, subdirs, names in os.walk(root, followlinks=False):
+                      subdirs[:] = sorted(name for name in subdirs if not (Path(directory) / name).is_symlink())
+                      for name in sorted(names):
+                          source = Path(directory) / name
+                          if source.suffix not in (".txt", ".log", ".pcap", ".pcapng"):
+                              continue
+                          if count >= 300:
+                              continue
+                          try:
+                              if not stat.S_ISREG(source.lstat().st_mode):
+                                  continue
+                              fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                              with os.fdopen(fd, "rb") as reader:
+                                  info = os.fstat(reader.fileno())
+                                  if not stat.S_ISREG(info.st_mode):
+                                      continue
+                                  length = min(info.st_size, 2 * 1024 * 1024)
+                                  if length > remaining or source.suffix in (".pcap", ".pcapng") and length < info.st_size:
+                                      continue
+                                  reader.seek(info.st_size - length)
+                                  target = destination / f"{count:04d}{source.suffix}"
+                                  target.write_bytes(reader.read(length))
+                          except OSError as error:
+                              if len(report) < 600:
+                                  report.append(f"SKIP {str(source)[:500]}: {error}")
+                              continue
+                          report.append(f"{source} -> {target.name}: {length}/{info.st_size}")
+                          remaining -= length
+                          count += 1
+              (destination / "collection.txt").write_text("Limits: 32 MiB; 2 MiB/file; 300 files; text tails; no symlinks.\n" + "\n".join(report))
+
+          def expected_ids():
+              tree = ast.parse(Path(TEST).read_text())
+              methods = {cls.name: [node.name for node in cls.body if isinstance(node, ast.FunctionDef)
+                                    and node.name.startswith("test_")]
+                         for cls in tree.body if isinstance(cls, ast.ClassDef)}
+              return [f"test_http_static.{cls}.{method}" for cls in (*CLASSES, "TestHttpStaticVapi")
+                      for method in methods["TestHttpStaticCli" if cls in CLASSES else cls]]
+
+          def validate(events, console, rc, expected, variant, logs):
+              forbidden = ("addError", "addSkip", "addExpectedFailure", "addUnexpectedSuccess")
+              require(not any(event["kind"] in forbidden for event in events), "Error/skip/expected failure callback")
+              require(not re.search(r"SIGSEGV|segmentation fault|core was generated|timed out|TimeoutError|"
+                                    r"not enough cpus|Skipping tests due to setup failure", console + logs, re.I),
+                      "Infrastructure/crash/timeout evidence")
+              starts = [event for event in events if event["kind"] == "startTest"]
+              stops = [event for event in events if event["kind"] == "stopTest"]
+              wanted = collections.Counter(expected)
+              require(collections.Counter(event["test"] for event in starts) == wanted, "Wrong/missing/duplicate test starts")
+              require(collections.Counter(event["test"] for event in stops) == wanted, "Missing normal stopTest")
+              complete = [event for event in events if event["kind"] == "completed" and event["tests"]]
+              require(sum(event["tests"] for event in complete) == len(expected), "Missing normal runner completion")
+              require(all(not any(event[key] for key in ("errors", "skips", "expected", "unexpected")) for event in complete),
+                      "Invalid runner summary")
+              loaded = {event["pid"] for event in events if event["kind"] == "loaded"}
+              require(loaded and all(event["pid"] in loaded for event in starts + stops + complete),
+                      "Missing observer load provenance")
+              for event in starts:
+                  require(event["workers"] == (1 if ".TestHttpStaticCliWorker." in event["test"] else 0),
+                          "Wrong worker configuration")
+                  require(event.get("netns_disabled") is False and
+                          not set(event.get("excluded", [])) & {"http_static", "tlsopenssl", "quic"},
+                          "Namespace or required plugin excluded")
+                  cmdline = " ".join(event.get("vpp_cmdline", []))
+                  require(cmdline and not re.search(r"(?:tlsopenssl|quic|http_static)_plugin.so\s*\{\s*disable", cmdline),
+                          "Missing startup command or required plugin disabled")
+              subs = [event for event in events if event["kind"] == "addSubTest"]
+              outcomes = [event for event in events if event["kind"] in ("addSuccess", "addFailure")]
+              callbacks = re.findall(r"--- (add\w+)\(\) (\w+)\.(\w+)\(", logs)
+              if variant == "fixed":
+                  require(rc == 0, f"Fixed test command failed: {rc}")
+                  require(collections.Counter(event["test"] for event in outcomes if event["kind"] == "addSuccess") == wanted,
+                          "Missing actual successes")
+                  require(all(event["kind"] == "addSuccess" for event in outcomes), "Fixed assertion failure")
+                  require(not any(event.get("error") for event in subs), "Fixed subtest failure")
+                  require(collections.Counter(f"test_http_static.{cls}.{method}" for kind, cls, method in callbacks
+                                              if kind == "addSuccess") == wanted and
+                          all(kind == "addSuccess" for kind, _, _ in callbacks), "Framework callbacks mismatch")
+                  for cls in CLASSES:
+                      identity = f"test_http_static.{cls}.test_http_static_listener_uri_identity"
+                      require(collections.Counter(event["params"].get("protocol") for event in subs if event["test"] == identity) ==
+                              collections.Counter(("tcp", "http", "tls", "https")), "Incomplete secure subtests")
+                      helpers = [event for event in events if event["kind"] == "helper" and event["test"] == identity]
+                      clients = [event for event in helpers if event["helper"] == "_client"]
+                      responses = [event for event in helpers if event["helper"] == "_response"]
+                      refusals = [event for event in helpers if event["helper"] == "_refused"]
+                      require([event["secure"] for event in clients] == [False] * 4 + [True] * 4,
+                              "Missing real TLS/HTTPS requests")
+                      require(len(responses) == 8 and all(event["response"].get("status") == 200 for event in responses),
+                              "Missing actual HTTP200 responses")
+                      require(len(refusals) == 8 and all(event["rc"] == 0 and event["stdout"].strip() == "ECONNREFUSED"
+                                                       for event in refusals), "Missing real TCP refusals")
+                      sequence = [event["helper"] for event in helpers]
+                      require(sequence == ["_client", "_response", "_refused"] * 8,
+                              "HTTP200/delete/refusal sequence differs")
+                  require(any(event["kind"] == "cli" and event["command"] == "show session listeners quic verbose 2"
+                              and "[Q]" in event["reply"] and "h3" in event["reply"] for event in events),
+                          "No real QUIC listener and ALPN evidence")
+              else:
+                  require(rc > 0, "Restored command unexpectedly passed or was signalled")
+                  require(len(outcomes) == len(expected) and all(event["kind"] == "addFailure" for event in outcomes),
+                          "Restored outcomes are not assertion failures")
+                  require(sum(event["failures"] for event in complete) == len(expected), "Wrong assertion summary")
+                  require(collections.Counter(f"test_http_static.{cls}.{method}" for kind, cls, method in callbacks
+                                              if kind == "addFailure") == wanted and
+                          all(kind == "addFailure" for kind, _, _ in callbacks), "Negative framework callbacks mismatch")
+                  expression = ('self.assertEqual(reply.cache_size_limit, 2 << 20)' if variant == "cache-limit" else
+                                'self.assertEqual(reply.uri, "http://10.10.1.2:8083")')
+                  witness = ("AssertionError: 0 != 2097152" if variant == "cache-limit" else
+                             "AssertionError: 'tcp://10.10.1.2:8083' != 'http://10.10.1.2:8083'")
+                  for event in outcomes:
+                      require(event.get("error") == "AssertionError" and expression in event.get("traceback", "") and
+                              witness in event["traceback"], "Wrong restored assertion witness")
+                      require(expression in logs and witness in logs, "Missing raw assertion witness")
+
+          def tests():
+              manifest = json.loads((OUT / "manifest.json").read_text())
+              require(git("hash-object", SOURCE) == manifest["source"]["built_blob"], "Built source moved")
+              for path, provenance in manifest["tests"].items():
+                  require(digest(path) == provenance["sha256"], "Candidate tests changed")
+              selector = "http_static" if VARIANT == "fixed" else ",".join(
+                  f"http_static.{cls}.test_http_static_default_get_states" for cls in CLASSES)
+              expected = expected_ids() if VARIANT == "fixed" else [
+                  f"test_http_static.{cls}.test_http_static_default_get_states" for cls in CLASSES]
+              event_base = OUT / "events"
+              env = dict(os.environ, HSS_EVENTS=str(event_base),
+                         PYTHONPATH=str(TOOLS) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+              args = ["make", "UNATTENDED=yes", "TEST_JOBS=1", "FORCE_FOREGROUND=1", "VPP_WORKER_COUNT=0",
+                      "RETRIES=0", "FAILFAST=0", "SKIP_TESTS=", "VPP_EXCLUDED_PLUGINS=", "V=2",
+                      "COREDUMP_SIZE=0", "DECODE_PCAPS=none", "RND_SEED=48", f"TEST={selector}", "test-debug"]
+              rc, console = command("runtime", args, env)
+              collect(OUT / "runtime" / "diagnostics")
+              events = [json.loads(line) for path in sorted(OUT.glob("events.*.jsonl"))
+                        for line in path.read_text().splitlines()]
+              logs = "\n".join(path.read_text(errors="replace") for path in sorted(Path("/tmp").glob("vpp-unittest-*/log.txt"))
+                               if path.is_file() and not path.is_symlink())
+              try:
+                  validate(events, console, rc, expected, VARIANT, logs)
+              except Exception as error:
+                  save("acceptance.json", dict(status="FAIL", error=str(error), expected=expected))
+                  raise
+              save("acceptance.json", dict(status="PASS", expected=expected,
+                                           claims="full fixed suite and14 new successes" if VARIANT == "fixed" else
+                                           "narrow restored API field only; lifecycle negative gaps remain"))
+
+          def binaries():
+              paths = [*Path("build-root/install-vpp_debug-native").rglob("vpp"),
+                       *Path("build-root/install-vpp_debug-native").rglob("http_static_plugin.so"),
+                       *Path("build-root/install-vpp_debug-native").rglob("tlsopenssl_plugin.so"),
+                       *Path("build-root/install-vpp_debug-native").rglob("quic_plugin.so")]
+              files = {str(path): digest(path) for path in paths if path.is_file()}
+              for name in ("vpp", "http_static_plugin.so", "tlsopenssl_plugin.so", "quic_plugin.so"):
+                  require(any(Path(path).name == name for path in files), f"Required binary/plugin missing: {name}")
+              save("binaries.json", files)
+              caches = list(Path("build-root/build-vpp_debug-native").rglob("CMakeCache.txt"))
+              require(caches, "Missing build cache")
+              (OUT / "CMakeCache.txt").write_text("\n".join(path.read_text() for path in caches))
+
+          if __name__ == "__main__":
+              action = sys.argv[1]
+              if action == "prepare":
+                  prepare()
+              elif action == "mutate":
+                  mutate()
+              elif action == "tests":
+                  tests()
+              elif action == "binaries":
+                  binaries()
+              elif action == "collect":
+                  collect(OUT / "final-diagnostics")
+              else:
+                  status, _ = command(action, sys.argv[2:])
+                  raise SystemExit(status)
+          PY
+          python3 "$TOOLS/control.py" prepare
+
+      - name: Install exact candidate dependencies
+        run: python3 "$TOOLS/control.py" dependencies make UNATTENDED=yes install-dep
+
+      - name: Check exact candidate style API and pinned Python
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain -uno)"
+          python3 "$TOOLS/control.py" feature-list make checkfeaturelist
+          for commit in $(git rev-list --reverse --no-merges "$FROZEN_SHA..$CANDIDATE_SHA"); do
+            CHECKSTYLE_COMMIT="$commit" python3 "$TOOLS/control.py" "style-$commit" make checkstyle
+            git checkout --detach "$commit"
+            test -z "$(git status --porcelain -uno)"
+            python3 "$TOOLS/control.py" "api-$commit" make checkstyle-api
+            python3 "$TOOLS/control.py" "message-$commit" extras/scripts/check_commit_msg.sh
+          done
+          git checkout --detach "$CANDIDATE_SHA"
+          python3 "$TOOLS/control.py" pinned-python make checkstyle-python
+          python3 "$TOOLS/control.py" black-version build-root/test/venv/bin/python -c \
+            'import black; assert black.__version__ == "26.5.1", black.__version__; print(black.__version__)'
+          python3 "$TOOLS/control.py" fixture-python-style build-root/test/venv/bin/black --check -t py39 \
+            src/plugins/http_static/test_lifetime_fixtures.py test/asf/test_http_static.py
+
+      - name: Execute exactly eight standalone fixtures
+        run: |
+          set -euo pipefail
+          python3 "$TOOLS/control.py" fixtures python3 src/plugins/http_static/test_lifetime_fixtures.py -v
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          text = (Path(os.environ["EVIDENCE"]) / "fixtures/console.log").read_text()
+          assert "Ran 8 tests in " in text and "\nOK\n" in text, text
+          PY
+
+      - name: Restore narrow source field and identify build tree
+        run: python3 "$TOOLS/control.py" mutate
+
+      - name: Supply reproducible fallback version
+        run: |
+          set -euo pipefail
+          if ! git describe --long --match 'v[0-9]*' 2>/dev/null; then
+            echo "0.0.0-release+$(git log -1 --format=%ct).$(git rev-list --count HEAD)-g$(git rev-parse --short=7 HEAD)" > src/scripts/.version
+          fi
+          if [ -f src/scripts/.version ]; then cp src/scripts/.version "$EVIDENCE/version.txt"; fi
+
+      - name: Build independent debug variant with TLS and QUIC
+        run: |
+          set -euo pipefail
+          python3 "$TOOLS/control.py" build make UNATTENDED=yes VPP_EXCLUDED_PLUGINS= build
+          python3 "$TOOLS/control.py" binaries
+
+      - name: Prepare namespace runtime
+        uses: ./.github/actions/vpp-docker-runtime-setup
+        with:
+          WORKSPACE: ${{ github.workspace }}
+          SHM_SIZE: 2G
+          LOG_DIR: ${{ runner.temp }}/hss-evidence/runtime-setup
+
+      - name: Record and require CPU namespace and OpenSSL environment
+        run: |
+          set -euo pipefail
+          python3 "$TOOLS/control.py" environment bash -euo pipefail -c '
+            uname -a
+            cat /etc/os-release
+            openssl version -a
+            python3 -c "import os; print(sorted(os.sched_getaffinity(0))); assert len(os.sched_getaffinity(0)) >= 2"
+            mountpoint /dev/shm
+            test "$(df -B1 --output=size /dev/shm | tail -n 1)" -ge 2147483648
+            namespace="hss-preflight-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            trap '\''ip netns del "$namespace"'\'' EXIT
+            ip netns add "$namespace"
+            ip netns exec "$namespace" ip link set lo up
+            ip netns exec "$namespace" ip link show lo
+            dpkg-query -W libssl-dev clang-format-19 python3
+          '
+
+      - name: Run full fixed suite or exact restored assertions
+        run: python3 "$TOOLS/control.py" tests
+
+      - name: Always retain tools diagnostics and provenance
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE"
+          if [ -d "$TOOLS" ]; then cp "$TOOLS/"*.py "$EVIDENCE/"; fi
+          if [ -f "$TOOLS/control.py" ]; then python3 "$TOOLS/control.py" collect; fi
+          git status --short > "$EVIDENCE/final-status.txt"
+          git diff --binary > "$EVIDENCE/final.diff"
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ["EVIDENCE"])
+          files = {str(path.relative_to(root)): {"bytes": path.stat().st_size,
+                   "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                   for path in sorted(root.rglob("*")) if path.is_file() and not path.is_symlink()}
+          (root / "evidence-index.json").write_text(json.dumps(files, indent=2) + "\n")
+          PY
+
+      - name: Upload bounded HSS evidence on every outcome
+        id: evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hss-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hss-evidence/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 6
+
+      - name: Report artifact identity
+        if: always()
+        env:
+          ARTIFACT_ID: ${{ steps.evidence.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.evidence.outputs.artifact-url }}
+          ARTIFACT_DIGEST: ${{ steps.evidence.outputs.artifact-digest }}
+        run: |
+          printf 'Artifact ID: %s\nArtifact URL: %s\nArtifact digest: %s\n' \
+            "$ARTIFACT_ID" "$ARTIFACT_URL" "$ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"
