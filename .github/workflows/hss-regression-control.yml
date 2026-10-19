@@ -230,6 +230,469 @@ jobs:
         run: |
           set -euo pipefail
           cp .github/workflows/hss-regression-control.yml "$EVIDENCE/workflow.yml"
+          cat > "$TOOLS/hss_diagnostics.py" <<'PY'
+          import atexit
+          import fcntl
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import selectors
+          import stat
+          import subprocess
+          import sys
+          import threading
+          import time
+
+          CLASSES = ("TestHttpStaticVapi", "TestHttpStaticCli", "TestHttpStaticCliWorker")
+          FILES = ("stdout.bin", "stderr.bin", "show-logging.stdout.bin", "show-logging.stderr.bin")
+          SOURCES = {"asfframework": "test/asf/asfframework.py",
+                     "vpp_papi_provider": "test/vpp_papi_provider.py",
+                     "test_http_static": "test/asf/test_http_static.py"}
+
+          def directory(path):
+              if not os.path.isabs(path) or ".." in Path(path).parts:
+                  raise ValueError("Noncanonical diagnostic directory")
+              descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+              try:
+                  for part in Path(path).parts[1:]:
+                      child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                      dir_fd=descriptor)
+                      os.close(descriptor)
+                      descriptor = child
+                  return descriptor
+              except BaseException:
+                  os.close(descriptor)
+                  raise
+
+          def stamp(descriptor):
+              info = os.fstat(descriptor)
+              return info.st_dev, info.st_ino
+
+          def regular(parent, name, flags):
+              descriptor = os.open(name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
+              info = os.fstat(descriptor)
+              if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                  os.close(descriptor)
+                  raise ValueError("Nonregular diagnostic file")
+              return descriptor
+
+          def file_hash(root, relative):
+              parts = Path(relative).parts
+              if not parts or any(part in ("..", "/") for part in parts):
+                  raise ValueError("Invalid source path")
+              parent = os.dup(root)
+              try:
+                  for part in parts[:-1]:
+                      child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                      dir_fd=parent)
+                      os.close(parent)
+                      parent = child
+                  descriptor = regular(parent, parts[-1], os.O_RDONLY)
+                  try:
+                      value = hashlib.sha256()
+                      while True:
+                          chunk = os.read(descriptor, 65536)
+                          if not chunk:
+                              return value.hexdigest()
+                          value.update(chunk)
+                  finally:
+                      os.close(descriptor)
+              finally:
+                  os.close(parent)
+
+          def encoded_record(value):
+              def encode(item):
+                  return (json.dumps(item, sort_keys=True, ensure_ascii=True) + "\n").encode("utf-8")
+              raw = encode(value)
+              if len(raw) <= 16384:
+                  return raw
+              value = dict(value)
+              for key in ("summary", "error", "argv"):
+                  value.pop(key, None)
+              raw = encode(value)
+              if len(raw) <= 16384:
+                  return raw
+              return encode(dict(status="diagnostic-contract-error", slot=value.get("slot"),
+                                 observer_pid=value.get("observer_pid"), event_seq=value.get("event_seq")))
+
+          class Stream:
+              def __init__(self, descriptor, limit):
+                  self.descriptor, self.limit = descriptor, limit
+                  self.count, self.observed, self.truncated = 0, 0, False
+                  self.error = None
+                  self.hash = hashlib.sha256()
+
+              def write(self, raw):
+                  if self.error is not None:
+                      return False
+                  self.observed += len(raw)
+                  chunk = raw[:max(0, self.limit - self.count)]
+                  self.truncated |= len(chunk) != len(raw)
+                  try:
+                      written = os.write(self.descriptor, chunk) if chunk else 0
+                      self.hash.update(chunk[:written])
+                      self.count += written
+                      if written != len(chunk):
+                          self.error = "short_write"
+                  except OSError:
+                      self.error = "write_error"
+                  return self.error is None and not self.truncated
+
+              def freeze(self):
+                  if self.descriptor is not None:
+                      os.close(self.descriptor)
+                      self.descriptor = None
+                  return dict(bytes=self.count, observed_bytes=self.observed, sha256=self.hash.hexdigest(),
+                              truncated=self.truncated, error=self.error)
+
+          class Slot:
+              def __init__(self, owner, name, process, descriptor, pending):
+                  self.owner, self.name, self.process = owner, name, process
+                  self.descriptor, self.pending = descriptor, pending
+                  self.inode = stamp(descriptor)
+                  self.pid, self.observer_pid = process.pid, os.getpid()
+                  self.tempdir = None
+                  self.lock = threading.Lock()
+                  self.streams, self.once, self.frozen, self.query_active = {}, False, False, False
+                  self.record = dict(slot=name, observer_pid=self.observer_pid, vpp_pid=self.pid,
+                                     status="pending", query_status="not_triggered", rc=None,
+                                     cleanup_complete=None, event_seq=None, identity=owner.identity,
+                                     source=owner.provenance, coverage="frozen_prefix_through_snapshot")
+
+              def write(self, index, raw):
+                  if not self.lock.acquire(blocking=False):
+                      return False
+                  try:
+                      if self.frozen or self.observer_pid != os.getpid():
+                          return False
+                      return self.streams[index].write(raw)
+                  finally:
+                      self.lock.release()
+
+              def finish(self):
+                  if not self.lock.acquire(blocking=False):
+                      return
+                  try:
+                      if self.frozen or self.observer_pid != os.getpid() or self.query_active or self.record["query_status"] == "running":
+                          return
+                      self.frozen = True
+                      self.record.update(snapshot_at=time.time(), observed_until=time.time(), status="frozen",
+                                         files={FILES[index]: stream.freeze() for index, stream in self.streams.items()})
+                      if stamp(self.descriptor) != self.inode:
+                          return
+                      raw = encoded_record(self.record)
+                      os.ftruncate(self.pending, 0)
+                      os.lseek(self.pending, 0, os.SEEK_SET)
+                      if os.write(self.pending, raw) != len(raw):
+                          return
+                      os.close(self.pending)
+                      self.pending = None
+                      try:
+                          os.stat("record.json", dir_fd=self.descriptor, follow_symlinks=False)
+                      except FileNotFoundError:
+                          os.rename("record.pending", "record.json", src_dir_fd=self.descriptor,
+                                    dst_dir_fd=self.descriptor)
+                  except (OSError, ValueError, TypeError):
+                      pass
+                  finally:
+                      self.lock.release()
+
+              def close(self):
+                  for stream in self.streams.values():
+                      if stream.descriptor is not None:
+                          os.close(stream.descriptor)
+                          stream.descriptor = None
+                  if self.pending is not None:
+                      os.close(self.pending)
+                      self.pending = None
+                  os.close(self.descriptor)
+
+          class Diagnostics:
+              def __init__(self, config):
+                  self.config = config
+                  self.startup = os.getcwd()
+                  self.pid = os.getpid()
+                  self.root_path = config["directory"]
+                  self.source_path = config["root"]
+                  self.source_fd = directory(self.source_path)
+                  self.root_fd = directory(self.root_path)
+                  self.root_inode = stamp(self.root_fd)
+                  self.slots, self.frames = {}, {}
+                  self.guard = threading.Lock()
+                  self.identity = {key: config[key] for key in ("workflow", "candidate", "variant", "runtime")}
+                  parents = json.loads(os.environ.get("HSS_COMMAND_PARENTS", "[]"))
+                  runtime = next((item for item in reversed(parents) if item.get("result") == "runtime/result.json"), None)
+                  self.identity["command"] = runtime
+                  self.provenance = config["sources"]
+                  for path, value in self.provenance.items():
+                      if file_hash(self.source_fd, path) != value["sha256"]:
+                          raise ValueError("Diagnostic source mismatch")
+                  alias = os.path.join(self.source_path, "test/asfframework.py")
+                  if os.readlink(alias) != "asf/asfframework.py":
+                      raise ValueError("Unknown framework alias")
+                  self.tool = config["vppctl"]
+                  if self.tool != os.path.join(self.source_path, "build-root/install-vpp_debug-native/vpp/bin/vppctl"):
+                      raise ValueError("Unexpected diagnostic executable")
+                  atexit.register(self.finish)
+
+              def after_fork(self):
+                  if self.pid == os.getpid():
+                      return
+                  for slot in self.slots.values():
+                      slot.close()
+                  self.slots, self.frames = {}, {}
+                  os.close(self.root_fd)
+                  self.root_fd = directory(self.root_path)
+                  self.root_inode = stamp(self.root_fd)
+                  self.pid = os.getpid()
+                  self.guard = threading.Lock()
+
+              def code(self, module_name, function, code):
+                  module = sys.modules.get(module_name)
+                  if module is None:
+                      return False
+                  expected = os.path.join(self.source_path, SOURCES[module_name])
+                  aliases = {expected}
+                  if module_name == "asfframework":
+                      aliases.add(os.path.join(self.source_path, "test/asfframework.py"))
+                  def origin(value):
+                      if not isinstance(value, str):
+                          return None
+                      return os.path.normpath(value if os.path.isabs(value) else os.path.join(self.startup, value))
+                  if origin(getattr(module, "__file__", None)) not in aliases:
+                      return False
+                  if origin(getattr(getattr(module, "__spec__", None), "origin", None)) not in aliases:
+                      return False
+                  if origin(code.co_filename) not in aliases:
+                      return False
+                  return getattr(function, "__code__", None) is code
+
+              def claim(self, cls, process):
+                  name = cls.__name__
+                  if name not in CLASSES or cls.__module__ != "test_http_static":
+                      return None
+                  module = sys.modules.get("test_http_static")
+                  if module is None or getattr(module, name, None) is not cls:
+                      return None
+                  if not self.guard.acquire(blocking=False):
+                      return None
+                  try:
+                      if name in self.slots:
+                          slot = self.slots[name]
+                          return slot if slot.process is process else None
+                      check = directory(self.root_path)
+                      try:
+                          if stamp(check) != self.root_inode:
+                              return None
+                      finally:
+                          os.close(check)
+                      try:
+                          fcntl.flock(self.root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                      except OSError:
+                          return None
+                      try:
+                          try:
+                              os.mkdir(name, 0o700, dir_fd=self.root_fd)
+                          except FileExistsError:
+                              return None
+                          descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                               dir_fd=self.root_fd)
+                          pending = None
+                          slot = None
+                          try:
+                              pending = regular(descriptor, "record.pending", os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+                              slot = Slot(self, name, process, descriptor, pending)
+                              slot.tempdir = getattr(cls, "tempdir", None)
+                              self.slots[name] = slot
+                              for index, filename in enumerate(FILES):
+                                  fd = regular(descriptor, filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+                                  slot.streams[index] = Stream(fd, (2 if index < 2 else 1) * 1024 * 1024)
+                              return slot
+                          except BaseException:
+                              if slot is None:
+                                  if pending is not None:
+                                      os.close(pending)
+                                  os.close(descriptor)
+                              raise
+                      finally:
+                          fcntl.flock(self.root_fd, fcntl.LOCK_UN)
+                  finally:
+                      self.guard.release()
+
+              def observe(self, frame, event, value):
+                  try:
+                      self.after_fork()
+                      module = sys.modules.get("asfframework")
+                      pump = getattr(module, "pump_output", None)
+                      if not self.code("asfframework", pump, frame.f_code):
+                          return
+                      if event == "call":
+                          cls = frame.f_locals.get("testclass")
+                          process = getattr(cls, "vpp", None)
+                          if process is None:
+                              return
+                          slot = self.claim(cls, process)
+                          if slot is not None:
+                              self.frames[frame] = (slot, process.stdout.fileno(), process.stderr.fileno())
+                      elif event == "return":
+                          self.frames.pop(frame, None)
+                      elif event == "c_call" and frame in self.frames:
+                          raw = frame.f_locals.get("read")
+                          if not isinstance(raw, bytes) or getattr(value, "__name__", None) != "decode" or getattr(value, "__self__", None) is not raw:
+                              return
+                          slot, stdout, stderr = self.frames[frame]
+                          if frame.f_locals.get("stdout_fd") != stdout or frame.f_locals.get("stderr_fd") != stderr:
+                              return
+                          index = {123: 0, 140: 1}.get(frame.f_lineno)
+                          if index is not None:
+                              slot.write(index, raw)
+                  except Exception:
+                      pass
+
+              def failure(self, frame, value, sequence):
+                  started = time.monotonic()
+                  try:
+                      self.after_fork()
+                      module = sys.modules.get("vpp_papi_provider")
+                      provider_type = getattr(module, "VppPapiProvider", None)
+                      if not self.code("vpp_papi_provider", getattr(provider_type, "cli_return_response", None), frame.f_code):
+                          return
+                      caller = frame.f_back
+                      setup = caller.f_back if caller else None
+                      if caller is None or setup is None or not self.code("vpp_papi_provider", getattr(provider_type, "cli", None), caller.f_code) or caller.f_lineno != 480:
+                          return
+                      provider = frame.f_locals.get("self")
+                      cls = getattr(provider, "test_class", None)
+                      name = getattr(cls, "__name__", None)
+                      cases = sys.modules.get("test_http_static")
+                      declared = getattr(cases, "TestHttpStaticVapi" if name == CLASSES[0] else "TestHttpStaticCli", None)
+                      function = getattr(getattr(declared, "setUpClass", None), "__func__", None)
+                      if name not in CLASSES or not self.code("test_http_static", function, setup.f_code):
+                          return
+                      if setup.f_lineno != (58 if name == CLASSES[0] else 198) or setup.f_locals.get("cls") is not cls:
+                          return
+                      if caller.f_locals.get("self") is not provider or getattr(cls, "vapi", None) is not provider:
+                          return
+                      command = frame.f_locals.get("cli", "").strip()
+                      if re.fullmatch(r"create host-interface name [^\s]+", command) is None or value is None or type(value.retval) is not int or value.retval == 0:
+                          return
+                      slot = self.slots.get(name)
+                      if slot is None or slot.process is not getattr(cls, "vpp", None) or not slot.lock.acquire(blocking=False):
+                          return
+                      try:
+                          if slot.once or slot.frozen:
+                              return
+                          slot.once, slot.query_active = True, True
+                          slot.record.update(query_status="running", event_seq=sequence,
+                                             event_file=f"events.{os.getpid()}.jsonl", retval=value.retval)
+                      finally:
+                          slot.lock.release()
+                      try:
+                          reply = str(value.reply)
+                          reply_hash, size = hashlib.sha256(), 0
+                          for offset in range(0, len(reply), 65536):
+                              chunk = reply[offset:offset + 65536].encode("utf-8", errors="backslashreplace")
+                              reply_hash.update(chunk)
+                              size += len(chunk)
+                              if time.monotonic() >= started + 1.5:
+                                  raise TimeoutError("Diagnostic metadata budget")
+                          slot.record.update(reply_sha256=reply_hash.hexdigest(), reply_bytes=size,
+                                             event_reply_slice_characters=65536)
+                          self.query(slot, cls, started)
+                      except Exception:
+                          slot.record.update(query_status="unavailable")
+                      finally:
+                          slot.query_active = False
+                          slot.finish()
+                  except Exception:
+                      pass
+
+              def query(self, slot, cls, started):
+                  process = None
+                  execution = started + 1.5
+                  deadline = started + 2
+                  result = slot.record
+                  try:
+                      if float(os.environ["WORK_DEADLINE"]) - time.time() < 2 or time.monotonic() >= execution:
+                          result["query_status"] = "work_budget_unavailable"
+                          return
+                      if slot.process.poll() is not None or getattr(cls, "vpp", None) is not slot.process:
+                          result["query_status"] = "not_live"
+                          return
+                      socket = cls.get_cli_sock_path()
+                      if cls.tempdir != slot.tempdir or socket != os.path.join(slot.tempdir, "cli.sock") or not os.path.isabs(socket):
+                          raise ValueError("Foreign CLI socket")
+                      socket_parent = directory(cls.tempdir)
+                      try:
+                          info = os.stat("cli.sock", dir_fd=socket_parent, follow_symlinks=False)
+                          if not stat.S_ISSOCK(info.st_mode):
+                              raise ValueError("Invalid CLI socket")
+                      finally:
+                          os.close(socket_parent)
+                      relative = "build-root/install-vpp_debug-native/vpp/bin/vppctl"
+                      if file_hash(self.source_fd, relative) != self.config["vppctl_sha256"]:
+                          raise ValueError("Diagnostic executable mismatch")
+                      if time.monotonic() >= execution:
+                          raise TimeoutError("Diagnostic preparation budget")
+                      args = [self.tool, "-s", socket, "show", "logging"]
+                      process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                                 stderr=subprocess.PIPE, shell=False, cwd=self.source_path)
+                      result.update(query_pid=process.pid, query_status="completed")
+                      with selectors.DefaultSelector() as selector:
+                          for index, pipe in ((2, process.stdout), (3, process.stderr)):
+                              os.set_blocking(pipe.fileno(), False)
+                              selector.register(pipe, selectors.EVENT_READ, index)
+                          while selector.get_map() or process.poll() is None:
+                              if time.monotonic() >= execution:
+                                  result["query_status"] = "timeout"
+                                  break
+                              for key, _ in selector.select(min(.02, max(0, execution - time.monotonic()))):
+                                  try:
+                                      raw = os.read(key.fd, 65536)
+                                  except BlockingIOError:
+                                      continue
+                                  if not raw:
+                                      selector.unregister(key.fileobj)
+                                  elif not slot.write(key.data, raw):
+                                      result["query_status"] = "output_limit_or_write_error"
+                                      return
+                  except Exception as error:
+                      result.update(query_status="unavailable", error=type(error).__name__[:64])
+                  finally:
+                      if process is not None:
+                          try:
+                              if process.poll() is None:
+                                  process.terminate()
+                                  try:
+                                      process.wait(timeout=max(0, started + 1.75 - time.monotonic()))
+                                  except subprocess.TimeoutExpired:
+                                      process.kill()
+                              process.wait(timeout=max(0, deadline - time.monotonic()))
+                              result.update(rc=process.returncode, cleanup_complete=True)
+                          except (OSError, subprocess.SubprocessError):
+                              result.update(rc=process.returncode, cleanup_complete=False)
+                          finally:
+                              process.stdout.close()
+                              process.stderr.close()
+                      result.update(query_elapsed=time.monotonic() - started)
+
+              def finish(self):
+                  if self.pid != os.getpid():
+                      return
+                  for slot in list(self.slots.values()):
+                      slot.finish()
+
+          def configure():
+              try:
+                  raw = os.environ.get("HSS_DIAGNOSTIC_CONFIG", "")
+                  if not raw or len(raw) > 16384:
+                      return None
+                  return Diagnostics(json.loads(raw))
+              except Exception:
+                  return None
+          PY
           cat > "$TOOLS/sitecustomize.py" <<'PY'
           import json
           import os
@@ -241,6 +704,8 @@ jobs:
 
           target = os.environ.get("HSS_EVENTS")
           if target:
+              import hss_diagnostics
+              diagnostics = hss_diagnostics.configure()
               sequence = 0
               def emit(kind, **values):
                   global sequence
@@ -294,6 +759,8 @@ jobs:
 
               # Observe returns from unchanged real helpers; never replace their results.
               def profile(frame, event, value):
+                  if diagnostics is not None:
+                      diagnostics.observe(frame, event, value)
                   if event != "return":
                       return
                   filename, name = frame.f_code.co_filename, frame.f_code.co_name
@@ -323,6 +790,8 @@ jobs:
                       elif name == "cli_return_response" and value is not None:
                           emit("cli_reply", command=frame.f_locals["cli"].strip(),
                                retval=value.retval, reply=str(value.reply)[:65536])
+                          if diagnostics is not None:
+                              diagnostics.failure(frame, value, sequence)
               sys.setprofile(profile)
               threading.setprofile(profile)
               emit("loaded")
@@ -621,6 +1090,12 @@ jobs:
                                    for path in (TEST, FIXTURE)}
               manifest["source"] = dict(path=SOURCE, candidate_blob=git("rev-parse", f"{CANDIDATE}:{SOURCE}"),
                                         frozen_blob=git("rev-parse", f"{FROZEN}:{SOURCE}"))
+              manifest["diagnostic_sources"] = {path: dict(blob=git("rev-parse", f"{CANDIDATE}:{path}"),
+                      sha256=hashlib.sha256(content(CANDIDATE, path)).hexdigest()) for path in
+                      ("test/asf/asfframework.py", "test/vpp_papi_provider.py", TEST)}
+              require(content(CANDIDATE, "test/asfframework.py") == b"asf/asfframework.py",
+                      "Unexpected framework alias")
+              manifest["live_diagnostic_limits"] = "3 identities; 15 files including pending; 18 MiB + 48 KiB; 2 s/query"
               manifest["tools"] = {path.name: digest(path) for path in TOOLS.glob("*.py")}
               manifest["work_deadline"] = float(os.environ["WORK_DEADLINE"])
               manifest["upload_limit"] = "External runner termination can prevent upload; own work stops before reserved collection/upload budget."
@@ -883,7 +1358,22 @@ jobs:
               expected = expected_ids() if VARIANT == "fixed" else [
                   f"test_http_static.{cls}.{method}" for cls in CLASSES]
               event_base = OUT / "events"
+              diagnostic_config = None
+              try:
+                  import hss_diagnostics
+                  directory = OUT / "live-diagnostics"
+                  directory.mkdir(mode=0o700)
+                  for path, provenance in manifest["diagnostic_sources"].items():
+                      require(digest(path) == provenance["sha256"], "Diagnostic source changed")
+                  tool = "build-root/install-vpp_debug-native/vpp/bin/vppctl"
+                  diagnostic_config = dict(directory=str(directory.absolute()), root=str(ROOT.absolute()),
+                      vppctl=str((ROOT / tool).absolute()), vppctl_sha256=digest(tool),
+                      sources=manifest["diagnostic_sources"], workflow=manifest["workflow_sha"],
+                      candidate=CANDIDATE, variant=VARIANT, runtime="runtime")
+              except Exception:
+                  pass
               env = dict(os.environ, HSS_EVENTS=str(event_base),
+                         HSS_DIAGNOSTIC_CONFIG=json.dumps(diagnostic_config) if diagnostic_config else "",
                          PYTHONPATH=str(TOOLS) + os.pathsep + os.environ.get("PYTHONPATH", ""))
               args = ["make", "UNATTENDED=yes", "TEST_JOBS=1", "FORCE_FOREGROUND=1", "VPP_WORKER_COUNT=0",
                       "RETRIES=0", "FAILFAST=0", "SKIP_TESTS=", "VPP_EXCLUDED_PLUGINS=", "V=2",
@@ -917,6 +1407,9 @@ jobs:
               files = {str(path): digest(path) for path in paths if path.is_file()}
               for name in ("vpp", "http_static_plugin.so", "tlsopenssl_plugin.so", "quic_plugin.so"):
                   require(any(Path(path).name == name for path in files), f"Required binary/plugin missing: {name}")
+              tool = Path("build-root/install-vpp_debug-native/vpp/bin/vppctl")
+              if tool.is_file():
+                  files[str(tool)] = digest(tool)
               save("binaries.json", files)
               caches = list(Path("build-root/build-vpp_debug-native").rglob("CMakeCache.txt"))
               require(caches, "Missing build cache")
