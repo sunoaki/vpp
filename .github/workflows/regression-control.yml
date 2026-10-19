@@ -122,19 +122,73 @@ jobs:
               if not condition:
                   raise AssertionError(message)
 
+          def validate_fib_cli_error(variant, selector, rc, console, logs, stderr,
+                                     callbacks, subtests, expected):
+              require(selector == "fib.TestFIB.test_fib" and expected == [("TestFIB", "test_fib")],
+                      "Unexpected FIB negative selector")
+              require(rc == 2 and callbacks == [("addError", "TestFIB", "test_fib")] and not subtests,
+                      "Unexpected FIB negative result")
+              require(not re.search(r"SIGSEGV|segmentation fault|Core was generated|"
+                                    r"timed out|TimeoutError|AssertionError|(?:^|\n)SKIP:|"
+                                    r"OK \(skipped=", console + logs + stderr, re.IGNORECASE),
+                      "FIB infrastructure error or skipped test")
+              require(re.findall(r"(?m)^(?:ERROR|FAIL|SKIP):[^\n]*", console) ==
+                      ["ERROR: FIB Unit Tests"], "Unexpected FIB error heading")
+              require(re.findall(r"(?m)^Ran [^\n]*", console) and
+                      len(re.findall(r"(?m)^Ran [^\n]*", console)) == 1 and
+                      re.search(r"(?m)^Ran 1 test in [0-9]+\.[0-9]+s$", console),
+                      "Missing or duplicate completed FIB test summary")
+              require(re.findall(r"(?m)^(?:FAILED|OK)[^\n]*", console) == ["FAILED (errors=1)"],
+                      "Unexpected FIB failure summary")
+              exception = "vpp_papi_exceptions.CliFailedCommandError: test fib: FIB Unit Test Failed"
+              frames = (r'  File "[^"\n]*/test/asf/test_fib\.py", line 22, in test_fib\n'
+                        r'    error = self\.vapi\.cli\("test fib"\)\n'
+                        r'  File "[^"\n]*/test/vpp_papi_provider\.py", line 484, in cli\n'
+                        r'    raise CliFailedCommandError\(r\.reply\)\n' + re.escape(exception))
+              for text in (console, logs):
+                  require(len(re.findall(r"(?m)^" + re.escape(exception) + r"$", text)) == 1 and
+                          len(re.findall(frames, text)) == 1 and
+                          text.count("Traceback (most recent call last):") == 1,
+                          "Missing or unexpected FIB CLI traceback")
+              clock = r"(?m:^)\d{2}:\d{2}:\d{2},\d{3} "
+              call = (clock + r"CLI: test fib\n" + clock +
+                      r"Calling cli_inband\('cmd':'test fib\\n','context':(?P<context>\d+),"
+                      r"'_vl_msg_id':\d+,'client_index':\d+\)\n" + clock +
+                      r"Return value: cli_inband_reply\(_0=\d+, context=(?P=context), "
+                      r"retval=-1, reply='test fib: FI\.\.\.\n")
+              calls = list(re.finditer(call, logs))
+              require(len(calls) == 1 and len(re.findall(clock + r"CLI: test fib(?m:$)", logs)) == 1,
+                      "Missing or duplicate failing test fib CLI call")
+              require([int(value) for value in re.findall(r"Return value: [^\n]*retval=(-?\d+)", logs)
+                       if int(value) != 0] == [-1], "Unexpected failing API return")
+              outcome = (clock + r"--- addError\(\) TestFIB\.test_fib\(FIB Unit Tests\) called, "
+                         r"error is \(<class 'vpp_papi_exceptions\.CliFailedCommandError'>, "
+                         r"CliFailedCommandError\('test fib: FIB Unit Test Failed\\n'\), "
+                         r"<traceback object at 0x[0-9a-f]+>\)(?m:$)")
+              results = list(re.finditer(outcome, logs))
+              require(len(results) == 1 and calls[0].end() == results[0].start(),
+                      "FIB CLI error did not produce the exact result callback")
+              lifecycle = ["--- START setUp() TestFIB.test_fib(",
+                           "--- END setUp() TestFIB.test_fib(",
+                           "CLI: test fib\n", "--- addError() TestFIB.test_fib(", exception,
+                           "--- START tearDown() TestFIB.test_fib(",
+                           "--- END tearDown() TestFIB.test_fib(",
+                           "--- START tearDownClass() TestFIB ---",
+                           "--- END tearDownClass() TestFIB ---"]
+              positions = [logs.find(token) for token in lifecycle]
+              require(all(logs.count(token) == 1 for token in lifecycle) and
+                      positions == sorted(positions), "Incomplete or duplicate FIB lifecycle")
+              require(console.index(exception) < console.index("Ran 1 test in ") <
+                      console.index("FAILED (errors=1)"), "FIB summary precedes the failure")
+              marker = ("FAIL:5809: special update purges import delegate"
+                        if variant == "special-update" else
+                        "FAIL:5702: incremental add creates import delegate")
+              markers = re.findall(r"(?m)^FAIL:[0-9]+: [^\n]*", stderr)
+              require(markers and markers[0] == marker and markers.count(marker) == 1,
+                      f"Wrong, missing, or duplicate first FIB assertion: {markers[:1]}")
+
           def validate(feature, variant, selector, rc, console, logs, events, expected, stderr=""):
               callbacks = CALLBACK.findall(logs)
-              require(callbacks or feature == "gre" and variant == "restored",
-                      "Missing framework result callbacks")
-              require(not any(callback in ("addError", "addSkip", "addExpectedFailure",
-                                           "addUnexpectedSuccess")
-                              for callback, _, _ in callbacks), "Invalid result callback")
-              require(not re.search(r"(?:^|\n)(?:ERROR|SKIP):|FAILED \([^\n]*errors=|"
-                                    r"OK \(skipped=|SIGSEGV|segmentation fault|"
-                                    r"Core was generated|timed out|TimeoutError", console,
-                                    re.IGNORECASE), "Infrastructure error or skipped test")
-              require(re.search(r"Ran [1-9][0-9]* tests? in ", console),
-                      "Missing completed unittest summary")
               loaded = [event["pid"] for event in events if event["kind"] == "loaded"]
               starts = [event for event in events if event["kind"] == "start"]
               subtests = [event for event in events if event["kind"] == "subtest"]
@@ -148,6 +202,21 @@ jobs:
               require(all(any(start["pid"] == event["pid"] and start["test"] == event["test"]
                               for start in starts) for event in subtests),
                       "Subtest without observed test start")
+              if feature == "fib" and variant in ("restored", "special-update"):
+                  validate_fib_cli_error(variant, selector, rc, console, logs, stderr,
+                                         callbacks, subtests, expected)
+                  return
+              require(callbacks or feature == "gre" and variant == "restored",
+                      "Missing framework result callbacks")
+              require(not any(callback in ("addError", "addSkip", "addExpectedFailure",
+                                           "addUnexpectedSuccess")
+                              for callback, _, _ in callbacks), "Invalid result callback")
+              require(not re.search(r"(?:^|\n)(?:ERROR|SKIP):|FAILED \([^\n]*errors=|"
+                                    r"OK \(skipped=|SIGSEGV|segmentation fault|"
+                                    r"Core was generated|timed out|TimeoutError", console,
+                                    re.IGNORECASE), "Infrastructure error or skipped test")
+              require(re.search(r"Ran [1-9][0-9]* tests? in ", console),
+                      "Missing completed unittest summary")
               actual = [(cls, method) for callback, cls, method in callbacks
                         if callback == "addSuccess"]
               if variant == "fixed":
@@ -165,20 +234,6 @@ jobs:
                           "Expected completed assertion-only failure summary")
                   require(not actual, "Restored exact method unexpectedly succeeded")
               if feature == "fib":
-                  if variant in ("restored", "special-update"):
-                      require(callbacks == [("addFailure", "TestFIB", "test_fib")],
-                              f"Unexpected FIB outcomes: {callbacks}")
-                      marker = ("FAIL:5807: special update purges import delegate"
-                                if variant == "special-update" else
-                                "FAIL:5700: incremental add creates import delegate")
-                      markers = re.findall(r"(?m)^FAIL:[0-9]+: [^\n]*", stderr)
-                      require(markers and markers[0] == marker,
-                              f"Wrong first FIB assertion: {markers[:1]}")
-                      require(markers.count(marker) == 1,
-                              "Missing or duplicate intended FIB assertion")
-                      require("self.assertNotIn(\"Failed\", error)" in logs and
-                              "AssertionError:" in logs and "FIB Unit Test Failed" in logs,
-                              "FIB did not finish through unchanged Python assertion")
                   return
               selected = METHODS if selector == "gre" else [selector.rsplit(".", 1)[1]]
               for method in selected:
@@ -370,7 +425,7 @@ jobs:
                                      f"/actions/runs/{os.environ['GITHUB_RUN_ID']}",
                           "artifact_name": f"regression-{feature}-{variant}-"
                                            f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
-                          "expected_failure": ("FAIL:5700: incremental add creates import delegate"
+                          "expected_failure": ("FAIL:5702: incremental add creates import delegate"
                                                if feature == "fib" else
                                                "key=268370692 flags=4 count=1: outer.tos/tc 252 != 20; "
                                                "mGRE count=1: outer.tos 255 != 21"),
@@ -392,7 +447,7 @@ jobs:
                   Path(source).write_bytes(selective_source(candidate_bytes, frozen_bytes))
                   candidate_bytes, frozen_bytes, restored, headers = verify_selective_source()
                   expected_source = git("hash-object", source)
-                  manifest["expected_failure"] = "FAIL:5807: special update purges import delegate"
+                  manifest["expected_failure"] = "FAIL:5809: special update purges import delegate"
                   manifest["selective_restore"] = {
                       "function": "fib_entry_special_update",
                       "candidate_function_sha256": hashlib.sha256(
