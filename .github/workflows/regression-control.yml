@@ -493,8 +493,55 @@ jobs:
                   record_root_exit(process, reaped)
               return process.returncode
 
+          def process_evidence(pid, birth):
+              result = {"pid": pid, "birth": birth, "state": None, "comm": None, "cmdline": None}
+              current = process_identity(pid)
+              if current is None or current[1] != birth:
+                  result["identity_matches"] = False
+                  return result
+              try:
+                  with Path(f"/proc/{pid}/stat").open("rb") as stream:
+                      result["state"] = stream.read(4096).rsplit(b")", 1)[1].split()[0].decode()
+                  for name, limit in (("comm", 256), ("cmdline", 1024)):
+                      with Path(f"/proc/{pid}/{name}").open("rb") as stream:
+                          data = stream.read(limit + 1)
+                      result[name] = data[:limit].replace(b"\0", b" ").decode(errors="replace").rstrip()
+                      result[f"{name}_truncated"] = len(data) > limit
+              except (OSError, ValueError, IndexError) as error:
+                  result["error"] = str(error)[:500]
+              current = process_identity(pid)
+              if current is None or current[1] != birth:
+                  return {"pid": pid, "birth": birth, "identity_matches": False,
+                          "state": None, "comm": None, "cmdline": None}
+              result["identity_matches"] = True
+              return result
+
+          def reap_completed(tracked, baseline, unresolved, result):
+              observed = set()
+              deadline = time.monotonic() + 5
+              while True:
+                  progress = False
+                  for pid in sorted(descendants(tracked, baseline, unresolved)):
+                      if time.monotonic() >= deadline:
+                          raise TimeoutError("Completion reap deadline exceeded")
+                      birth = tracked[pid]
+                      if (pid, birth) not in observed:
+                          if len(observed) >= 2048:
+                              raise RuntimeError("Completion process evidence limit exceeded")
+                          result["processes"].append(process_evidence(pid, birth))
+                          observed.add((pid, birth))
+                      _, reaped = inspect_process(pid, birth)
+                      if reaped is not None:
+                          if len(result["reaped"]) >= 2048:
+                              raise RuntimeError("Completion reap evidence limit exceeded")
+                          result["reaped"].append([reaped.si_pid, birth, reaped.si_status, reaped.si_code])
+                          progress = True
+                  if not progress:
+                      return
+
           def cleanup(process, tracked, baseline, unresolved):
-              result = {"signals": [], "reaped": [], "survivors": []}
+              result = {"signals": [], "reaped": [], "survivors": [], "processes": []}
+              observed = set()
               deadline = time.monotonic() + 5
               for sig, seconds in ((signal.SIGTERM, 1), (signal.SIGKILL, 3)):
                   stage_end = min(deadline, time.monotonic() + seconds)
@@ -502,11 +549,21 @@ jobs:
                       live = descendants(tracked, baseline, unresolved)
                       identities = [(pid, tracked[pid]) for pid in sorted(live)]
                       for pid, birth in identities:
+                          if (pid, birth) not in observed:
+                              if len(observed) < 2048:
+                                  result["processes"].append(process_evidence(pid, birth))
+                                  observed.add((pid, birth))
+                              else:
+                                  result["processes_truncated"] = True
                           sent, reaped = inspect_process(pid, birth, sig)
                           if sent and len(result["signals"]) < 2048:
                               result["signals"].append([pid, birth, int(sig)])
                           if reaped is not None:
-                              result["reaped"].append([reaped.si_pid, birth, reaped.si_status])
+                              if len(result["reaped"]) < 2048:
+                                  result["reaped"].append([reaped.si_pid, birth, reaped.si_status,
+                                                           reaped.si_code])
+                              else:
+                                  result["reaped_truncated"] = True
                               record_root_exit(process, reaped)
                       if not descendants(tracked, baseline, unresolved) or time.monotonic() >= stage_end:
                           break
@@ -530,7 +587,8 @@ jobs:
                           (300 if evidence else 0))
               deadline = time.monotonic() + max(0, limit - now)
               result = {"command": args, "start": now, "deadline": limit, "rc": None,
-                        "outcome": "running", "exception": None, "cleanup": None}
+                        "outcome": "running", "exception": None, "cleanup": None,
+                        "completion": {"processes": [], "reaped": []}}
               result_path = directory / "result.json"
               result_path.write_text(json.dumps(result, indent=2))
               (directory / "console.log").touch()
@@ -578,6 +636,7 @@ jobs:
                               stream.truncate()
                               stream.flush()
                       result["rc"] = process.returncode
+                  reap_completed(tracked, baseline, unresolved, result["completion"])
                   if descendants(tracked, baseline, unresolved):
                       raise RuntimeError("Command left descendant processes after completion")
                   result["outcome"] = "success" if result["rc"] == 0 else "nonzero"
