@@ -350,7 +350,21 @@ fib_entry_src_interpose_format (fib_entry_src_t *src,
     return (s);
 }
 
+static void
+fib_entry_src_interpose_installed (fib_entry_src_t *src,
+                                  const fib_entry_t *fib_entry)
+{
+  fib_entry_src_t *best_src;
+
+  best_src = fib_entry_src_rr_get_next_best (src, fib_entry);
+  if (best_src && (best_src->fes_flags & FIB_ENTRY_SRC_FLAG_CONTRIBUTING))
+    {
+      FIB_ENTRY_SRC_VFT_INVOKE (fib_entry, best_src, fesv_installed, (best_src, fib_entry));
+    }
+}
+
 const static fib_entry_src_vft_t interpose_src_vft = {
+    .fesv_installed = fib_entry_src_interpose_installed,
     .fesv_init = fib_entry_src_interpose_init,
     .fesv_deinit = fib_entry_src_interpose_deinit,
     .fesv_activate = fib_entry_src_interpose_activate,
