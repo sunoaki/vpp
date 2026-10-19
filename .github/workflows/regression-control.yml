@@ -49,8 +49,10 @@ jobs:
       GIT_CONFIG_VALUE_0: ${{ github.workspace }}
     steps:
       - name: Install base tools
+        timeout-minutes: 5
         run: |
           set -euo pipefail
+          printf 'CONTROL_WORK_DEADLINE=%s\n' "$(( $(date +%s) + 4500 ))" >> "$GITHUB_ENV"
           printf 'CONTROL_DIR=%s/regression-control\nEVIDENCE_DIR=%s/regression-evidence\n' \
             "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/regression-control" "$RUNNER_TEMP/regression-evidence"
@@ -59,6 +61,7 @@ jobs:
           apt-get install -y -qq sudo make git bash iproute2 python3
 
       - name: Check out the workflow commit
+        timeout-minutes: 3
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
@@ -67,6 +70,7 @@ jobs:
           persist-credentials: false
 
       - name: Prepare immutable source and evidence tools
+        timeout-minutes: 2
         run: |
           set -euo pipefail
           git config --global --add safe.directory "$PWD"
@@ -354,12 +358,17 @@ jobs:
           PY
           cat > "$CONTROL_DIR/run.py" <<'PY'
           import ast
+          import ctypes
           import hashlib
           import json
           import os
           import re
+          import selectors
+          import signal
           import subprocess
+          import sys
           import time
+          import traceback
           from pathlib import Path
           from collect import collect
           from validate import CALLBACK, METHODS, validate
@@ -406,31 +415,171 @@ jobs:
                   assert Path(path).read_bytes() == original, f"Candidate invariant failed: {path}"
               return candidate_bytes, frozen_bytes, expected, headers
 
-          def command(label, args, env=None):
+          def process_identity(pid):
+              try:
+                  fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+                  return int(fields[1]), int(fields[19])
+              except (OSError, ValueError, IndexError):
+                  return None
+
+          def process_table():
+              table = {}
+              for path in Path("/proc").glob("[0-9]*/stat"):
+                  pid = int(path.parent.name)
+                  identity = process_identity(pid)
+                  if identity is not None:
+                      table[pid] = identity
+              return table
+
+          def descendants(tracked, baseline):
+              table = process_table()
+              changed = True
+              while changed:
+                  changed = False
+                  for pid, (parent, birth) in table.items():
+                      if tracked.get(pid) == birth or baseline.get(pid) == birth:
+                          continue
+                      if parent == os.getpid() or (parent in tracked and parent in table and
+                                                  tracked[parent] == table[parent][1]):
+                          tracked[pid] = birth
+                          changed = True
+              return {pid for pid, birth in tracked.items()
+                      if pid in table and table[pid][1] == birth}
+
+          def cleanup(process, tracked, baseline):
+              result = {"signals": [], "reaped": [], "survivors": []}
+              deadline = time.monotonic() + 5
+              for sig, seconds in ((signal.SIGTERM, 1), (signal.SIGKILL, 3)):
+                  stage_end = min(deadline, time.monotonic() + seconds)
+                  while True:
+                      live = descendants(tracked, baseline)
+                      if process is not None:
+                          process.poll()
+                      for pid in sorted(live):
+                          try:
+                              descriptor = os.pidfd_open(pid)
+                          except ProcessLookupError:
+                              continue
+                          try:
+                              current = process_identity(pid)
+                              if current is not None and current[1] == tracked[pid]:
+                                  signal.pidfd_send_signal(descriptor, sig)
+                                  if len(result["signals"]) < 2048:
+                                      result["signals"].append([pid, tracked[pid], int(sig)])
+                          except ProcessLookupError:
+                              pass
+                          finally:
+                              os.close(descriptor)
+                      for pid in sorted(live):
+                          if process is not None and pid == process.pid:
+                              continue
+                          try:
+                              reaped, status = os.waitpid(pid, os.WNOHANG)
+                              if reaped:
+                                  result["reaped"].append([reaped, status])
+                          except ChildProcessError:
+                              pass
+                      if not descendants(tracked, baseline) or time.monotonic() >= stage_end:
+                          break
+                      time.sleep(0.02)
+              if process is not None:
+                  try:
+                      process.wait(timeout=max(0.01, deadline - time.monotonic()))
+                  except subprocess.TimeoutExpired:
+                      result["survivors"].append(process.pid)
+              result["survivors"] = sorted(set(result["survivors"]) | descendants(tracked, baseline))
+              return result
+
+          def command(label, args, env=None, seconds=900, evidence=False):
               directory = output / label
               directory.mkdir()
-              result = {"command": args, "start": time.time(), "rc": None}
+              now = time.time()
+              limit = min(now + seconds, float(os.environ["CONTROL_WORK_DEADLINE"]) +
+                          (300 if evidence else 0))
+              deadline = time.monotonic() + max(0, limit - now)
+              result = {"command": args, "start": now, "deadline": limit, "rc": None,
+                        "outcome": "running", "exception": None, "cleanup": None}
               result_path = directory / "result.json"
               result_path.write_text(json.dumps(result, indent=2))
-              process = subprocess.Popen(args, stdout=subprocess.PIPE,
-                                         stderr=subprocess.STDOUT, env=env)
-              tail = bytearray()
-              with (directory / "console.log").open("w+b") as stream:
-                  for chunk in iter(lambda: process.stdout.read1(65536), b""):
-                      print(chunk.decode(errors="replace"), end="", flush=True)
-                      tail.extend(chunk)
-                      if len(tail) > 8 * 1024 * 1024:
-                          del tail[:-8 * 1024 * 1024]
-                          stream.seek(0)
-                          stream.write(tail)
-                          stream.truncate()
-                      else:
-                          stream.write(chunk)
-                      stream.flush()
-              rc = process.wait()
-              result.update(rc=rc, end=time.time())
-              result_path.write_text(json.dumps(result, indent=2))
-              return directory, rc, tail.decode(errors="replace")
+              (directory / "console.log").touch()
+              tail, process, tracked = bytearray(), None, {}
+              baseline = {pid: birth for pid, (_, birth) in process_table().items()}
+              poller = selectors.DefaultSelector()
+              handlers = {}
+
+              def interrupted(signum, frame):
+                  raise KeyboardInterrupt(f"Runner received signal {signum}")
+
+              try:
+                  for sig in (signal.SIGTERM, signal.SIGINT):
+                      handlers[sig] = signal.signal(sig, interrupted)
+                  if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
+                      raise OSError(ctypes.get_errno(), "Cannot become child subreaper")
+                  if time.monotonic() >= deadline:
+                      raise TimeoutError("Command budget exhausted before spawn")
+                  process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                             env=env, start_new_session=True)
+                  descendants(tracked, baseline)
+                  result["pid"] = process.pid
+                  result["pid_starttime"] = tracked.get(process.pid)
+                  result_path.write_text(json.dumps(result, indent=2))
+                  os.set_blocking(process.stdout.fileno(), False)
+                  poller.register(process.stdout, selectors.EVENT_READ)
+                  with (directory / "console.log").open("w+b") as stream:
+                      while poller.get_map() or process.poll() is None:
+                          descendants(tracked, baseline)
+                          remaining = deadline - time.monotonic()
+                          if remaining <= 0:
+                              raise TimeoutError("Absolute command deadline exceeded")
+                          for key, _ in poller.select(min(0.1, remaining)):
+                              try:
+                                  chunk = os.read(key.fd, 65536)
+                              except BlockingIOError:
+                                  continue
+                              if not chunk:
+                                  poller.unregister(key.fileobj)
+                                  continue
+                              tail.extend(chunk)
+                              del tail[:-8 * 1024 * 1024]
+                              stream.seek(0)
+                              stream.write(tail)
+                              stream.truncate()
+                              stream.flush()
+                      result["rc"] = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+                  if descendants(tracked, baseline):
+                      raise RuntimeError("Command left descendant processes after completion")
+                  result["outcome"] = "success" if result["rc"] == 0 else "nonzero"
+              except BaseException as error:
+                  result["outcome"] = ("timeout" if isinstance(error, (TimeoutError, subprocess.TimeoutExpired))
+                                       else "exception")
+                  result["exception"] = {"type": type(error).__name__, "message": str(error),
+                                         "traceback": traceback.format_exc()}
+              finally:
+                  for sig in handlers:
+                      signal.signal(sig, signal.SIG_IGN)
+                  try:
+                      result["cleanup"] = cleanup(process, tracked, baseline)
+                  except BaseException as error:
+                      result["cleanup"] = {"error": repr(error), "survivors": sorted(tracked)}
+                  if process is not None:
+                      result["rc"] = process.returncode
+                  try:
+                      if process is not None:
+                          process.stdout.close()
+                      poller.close()
+                  except OSError as error:
+                      result["cleanup"]["error"] = repr(error)
+                  if result["cleanup"]["survivors"] or "error" in result["cleanup"]:
+                      result["outcome"] = "cleanup-failed"
+                  result["spawned"] = process is not None
+                  result["retained_bytes"] = len(tail)
+                  result["runner_rc"] = result["rc"] if result["outcome"] in ("success", "nonzero") else 125
+                  result["end"] = time.time()
+                  result_path.write_text(json.dumps(result, indent=2))
+                  for sig, handler in handlers.items():
+                      signal.signal(sig, handler)
+              status = result["rc"] if result["outcome"] in ("success", "nonzero") else 125
+              return directory, status, tail.decode(errors="replace")
 
           def prepare():
               workflow_sha = os.environ["WORKFLOW_SHA"]
@@ -553,33 +702,65 @@ jobs:
                           "COREDUMP_SIZE=0", "DECODE_PCAPS=none", "RND_SEED=47", f"TEST={selector}",
                           "test-debug"]
                   directory, rc, console = command(label, args, environment)
-                  # Snapshot before the next make test-dep resets /tmp/vpp-unittest-*.
-                  collect(directory / "diagnostics")
-                  log_paths = sorted(Path("/tmp").glob("vpp-unittest-*/log.txt"))
-                  stderr_paths = sorted(Path("/tmp").glob("vpp-unittest-*/vpp_stderr.txt"))
-                  stderr = "\n".join(path.read_text(errors="replace") for path in stderr_paths
-                                     if path.is_file() and not path.is_symlink())
                   expected = all_methods if selector == feature else [tuple(selector.split(".")[1:])]
-                  try:
-                      logs = retain_callbacks(directory, log_paths, events_path)
-                      events = [json.loads(line) for line in events_path.read_text().splitlines()]
-                      validate(feature, variant, selector, rc, console, logs, events, expected, stderr)
-                  except (AssertionError, OSError, ValueError) as error:
-                      errors.append(f"{selector}: {error}")
-                      (directory / "validation.txt").write_text(f"FAIL: {error}\n")
-                  else:
-                      (directory / "validation.txt").write_text("PASS\n")
+                  request = {"label": label, "selector": selector, "expected": expected,
+                             "events": str(events_path), "status": rc}
+                  (directory / "snapshot-request.json").write_text(json.dumps(request))
+                  _, diagnostic_status, _ = command(
+                      f"diagnostics-{label}", [sys.executable, str(tools / "run.py"), "collect", label],
+                      seconds=60, evidence=True)
+                  _, snapshot_status, _ = command(
+                      f"snapshot-{label}", [sys.executable, str(tools / "run.py"), "snapshot", label],
+                      seconds=60, evidence=True)
+                  if diagnostic_status or snapshot_status:
+                      errors.append(f"{selector}: diagnostics={diagnostic_status}, snapshot={snapshot_status}")
+                  if json.loads((directory / "result.json").read_text())["outcome"] not in (
+                          "success", "nonzero"):
+                      errors.append(f"{selector}: invocation infrastructure failure")
+                      break
               if errors:
                   raise AssertionError("\n".join(errors))
 
+          def snapshot(label):
+              directory = output / label
+              request = json.loads((directory / "snapshot-request.json").read_text())
+              errors = []
+              try:
+                  log_paths = sorted(Path("/tmp").glob("vpp-unittest-*/log.txt"))
+                  events_path = Path(request["events"])
+                  logs = retain_callbacks(directory, log_paths, events_path)
+                  stderr_paths = sorted(Path("/tmp").glob("vpp-unittest-*/vpp_stderr.txt"))
+                  stderr = "\n".join(path.read_text(errors="replace") for path in stderr_paths
+                                     if path.is_file() and not path.is_symlink())
+                  events = [json.loads(line) for line in events_path.read_text().splitlines()]
+                  result = json.loads((directory / "result.json").read_text())
+                  assert result["outcome"] in ("success", "nonzero"), "Invocation infrastructure failure"
+                  assert result["rc"] == request["status"] and result["end"] >= result["start"]
+                  validate(feature, variant, request["selector"], result["rc"],
+                           (directory / "console.log").read_text(errors="replace"), logs, events,
+                           [tuple(item) for item in request["expected"]], stderr)
+              except (AssertionError, OSError, ValueError) as error:
+                  errors.append(f"Callbacks/validation: {error}")
+              (directory / "validation.txt").write_text(
+                  "FAIL: " + "; ".join(errors) + "\n" if errors else "PASS\n")
+              if errors:
+                  raise AssertionError("; ".join(errors))
+
           if __name__ == "__main__":
-              import sys
               if sys.argv[1] == "prepare":
                   prepare()
               elif sys.argv[1] == "tests":
                   run_tests()
+              elif sys.argv[1] == "snapshot":
+                  snapshot(sys.argv[2])
+              elif sys.argv[1] == "collect":
+                  destination = output / sys.argv[2] / "diagnostics" if len(sys.argv) > 2 else output / "final-diagnostics"
+                  collect(destination)
               else:
-                  _, status, _ = command(sys.argv[1], sys.argv[2:])
+                  label = sys.argv[1]
+                  seconds = {"dependencies": 900, "build": 2400, "final-collection": 60}.get(label, 900)
+                  _, status, _ = command(label, sys.argv[2:], seconds=seconds,
+                                         evidence=label == "final-collection")
                   raise SystemExit(status)
           PY
           python3 "$CONTROL_DIR/run.py" prepare
@@ -606,6 +787,7 @@ jobs:
           python3 "$CONTROL_DIR/run.py" build make UNATTENDED=yes build
 
       - name: Set up test runtime
+        timeout-minutes: 2
         uses: ./.github/actions/vpp-docker-runtime-setup
         with:
           WORKSPACE: ${{ github.workspace }}
@@ -621,26 +803,21 @@ jobs:
 
       - name: Retain final diagnostics and tool provenance
         if: always()
+        timeout-minutes: 2
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"
           if [ -d "$CONTROL_DIR" ]; then
             cp "$CONTROL_DIR/"*.py "$EVIDENCE_DIR/"
           fi
-          if [ -f "$CONTROL_DIR/collect.py" ]; then
-            python3 - <<'PY'
-          import os
-          import sys
-          from pathlib import Path
-          sys.path.insert(0, os.environ["CONTROL_DIR"])
-          from collect import collect
-          collect(Path(os.environ["EVIDENCE_DIR"]) / "final-diagnostics")
-          PY
+          if [ -f "$CONTROL_DIR/run.py" ]; then
+            python3 "$CONTROL_DIR/run.py" final-collection python3 "$CONTROL_DIR/run.py" collect
           fi
 
       - name: Upload bounded control evidence
         id: evidence
         if: always()
+        timeout-minutes: 5
         uses: actions/upload-artifact@v4
         with:
           name: regression-${{ matrix.feature }}-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
