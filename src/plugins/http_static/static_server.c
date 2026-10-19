@@ -1502,6 +1502,7 @@ hss_test_pending_accept_command_fn (vlib_main_t *vm, unformat_input_t *input,
 {
   hss_main_t *hsm = &hss_main;
   hss_listener_t cfg = { .sep = SESSION_ENDPOINT_CFG_NULL };
+  vnet_app_detach_args_t da;
   session_handle_t handles[130], listener;
   app_worker_t *app_wrk;
   hss_session_t *hs;
@@ -1616,7 +1617,7 @@ hss_test_pending_accept_command_fn (vlib_main_t *vm, unformat_input_t *input,
     error = clib_error_return (0, "pending accept stream reference failed");
 
 done:
-  vnet_app_detach_args_t da = { .app_index = hsm->app_index, .api_client_index = ~0 };
+  da = (vnet_app_detach_args_t) { .app_index = hsm->app_index, .api_client_index = ~0 };
   if (error)
     hss_test_accept_recover (handles, count, old_index);
   u32 budget = clib_fifo_elts (app_wrk->wrk_evts[0]);
