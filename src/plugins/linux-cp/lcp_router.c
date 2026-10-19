@@ -10,6 +10,7 @@
 #include <vlib/unix/plugin.h>
 #include <linux-cp/lcp_nl.h>
 #include <linux-cp/lcp_interface.h>
+#include <linux-cp/lcp_router.h>
 
 #include <netlink/msg.h>
 #include <netlink/netlink.h>
@@ -54,6 +55,7 @@ const static fib_prefix_t pfx_all1s = {
 
 static fib_source_t lcp_rt_fib_src;
 static fib_source_t lcp_rt_fib_src_dynamic;
+static fib_source_t lcp_rt_fib_src_special;
 
 #define LCP_ROUTER_DBG(...) vlib_log_debug (lcp_router_logger, __VA_ARGS__);
 
@@ -921,10 +923,10 @@ lcp_router_table_add_del_special_routes (lcp_router_table_t *nlt, u8 is_add)
     {
       /* Set the all 1s address in this table to punt */
       if (is_add)
-	fib_table_entry_special_add (nlt->nlt_fib_index, &pfx_all1s, lcp_rt_fib_src,
+	fib_table_entry_special_add (nlt->nlt_fib_index, &pfx_all1s, lcp_rt_fib_src_special,
 				     FIB_ENTRY_FLAG_LOCAL);
       else
-	fib_table_entry_special_remove (nlt->nlt_fib_index, &pfx_all1s, lcp_rt_fib_src);
+	fib_table_entry_special_remove (nlt->nlt_fib_index, &pfx_all1s, lcp_rt_fib_src_special);
 
       const fib_route_path_t path = {
 	.frp_proto = DPO_PROTO_IP4,
@@ -1014,11 +1016,53 @@ lcp_router_table_unlock (lcp_router_table_t *nlt)
       lcp_router_table_add_del_special_routes (nlt, 0);
 
       fib_table_unlock (nlt->nlt_fib_index, nlt->nlt_proto, lcp_rt_fib_src);
-      mfib_table_unlock (nlt->nlt_mfib_index, nlt->nlt_proto, MFIB_SOURCE_PLUGIN_LOW);
+      if (nlt->nlt_mfib_index != ~0)
+	mfib_table_unlock (nlt->nlt_mfib_index, nlt->nlt_proto, MFIB_SOURCE_PLUGIN_LOW);
 
       hash_unset (lcp_router_table_db[nlt->nlt_proto], nlt->nlt_id);
       pool_put (lcp_router_table_pool, nlt);
     }
+}
+
+static u32
+lcp_router_table_source_count (const lcp_router_table_t *nlt, fib_source_t source)
+{
+  const fib_table_t *table = fib_table_get (nlt->nlt_fib_index, nlt->nlt_proto);
+
+  return source < vec_len (table->ft_src_route_counts) ? table->ft_src_route_counts[source] : 0;
+}
+
+static void
+lcp_router_table_reconcile (lcp_router_table_t *nlt, fib_source_t source, u32 before)
+{
+  u32 after = lcp_router_table_source_count (nlt, source);
+
+  /* Each learned prefix/source owns one reference, including each MPLS EOS
+   * variant. The caller holds a temporary reference until reconciliation ends. */
+  if (after >= before)
+    nlt->nlt_refs += after - before;
+  else
+    {
+      ASSERT (nlt->nlt_refs > before - after);
+      nlt->nlt_refs -= before - after;
+    }
+  lcp_router_table_unlock (nlt);
+}
+
+int
+lcp_router_table_state (u32 table_id, fib_protocol_t proto, lcp_router_table_state_t *state)
+{
+  const lcp_router_table_t *nlt = lcp_router_table_find (table_id, proto);
+
+  if (!nlt)
+    return 0;
+  *state = (lcp_router_table_state_t) {
+    .refs = nlt->nlt_refs,
+    .fib_index = nlt->nlt_fib_index,
+    .mfib_index = nlt->nlt_mfib_index,
+    .sources = { lcp_rt_fib_src, lcp_rt_fib_src_dynamic, lcp_rt_fib_src_special },
+  };
+  return 1;
 }
 
 static void
@@ -1321,6 +1365,9 @@ lcp_router_route_del (struct rtnl_route *rr)
       fib_source_t fib_src;
 
       fib_src = lcp_router_proto_fib_source (rproto);
+      u32 before = lcp_router_table_source_count (nlt, fib_src);
+      if (rtype != RTN_MULTICAST)
+	nlt->nlt_refs++;
 
       switch (pfx.fp_proto)
 	{
@@ -1337,7 +1384,10 @@ lcp_router_route_del (struct rtnl_route *rr)
 					np.paths);
 	}
 
-      lcp_router_table_unlock (nlt);
+      if (rtype == RTN_MULTICAST)
+	lcp_router_table_unlock (nlt);
+      else
+	lcp_router_table_reconcile (nlt, fib_src, before);
     }
 
   vec_free (np.paths);
@@ -1442,6 +1492,7 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
 	    }
 
 	  fib_src = lcp_router_proto_fib_source (rproto);
+	  u32 before = lcp_router_table_source_count (nlt, fib_src);
 
 	  if (pfx.fp_proto == FIB_PROTOCOL_MPLS)
 	    {
@@ -1467,6 +1518,7 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
 	  else
 	    fib_table_entry_path_add2 (nlt->nlt_fib_index, &pfx, fib_src,
 				       entry_flags, np.paths);
+	  lcp_router_table_reconcile (nlt, fib_src, before);
 	}
     }
   else
@@ -1499,9 +1551,17 @@ static void
 lcp_router_route_sync_end (void)
 {
   lcp_router_table_t *nlt;
+  u32 *indices = NULL, *index;
 
   pool_foreach (nlt, lcp_router_table_pool)
+    vec_add1 (indices, nlt - lcp_router_table_pool);
+
+  vec_foreach (index, indices)
     {
+      nlt = pool_elt_at_index (lcp_router_table_pool, *index);
+      nlt->nlt_refs++;
+      u32 before = lcp_router_table_source_count (nlt, lcp_rt_fib_src) +
+	lcp_router_table_source_count (nlt, lcp_rt_fib_src_dynamic);
       fib_table_sweep (nlt->nlt_fib_index, nlt->nlt_proto, lcp_rt_fib_src);
       fib_table_sweep (nlt->nlt_fib_index, nlt->nlt_proto,
 		       lcp_rt_fib_src_dynamic);
@@ -1509,7 +1569,13 @@ lcp_router_route_sync_end (void)
       LCP_ROUTER_INFO ("End synchronization of %U routes in table %u",
 		       format_fib_protocol, nlt->nlt_proto,
 		       nlt->nlt_fib_index);
+      u32 after = lcp_router_table_source_count (nlt, lcp_rt_fib_src) +
+	lcp_router_table_source_count (nlt, lcp_rt_fib_src_dynamic);
+      ASSERT (before >= after && nlt->nlt_refs > before - after);
+      nlt->nlt_refs -= before - after;
+      lcp_router_table_unlock (nlt);
     }
+  vec_free (indices);
 }
 
 typedef struct lcp_router_table_flush_entry_t
@@ -1617,7 +1683,7 @@ lcp_router_table_flush (lcp_router_table_t *nlt, u32 *sw_if_index_to_bool,
   vec_free (ctx.lrtf_entries);
 }
 
-const nl_vft_t lcp_router_vft = {
+__clib_export const nl_vft_t lcp_router_vft = {
   .nvl_rt_link_add = { .is_mp_safe = 0, .cb = lcp_router_link_add },
   .nvl_rt_link_del = { .is_mp_safe = 0, .cb = lcp_router_link_del },
   .nvl_rt_link_sync_begin = { .is_mp_safe = 0,
@@ -1745,7 +1811,7 @@ lcp_router_init (vlib_main_t *vm)
   VNET_SW_INTERFACE_TABLE_BIND_V6_CB (lcp_router_table_bind_v6);
 
   /*
-   * allocate 2 route sources. The low priority source will be for
+   * Allocate separate learned and permanent sources. The low priority source is for
    * dynamic routes. If a dynamic route daemon (FRR) tries to remove its
    * route, it will use the low priority source to ensure it will not
    * remove static routes which were added with the higher priority source.
@@ -1755,6 +1821,9 @@ lcp_router_init (vlib_main_t *vm)
 
   lcp_rt_fib_src_dynamic = fib_source_allocate (
     "lcp-rt-dynamic", FIB_SOURCE_PRIORITY_HI + 1, FIB_SOURCE_BH_API);
+
+  lcp_rt_fib_src_special = fib_source_allocate (
+    "lcp-rt-special", FIB_SOURCE_PRIORITY_HI, FIB_SOURCE_BH_API);
 
   return (NULL);
 }
