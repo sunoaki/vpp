@@ -393,7 +393,10 @@ hss_cache_init (hss_cache_t *hc, uword cache_size, u8 debug_level)
 void
 hss_cache_free (hss_cache_t *hc)
 {
-  hss_cache_clear (hc);
+  u32 busy_items = hss_cache_clear (hc);
+  ASSERT (busy_items == 0);
+  (void) busy_items;
+  pool_free (hc->cache_pool);
   BV (clib_bihash_free) (&hc->name_to_data);
   clib_spinlock_free (&hc->cache_lock);
 }
