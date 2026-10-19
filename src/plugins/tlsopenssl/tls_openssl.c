@@ -155,6 +155,62 @@ typedef struct
   openssl_test_dtls_pool_t contexts, sessions, half_open;
 } openssl_test_dtls_sample_t;
 
+typedef struct
+{
+  clib_mem_usage_t usage;
+  uword heap_address;
+  u8 intercept;
+} openssl_test_dtls_stage_t;
+
+typedef struct
+{
+  openssl_test_dtls_stage_t stage[8];
+  uword original_address, detached_address, attached_address;
+  uword original_usable, detached_usable, attached_usable;
+  u32 original_slot, attached_slot;
+  u32 mode, generation, previous_generation, thread_index;
+  u16 identity_valid;
+  u8 stage_valid, complete;
+  u8 original_member, detached_member, attached_member;
+  u8 chain_status;
+} openssl_test_dtls_record_t;
+
+typedef struct
+{
+  openssl_test_dtls_record_t *record, *previous;
+  u32 record_index, completed_records;
+  word observed, predicted, residual, sum;
+  u8 math_valid;
+} openssl_test_dtls_control_t;
+
+static void
+openssl_test_dtls_touch (void *object, uword size)
+{
+  volatile u8 *bytes = object;
+
+  while (size--)
+    *bytes++ = 0;
+}
+
+static void
+openssl_test_dtls_stage_copy (openssl_test_dtls_record_t *record, u32 stage,
+			     const clib_mem_usage_t *usage)
+{
+  record->stage[stage].usage = *usage;
+  record->stage[stage].heap_address = pointer_to_uword (clib_mem_get_heap ());
+  record->stage[stage].intercept = clib_mem_main.alloc_free_intercept;
+  record->stage_valid |= 1 << stage;
+}
+
+static void
+openssl_test_dtls_stage_sample (openssl_test_dtls_record_t *record, u32 stage)
+{
+  record->stage[stage].heap_address = pointer_to_uword (clib_mem_get_heap ());
+  clib_mem_get_heap_usage (clib_mem_get_heap (), &record->stage[stage].usage);
+  record->stage[stage].intercept = clib_mem_main.alloc_free_intercept;
+  record->stage_valid |= 1 << stage;
+}
+
 static void
 openssl_test_dtls_pool_sample (void *pool, uword elt_size, openssl_test_dtls_pool_t *sample)
 {
@@ -177,7 +233,7 @@ openssl_test_dtls_pool_sample (void *pool, uword elt_size, openssl_test_dtls_poo
 
 static void
 openssl_test_dtls_sample (openssl_ctx_t *cached, app_worker_t *app_wrk,
-			  openssl_test_dtls_sample_t *sample)
+			  openssl_test_dtls_sample_t *sample, openssl_test_dtls_stage_t *stage)
 {
   clib_thread_index_t thread_index = vlib_get_thread_index ();
   clib_mem_usage_t usage;
@@ -186,6 +242,12 @@ openssl_test_dtls_sample (openssl_ctx_t *cached, app_worker_t *app_wrk,
   clib_mem_get_heap_usage (sample->heap, &usage);
   sample->heap_bytes = usage.bytes_used;
   sample->intercept = clib_mem_main.alloc_free_intercept;
+  if (stage)
+    {
+      stage->usage = usage;
+      stage->heap_address = pointer_to_uword (sample->heap);
+      stage->intercept = sample->intercept;
+    }
   sample->cached = cached;
   sample->cached_bytes = clib_mem_size (cached);
   sample->cached_index = cached->openssl_ctx_index;
@@ -235,8 +297,303 @@ openssl_test_dtls_attach_error (clib_error_t *error, const char *stage,
 			    sample->attached_index, sample->attached_bytes);
 }
 
+static int
+openssl_test_dtls_add (word left, word right, word *result)
+{
+  if ((right > 0 && left > CLIB_WORD_MAX - right) ||
+      (right < 0 && left < (-CLIB_WORD_MAX - 1) - right))
+    return 0;
+  *result = left + right;
+  return 1;
+}
+
+static int
+openssl_test_dtls_subtract (word left, word right, word *result)
+{
+  if ((right > 0 && left < (-CLIB_WORD_MAX - 1) + right) ||
+      (right < 0 && left > CLIB_WORD_MAX + right))
+    return 0;
+  *result = left - right;
+  return 1;
+}
+
+static int
+openssl_test_dtls_delta (uword after, uword before, word *result)
+{
+  if (after > CLIB_WORD_MAX || before > CLIB_WORD_MAX)
+    return 0;
+  return openssl_test_dtls_subtract ((word) after, (word) before, result);
+}
+
+static int
+openssl_test_dtls_record_stable (const openssl_test_dtls_record_t *record)
+{
+  if (!record->complete || record->stage_valid != 0xff || (record->identity_valid & 7) != 7 ||
+      record->detached_address != record->attached_address ||
+      record->detached_usable != record->attached_usable)
+    return 0;
+  for (u32 stage = 1; stage < 8; stage++)
+    if (record->stage[stage].heap_address != record->stage[0].heap_address ||
+	record->stage[stage].intercept != record->stage[0].intercept)
+      return 0;
+  return 1;
+}
+
+static void
+openssl_test_dtls_link (openssl_test_dtls_control_t *control)
+{
+  openssl_test_dtls_record_t *record = control->record;
+  openssl_test_dtls_record_t *previous = control->previous;
+
+  if (!record->complete || record->stage_valid != 0xff)
+    record->chain_status = 3;
+  else if (!openssl_test_dtls_record_stable (record) ||
+	   (previous && (!openssl_test_dtls_record_stable (previous) ||
+			 previous->stage[7].heap_address != record->stage[0].heap_address ||
+			 previous->stage[7].intercept != record->stage[0].intercept)))
+    record->chain_status = 4;
+  else if (previous)
+    {
+      record->chain_status = 2;
+      if (record->generation == previous->generation + 1 && record->mode == previous->mode &&
+	  record->thread_index == previous->thread_index &&
+	  record->original_address == previous->attached_address &&
+	  record->original_slot == previous->attached_slot &&
+	  record->original_usable == previous->attached_usable &&
+	  record->detached_address == record->attached_address &&
+	  record->detached_usable == record->attached_usable)
+	{
+	  record->previous_generation = previous->generation;
+	  record->identity_valid |= 8;
+	  record->chain_status = 1;
+	  control->completed_records++;
+	}
+    }
+}
+
 static clib_error_t *
-openssl_test_dtls_migration (openssl_test_dtls_attach_t *diagnostic)
+openssl_test_dtls_usage_error (clib_error_t *error, const char *name,
+			      const openssl_test_dtls_stage_t *stage)
+{
+  const clib_mem_usage_t *usage = &stage->usage;
+
+  return clib_error_return (
+    error,
+    "[DTLS-STAGE] %s heap-address %lu intercept %u used %lu arena %lu free %lu "
+    "footprint-minus-arena %lu maxfootprint %lu freechunkcount %lu topbytes %lu "
+    "unsupported-object-count %lu unsupported-sbrk %lu",
+    name, stage->heap_address, stage->intercept, usage->bytes_used, usage->bytes_total,
+    usage->bytes_free, usage->bytes_used_mmap, usage->bytes_max, usage->bytes_free_reclaimed,
+    usage->bytes_overhead, usage->object_count, usage->bytes_used_sbrk);
+}
+
+static clib_error_t *
+openssl_test_dtls_edge_error (clib_error_t *error, openssl_test_dtls_control_t *control,
+			     uword before, uword after)
+{
+  if (!openssl_test_dtls_delta (after, before, &control->observed))
+    {
+      control->math_valid = 0;
+      return clib_error_return (error, "[DTLS-STAGE] delta unrepresentable/incomplete");
+    }
+  if (control->math_valid &&
+      !openssl_test_dtls_add (control->sum, control->observed, &control->sum))
+    control->math_valid = 0;
+  return clib_error_return (error, "[DTLS-STAGE] delta %ld", control->observed);
+}
+
+static clib_error_t *
+openssl_test_dtls_record_error (clib_error_t *error, openssl_test_dtls_control_t *control)
+{
+  openssl_test_dtls_record_t *record = control->record;
+
+  openssl_test_dtls_link (control);
+  if ((record->identity_valid & 7) != 7)
+    {
+      control->math_valid = 0;
+      return clib_error_return (error, "[DTLS-STAGE] identity unavailable/incomplete mode %u "
+				      "generation %u valid %u", record->mode, record->generation,
+				      record->identity_valid);
+    }
+  error = clib_error_return (
+    error,
+    "[DTLS-STAGE] mode %u generation %u thread %u previous %u chain %u "
+    "identity-valid %u stages-valid %u complete %u original-address %lu slot %u usable %lu "
+    "detached-address %lu usable %lu attached-address %lu slot %u usable %lu "
+    "weak-range-membership %u/%u/%u",
+    record->mode, record->generation, record->thread_index, record->previous_generation,
+    record->chain_status, record->identity_valid, record->stage_valid, record->complete,
+    record->original_address, record->original_slot, record->original_usable,
+    record->detached_address, record->detached_usable, record->attached_address,
+    record->attached_slot, record->attached_usable, record->original_member,
+    record->detached_member, record->attached_member);
+  for (u32 stage = 0; stage < 8; stage++)
+    {
+      if (!(record->stage_valid & (1 << stage)))
+	{
+	  control->math_valid = 0;
+	  continue;
+	}
+      error = clib_error_return (error, "[DTLS-STAGE] record %u boundary %u", record->generation,
+				stage);
+      error = openssl_test_dtls_usage_error (error, "boundary", &record->stage[stage]);
+      if (!control->record_index || !stage)
+	continue;
+      if (!(record->stage_valid & (1 << (stage - 1))))
+	{
+	  control->math_valid = 0;
+	  continue;
+	}
+      error = openssl_test_dtls_edge_error (error, control,
+					   record->stage[stage - 1].usage.bytes_used,
+					   record->stage[stage].usage.bytes_used);
+      if (stage != 4 && stage != 6)
+	continue;
+      if ((record->identity_valid & 7) != 7 || !openssl_test_dtls_record_stable (record) ||
+	  !openssl_test_dtls_delta (stage == 4 ? record->detached_usable : record->original_usable,
+				    0, &control->predicted) ||
+	  !openssl_test_dtls_add (control->predicted, 16, &control->predicted))
+	{
+	  error = clib_error_return (error, "[DTLS-STAGE] conditional prediction unavailable");
+	  continue;
+	}
+      if (stage == 6)
+	control->predicted = -control->predicted;
+      if (!openssl_test_dtls_delta (record->stage[stage].usage.bytes_used,
+				    record->stage[stage - 1].usage.bytes_used,
+				    &control->observed) ||
+	  !openssl_test_dtls_subtract (control->observed, control->predicted, &control->residual))
+	error = clib_error_return (error, "[DTLS-STAGE] residual unrepresentable/incomplete");
+      else
+	error = clib_error_return (error, "[DTLS-STAGE] conditional-debug-ordinary predicted %ld "
+					"residual %ld", control->predicted, control->residual);
+    }
+  return error;
+}
+
+static clib_error_t *
+openssl_test_dtls_outside_error (clib_error_t *error, const char *name, uword before, uword after)
+{
+  word delta;
+
+  if (!openssl_test_dtls_delta (after, before, &delta))
+    return clib_error_return (error, "[DTLS-STAGE] outside %s unrepresentable/incomplete", name);
+  return clib_error_return (error, "[DTLS-STAGE] outside %s delta %ld", name, delta);
+}
+
+static clib_error_t *
+openssl_test_dtls_cache_error (clib_error_t *error, openssl_test_dtls_control_t *control,
+			     const openssl_test_dtls_record_t *records)
+{
+  word total = 0, detached, original, replacement;
+
+  for (u32 index = 1; index < 65; index++)
+    {
+      if (records[index].chain_status != 1 ||
+	  !openssl_test_dtls_delta (records[index].detached_usable, 0, &detached) ||
+	  !openssl_test_dtls_delta (records[index].original_usable, 0, &original) ||
+	  !openssl_test_dtls_add (detached, 16, &detached) ||
+	  !openssl_test_dtls_add (original, 16, &original) ||
+	  !openssl_test_dtls_subtract (detached, original, &replacement) ||
+	  !openssl_test_dtls_add (total, replacement, &total))
+	return clib_error_return (error,
+				  "[DTLS-STAGE] conditional cache sum unavailable/incomplete");
+    }
+  if (!openssl_test_dtls_delta (records[64].attached_usable, records[0].attached_usable,
+				&control->predicted))
+    return clib_error_return (error, "[DTLS-STAGE] conditional cache endpoint unrepresentable");
+  return clib_error_return (error, "[DTLS-STAGE] conditional cache prediction sum %ld "
+				  "endpoint-change %ld equal %u", total, control->predicted,
+			    total == control->predicted);
+}
+
+static clib_error_t *
+openssl_test_dtls_report (clib_error_t *error, openssl_test_dtls_record_t *records,
+			 openssl_test_dtls_control_t *control,
+			 const openssl_test_dtls_stage_t *baseline,
+			 const openssl_test_dtls_stage_t *final, const clib_mem_usage_t *before,
+			 const clib_mem_usage_t *after)
+{
+  control->math_valid = 1;
+  error = clib_error_return (
+    error,
+    "[DTLS-STAGE] diagnostic-only conditional debug ordinary chunks with fixed overhead 16; "
+    "chain-status 0 unknown 1 linked 2 break 3 incomplete 4 heap/intercept changed; "
+    "weak range membership is not liveness; S7 follows read-only ownership checks; "
+    "warmup original generation unknown; before/after usage has no atomic heap/intercept identity; "
+    "extra snapshots perturb timing");
+  error = openssl_test_dtls_usage_error (error, "baseline-anchor", baseline);
+  error = openssl_test_dtls_usage_error (error, "final-anchor", final);
+  if (records[0].stage_valid & (1 << 7))
+    error = openssl_test_dtls_outside_error (error, "warmup-S7-to-before",
+					   records[0].stage[7].usage.bytes_used,
+					   before->bytes_used);
+  else
+    error = clib_error_return (error, "[DTLS-STAGE] warmup-S7 unavailable/incomplete");
+  error = openssl_test_dtls_outside_error (error, "after-to-final-anchor", after->bytes_used,
+					 final->usage.bytes_used);
+  error = clib_error_return (error, "[DTLS-STAGE] inside before-to-baseline-anchor");
+  error = openssl_test_dtls_edge_error (error, control, before->bytes_used,
+				       baseline->usage.bytes_used);
+  for (control->record_index = 0; control->record_index < 65; control->record_index++)
+    {
+      control->record = &records[control->record_index];
+      control->previous = control->record_index ? &records[control->record_index - 1] : 0;
+      if (control->record_index)
+	{
+	  error = clib_error_return (error, "[DTLS-STAGE] inside %s-to-record-%u-S0",
+				    control->record_index == 1 ? "baseline-anchor" : "previous-S7",
+				    control->record_index);
+	  if (!(control->record->stage_valid & 1) ||
+	      (control->record_index > 1 && !(control->previous->stage_valid & (1 << 7))))
+	    {
+	      control->math_valid = 0;
+	      error = clib_error_return (error, "[DTLS-STAGE] inside gap unavailable/incomplete");
+	    }
+	  else
+	    error = openssl_test_dtls_edge_error (
+	      error, control,
+	      control->record_index == 1 ? baseline->usage.bytes_used :
+					  control->previous->stage[7].usage.bytes_used,
+	      control->record->stage[0].usage.bytes_used);
+	}
+      error = openssl_test_dtls_record_error (error, control);
+    }
+  error = openssl_test_dtls_cache_error (error, control, records);
+  error = clib_error_return (error, "[DTLS-STAGE] inside last-S7-to-after");
+  if (records[64].stage_valid & (1 << 7))
+    error = openssl_test_dtls_edge_error (error, control, records[64].stage[7].usage.bytes_used,
+					 after->bytes_used);
+  else
+    control->math_valid = 0;
+  if (!control->math_valid ||
+      !openssl_test_dtls_delta (after->bytes_used, before->bytes_used, &control->observed))
+    error = clib_error_return (error,
+			      "[DTLS-STAGE] aggregate bookkeeping unrepresentable/incomplete");
+  else
+    error = clib_error_return (
+      error, "[DTLS-STAGE] aggregate observed %ld inside-stage-gap-sum %ld equal %u",
+      control->observed, control->sum, control->observed == control->sum);
+  if (control->completed_records != 64 ||
+      baseline->heap_address != records[0].stage[7].heap_address ||
+      baseline->intercept != records[0].stage[7].intercept ||
+      final->heap_address != records[64].stage[7].heap_address ||
+      final->intercept != records[64].stage[7].intercept ||
+      !openssl_test_dtls_delta (after->bytes_used, before->bytes_used, &control->observed) ||
+      !openssl_test_dtls_delta (records[64].attached_usable, records[0].attached_usable,
+				&control->predicted) ||
+      !openssl_test_dtls_subtract (control->observed, control->predicted, &control->residual))
+    return clib_error_return (error, "[DTLS-STAGE] conditional aggregate unavailable/incomplete "
+				    "linked %u/64", control->completed_records);
+  return clib_error_return (error, "[DTLS-STAGE] conditional aggregate observed %ld "
+				  "cache-usable-change %ld residual %ld; no baseline adjustment "
+				  "or exclusive-cause proof", control->observed, control->predicted,
+			    control->residual);
+}
+
+static clib_error_t *
+openssl_test_dtls_migration (openssl_test_dtls_attach_t *diagnostic,
+			     openssl_test_dtls_record_t *record)
 {
   clib_thread_index_t thread_index = vlib_get_thread_index ();
   clib_mem_usage_t owned, migrated;
@@ -248,6 +605,7 @@ openssl_test_dtls_migration (openssl_test_dtls_attach_t *diagnostic)
   u8 *hostname;
   u32 ctx_index;
 
+  openssl_test_dtls_stage_sample (record, 0);
   ssl_ctx = SSL_CTX_new (DTLS_client_method ());
   if (!ssl_ctx)
     return clib_error_return (0, "DTLS migration SSL context allocation failed");
@@ -255,8 +613,15 @@ openssl_test_dtls_migration (openssl_test_dtls_attach_t *diagnostic)
   SSL_CTX_free (ssl_ctx);
   if (!ssl)
     return clib_error_return (0, "DTLS migration SSL allocation failed");
+  openssl_test_dtls_stage_sample (record, 1);
   ctx_index = openssl_ctx_alloc ();
   original = (openssl_ctx_t *) openssl_ctx_get (ctx_index);
+  record->original_address = pointer_to_uword (original);
+  record->original_slot = ctx_index;
+  record->original_usable = clib_mem_size (original);
+  record->original_member = !!clib_mem_heap_is_heap_object (clib_mem_get_heap (), original);
+  record->identity_valid |= 1;
+  openssl_test_dtls_stage_sample (record, 2);
   original->ctx.srv_hostname = format (0, "migration.example.test%c", 0);
   original->ctx.tls_session_handle = SESSION_INVALID_HANDLE;
   original->ssl = ssl;
@@ -272,16 +637,23 @@ openssl_test_dtls_migration (openssl_test_dtls_attach_t *diagnostic)
   SSL_set_bio (ssl, original->rbio, original->wbio);
   hostname = original->ctx.srv_hostname;
   async_ctx = original->async_ctx;
+  openssl_test_dtls_stage_sample (record, 3);
   copy = openssl_ctx_detach (&original->ctx);
   diagnostic->original = original;
   diagnostic->original_index = original->openssl_ctx_index;
   diagnostic->original_bytes = clib_mem_size (original);
   diagnostic->detached = copy;
   diagnostic->detached_bytes = clib_mem_size (copy);
+  record->detached_address = pointer_to_uword (copy);
+  record->detached_usable = diagnostic->detached_bytes;
+  record->detached_member = !!clib_mem_heap_is_heap_object (clib_mem_get_heap (), copy);
+  record->identity_valid |= 2;
   clib_mem_get_heap_usage (clib_mem_get_heap (), &owned);
+  openssl_test_dtls_stage_copy (record, 4, &owned);
   original->ctx.flags |= TLS_CONN_F_MIGRATED;
   openssl_ctx_free (&original->ctx);
   clib_mem_get_heap_usage (clib_mem_get_heap (), &migrated);
+  openssl_test_dtls_stage_copy (record, 5, &migrated);
   if (owned.bytes_used != migrated.bytes_used || copy->ctx.srv_hostname != hostname ||
       strcmp ((char *) hostname, "migration.example.test") || copy->ssl != ssl ||
       copy->async_ctx.rd_evt_list != async_ctx.rd_evt_list ||
@@ -294,6 +666,12 @@ openssl_test_dtls_migration (openssl_test_dtls_attach_t *diagnostic)
   diagnostic->attached = copy;
   diagnostic->attached_index = ctx_index;
   diagnostic->attached_bytes = clib_mem_size (copy);
+  record->attached_address = pointer_to_uword (copy);
+  record->attached_slot = ctx_index;
+  record->attached_usable = diagnostic->attached_bytes;
+  record->attached_member = !!clib_mem_heap_is_heap_object (clib_mem_get_heap (), copy);
+  record->identity_valid |= 4;
+  openssl_test_dtls_stage_sample (record, 6);
   if (copy->ctx.flags & TLS_CONN_F_MIGRATED)
     error = clib_error_return (error, "DTLS destination inherited migrated flag");
   openssl_ctx_free (&copy->ctx);
@@ -311,6 +689,15 @@ openssl_test_dtls_failures (vnet_connect_args_t *args)
   clib_mem_usage_t before, after;
   openssl_test_dtls_sample_t baseline, previous, current, final, first_before, first_after;
   openssl_test_dtls_attach_t warmup_attach, last_attach, first_attach;
+  openssl_test_dtls_record_t records[65];
+  openssl_test_dtls_stage_t baseline_stage, final_stage;
+  openssl_test_dtls_control_t control;
+  STATIC_ASSERT (sizeof (records) + sizeof (baseline) + sizeof (previous) + sizeof (current) +
+		   sizeof (final) + sizeof (first_before) + sizeof (first_after) +
+		   sizeof (warmup_attach) + sizeof (last_attach) + sizeof (first_attach) +
+		   sizeof (before) + sizeof (after) + sizeof (baseline_stage) +
+		   sizeof (final_stage) + sizeof (control) + 1024 <= (64 << 10),
+		 "DTLS diagnostic object budget");
   openssl_ctx_t *ctx;
   clib_error_t *error;
   u32 ctx_index, n_contexts, n_sessions, n_half_open;
@@ -318,7 +705,18 @@ openssl_test_dtls_failures (vnet_connect_args_t *args)
   app_worker_t *app_wrk;
   int rv;
 
+  openssl_test_dtls_touch (records, sizeof (records));
+  openssl_test_dtls_touch (&baseline_stage, sizeof (baseline_stage));
+  openssl_test_dtls_touch (&final_stage, sizeof (final_stage));
+  clib_memset (&control, 0, sizeof (control));
   ext = session_endpoint_get_ext_cfg (&args->sep_ext, TRANSPORT_ENDPT_EXT_CFG_CRYPTO);
+  for (u32 record_index = 0; record_index < ARRAY_LEN (records); record_index++)
+    {
+      records[record_index].mode = 2 * openssl_main.async + (ext->crypto.hostname[0] != 0);
+      records[record_index].generation = record_index;
+      records[record_index].previous_generation = ~0;
+      records[record_index].thread_index = thread_index;
+    }
   app_wrk = application_get_default_worker (application_get (args->app_index));
   n_half_open = pool_elts (app_wrk->half_open_table);
   n_sessions = pool_elts (session_main.wrk[thread_index].sessions);
@@ -358,16 +756,21 @@ openssl_test_dtls_failures (vnet_connect_args_t *args)
 			      before.bytes_used, after.bytes_used, ext->crypto.hostname[0] != 0,
 			      openssl_main.async);
 
-  if ((error = openssl_test_dtls_migration (&warmup_attach)))
+  if ((error = openssl_test_dtls_migration (&warmup_attach, &records[0])))
     return error;
+  openssl_test_dtls_stage_sample (&records[0], 7);
+  records[0].complete = records[0].stage_valid == 0xff;
   clib_mem_get_heap_usage (clib_mem_get_heap (), &before);
-  openssl_test_dtls_sample (warmup_attach.attached, app_wrk, &baseline);
+  openssl_test_dtls_sample (warmup_attach.attached, app_wrk, &baseline, &baseline_stage);
   previous = baseline;
   for (u32 iteration = 0; iteration < 64; iteration++)
     {
-      if ((error = openssl_test_dtls_migration (&last_attach)))
+      if ((error = openssl_test_dtls_migration (&last_attach, &records[iteration + 1])))
 	return error;
-      openssl_test_dtls_sample (last_attach.attached, app_wrk, &current);
+      openssl_test_dtls_sample (last_attach.attached, app_wrk, &current,
+				&records[iteration + 1].stage[7]);
+      records[iteration + 1].stage_valid |= 1 << 7;
+      records[iteration + 1].complete = records[iteration + 1].stage_valid == 0xff;
       if (first_iteration == ~0 && current.heap_bytes != previous.heap_bytes)
 	{
 	  first_iteration = iteration;
@@ -378,7 +781,7 @@ openssl_test_dtls_failures (vnet_connect_args_t *args)
       previous = current;
     }
   clib_mem_get_heap_usage (clib_mem_get_heap (), &after);
-  openssl_test_dtls_sample (last_attach.attached, app_wrk, &final);
+  openssl_test_dtls_sample (last_attach.attached, app_wrk, &final, &final_stage);
   if (before.bytes_used != after.bytes_used)
     {
       error = clib_error_return (0, "DTLS migration/disposal grew heap from %lu to %lu",
@@ -400,7 +803,8 @@ openssl_test_dtls_failures (vnet_connect_args_t *args)
 	  error = openssl_test_dtls_sample_error (error, "first-after", &first_after);
 	  error = openssl_test_dtls_attach_error (error, "first", &first_attach);
 	}
-      return error;
+      return openssl_test_dtls_report (error, records, &control, &baseline_stage, &final_stage,
+				       &before, &after);
     }
   return 0;
 }
