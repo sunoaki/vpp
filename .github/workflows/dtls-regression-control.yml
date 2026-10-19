@@ -175,6 +175,14 @@ jobs:
               require(data.count(BEFORE) == 1, "Restoration anchor is missing or ambiguous")
               return data.replace(BEFORE, AFTER, 1)
 
+          FATAL_DIAGNOSTIC = (r"\bSIG(?:SEGV|ABRT|BUS|ILL|FPE|QUIT|INT|HUP)\b|"
+                              r"segmentation fault|\bAborted\b|\bBus error\b|"
+                              r"illegal instruction|floating point exception|core dumped|"
+                              r"Core was generated|AddressSanitizer|runtime error:|assertion.*fails")
+
+          def fatal_diagnostic(text):
+              return bool(re.search(FATAL_DIAGNOSTIC, text, re.I))
+
           def validate(variant, cls, workers, rc, console, logs, stderr, events):
               identity = f"test_tls.{cls}.test_dtls_cleanup"
               loaded = [e["pid"] for e in events if e["kind"] == "loaded"]
@@ -195,8 +203,8 @@ jobs:
               require(len(re.findall(r"(?m)^Ran 1 tests? in [0-9.]+s\s*$", console)) == 1,
                       "Missing normal single-test completion")
               channels = "\n".join((console, logs, stderr))
-              require(not re.search(r"SIGSEGV|segmentation fault|Core was generated|"
-                                    r"timed out|TimeoutError|VppTransportSocketIOError|"
+              require(not fatal_diagnostic(channels), "Fatal VPP diagnostic in test evidence")
+              require(not re.search(r"timed out|TimeoutError|VppTransportSocketIOError|"
                                     r"Vpp\s+dead\b|VPP.*(?:died|crashed)|"
                                     r"(?m:^)(?:ERROR|SKIP):|OK \(skipped=", channels, re.I),
                       "Crash, caught transport failure, timeout, setup error, or skipped test")
@@ -369,59 +377,84 @@ jobs:
                               and isinstance(item.get("command_id"), str)
                               for item in record["ancestors"]))
 
+          def evidence_bytes(path):
+              require(not path.is_symlink() and stat.S_ISREG(path.stat().st_mode)
+                      and path.stat().st_size <= 1024 * 1024, "Invalid or oversized evidence record")
+              return path.read_bytes()
+
+          def interrupted_record(path, output):
+              evidence = {"raw_result": str(path.relative_to(output)), "raw_result_sha256": None,
+                          "raw_result_state": "missing", "ownership": None, "partial_results": []}
+              diagnostic = None
+              try:
+                  raw = evidence_bytes(path)
+                  evidence.update(raw_result_sha256=hashlib.sha256(raw).hexdigest(), raw_result_state="malformed")
+                  child = json.loads(raw)
+                  require(command_identity(child), "Invalid command identity")
+                  evidence["raw_result_state"] = "running"
+                  return child, evidence, None
+              except (OSError, ValueError, AssertionError) as error:
+                  diagnostic = {"result": evidence["raw_result"], "raw_sha256": evidence["raw_result_sha256"],
+                                "error": str(error), "ownership_recovered": False}
+              try:
+                  owner_path = path.parent / "ownership.json"
+                  owner_raw = evidence_bytes(owner_path)
+                  child = json.loads(owner_raw)
+                  require(command_identity(child) and child.get("result") == evidence["raw_result"],
+                          "Ownership record does not identify this result")
+                  evidence["ownership"] = {"path": str(owner_path.relative_to(output)),
+                                           "sha256": hashlib.sha256(owner_raw).hexdigest()}
+                  diagnostic["ownership_recovered"] = True
+              except (OSError, ValueError, AssertionError) as error:
+                  diagnostic["ownership_error"] = str(error)
+                  return None, evidence, diagnostic
+              return child, evidence, diagnostic
+
+          def partial_result_evidence(directory, output):
+              paths = sorted(directory.glob(".result.json.*.tmp"))
+              require(len(paths) <= 32, "Too many partial result records")
+              records, remaining = [], 1024 * 1024
+              for path in paths:
+                  record = {"path": str(path.relative_to(output))}
+                  try:
+                      require(path.stat().st_size <= remaining, "Partial result evidence exceeds 1 MiB")
+                      raw = evidence_bytes(path)
+                      remaining -= len(raw)
+                      record.update(size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                  except (OSError, AssertionError) as error:
+                      record["error"] = str(error)
+                  records.append(record)
+              return records
+
           def record_interruptions(parent_status, parent_result):
               if parent_result["cleanup"].get("exception") or parent_result["cleanup"]["survivors"]:
                   return
               output = Path(os.environ["EVIDENCE_DIR"])
               reference = {"result": str(parent_status.relative_to(output)),
                            "command_id": parent_result["command_id"]}
-              paths = sorted(output.glob("*/result.json"))
+              paths = sorted({path.parent / "result.json" for pattern in ("*/result.json", "*/ownership.json")
+                              for path in output.glob(pattern)})
               require(len(paths) <= 1000, "Too many command records for interruption attribution")
               errors = []
               for path in paths:
                   if path.is_symlink() or path.parent.is_symlink():
                       continue
-                  require(path.stat().st_size <= 1024 * 1024, "Command record exceeds attribution limit")
-                  raw = path.read_bytes()
-                  malformed = None
-                  ownership = None
-                  try:
-                      child = json.loads(raw)
-                      if not command_identity(child):
-                          raise ValueError("Invalid command identity")
-                  except (ValueError, UnicodeError) as error:
-                      malformed = {"result": str(path.relative_to(output)),
-                                   "raw_sha256": hashlib.sha256(raw).hexdigest(),
-                                   "error": str(error), "ownership_recovered": False}
-                      errors.append(malformed)
-                      owner_path = path.parent / "ownership.json"
-                      try:
-                          require(not owner_path.is_symlink() and owner_path.stat().st_size <= 1024 * 1024,
-                                  "Invalid ownership record")
-                          owner_raw = owner_path.read_bytes()
-                          child = json.loads(owner_raw)
-                          require(command_identity(child)
-                                  and child.get("result") == str(path.relative_to(output)),
-                                  "Ownership record does not identify this result")
-                      except (OSError, ValueError, UnicodeError, AssertionError) as owner_error:
-                          malformed["ownership_error"] = str(owner_error)
-                          continue
-                      ownership = {"path": str(owner_path.relative_to(output)),
-                                   "sha256": hashlib.sha256(owner_raw).hexdigest()}
-                      malformed["ownership_recovered"] = True
-                  if (reference not in child["ancestors"]
-                          or (malformed is None and (child.get("outcome") != "running" or "end" in child))
+                  child, evidence, diagnostic = interrupted_record(path, output)
+                  if diagnostic:
+                      errors.append(diagnostic)
+                  if (child is None or reference not in child["ancestors"]
+                          or (diagnostic is None and (child.get("outcome") != "running" or "end" in child))
                           or (path.parent / "interruption.json").exists()):
                       continue
-                  interruption = {"outcome": "interrupted-by-parent", "observed_at": time.time(),
-                                  "parent": reference, "parent_outcome": parent_result["outcome"],
-                                  "raw_result": str(path.relative_to(output)),
-                                  "raw_result_sha256": hashlib.sha256(raw).hexdigest(),
-                                  "raw_result_state": "malformed" if malformed else "running",
-                                  "ownership": ownership,
-                                  "command_id": child["command_id"], "rc": None, "cleanup": None,
-                                  "unknowns": "Child exit status and child supervisor cleanup are unknown; "
-                                              "parent cleanup is recorded only in the referenced parent result."}
+                  try:
+                      evidence["partial_results"] = partial_result_evidence(path.parent, output)
+                  except AssertionError as error:
+                      evidence["partial_results_error"] = str(error)
+                  interruption = dict(evidence, outcome="interrupted-by-parent", observed_at=time.time(),
+                                      parent=reference, parent_outcome=parent_result["outcome"],
+                                      command_id=child["command_id"], rc=None, cleanup=None, spawned=None,
+                                      unknowns="Child workload spawn, exit status and child supervisor cleanup are unknown; "
+                                               "parent cleanup is recorded only in the referenced parent result.")
                   try:
                       publish_json(path.parent / "interruption.json", interruption, exclusive=True)
                   except FileExistsError:
@@ -429,14 +462,10 @@ jobs:
               if errors:
                   publish_json(parent_status.parent / "attribution-errors.json", errors)
 
-          def command(label, args, env=None, seconds=300):
-              directory = Path(os.environ["EVIDENCE_DIR"]) / label
-              directory.mkdir()
+          def initialize_command(directory, args, seconds, inherited):
               now = time.time()
               limit = min(now + seconds, float(os.environ.get("DTLS_WORK_DEADLINE", now + seconds)),
                           float(os.environ.get("DTLS_PHASE_DEADLINE", now + seconds)))
-              deadline = time.monotonic() + max(0, limit - now)
-              inherited = os.environ if env is None else env
               ancestors = json.loads(inherited.get("DTLS_COMMAND_ANCESTORS", "[]"))
               command_id = os.urandom(16).hex()
               result = {"command": args, "start": now, "deadline": limit, "rc": None,
@@ -447,6 +476,40 @@ jobs:
                            {"result": str(status.relative_to(Path(os.environ["EVIDENCE_DIR"]))),
                             "command_id": command_id, "ancestors": ancestors}, exclusive=True)
               publish_json(status, result)
+              return result, time.monotonic() + max(0, limit - time.time())
+
+          def update_command_output(stream, tail, window, chunk, result):
+              window = (window + chunk)[-131072:]
+              result["caught_transport"] = result.get("caught_transport", False) or bool(re.search(
+                  rb"VppTransportSocketIOError|Vpp\s+dead\b", window, re.I))
+              result["fatal_diagnostic"] = result.get("fatal_diagnostic", False) or fatal_diagnostic(
+                  window.decode(errors="replace"))
+              tail.extend(chunk)
+              del tail[:-8 * 1024 * 1024]
+              stream.seek(0)
+              stream.write(tail)
+              stream.truncate()
+              stream.flush()
+              return window
+
+          def publish_command_result(status, result, caught_transport):
+              if result["cleanup"]["survivors"]:
+                  result["outcome"] = "cleanup-failed"
+              result["caught_transport"] = caught_transport
+              if caught_transport:
+                  result["outcome"] = "transport-failure"
+              if result.get("fatal_diagnostic"):
+                  result["outcome"] = "fatal-diagnostic"
+              result["end"] = time.time()
+              publish_json(status, result)
+
+          def command(label, args, env=None, seconds=300):
+              directory = Path(os.environ["EVIDENCE_DIR"]) / label
+              directory.mkdir()
+              inherited = os.environ if env is None else env
+              result, deadline = initialize_command(directory, args, seconds, inherited)
+              status = directory / "result.json"
+              limit, command_id, ancestors = result["deadline"], result["command_id"], result["ancestors"]
               tail, process, tracked = bytearray(), None, {}
               diagnostic_window = b""
               caught_transport = False
@@ -477,15 +540,9 @@ jobs:
                               if not chunk:
                                   poller.unregister(key.fileobj)
                                   continue
-                              diagnostic_window = (diagnostic_window + chunk)[-131072:]
-                              caught_transport |= bool(re.search(
-                                  rb"VppTransportSocketIOError|Vpp\s+dead\b", diagnostic_window, re.I))
-                              tail.extend(chunk)
-                              del tail[:-8 * 1024 * 1024]
-                              stream.seek(0)
-                              stream.write(tail)
-                              stream.truncate()
-                              stream.flush()
+                              diagnostic_window = update_command_output(
+                                  stream, tail, diagnostic_window, chunk, result)
+                              caught_transport |= result.get("caught_transport", False)
                   result["rc"] = process.wait(timeout=max(0.01, deadline - time.monotonic()))
                   require(not (descendants(tracked, baseline) - {process.pid}),
                           "Command left descendant processes after completion")
@@ -506,13 +563,7 @@ jobs:
                           result["rc"] = process.returncode
                           process.stdout.close()
                       poller.close()
-                      if result["cleanup"]["survivors"]:
-                          result["outcome"] = "cleanup-failed"
-                      result["caught_transport"] = caught_transport
-                      if caught_transport:
-                          result["outcome"] = "transport-failure"
-                      result["end"] = time.time()
-                      publish_json(status, result)
+                      publish_command_result(status, result, caught_transport)
               record_interruptions(status, result)
               if result["outcome"] not in ("success", "nonzero"):
                   raise RuntimeError(f"{label}: {result['outcome']}; see {status}")
@@ -704,8 +755,16 @@ jobs:
                           else:
                               raise AssertionError("Accepted invalid completion")
                       for channel in range(3):
+                          orderly = [console, logs, stderr]
+                          orderly[channel] += "\nreceived signal SIGTERM, PC 0x1\nreceived SIGTERM from PID 1 UID 0, exiting..."
+                          validate(variant, cls, workers, rc, *orderly, events)
                           for diagnostic in ("VppTransportSocketIOError: Vpp dead. Cannot log show commands.",
-                                             "Vpp dead", "caught VppTransportSocketIOError"):
+                                             "Vpp dead", "caught VppTransportSocketIOError",
+                                             "received signal SIGABRT, PC 0x1", "received signal SIGBUS, PC 0x1",
+                                             "received signal SIGILL, PC 0x1", "received signal SIGFPE, PC 0x1",
+                                             "Aborted", "Bus error (core dumped)", "received signal SIGSEGV, PC 0x1",
+                                             "received signal SIGQUIT, PC 0x1", "received signal SIGINT, PC 0x1",
+                                             "received signal SIGHUP, PC 0x1"):
                               channels = [console, logs, stderr]
                               channels[channel] += "\n" + diagnostic
                               try:
@@ -823,15 +882,13 @@ jobs:
                   require(child_path.read_bytes() == raw, "Nested raw evidence was overwritten")
               print("Actual nested deadlines preserve raw/unknown status with authoritative parent interruption")
 
-          def publication_fixtures():
-              output = Path(os.environ["EVIDENCE_DIR"])
-              control = str(Path(os.environ["CONTROL_DIR"]) / "control.py")
-              script = (
+          def publication_script():
+              return (
                   "import json,runpy,sys,time\nfrom pathlib import Path\n"
                   "space=runpy.run_path(sys.argv[1],run_name='publication_fixture')\n"
                   "original=Path.write_text\n"
                   "def partial(path,data,*args,**kwargs):\n"
-                  " if path.name.startswith('.result.json.') and 'end' in json.loads(data):\n"
+                  " if path.name.startswith('.result.json.') and ('end' in json.loads(data)) == (sys.argv[3]=='terminal'):\n"
                   "  with path.open('w') as stream:\n"
                   "   stream.write('{');stream.flush()\n"
                   "   (path.parent/'publication-ready').write_bytes(b'ready')\n"
@@ -839,39 +896,59 @@ jobs:
                   " return original(path,data,*args,**kwargs)\n"
                   "Path.write_text=partial\n"
                   "space['command'](sys.argv[2],[sys.executable,'-c','pass'])\n")
-              for number in range(3):
-                  label = f"publication-child-{number}"
-                  args = [sys.executable, "-c", script, control, label]
-                  if number == 2:
-                      args = [sys.executable, control, "publication-middle", *args]
-                  try:
-                      command(f"publication-parent-{number}", args, seconds=0.5)
-                  except RuntimeError:
-                      pass
-                  else:
-                      raise AssertionError("Interrupted publication unexpectedly completed")
-                  parent_path = output / f"publication-parent-{number}" / "result.json"
-                  parent = json.loads(parent_path.read_bytes())
-                  directory = output / label
+
+          def check_publication(parent_path, directory, mode):
+              output = Path(os.environ["EVIDENCE_DIR"])
+              parent = json.loads(parent_path.read_bytes())
+              interrupted = json.loads((directory / "interruption.json").read_bytes())
+              reference = {"result": str(parent_path.relative_to(output)), "command_id": parent["command_id"]}
+              require((directory / "publication-ready").read_bytes() == b"ready"
+                      and any(path.read_bytes() == b"{" for path in directory.glob(".result.json.*.tmp")),
+                      "Fixture missed partial publication window")
+              require(parent["outcome"] == "timeout" and not parent["cleanup"]["survivors"]
+                      and interrupted["parent"] == reference and interrupted["observed_at"] >= parent["end"]
+                      and interrupted["rc"] is None and interrupted["cleanup"] is None
+                      and interrupted["spawned"] is None, "Missing parent attribution or unknowns")
+              if mode == "terminal":
                   raw = (directory / "result.json").read_bytes()
                   child = json.loads(raw)
-                  interrupted = json.loads((directory / "interruption.json").read_bytes())
-                  require((directory / "publication-ready").read_bytes() == b"ready"
-                          and any(path.read_bytes() == b"{" for path in directory.glob(".result.json.*.tmp")),
-                          "Fixture missed partial terminal publication window")
-                  require(parent["outcome"] == "timeout" and not parent["cleanup"]["survivors"]
-                          and child["outcome"] == "running" and "end" not in child
-                          and child["rc"] is None and child["cleanup"] is None,
-                          "Atomic publication lost complete running evidence")
-                  reference = {"result": str(parent_path.relative_to(output)), "command_id": parent["command_id"]}
-                  require(interrupted["parent"] == reference and interrupted["observed_at"] >= parent["end"]
-                          and interrupted["raw_result_sha256"] == hashlib.sha256(raw).hexdigest()
-                          and interrupted["rc"] is None and interrupted["cleanup"] is None,
-                          "Interrupted publication lost parent attribution or unknowns")
-                  if number == 2:
-                      require(len(child["ancestors"]) >= 2 and reference in child["ancestors"],
-                              "Grandparent explicit ancestry missing")
-              parent_path = output / "publication-parent-2" / "result.json"
+                  require(child["outcome"] == "running" and "end" not in child and child["rc"] is None
+                          and child["cleanup"] is None and interrupted["raw_result_sha256"] == hashlib.sha256(raw).hexdigest(),
+                          "Atomic terminal publication lost complete running evidence")
+              else:
+                  owner_raw = (directory / "ownership.json").read_bytes()
+                  require(not (directory / "result.json").exists()
+                          and interrupted["raw_result_state"] == "missing" and interrupted["raw_result_sha256"] is None
+                          and interrupted["ownership"]["sha256"] == hashlib.sha256(owner_raw).hexdigest()
+                          and any(item.get("sha256") == hashlib.sha256(b"{").hexdigest()
+                                  for item in interrupted["partial_results"]), "Missing initial publication evidence")
+              return parent
+
+          def publication_deadline_fixtures():
+              output = Path(os.environ["EVIDENCE_DIR"])
+              control = str(Path(os.environ["CONTROL_DIR"]) / "control.py")
+              for mode in ("terminal", "initial"):
+                  for number in range(3):
+                      label = f"{mode}-publication-child-{number}"
+                      args = [sys.executable, "-c", publication_script(), control, label, mode]
+                      if number == 2:
+                          args = [sys.executable, control, f"{mode}-publication-middle", *args]
+                      parent_path = output / f"{mode}-publication-parent-{number}" / "result.json"
+                      try:
+                          command(parent_path.parent.name, args, seconds=0.5)
+                      except RuntimeError:
+                          pass
+                      else:
+                          raise AssertionError("Interrupted publication unexpectedly completed")
+                      parent = check_publication(parent_path, output / label, mode)
+                      owner = json.loads((output / label / "ownership.json").read_bytes())
+                      require(len(owner["ancestors"]) >= (2 if number == 2 else 1)
+                              and {"result": str(parent_path.relative_to(output)), "command_id": parent["command_id"]}
+                              in owner["ancestors"], "Missing explicit grandparent ancestry")
+              return parent_path
+
+          def malformed_publication_fixtures(parent_path):
+              output = Path(os.environ["EVIDENCE_DIR"])
               parent = json.loads(parent_path.read_bytes())
               reference = {"result": str(parent_path.relative_to(output)), "command_id": parent["command_id"]}
               snapshots = {}
@@ -920,6 +997,59 @@ jobs:
                       and any(not item["ownership_recovered"] for item in errors),
                       "Missing bounded malformed ownership diagnostics")
               print("Atomic interrupted publication twice/grandparent, damaged raw isolation and ownership guards passed")
+
+          def missing_result_guards(parent_path):
+              output = Path(os.environ["EVIDENCE_DIR"])
+              parent = json.loads(parent_path.read_bytes())
+              reference = {"result": str(parent_path.relative_to(output)), "command_id": parent["command_id"]}
+              cases = {"missing-owned": [reference], "missing-wrong-id": [dict(reference, command_id="wrong")],
+                       "missing-wrong-path": [dict(reference, result="wrong/result.json")],
+                       "missing-unrelated": [], "missing-damaged": None,
+                       "missing-owner-result-mismatch": [reference]}
+              snapshots = {}
+              for name, ancestors in cases.items():
+                  directory = output / name
+                  directory.mkdir()
+                  result_path = "wrong/result.json" if name == "missing-owner-result-mismatch" else f"{name}/result.json"
+                  raw = b"{" if ancestors is None else json.dumps(
+                      {"result": result_path, "command_id": name, "ancestors": ancestors}).encode()
+                  (directory / "ownership.json").write_bytes(raw)
+                  snapshots[name] = raw
+              for cleanup_failure in ({"survivors": [123]}, {"survivors": [], "exception": {"type": "fixture"}}):
+                  record_interruptions(parent_path, dict(parent, cleanup=cleanup_failure))
+                  require(not (output / "missing-owned/interruption.json").exists(), "Cleanup failure authorized missing result")
+              record_interruptions(parent_path, parent)
+              for name, raw in snapshots.items():
+                  directory = output / name
+                  require((directory / "ownership.json").read_bytes() == raw and not (directory / "result.json").exists()
+                          and (directory / "interruption.json").exists() == (name == "missing-owned"),
+                          "Missing-result ownership guessed or raw changed")
+              sidecar = output / "missing-owned/interruption.json"
+              original = sidecar.read_bytes()
+              record_interruptions(parent_path, parent)
+              require(sidecar.read_bytes() == original, "Existing missing-result interruption changed")
+
+          def fatal_stream_fixtures():
+              output = Path(os.environ["EVIDENCE_DIR"])
+              script = "import sys;print('received signal SIGABRT, PC 0x1',flush=True);sys.stdout.write('x'*(9*1024*1024))"
+              try:
+                  command("early-fatal-proof", [sys.executable, "-c", script], seconds=5)
+              except RuntimeError:
+                  pass
+              else:
+                  raise AssertionError("Early fatal diagnostic accepted")
+              result = json.loads((output / "early-fatal-proof/result.json").read_bytes())
+              tail = (output / "early-fatal-proof/console.log").read_bytes()
+              require(result["outcome"] == "fatal-diagnostic" and result["fatal_diagnostic"]
+                      and not result["cleanup"]["survivors"] and len(tail) == 8 * 1024 * 1024
+                      and b"SIGABRT" not in tail, "Truncated fatal evidence lost failure")
+
+          def publication_fixtures():
+              parent_path = publication_deadline_fixtures()
+              malformed_publication_fixtures(parent_path)
+              missing_result_guards(parent_path)
+              fatal_stream_fixtures()
+              print("Initial/terminal/grandparent publication, missing-result guards and persistent fatal diagnostics passed")
 
           def identity_fixtures():
               from types import SimpleNamespace
@@ -1165,6 +1295,7 @@ jobs:
         with:
           name: dtls-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/dtls-evidence/
+          include-hidden-files: true
           retention-days: 7
           if-no-files-found: error
           compression-level: 6
