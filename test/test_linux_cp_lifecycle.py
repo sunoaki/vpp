@@ -113,7 +113,7 @@ class TestLinuxCPLifecycle(VppTestCase):
         self.assertFalse(os.path.exists(f"/var/run/netns/{missing}"))
         before = self._namespace_fd_count(self.ns_name)
         for _ in range(16):
-            with self.vapi.assert_negative_api_retval():
+            with self.vapi.assert_known_api_retval([-11]):
                 self.vapi.lcp_default_ns_set(netns=missing)
             self.assertEqual(self.vapi.lcp_default_ns_get().netns, self.ns_name)
             self.assertEqual(self._namespace_fd_count(self.ns_name), before)
