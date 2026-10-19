@@ -1131,9 +1131,9 @@ fib_entry_src_action_deactivate (fib_entry_t *fib_entry,
     fib_entry->fe_sibling = FIB_NODE_INDEX_INVALID;
 }
 
-static void
-fib_entry_src_action_fwd_update (const fib_entry_t *fib_entry,
-				 fib_source_t source)
+static fib_entry_t *
+fib_entry_src_action_fwd_update (fib_entry_t *fib_entry,
+                                 fib_source_t source)
 {
     fib_entry_src_t *esrc;
 
@@ -1142,9 +1142,11 @@ fib_entry_src_action_fwd_update (const fib_entry_t *fib_entry,
 	FIB_ENTRY_SRC_VFT_INVOKE(fib_entry, esrc, fesv_fwd_update,
                                  (esrc, fib_entry, source));
     }
+
+    return (fib_entry);
 }
 
-void
+fib_entry_t *
 fib_entry_src_action_reactivate (fib_entry_t *fib_entry,
 				 fib_source_t source)
 {
@@ -1225,7 +1227,7 @@ fib_entry_src_action_reactivate (fib_entry_t *fib_entry,
     {
         fib_entry_src_action_install(fib_entry, source);
     }
-    fib_entry_src_action_fwd_update(fib_entry, source);
+    return (fib_entry_src_action_fwd_update(fib_entry, source));
 }
 
 fib_entry_t *
@@ -1239,9 +1241,7 @@ fib_entry_src_action_installed (fib_entry_t *fib_entry,
     FIB_ENTRY_SRC_VFT_INVOKE(fib_entry, esrc, fesv_installed,
                              (esrc, fib_entry));
 
-    fib_entry_src_action_fwd_update(fib_entry, source);
-
-    return (fib_entry);
+    return (fib_entry_src_action_fwd_update(fib_entry, source));
 }
 
 /*

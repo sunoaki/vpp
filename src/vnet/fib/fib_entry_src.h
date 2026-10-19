@@ -266,7 +266,7 @@ extern void fib_entry_src_action_activate(fib_entry_t *fib_entry,
 
 extern void fib_entry_src_action_deactivate(fib_entry_t *fib_entry,
 					    fib_source_t source);
-extern void fib_entry_src_action_reactivate(fib_entry_t *fib_entry,
+extern fib_entry_t* fib_entry_src_action_reactivate(fib_entry_t *fib_entry,
 					    fib_source_t source);
 
 extern fib_entry_t* fib_entry_src_action_add(fib_entry_t *fib_entry,

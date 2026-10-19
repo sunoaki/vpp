@@ -773,7 +773,7 @@ fib_entry_recalculate_forwarding (fib_node_index_t fib_entry_index)
     bsrc = fib_entry_get_best_src_i(fib_entry);
     best_source = fib_entry_src_get_source(bsrc);
 
-    fib_entry_src_action_reactivate(fib_entry, best_source);
+    fib_entry = fib_entry_src_action_reactivate(fib_entry, best_source);
 }
 
 static void
@@ -798,7 +798,7 @@ fib_entry_source_change_w_flags (fib_entry_t *fib_entry,
          * in case it is an interposer and hence relied on the losing
          * source's path-list.
          */
-        fib_entry_src_action_reactivate(fib_entry, old_source);
+        fib_entry = fib_entry_src_action_reactivate(fib_entry, old_source);
         return;
 
     case FIB_SOURCE_CMP_EQUAL:
@@ -807,7 +807,7 @@ fib_entry_source_change_w_flags (fib_entry_t *fib_entry,
 	 * But the path-list was updated, which will contribute new forwarding,
 	 * so install it.
 	 */
-        fib_entry_src_action_reactivate(fib_entry, new_source);
+        fib_entry = fib_entry_src_action_reactivate(fib_entry, new_source);
         break;
     }
 
@@ -1039,7 +1039,7 @@ fib_entry_path_remove (fib_node_index_t fib_entry_index,
 	    /*
 	     * re-install the new forwarding information
 	     */
-	    fib_entry_src_action_reactivate(fib_entry, source);
+	    fib_entry = fib_entry_src_action_reactivate(fib_entry, source);
 	}
         break;
     }
@@ -1124,7 +1124,7 @@ fib_entry_special_remove (fib_node_index_t fib_entry_index,
             /*
              * reactivate the best source so the interposer gets restacked
              */
-            fib_entry_src_action_reactivate(fib_entry, best_source);
+            fib_entry = fib_entry_src_action_reactivate(fib_entry, best_source);
 
             return (FIB_ENTRY_SRC_FLAG_ADDED);
         }
@@ -1143,7 +1143,7 @@ fib_entry_special_remove (fib_node_index_t fib_entry_index,
 	    /*
 	     * re-install the new forwarding information
 	     */
-	    fib_entry_src_action_reactivate(fib_entry, source);
+	    fib_entry = fib_entry_src_action_reactivate(fib_entry, source);
 	}
         break;
     }
@@ -1264,7 +1264,7 @@ fib_entry_cover_changed (fib_node_index_t fib_entry_index)
 
     if (res.install)
     {
-	fib_entry_src_action_reactivate(fib_entry,
+	fib_entry = fib_entry_src_action_reactivate(fib_entry,
 					fib_entry_src_get_source(
 					    fib_entry_get_best_src_i(fib_entry)));
         fib_entry = fib_entry_post_install_actions(fib_entry,
@@ -1356,7 +1356,7 @@ fib_entry_cover_updated (fib_node_index_t fib_entry_index)
 
     if (res.install)
     {
-	fib_entry_src_action_reactivate(fib_entry,
+	fib_entry = fib_entry_src_action_reactivate(fib_entry,
 					fib_entry_src_get_source(
 					    fib_entry_get_best_src_i(fib_entry)));
         fib_entry = fib_entry_post_install_actions(fib_entry,
@@ -1487,7 +1487,8 @@ fib_entry_back_walk_notify (fib_node_t *node,
 
         bflags = fib_entry_src_get_flags(bsrc);
 
-	fib_entry_src_action_reactivate(fib_entry, best_source);
+	fib_entry = fib_entry_src_action_reactivate(fib_entry, best_source);
+        bsrc = fib_entry_get_best_src_i(fib_entry);
 
         /* re-evaluate whether the prefix is cross table */
         if (fib_entry_attached_cross_table(
@@ -1513,7 +1514,7 @@ fib_entry_back_walk_notify (fib_node_t *node,
              FIB_NODE_BW_REASON_FLAG_INTERFACE_BIND & ctx->fnbw_reason  ||
              FIB_NODE_BW_REASON_FLAG_INTERFACE_DELETE & ctx->fnbw_reason)
     {
-	fib_entry_src_action_reactivate(fib_entry, best_source);
+	fib_entry = fib_entry_src_action_reactivate(fib_entry, best_source);
     }
 
     /*
