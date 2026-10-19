@@ -170,3 +170,104 @@ class TestLinuxCPNetlinkSocketOwnership(TestLinuxCPNetNSBase):
         new_inode = self._check_single_notification_socket(after, current)
         self.assertNotEqual(old_inode, new_inode, current)
         self._check_route_updates()
+
+
+@unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
+@unittest.skipIf("linux-cp" in config.excluded_plugins, "Exclude linux-cp plugin tests")
+class TestLinuxCPNetlinkDumpCompletion(TestLinuxCPNetNSBase):
+    """Kernel dump status reaches the real receiver and recovery process."""
+
+    extra_vpp_plugin_config = TestLinuxCPNetlinkSocketOwnership.extra_vpp_plugin_config
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.create_loopback_interfaces(1)
+        cls.vapi.cli(f"lcp create loop0 host-if hloop0 netns {cls.ns_name}")
+        cls.lo_interfaces[0].admin_up()
+
+    def _stats(self):
+        fields = {}
+        for line in self.vapi.cli("show lcp netlink").splitlines():
+            key, separator, value = line.partition(":")
+            if separator:
+                fields[key.strip()] = value.strip()
+        return fields
+
+    def _check_case(self, sock_type, scenario, expect_failure):
+        before = self._stats()
+        self.assertEqual(before["State"], "notification", before)
+        completed = int(before["Synchronization completed"])
+        failed = int(before["Synchronization failed"])
+        try:
+            self.vapi.cli(f"test lcp netlink-dump {sock_type} {scenario}")
+            self.vapi.cli("test lcp netlink-error")
+
+            def finished():
+                stats = self._stats()
+                if expect_failure:
+                    return (
+                        int(stats["Synchronization failed"]) > failed
+                        and stats["State"] == "synchronizing"
+                        and stats["Socket"] == "-1"
+                    )
+                return (
+                    int(stats["Synchronization completed"]) > completed
+                    and stats["State"] == "notification"
+                )
+
+            self.poll_for("injected dump attempt finished", finished, True, timeout=20)
+            stats = self._stats()
+            self.logger.info(
+                "Dump type=%s scenario=%s before=%s after=%s",
+                sock_type,
+                scenario,
+                before,
+                stats,
+            )
+            self.assertEqual(stats["Test dump injected"], "1", stats)
+            if expect_failure:
+                self.assertLess(int(stats["Test dump result"]), 0, stats)
+                self.assertEqual(
+                    int(stats["Synchronization failed"]), failed + 1, stats
+                )
+                self.assertEqual(
+                    int(stats["Synchronization completed"]), completed, stats
+                )
+                self.assertEqual(stats["Test dump sync ends"], "0", stats)
+            else:
+                self.assertGreater(int(stats["Test dump result"]), 0, stats)
+                self.assertEqual(int(stats["Synchronization failed"]), failed, stats)
+                self.assertEqual(int(stats["Synchronization completed"]), completed + 1)
+                self.assertEqual(stats["Test dump sync ends"], "4", stats)
+        finally:
+            self.vapi.cli("test lcp netlink-sync-pause off")
+
+        if expect_failure:
+
+            def recovered():
+                stats = self._stats()
+                return (
+                    stats["State"] == "notification"
+                    and int(stats["Synchronization completed"]) == completed + 1
+                )
+
+            self.poll_for("clean retry completed", recovered, True, timeout=20)
+            stats = self._stats()
+            self.assertEqual(int(stats["Synchronization failed"]), failed + 1, stats)
+            self.assertEqual(stats["Test dump sync ends"], "4", stats)
+
+    def test_dump_completion_errors(self):
+        """Interrupted and failed dumps never finish synchronization"""
+        self._check_case(0, 1, True)
+        for sock_type in range(4):
+            for scenario in range(2, 6):
+                with self.subTest(sock_type=sock_type, scenario=scenario):
+                    self._check_case(sock_type, scenario, True)
+
+    def test_dump_completion_success(self):
+        """Zero dump status accepts optional extended ACK data"""
+        for sock_type in range(4):
+            for scenario in (6, 7):
+                with self.subTest(sock_type=sock_type, scenario=scenario):
+                    self._check_case(sock_type, scenario, False)

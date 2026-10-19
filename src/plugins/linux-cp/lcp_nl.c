@@ -45,6 +45,18 @@ typedef enum nl_sock_type_t_
 
 #define NL_SOCK_TYPES_N (NL_SOCK_TYPE_ROUTE + 1)
 
+typedef enum
+{
+  NL_TEST_DUMP_NONE,
+  NL_TEST_DUMP_INTR_OBJECT,
+  NL_TEST_DUMP_INTR_DONE,
+  NL_TEST_DUMP_ENOMEM,
+  NL_TEST_DUMP_EINVAL,
+  NL_TEST_DUMP_SHORT_DONE,
+  NL_TEST_DUMP_ZERO,
+  NL_TEST_DUMP_EXTACK,
+} nl_test_dump_scenario_t;
+
 /* Socket type, message type, type name, function subname */
 #define foreach_sock_type                                                     \
   _ (NL_SOCK_TYPE_LINK, RTM_GETLINK, "link", link)                            \
@@ -84,6 +96,15 @@ typedef struct nl_main
   u64 sync_completed;
   u64 sync_failed;
   u8 test_sync_pause;
+  struct
+  {
+    nl_test_dump_scenario_t scenario;
+    nl_sock_type_t sock_type;
+    u8 injected;
+    u8 next_done;
+    int result;
+    u64 sync_ends;
+  } test_dump;
 
 } nl_main_t;
 
@@ -432,6 +453,89 @@ lcp_nl_route_dump_cb (struct nl_msg *msg, void *arg)
 }
 
 static int
+lcp_nl_test_recv_dump (nl_sock_type_t sock_type, struct sockaddr_nl *nla, u8 **buf)
+{
+  nl_main_t *nm = &nl_main;
+  struct nlmsghdr *hdr;
+  int n_bytes, remaining;
+  u32 scenario = nm->test_dump.scenario;
+
+  if (scenario && nm->test_dump.sock_type == sock_type && nm->test_dump.next_done)
+    {
+      *buf = calloc (1, NLMSG_SPACE (sizeof (int)));
+      if (!*buf)
+	return -NLE_NOMEM;
+      hdr = (struct nlmsghdr *) *buf;
+      hdr->nlmsg_len = NLMSG_LENGTH (sizeof (int));
+      hdr->nlmsg_type = NLMSG_DONE;
+      hdr->nlmsg_flags = NLM_F_MULTI;
+      clib_memset (nla, 0, sizeof (*nla));
+      nla->nl_family = AF_NETLINK;
+      nm->test_dump.next_done = 0;
+      return hdr->nlmsg_len;
+    }
+
+  n_bytes = nl_recv (nm->sk_route_sync[sock_type], nla, buf, NULL);
+  if (n_bytes <= 0 || !scenario || nm->test_dump.injected ||
+      nm->test_dump.sock_type != sock_type)
+    return n_bytes;
+
+  remaining = n_bytes;
+  hdr = (struct nlmsghdr *) *buf;
+  while (nlmsg_ok (hdr, remaining))
+    {
+      if (scenario == NL_TEST_DUMP_INTR_OBJECT && hdr->nlmsg_type >= NLMSG_MIN_TYPE)
+	{
+	  hdr->nlmsg_flags |= NLM_F_DUMP_INTR;
+	  /* Split the object and clean terminal into separate receiver batches. */
+	  memmove (*buf, hdr, hdr->nlmsg_len);
+	  nm->test_dump.injected = nm->test_dump.next_done = 1;
+	  return NLMSG_ALIGN (((struct nlmsghdr *) *buf)->nlmsg_len);
+	}
+      if (scenario != NL_TEST_DUMP_INTR_OBJECT && hdr->nlmsg_type == NLMSG_DONE)
+	{
+	  int status = scenario == NL_TEST_DUMP_ENOMEM ? -ENOMEM :
+		       scenario == NL_TEST_DUMP_EINVAL ? -EINVAL : 0;
+	  u32 offset = (u8 *) hdr - *buf;
+	  u32 length = NLMSG_LENGTH (sizeof (status));
+	  u8 *resized;
+
+	  if (scenario == NL_TEST_DUMP_EXTACK)
+	    length += NLA_ALIGN (NLA_HDRLEN + sizeof (u32));
+	  resized = realloc (*buf, offset + length);
+	  if (!resized)
+	    {
+	      free (*buf);
+	      *buf = NULL;
+	      return -NLE_NOMEM;
+	    }
+	  *buf = resized;
+	  hdr = (struct nlmsghdr *) (*buf + offset);
+	  hdr->nlmsg_len = length;
+	  hdr->nlmsg_flags = NLM_F_MULTI;
+	  clib_memcpy (nlmsg_data (hdr), &status, sizeof (status));
+	  if (scenario == NL_TEST_DUMP_INTR_DONE)
+	    hdr->nlmsg_flags |= NLM_F_DUMP_INTR;
+	  else if (scenario == NL_TEST_DUMP_SHORT_DONE)
+	    hdr->nlmsg_len = NLMSG_LENGTH (sizeof (status) - 1);
+	  else if (scenario == NL_TEST_DUMP_EXTACK)
+	    {
+	      struct nlattr *attr = (void *) ((u8 *) nlmsg_data (hdr) + sizeof (status));
+
+	      hdr->nlmsg_flags |= NLM_F_ACK_TLVS;
+	      attr->nla_type = NLMSGERR_ATTR_OFFS;
+	      attr->nla_len = NLA_HDRLEN + sizeof (u32);
+	      clib_memset ((u8 *) attr + NLA_HDRLEN, 0, sizeof (u32));
+	    }
+	  nm->test_dump.injected = 1;
+	  return offset + NLMSG_ALIGN (hdr->nlmsg_len);
+	}
+      hdr = nlmsg_next (hdr, &remaining);
+    }
+  return n_bytes;
+}
+
+static int
 lcp_nl_recv_dump_replies (nl_sock_type_t sock_type, int msg_limit,
 			  int *is_done_rcvd)
 {
@@ -452,7 +556,8 @@ lcp_nl_recv_dump_replies (nl_sock_type_t sock_type, int msg_limit,
   lcp_set_netlink_processing_active (1);
 
 continue_reading:
-  n_bytes = nl_recv (sk_route, &nla, &buf, /* creds */ NULL);
+  n_bytes = nm->test_dump.scenario ? lcp_nl_test_recv_dump (sock_type, &nla, &buf) :
+				   nl_recv (sk_route, &nla, &buf, NULL);
   if (n_bytes <= 0)
     {
       lcp_set_netlink_processing_active (0);
@@ -462,6 +567,12 @@ continue_reading:
   hdr = (struct nlmsghdr *) buf;
   while (nlmsg_ok (hdr, n_bytes))
     {
+      if (hdr->nlmsg_flags & NLM_F_DUMP_INTR)
+	{
+	  err = -NLE_DUMP_INTR;
+	  goto out;
+	}
+
       nlmsg_free (msg);
       msg = nlmsg_convert (hdr);
       if (!msg)
@@ -480,6 +591,24 @@ continue_reading:
        */
       if (hdr->nlmsg_type == NLMSG_DONE)
 	{
+	  int status;
+
+	  if (nlmsg_datalen (hdr) < sizeof (status))
+	    {
+	      err = -NLE_MSG_TRUNC;
+	      goto out;
+	    }
+	  clib_memcpy (&status, nlmsg_data (hdr), sizeof (status));
+	  if (status < 0)
+	    {
+	      err = -nl_syserr2nlerr (status);
+	      goto out;
+	    }
+	  if (status > 0)
+	    {
+	      err = -NLE_INVAL;
+	      goto out;
+	    }
 	  done = 1;
 	  goto out;
 	}
@@ -538,7 +667,7 @@ continue_reading:
   msg = NULL;
   buf = NULL;
 
-  if (!done && n_msgs < msg_limit)
+  if (!done && n_msgs < msg_limit && !nm->test_dump.next_done)
     goto continue_reading;
 
 out:
@@ -546,6 +675,18 @@ out:
 
   nlmsg_free (msg);
   free (buf);
+
+  if (nm->test_dump.scenario && nm->test_dump.sock_type == sock_type &&
+      nm->test_dump.injected)
+    {
+      nm->test_dump.result = err ? err : n_msgs;
+      if (err || done)
+	{
+	  nm->test_sync_pause = err != 0;
+	  nm->test_dump.scenario = 0;
+	  nm->test_dump.next_done = 0;
+	}
+    }
 
   if (err)
     return err;
@@ -707,7 +848,10 @@ nl_route_process (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  foreach_sock_type
 #undef _
 
-#define _(stype, mtype, tname, fn) nl_##fn##_sync_end ();
+#define _(stype, mtype, tname, fn)                                             \
+  nl_##fn##_sync_end ();                                                       \
+  if (nm->test_dump.injected)                                                  \
+    nm->test_dump.sync_ends++;
 	  foreach_sock_type
 #undef _
 
@@ -881,6 +1025,30 @@ void
 lcp_nl_test_set_sync_pause (u8 enable)
 {
   nl_main.test_sync_pause = enable;
+  if (!enable)
+    {
+      nl_main.test_dump.scenario = 0;
+      nl_main.test_dump.next_done = 0;
+    }
+}
+
+int
+lcp_nl_test_inject_dump (u32 sock_type, u32 scenario)
+{
+  nl_main_t *nm = &nl_main;
+
+  if (sock_type >= NL_SOCK_TYPES_N || scenario <= NL_TEST_DUMP_NONE ||
+      scenario > NL_TEST_DUMP_EXTACK ||
+      (scenario == NL_TEST_DUMP_INTR_OBJECT && sock_type != NL_SOCK_TYPE_LINK) ||
+      nm->nl_status != NL_STATUS_NOTIF_PROC || nm->test_dump.scenario)
+    return -1;
+
+  nm->test_dump.sock_type = sock_type;
+  nm->test_dump.scenario = scenario;
+  nm->test_dump.injected = nm->test_dump.next_done = 0;
+  nm->test_dump.result = 0;
+  nm->test_dump.sync_ends = 0;
+  return 0;
 }
 
 /* Set the RX buffer size to be used on the netlink socket */
@@ -1209,6 +1377,9 @@ lcp_nl_show_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_comma
   vlib_cli_output (vm, "Synchronization attempts: %lu", nm->sync_attempts);
   vlib_cli_output (vm, "Synchronization completed: %lu", nm->sync_completed);
   vlib_cli_output (vm, "Synchronization failed: %lu", nm->sync_failed);
+  vlib_cli_output (vm, "Test dump injected: %u", nm->test_dump.injected);
+  vlib_cli_output (vm, "Test dump result: %d", nm->test_dump.result);
+  vlib_cli_output (vm, "Test dump sync ends: %lu", nm->test_dump.sync_ends);
 
   return 0;
 }
