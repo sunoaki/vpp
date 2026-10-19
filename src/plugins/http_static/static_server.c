@@ -1486,9 +1486,9 @@ hss_test_accept_recover (session_handle_t *handles, u32 count, u32 old_index)
       if (!(s->flags & SESSION_F_RX_READY) && !hss_pending_accept_get (s))
 	{
 	  hss_pending_accept_t pending = { .handle = handles[i],
-					 .app_index = hss_main.app_index,
-					 .app_wrk_index = s->app_wrk_index,
-					 .listener_index = old_index };
+					   .app_index = hss_main.app_index,
+					   .app_wrk_index = s->app_wrk_index,
+					   .listener_index = old_index };
 	  vec_validate (hss_pending_accepts, 0);
 	  clib_atomic_add_fetch (&hss_listener_get (old_index)->ref_count, 1);
 	  vec_add1 (hss_pending_accepts[0], pending);
@@ -1498,7 +1498,7 @@ hss_test_accept_recover (session_handle_t *handles, u32 count, u32 old_index)
 
 static clib_error_t *
 hss_test_pending_accept_command_fn (vlib_main_t *vm, unformat_input_t *input,
-			    vlib_cli_command_t *cmd)
+				    vlib_cli_command_t *cmd)
 {
   hss_main_t *hsm = &hss_main;
   hss_listener_t cfg = { .sep = SESSION_ENDPOINT_CFG_NULL };
@@ -1558,8 +1558,8 @@ hss_test_pending_accept_command_fn (vlib_main_t *vm, unformat_input_t *input,
   listener = hss_test_listener_handle (old_index);
   for (i = 0; i < 129; i++)
     {
-      handles[count] = hss_test_accept_alloc (listener, i == 128 ? handles[0] :
-							      SESSION_INVALID_HANDLE);
+      handles[count] =
+	hss_test_accept_alloc (listener, i == 128 ? handles[0] : SESSION_INVALID_HANDLE);
       if (handles[count] == SESSION_INVALID_HANDLE)
 	{
 	  error = clib_error_return (0, "pending accept test allocation %u failed", i);
@@ -1571,8 +1571,7 @@ hss_test_pending_accept_command_fn (vlib_main_t *vm, unformat_input_t *input,
   guard = 1;
   vec_validate (hss_pending_accepts, 0);
   if (clib_fifo_elts (app_wrk->wrk_evts[0]) != 129 || hss_listener_del (&cfg) ||
-      vec_len (hss_pending_accepts[0]) != 129 ||
-      hss_listener_get (old_index)->ref_count != 130 ||
+      vec_len (hss_pending_accepts[0]) != 129 || hss_listener_get (old_index)->ref_count != 130 ||
       hss_preserve_pending_accepts (hss_listener_get (old_index)) ||
       hss_listener_get (old_index)->ref_count != 130)
     {
@@ -1608,8 +1607,8 @@ hss_test_pending_accept_command_fn (vlib_main_t *vm, unformat_input_t *input,
       hs = hss_session_get (0, s->opaque);
       if (!hs || hs->listener_index != old_index || !(s->flags & SESSION_F_RX_READY))
 	{
-	  error = clib_error_return (0, "pending accept session %u lost old listener %u", i,
-				    old_index);
+	  error =
+	    clib_error_return (0, "pending accept session %u lost old listener %u", i, old_index);
 	  goto done;
 	}
     }
@@ -1650,7 +1649,7 @@ done:
   hsm->is_init = 0;
   if (!error)
     vlib_cli_output (vm, "synthetic queued accept: 129 events, batches 128+1, "
-			"130 old owners released");
+			 "130 old owners released");
   return error;
 }
 
