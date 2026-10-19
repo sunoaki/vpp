@@ -3177,7 +3177,21 @@ session_test_dtls_cleanup (vlib_main_t *vm)
     session_test_dtls_cleanup_rpc (&test);
   else
     {
-      session_send_rpc_evt_to_thread (transport_cl_thread (), session_test_dtls_cleanup_rpc, &test);
+      session_worker_t *wrk = session_main_get_worker (transport_cl_thread ());
+      svm_msg_q_t *mq = wrk->vpp_event_queue;
+      svm_msg_q_msg_t msg;
+      session_event_t *evt;
+
+      rv = svm_msg_q_lock_and_alloc_msg_w_ring (mq, SESSION_MQ_IO_EVT_RING, SVM_Q_NOWAIT, &msg);
+      if (!SESSION_TEST_I (rv == 0, "DTLS cleanup RPC queued: %d", rv))
+	goto detach_application;
+      evt = svm_msg_q_msg_data (mq, &msg);
+      evt->rpc_args.fp = session_test_dtls_cleanup_rpc;
+      evt->rpc_args.arg = &test;
+      evt->event_type = SESSION_CTRL_EVT_RPC;
+      svm_msg_q_add_and_unlock (mq, &msg);
+      if (PREDICT_FALSE (wrk->state == SESSION_WRK_INTERRUPT))
+	vlib_node_set_interrupt_pending (wrk->vm, session_queue_node.index);
       vlib_worker_thread_barrier_release (vm);
       while (!clib_atomic_load_acq_n (&test.done))
 	CLIB_PAUSE ();
@@ -3194,6 +3208,7 @@ session_test_dtls_cleanup (vlib_main_t *vm)
       result = 0;
       vlib_cli_output (vm, "DTLS cleanup: 4 modes passed on thread %u", transport_cl_thread ());
     }
+detach_application:
   vnet_application_detach (&detach);
 
 cleanup_namespace:
