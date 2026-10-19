@@ -377,6 +377,64 @@ jobs:
                               and isinstance(item.get("command_id"), str)
                               for item in record["ancestors"]))
 
+          def finite_timestamp(value):
+              return type(value) in (int, float) and -float("inf") < value < float("inf")
+
+          def command_exception(value):
+              return (isinstance(value, dict) and isinstance(value.get("type"), str)
+                      and isinstance(value.get("message"), str)
+                      and ("traceback" not in value or isinstance(value["traceback"], str)))
+
+          def command_cleanup(value):
+              if not isinstance(value, dict) or not isinstance(value.get("survivors"), list):
+                  return False
+              if not all(type(pid) is int and pid > 0 for pid in value["survivors"]):
+                  return False
+              if "exception" in value:
+                  return command_exception(value["exception"])
+              return all(isinstance(value.get(key), list)
+                         and all(isinstance(pair, list) and len(pair) == 2
+                                 and all(type(item) is int for item in pair) for pair in value[key])
+                         for key in ("signals", "reaped"))
+
+          def command_state(record):
+              require(command_identity(record), "Invalid command identity")
+              require(isinstance(record.get("command"), list) and bool(record["command"])
+                      and all(isinstance(item, str) for item in record["command"])
+                      and finite_timestamp(record.get("start")) and finite_timestamp(record.get("deadline")),
+                      "Invalid command inputs or timestamps")
+              require(all(key in record for key in ("rc", "exception", "cleanup"))
+                      and (record["rc"] is None or type(record["rc"]) is int)
+                      and (record["exception"] is None or command_exception(record["exception"]))
+                      and all(key not in record or type(record[key]) is bool
+                              for key in ("caught_transport", "fatal_diagnostic")), "Invalid command status types")
+              outcome = record.get("outcome")
+              require(isinstance(outcome, str) and outcome in (
+                  "running", "success", "nonzero", "timeout", "exception", "cleanup-failed",
+                  "transport-failure", "fatal-diagnostic"), "Invalid command outcome")
+              if outcome == "running":
+                  require("end" not in record and record["rc"] is None and record["exception"] is None
+                          and record["cleanup"] is None and not record.get("caught_transport")
+                          and not record.get("fatal_diagnostic"), "Inconsistent running command state")
+                  return
+              require(finite_timestamp(record.get("end")) and record["end"] >= record["start"]
+                      and command_cleanup(record["cleanup"]), "Invalid terminal command state")
+              cleanup_failed = bool(record["cleanup"].get("exception") or record["cleanup"]["survivors"])
+              require((not record.get("fatal_diagnostic") or outcome == "fatal-diagnostic")
+                      and (not record.get("caught_transport") or outcome in ("transport-failure", "fatal-diagnostic"))
+                      and (not cleanup_failed or outcome in ("cleanup-failed", "transport-failure", "fatal-diagnostic")),
+                      "Inconsistent terminal failure flags")
+              if outcome in ("success", "nonzero"):
+                  require(type(record["rc"]) is int and (record["rc"] == 0) == (outcome == "success")
+                          and record["exception"] is None and not cleanup_failed, "Inconsistent command exit status")
+              elif outcome in ("timeout", "exception"):
+                  require(record["exception"] is not None and not cleanup_failed
+                          and (record["exception"]["type"] in ("TimeoutError", "TimeoutExpired")) == (outcome == "timeout"),
+                          "Inconsistent command exception state")
+              else:
+                  require({"cleanup-failed": cleanup_failed, "transport-failure": record.get("caught_transport"),
+                           "fatal-diagnostic": record.get("fatal_diagnostic")}[outcome], "Missing terminal failure evidence")
+
           def evidence_bytes(path):
               require(not path.is_symlink() and stat.S_ISREG(path.stat().st_mode)
                       and path.stat().st_size <= 1024 * 1024, "Invalid or oversized evidence record")
@@ -390,8 +448,8 @@ jobs:
                   raw = evidence_bytes(path)
                   evidence.update(raw_result_sha256=hashlib.sha256(raw).hexdigest(), raw_result_state="malformed")
                   child = json.loads(raw)
-                  require(command_identity(child), "Invalid command identity")
-                  evidence["raw_result_state"] = "running"
+                  command_state(child)
+                  evidence["raw_result_state"] = child["outcome"]
                   return child, evidence, None
               except (OSError, ValueError, AssertionError) as error:
                   diagnostic = {"result": evidence["raw_result"], "raw_sha256": evidence["raw_result_sha256"],
@@ -965,7 +1023,14 @@ jobs:
                   directory.mkdir()
                   identity = {"command_id": name, "ancestors": ancestors,
                               "result": f"{name}/result.json"}
-                  raw = record if isinstance(record, bytes) else json.dumps(dict(record, **identity)).encode()
+                  if isinstance(record, bytes):
+                      raw = record
+                  else:
+                      valid = fixture_command(identity)
+                      if record["outcome"] == "success":
+                          valid.update(outcome="success", end=3, rc=0,
+                                       cleanup={"signals": [], "reaped": [], "survivors": []})
+                      raw = json.dumps(valid).encode()
                   (directory / "result.json").write_bytes(raw)
                   snapshots[name] = raw
                   if ancestors is not None:
@@ -1044,10 +1109,132 @@ jobs:
                       and not result["cleanup"]["survivors"] and len(tail) == 8 * 1024 * 1024
                       and b"SIGABRT" not in tail, "Truncated fatal evidence lost failure")
 
+          def fixture_command(identity):
+              return dict(identity, command=[sys.executable, "-c", "pass"], start=1, deadline=2,
+                          outcome="running", rc=None, exception=None, cleanup=None)
+
+          def invalid_state_records(identity):
+              running = fixture_command(identity)
+              completed = dict(running, outcome="success", end=3, rc=0,
+                               cleanup={"signals": [], "reaped": [], "survivors": []})
+              cases = [{key: value for key, value in running.items() if key != "outcome"}]
+              cases += [dict(running, outcome=value) for value in ([], 42, None, {}, True, "unknown")]
+              cases += [dict(running, **change) for change in (
+                  {"end": 3}, {"rc": 0}, {"cleanup": {}}, {"exception": {"type": "Error", "message": "x"}},
+                  {"caught_transport": True}, {"fatal_diagnostic": True}, {"command": "python"},
+                  {"start": "1"}, {"deadline": None}, {"rc": False}, {"caught_transport": []})]
+              cases += [dict(completed, **change) for change in (
+                  {"end": None}, {"end": "3"}, {"end": 0}, {"end": float("nan")}, {"rc": None}, {"rc": 2},
+                  {"cleanup": None}, {"cleanup": []}, {"cleanup": {"survivors": "none"}},
+                  {"cleanup": {"survivors": [], "signals": [], "reaped": "none"}},
+                  {"exception": "Error"}, {"exception": {"type": 42, "message": "x"}},
+                  {"outcome": "timeout"}, {"outcome": "exception"}, {"outcome": "cleanup-failed"},
+                  {"outcome": "transport-failure"}, {"outcome": "fatal-diagnostic"})]
+              cases.append({key: value for key, value in completed.items() if key != "end"})
+              return cases
+
+          def state_schema_fixtures(parent_path):
+              output = Path(os.environ["EVIDENCE_DIR"])
+              parent = json.loads(parent_path.read_bytes())
+              reference = {"result": str(parent_path.relative_to(output)), "command_id": parent["command_id"]}
+              snapshots = {}
+              for number, record in enumerate(invalid_state_records({"command_id": "schema", "ancestors": [reference]})):
+                  directory = output / f"schema-invalid-{number:02d}"
+                  directory.mkdir()
+                  raw = json.dumps(record).encode()
+                  (directory / "result.json").write_bytes(raw)
+                  owner = dict(command_id=record["command_id"], ancestors=[reference],
+                               result=str((directory / "result.json").relative_to(output)))
+                  owner_raw = json.dumps(owner).encode()
+                  (directory / "ownership.json").write_bytes(owner_raw)
+                  snapshots[directory] = (raw, owner_raw)
+              record_interruptions(parent_path, parent)
+              errors = json.loads((parent_path.parent / "attribution-errors.json").read_bytes())
+              diagnostics = {item["result"]: item for item in errors}
+              for directory, (raw, owner_raw) in snapshots.items():
+                  interrupted = json.loads((directory / "interruption.json").read_bytes())
+                  require((directory / "result.json").read_bytes() == raw
+                          and interrupted["raw_result_sha256"] == hashlib.sha256(raw).hexdigest()
+                          and interrupted["ownership"]["sha256"] == hashlib.sha256(owner_raw).hexdigest()
+                          and interrupted["raw_result_state"] == "malformed" and interrupted["parent"] == reference
+                          and interrupted["spawned"] is None and interrupted["rc"] is None and interrupted["cleanup"] is None
+                          and diagnostics[str((directory / "result.json").relative_to(output))]["ownership_recovered"],
+                          "Invalid state omitted diagnostic, changed raw or fabricated child state")
+              state_schema_guards(parent_path)
+              valid_state_guards(parent_path)
+              print(f"{len(snapshots)} invalid command-state schemas recovered through immutable ownership; guards passed")
+
+          def valid_state_records(reference):
+              running = fixture_command({"command_id": "valid-state", "ancestors": [reference]})
+              completed = dict(running, end=3, rc=0, cleanup={"signals": [], "reaped": [], "survivors": []})
+              exception = {"type": "ValueError", "message": "fixture"}
+              return [dict(completed, outcome="success"), dict(completed, outcome="nonzero", rc=2),
+                      dict(completed, outcome="timeout", rc=-15, exception=dict(exception, type="TimeoutError")),
+                      dict(completed, outcome="exception", rc=None, exception=exception),
+                      dict(completed, outcome="cleanup-failed", cleanup={"survivors": [], "exception": exception}),
+                      dict(completed, outcome="transport-failure", caught_transport=True),
+                      dict(completed, outcome="fatal-diagnostic", fatal_diagnostic=True)]
+
+          def valid_state_guards(parent_path):
+              output = Path(os.environ["EVIDENCE_DIR"])
+              parent = json.loads(parent_path.read_bytes())
+              reference = {"result": str(parent_path.relative_to(output)), "command_id": parent["command_id"]}
+              snapshots = {}
+              for number, record in enumerate(valid_state_records(reference)):
+                  command_state(record)
+                  directory = output / f"schema-completed-{number}"
+                  directory.mkdir()
+                  raw = json.dumps(record).encode()
+                  (directory / "result.json").write_bytes(raw)
+                  snapshots[directory] = raw
+              directory = output / "schema-existing-sidecar"
+              directory.mkdir()
+              raw = json.dumps(dict(command_id="existing", ancestors=[reference], outcome=42)).encode()
+              (directory / "result.json").write_bytes(raw)
+              (directory / "ownership.json").write_text(json.dumps(
+                  dict(command_id="existing", ancestors=[reference], result="schema-existing-sidecar/result.json")))
+              sidecar = b'{"outcome":"existing-proof"}\n'
+              (directory / "interruption.json").write_bytes(sidecar)
+              record_interruptions(parent_path, parent)
+              require(all((path / "result.json").read_bytes() == data
+                          and not (path / "interruption.json").exists() for path, data in snapshots.items())
+                      and (directory / "result.json").read_bytes() == raw
+                      and (directory / "interruption.json").read_bytes() == sidecar,
+                      "Valid completed or existing interruption evidence changed")
+
+          def state_schema_guards(parent_path):
+              output = Path(os.environ["EVIDENCE_DIR"])
+              parent = json.loads(parent_path.read_bytes())
+              reference = {"result": str(parent_path.relative_to(output)), "command_id": parent["command_id"]}
+              cases = {"schema-no-owner": None, "schema-bad-owner": b"{",
+                       "schema-wrong-id": dict(reference, command_id="wrong"),
+                       "schema-wrong-path": dict(reference, result="wrong/result.json")}
+              for name, owner in cases.items():
+                  directory = output / name
+                  directory.mkdir()
+                  (directory / "result.json").write_text(json.dumps(dict(command_id=name, ancestors=[reference], outcome=42)))
+                  if owner is not None:
+                      (directory / "ownership.json").write_bytes(owner if isinstance(owner, bytes) else json.dumps(
+                          dict(command_id=name, ancestors=[owner], result=f"{name}/result.json")).encode())
+              completed = fixture_command({"command_id": "completed", "ancestors": [reference]})
+              completed.update(outcome="success", end=3, rc=0, cleanup={"signals": [], "reaped": [], "survivors": []})
+              for name, record in (("schema-valid-completed", completed), ("schema-valid-unrelated", fixture_command(
+                      {"command_id": "unrelated", "ancestors": []})), ("zz-schema-valid-later", fixture_command(
+                      {"command_id": "later", "ancestors": [reference]}))):
+                  directory = output / name
+                  directory.mkdir()
+                  (directory / "result.json").write_text(json.dumps(record))
+              record_interruptions(parent_path, parent)
+              require(all(not (output / name / "interruption.json").exists() for name in cases)
+                      and not (output / "schema-valid-completed/interruption.json").exists()
+                      and not (output / "schema-valid-unrelated/interruption.json").exists()
+                      and (output / "zz-schema-valid-later/interruption.json").exists(), "Schema recovery bypassed ownership or blocked later record")
+
           def publication_fixtures():
               parent_path = publication_deadline_fixtures()
               malformed_publication_fixtures(parent_path)
               missing_result_guards(parent_path)
+              state_schema_fixtures(parent_path)
               fatal_stream_fixtures()
               print("Initial/terminal/grandparent publication, missing-result guards and persistent fatal diagnostics passed")
 
