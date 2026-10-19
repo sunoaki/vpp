@@ -82,6 +82,66 @@ jobs:
             done < "$EVIDENCE/planned-phases.txt"
             printf '\n}\n'
           } > "$EVIDENCE/phase-status.json"
+          cat > "$TOOLS/evidence_schema.py" <<'PY'
+          import hashlib
+          import json
+          from pathlib import PurePosixPath
+
+          COMMAND_STATUSES = {"running", "completed", "work_budget_exhausted", "work_budget_timeout",
+                              "command_timeout", "cleanup_timeout", "execution_error", "cleanup_error"}
+          PHASE_STATUSES = COMMAND_STATUSES | {"failed", "not_run", "success", "failure", "cancelled"}
+
+          def check(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+          def identity(value):
+              return isinstance(value, str) and bool(value.strip())
+
+          def record(raw, command=False):
+              value = json.loads(raw)
+              check(isinstance(value, dict), "Record must be an object")
+              status = value.get("status")
+              check(isinstance(status, str) and status in (COMMAND_STATUSES if command else PHASE_STATUSES),
+                    "Unrecognized record status")
+              check("rc" in value and (value["rc"] is None or type(value["rc"]) is int), "Invalid return code")
+              if command or "ancestors" in value or "identity" in value:
+                  check(identity(value.get("identity")), "Missing command identity")
+                  check(isinstance(value.get("ancestors"), list) and
+                        all(identity(item) for item in value["ancestors"]), "Invalid ancestor identities")
+              check(status != "running" or value["rc"] is None, "Running command has an exit status")
+              check(status != "completed" or type(value["rc"]) is int, "Completed record lacks an exit status")
+              if "cleanup_complete" in value:
+                  check(value["cleanup_complete"] is None or type(value["cleanup_complete"]) is bool,
+                        "Invalid cleanup result")
+              return value
+
+          def interruption(raw, child, child_raw):
+              child = record(child_raw, command=True)
+              value = json.loads(raw)
+              check(isinstance(value, dict), "Interruption must be an object")
+              check(set(value) == {"status", "rc", "cleanup_complete", "observed_at", "parent",
+                                   "parent_identity", "raw_sha256", "reason"}, "Invalid interruption fields")
+              check(value.get("status") == "interrupted_by_parent", "Invalid interruption status")
+              check("rc" in value and value["rc"] is None and "cleanup_complete" in value and
+                    value["cleanup_complete"] is None, "Interruption unknowns must remain null")
+              observed = value.get("observed_at")
+              check(type(observed) in (int, float) and 0 <= observed <= 1e20,
+                    "Invalid interruption timestamp")
+              parent = value.get("parent")
+              check(identity(parent) and not PurePosixPath(parent).is_absolute() and
+                    ".." not in PurePosixPath(parent).parts and parent.endswith("/result.json"),
+                    "Invalid parent result path")
+              check(identity(value.get("parent_identity")) and child["status"] == "running" and
+                    value["parent_identity"] in child["ancestors"], "Interruption is not attributable")
+              check(value.get("raw_sha256") == hashlib.sha256(child_raw).hexdigest(), "Raw result hash mismatch")
+              check(identity(value.get("reason")), "Missing interruption reason")
+              return value
+
+          def invalid(path, raw, error):
+              return dict(status="invalid_record", rc=None, cleanup_complete=None,
+                          raw_result=str(path), raw_sha256=hashlib.sha256(raw).hexdigest(), error=str(error))
+          PY
           rm -f /etc/apt/apt.conf.d/docker-clean
           rc=0
           timeout --signal=TERM --kill-after=5s 300s bash -euo pipefail -c \
@@ -222,6 +282,7 @@ jobs:
           import subprocess
           import sys
           import time
+          import evidence_schema
 
           ROOT = Path.cwd()
           OUT = Path(os.environ["EVIDENCE"])
@@ -408,13 +469,12 @@ jobs:
                           "Invalid command record")
                   raw = path.read_bytes()
                   try:
-                      child = json.loads(raw)
-                  except (json.JSONDecodeError, UnicodeDecodeError):
-                      save(str(path.parent.relative_to(OUT) / "invalid-result.json"), dict(
-                          status="invalid_record", raw_sha256=hashlib.sha256(raw).hexdigest(),
-                          parent=str(parent_path.relative_to(OUT)), rc=None))
+                      child = evidence_schema.record(raw, command=True)
+                  except (ValueError, UnicodeDecodeError) as error:
+                      save(str(path.parent.relative_to(OUT) / "invalid-result.json"),
+                           evidence_schema.invalid(path.relative_to(OUT), raw, error))
                       continue
-                  if parent["identity"] not in child.get("ancestors", []) or child.get("status") != "running":
+                  if parent["identity"] not in child["ancestors"] or child["status"] != "running":
                       continue
                   save(str(path.parent.relative_to(OUT) / "interruption.json"), dict(
                       status="interrupted_by_parent", rc=None, cleanup_complete=None,
@@ -871,8 +931,10 @@ jobs:
           timeout 15s git status --short > "$EVIDENCE/final-status.txt" 2>&1
           timeout 15s git diff --binary > "$EVIDENCE/final.diff" 2>&1
           python3 - <<'PY'
-          import hashlib, json, os
+          import hashlib, json, os, sys
           from pathlib import Path
+          sys.path.insert(0, os.environ["TOOLS"])
+          import evidence_schema
           root = Path(os.environ["EVIDENCE"])
           phases = {}
           names = (root / "planned-phases.txt").read_text().splitlines()
@@ -882,15 +944,20 @@ jobs:
               paths = (root / name / "result.json", root / f"{name}-result.json")
               found = next((path for path in paths if path.is_file()), None)
               if found:
+                  raw, failed_path = b"", found
                   try:
-                      phases[name] = json.loads(found.read_text())
+                      raw = found.read_bytes()
+                      child_raw = raw
+                      child = evidence_schema.record(raw, command=found.name == "result.json")
+                      phases[name] = child
                       interruption = root / name / "interruption.json"
                       if interruption.is_file():
-                          phases[name] = dict(raw_result=str(found.relative_to(root)),
-                                              **json.loads(interruption.read_text()))
-                  except (json.JSONDecodeError, UnicodeDecodeError, OSError) as error:
-                      phases[name] = dict(status="invalid_record", rc=None, error=str(error),
-                                          raw_result=str(found.relative_to(root)))
+                          failed_path = interruption
+                          raw = interruption.read_bytes()
+                          checked = evidence_schema.interruption(raw, child, child_raw)
+                          phases[name] = dict(raw_result=str(found.relative_to(root)), **checked)
+                  except (ValueError, UnicodeDecodeError, OSError) as error:
+                      phases[name] = evidence_schema.invalid(failed_path.relative_to(root), raw, error)
               elif name in outcomes:
                   outcome = os.environ.get(outcomes[name], "skipped")
                   phases[name] = dict(status="not_run" if outcome == "skipped" else outcome,
