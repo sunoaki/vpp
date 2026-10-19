@@ -39,7 +39,7 @@ jobs:
     env:
       VARIANT_NAME: ${{ matrix.variant }}
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: aac52ac812709644cb539295b33c76cdef1f75e3
+      CANDIDATE_SHA: 191631cdb5c7754f64475517dbab6ee420be60e7
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
@@ -68,9 +68,7 @@ jobs:
           printf '%s\n' bootstrap checkout prepare dependencies feature-list pinned-python black-version \
             fixture-python-style fixtures mutate fallback-version build binaries namespace environment runtime tests collect \
             > "$EVIDENCE/planned-phases.txt"
-          for commit in 616ce15c0097bd129046531c0cfd21388613b265 27610f085ae248b73ce4d3a8d0a1c50f037ecea4 \
-            7238418f29a30398522a3f980094a5a8aa35ba49 bec8c9a5beefb18c1ffced34f68dc04eb5cd7138 \
-            aac52ac812709644cb539295b33c76cdef1f75e3; do
+          for commit in 191631cdb5c7754f64475517dbab6ee420be60e7; do
             printf 'style-%s\napi-%s\nmessage-%s\n' "$commit" "$commit" "$commit" >> "$EVIDENCE/planned-phases.txt"
           done
           {
@@ -613,7 +611,10 @@ jobs:
                               run_url=f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
                               limits="8 MiB console/command; 4 MiB observer/process; diagnostics 32 MiB/300 files",
                               uncovered_negative_controls=["premature listener/cache release/reuse", "omitted cleanup/ack",
-                                                           "deferred-only reset before pointer free", "ctx/cert heap release"],
+                                                           "deferred-only reset before pointer free", "ctx/cert heap release",
+                                                           "genuine pending HTTP scheduling", "worker pending queue/destroy",
+                                                           "synthetic callback rejection/parent branch safety"],
+                              synthetic_scope="two debug test successes; main-queue synthetic identity only, including worker1 class",
                               ipv6_http3_scope="control-plane identity and QUIC listener/ALPN; no IPv6 request or HTTP3 transfer")
               manifest["tests"] = {path: dict(blob=git("rev-parse", f"{CANDIDATE}:{path}"),
                                              sha256=hashlib.sha256(content(CANDIDATE, path)).hexdigest())
@@ -753,6 +754,15 @@ jobs:
               methods = {cls.name: [node.name for node in cls.body if isinstance(node, ast.FunctionDef)
                                     and node.name.startswith("test_")]
                          for cls in tree.body if isinstance(cls, ast.ClassDef)}
+              regressions = ("test_http_static_listener_delete_reuse", "test_http_static_cached_listener_retirement",
+                             "test_http_static_destroy_ownership", "test_http_static_default_get_states",
+                             "test_http_static_listener_uri_identity", "test_http_static_listener_ipv6_identity",
+                             "test_http_static_listener_http3_identity")
+              require(collections.Counter(methods["TestHttpStaticCli"]) == collections.Counter(
+                      (*regressions, "test_http_static_cli", "test_http_static_pending_accept_identity")),
+                      "Reviewed seven regressions or separate synthetic test changed")
+              require(methods["TestHttpStaticCliWorker"] == [] and
+                      methods["TestHttpStaticVapi"] == ["test_http_static_vapi"], "Reviewed suite classes changed")
               return [f"test_http_static.{cls}.{method}" for cls in (*CLASSES, "TestHttpStaticVapi")
                       for method in methods["TestHttpStaticCli" if cls in CLASSES else cls]]
 
@@ -799,6 +809,15 @@ jobs:
                                               if kind == "addSuccess") == wanted and
                           all(kind == "addSuccess" for kind, _, _ in callbacks), "Framework callbacks mismatch")
                   for cls in CLASSES:
+                      synthetic = f"test_http_static.{cls}.test_http_static_pending_accept_identity"
+                      start = next(event for event in starts if event["test"] == synthetic)
+                      stop = next(event for event in stops if event["test"] == synthetic)
+                      replies = [event for event in events if event["kind"] == "cli_reply" and
+                                 event["pid"] == start["pid"] and start["seq"] < event["seq"] < stop["seq"] and
+                                 event["command"] == "test http static pending accept"]
+                      require(len(replies) == 1 and replies[0]["retval"] == 0 and
+                              "synthetic queued accept: 129 events, batches 128+1, 130 old owners released"
+                              in replies[0]["reply"], "Missing separate main-queue synthetic success witness")
                       identity = f"test_http_static.{cls}.test_http_static_listener_uri_identity"
                       require(collections.Counter(event["params"].get("protocol") for event in subs if event["test"] == identity) ==
                               collections.Counter(("tcp", "http", "tls", "https")), "Incomplete secure subtests")
@@ -885,7 +904,7 @@ jobs:
                   save("acceptance.json", dict(status="FAIL", error=str(error), expected=expected))
                   raise
               save("acceptance.json", dict(status="PASS", expected=expected,
-                                           claims="full fixed suite and14 new successes" if VARIANT == "fixed" else
+                                           claims="full19 fixed successes:14 original regressions,2 main-queue synthetic,3 existing" if VARIANT == "fixed" else
                                            "narrow restored API field only; lifecycle negative gaps remain"))
 
           def binaries():
@@ -957,7 +976,7 @@ jobs:
           python3 "$TOOLS/control.py" fixture-python-style build-root/test/venv/bin/black --check -t py39 \
             src/plugins/http_static/test_lifetime_fixtures.py test/asf/test_http_static.py
 
-      - name: Execute exactly fourteen standalone fixtures
+      - name: Execute exactly seventeen standalone fixtures
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -966,7 +985,7 @@ jobs:
           import os
           from pathlib import Path
           text = (Path(os.environ["EVIDENCE"]) / "fixtures/console.log").read_text()
-          assert "Ran 14 tests in " in text and "\nOK\n" in text, text
+          assert "Ran 17 tests in " in text and "\nOK\n" in text, text
           PY
 
       - name: Restore narrow source field and identify build tree
