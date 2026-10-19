@@ -533,6 +533,34 @@ jobs:
                   if key in self.acquisitions:
                       self.acquisitions[key].update(values, updated=time.monotonic())
 
+              def blocked(self, key):
+                  return self.acquisitions.get(key, {}).get("reused", False)
+
+              def resolve(self, key, status):
+                  if self.blocked(key):
+                      self.unresolved.add(key)
+                      return False
+                  self.acquisition(key, status=status)
+                  self.unresolved.discard(key)
+                  return True
+
+              def observe(self, key, value, label):
+                  self.acquisition(key, last_identity=value, state=value[2])
+                  if value[1] != key[1]:
+                      record = self.acquisitions[key]
+                      record.setdefault("birth_mismatch", dict(stage=label, expected=key[1], actual=value))
+                      self.acquisition(key, reused=True, reason="birth_changed", status="pending")
+                      self.unresolved.add(key)
+                      return False
+                  return not self.blocked(key)
+
+              def acquisition_deadline(self):
+                  deadline = work_deadline() if "WORK_DEADLINE" in os.environ else float("inf")
+                  if hasattr(self, "deadline"):
+                      deadline = min(deadline, time.time() + self.deadline - time.monotonic())
+                  if time.time() >= deadline:
+                      raise TimeoutError("Acquisition deadline exhausted")
+
               def reconcile(self, table):
                   for key in list(self.unresolved):
                       pid, birth = key
@@ -542,23 +570,21 @@ jobs:
                       current = table.get(pid)
                       if current is not None:
                           record["absence_checks"] = 0
-                          self.acquisition(key, last_identity=current, state=current[2],
-                                           reused=current[1] != birth, reason="snapshot_present")
+                          self.acquisition(key, reason="snapshot_present")
+                          self.observe(key, current, "reconcile_snapshot")
                           continue
                       directory = None
                       try:
                           directory = os.open(f"/proc/{pid}", os.O_RDONLY | os.O_DIRECTORY)
                           current = self.identity(directory)
-                          self.acquisition(key, last_identity=current, state=current[2],
-                                           absence_checks=0, reused=current[1] != birth,
-                                           reason="direct_probe_present")
+                          self.acquisition(key, absence_checks=0, reason="direct_probe_present")
+                          self.observe(key, current, "reconcile_direct")
                       except (FileNotFoundError, ProcessLookupError) as error:
                           record["absence_checks"] += 1
                           self.acquisition(key, reason="direct_probe_absent", absence_errno=error.errno,
                                            absence_time=time.monotonic())
                           if record["absence_checks"] >= 2:
-                              self.acquisition(key, status="vanished")
-                              self.unresolved.discard(key)
+                              self.resolve(key, "vanished")
                       except (OSError, ValueError, IndexError, UnicodeError) as error:
                           self.acquisition(key, reason="direct_probe_uncertain", absence_checks=0,
                                            probe_error=type(error).__name__, probe_errno=getattr(error, "errno", None))
@@ -582,58 +608,131 @@ jobs:
                       poller.register(handle[1], selectors.EVENT_READ)
                       return bool(poller.select(0))
 
+              def parent_proof(self, parent, observation):
+                  if parent == os.getpid():
+                      value = Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]
+                      observation.update(kind="self", parent=parent, parent_birth=value)
+                      return (None, None) if value == self.self_birth else None
+                  for key, handle in self.handles.items():
+                      if key[0] != parent or self.blocked(key):
+                          continue
+                      observation.update(kind="owned", parent=parent, parent_birth=key[1],
+                                         parent_handle=list(handle))
+                      observation["exited"] = self.exited(handle)
+                      observation["identity"] = self.identity(handle[0])
+                      if not observation["exited"] and observation["identity"][1] == key[1]:
+                          return key, handle
+                  observation.setdefault("kind", "unverified")
+                  return None
+
+              def parent_still_owned(self, proof, observation):
+                  key, handle = proof
+                  if key is None:
+                      value = Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]
+                      observation.update(kind="self", parent_birth=value)
+                      return value == self.self_birth
+                  observation.update(kind="owned", parent_birth=key[1], parent_handle=list(handle),
+                                     same_handle=self.handles.get(key) is handle)
+                  observation["exited"] = self.exited(handle)
+                  observation["identity"] = self.identity(handle[0])
+                  return (observation["same_handle"] and not self.blocked(key) and not observation["exited"] and
+                          observation["identity"][1] == key[1])
+
+              def ownership_rounds(self, key, handle, attempt):
+                  directory, _ = handle
+                  for number in range(3):
+                      self.acquisition_deadline()
+                      observation = dict(number=number + 1, parent_before={}, parent_after={})
+                      attempt["rounds"].append(observation)
+                      first = self.identity(directory)
+                      observation["before"] = first
+                      if not self.observe(key, first, "round_before"):
+                          return False
+                      proof = self.parent_proof(first[0], observation["parent_before"])
+                      final = self.identity(directory)
+                      observation["final"] = final
+                      if not self.observe(key, final, "round_final"):
+                          return False
+                      observation["parent_changed"] = first[0] != final[0]
+                      if observation["parent_changed"]:
+                          self.acquisition(key, reason="parent_changed")
+                          continue
+                      if proof is None or not self.parent_still_owned(proof, observation["parent_after"]):
+                          self.acquisition(key, reason="ancestor_unverified")
+                          return False
+                      self.acquisition_deadline()
+                      if self.blocked(key):
+                          return False
+                      attempt["proof"] = observation
+                      return True
+                  self.acquisition(key, reason="parent_rounds_exhausted")
+                  return False
+
               def bind(self, pid, expected):
-                  directory = descriptor = None
                   key = (pid, expected[1])
-                  record = self.acquisitions.get(key)
-                  if record is not None:
-                      record["bind_attempts"] += 1
+                  if self.blocked(key):
+                      self.unresolved.add(key)
+                      return False
+                  if key in self.handles:
+                      return self.resolve(key, "bound")
+                  if key not in self.acquisitions:
+                      table = processes()
+                      if not self.attributable(expected, table):
+                          return False
+                      self.candidate(pid, expected, table)
+                  record = self.acquisitions[key]
+                  record["bind_attempts"] += 1
+                  attempt = dict(generation=record["bind_attempts"], expected=expected, rounds=[])
+                  record["last_attempt"] = attempt
+                  directory = descriptor = handle = None
                   stage = "open_proc"
                   try:
+                      self.acquisition_deadline()
                       directory = os.open(f"/proc/{pid}", os.O_RDONLY | os.O_DIRECTORY)
                       before = self.identity(directory)
-                      self.acquisition(key, last_identity=before, state=before[2])
-                      if before[:2] != expected[:2]:
-                          self.acquisition(key, reason="initial_identity_changed", reused=before[1] != expected[1])
+                      attempt["before"] = before
+                      if not self.observe(key, before, "before_pidfd"):
                           return False
                       stage = "open_pidfd"
                       descriptor = os.pidfd_open(pid)
+                      attempt["handles"] = dict(directory=directory, pidfd=descriptor)
                       stage = "verify_identity"
                       after = self.identity(directory)
-                      if after[:2] != before[:2]:
-                          self.acquisition(key, reason="binding_identity_changed", reused=after[1] != expected[1])
+                      attempt["after"] = after
+                      if not self.observe(key, after, "after_pidfd"):
                           return False
-                      parent = before[0]
-                      ancestors = [(key, handle) for key, handle in self.handles.items() if key[0] == parent]
                       stage = "verify_ancestor"
-                      owned = parent == os.getpid() or any(
-                          not self.exited(handle) and self.identity(handle[0])[1] == key[1]
-                          for key, handle in ancestors)
-                      if not owned:
-                          self.acquisition(key, reason="ancestor_unverified")
+                      handle = (directory, descriptor)
+                      if not self.ownership_rounds(key, handle, attempt) or self.blocked(key):
                           return False
-                      if self.identity(directory)[:2] != before[:2]:
-                          self.acquisition(key, reason="final_identity_changed", reused=True)
+                      self.observed.append(dict(pid=pid, birth=key[1], parent=attempt["proof"]["final"][0],
+                                                generation=attempt["generation"]))
+                      self.acquisition(key, reason="pidfd_bound", pidfd_bound=True)
+                      if not self.resolve(key, "bound") or self.blocked(key):
                           return False
-                      if parent != os.getpid() and not any(not self.exited(handle) for _, handle in ancestors):
-                          self.acquisition(key, reason="ancestor_exited")
-                          return False
-                      if key not in self.handles:
-                          self.handles[key] = (directory, descriptor)
-                          self.observed.append(dict(pid=pid, birth=before[1], parent=parent))
-                          directory = descriptor = None
-                      self.acquisition(key, status="bound", reason="pidfd_bound", pidfd_bound=True)
+                      self.handles[key] = handle
                       return True
-                  except OSError as error:
-                      self.acquisition(key, reason="bind_oserror", bind_stage=stage,
-                                       bind_error=type(error).__name__, bind_errno=error.errno)
+                  except TimeoutError:
+                      self.acquisition(key, reason="acquisition_deadline", bind_stage=stage)
+                      raise
+                  except (OSError, ValueError, IndexError, UnicodeError) as error:
+                      self.acquisition(key, reason="bind_uncertain", bind_stage=stage,
+                                       bind_error=type(error).__name__, bind_errno=getattr(error, "errno", None))
                       return False
                   finally:
-                      if record is not None:
+                      try:
+                          if handle is None or self.handles.get(key) is not handle:
+                              self.unresolved.add(key)
+                              self.acquisition(key, status="pending", pidfd_bound=False)
                           self.acquisition(key, bind_reason=record.get("reason"), bind_stage=stage)
-                      for fd in (directory, descriptor):
-                          if fd is not None:
-                              os.close(fd)
+                      finally:
+                          if handle is None or self.handles.get(key) is not handle:
+                              try:
+                                  if directory is not None:
+                                      os.close(directory)
+                              finally:
+                                  if descriptor is not None:
+                                      os.close(descriptor)
 
               def attributable(self, identity, table):
                   parent = identity[0]
@@ -655,13 +754,16 @@ jobs:
                       table = processes()
                       for pid, identity in table.items():
                           key = (pid, identity[1])
+                          if self.blocked(key):
+                              self.unresolved.add(key)
+                              continue
                           if key in self.handles:
-                              self.unresolved.discard(key)
+                              self.resolve(key, "bound")
                               continue
                           if self.attributable(identity, table):
                               self.candidate(pid, identity, table)
-                          if self.bind(pid, identity):
-                              self.unresolved.discard(key)
+                          if key in self.acquisitions and self.bind(pid, identity):
+                              self.resolve(key, "bound")
                       self.reconcile(table)
                       if len(self.handles) == count:
                           break
@@ -678,6 +780,7 @@ jobs:
                   try:
                       for sig in (signal.SIGTERM, signal.SIGKILL):
                           stop = time.monotonic() + 2
+                          self.deadline = stop
                           while time.monotonic() < stop:
                               self.discover()
                               self.signal(sig)
@@ -725,12 +828,13 @@ jobs:
                   process = subprocess.Popen(args, env=environment, stdout=subprocess.PIPE,
                                              stderr=subprocess.STDOUT, start_new_session=True)
                   result["pid"] = process.pid
+                  deadline = time.monotonic() + seconds
+                  owned.deadline = deadline
                   table = processes()
                   owned.candidate(process.pid, table[process.pid], table)
                   require(owned.bind(process.pid, table[process.pid]), "Root identity unavailable")
-                  owned.unresolved.discard((process.pid, table[process.pid][1]))
+                  require(owned.resolve((process.pid, table[process.pid][1]), "bound"), "Root birth mismatch")
                   root = next(handle for key, handle in owned.handles.items() if key[0] == process.pid)
-                  deadline = time.monotonic() + seconds
                   os.set_blocking(process.stdout.fileno(), False)
                   buffer = b""
                   with selectors.DefaultSelector() as poller, (directory / "console.log").open("w+b") as stream:
@@ -1168,6 +1272,7 @@ jobs:
               process_fixtures()
               scheduling_fixtures()
               acquisition_fixtures()
+              ownership_fixtures()
               first_failure_fixtures()
               observation_fixtures()
               deadline_fixtures()
@@ -1375,14 +1480,16 @@ jobs:
                   return False
               with patch.dict(globals(), processes=lambda: tables[0]), patch.object(owned, "bind", side_effect=bind):
                   owned.discover()
-              require((201, "new-birth") in acquired and (300, "replacement") in acquired, "Numeric tracking hid changed birth")
+              require((201, "new-birth") in acquired and (300, "replacement") not in acquired, "New owned birth hidden or unrelated replacement acquired")
               for identities in (((os.getpid(), "old", "S"), (os.getpid(), "new", "S")),):
                   candidate = OwnedProcesses()
+                  candidate.candidate(400, identities[0], {})
                   with patch.object(os, "open", return_value=40), patch.object(os, "pidfd_open", return_value=41), \
                        patch.object(os, "close"), patch.object(candidate, "identity", side_effect=identities):
                       require(not candidate.bind(400, identities[0]) and not candidate.handles, "Open-time replacement acquired wrong identity")
               candidate = OwnedProcesses()
               candidate.handles[(500, "old-parent")] = (50, 51)
+              candidate.candidate(600, (500, "child", "S"), {500: (1, "old-parent", "S")})
               with patch.object(os, "open", return_value=60), patch.object(os, "pidfd_open", return_value=61), \
                    patch.object(os, "close"), patch.object(candidate, "identity", side_effect=[(500, "child", "S")] * 2 + [(1, "new-parent", "S")]), \
                    patch.object(candidate, "exited", return_value=False):
@@ -1579,6 +1686,183 @@ jobs:
                           "Malformed identity became verified disappearance")
               save("acquisition-fixtures.json", dict(status="PASS", vanished=True,
                    rejected=["live", "uncertain", "reuse", "malformed"], signals="mocked pidfd only"))
+
+          def ownership_fixtures():
+              from unittest.mock import patch
+              baseline = (500, "child", "S")
+              adopted = (os.getpid(), "child", "Z")
+              def scenario(values, accepted, parent_exit=False, changes=None):
+                  owner = OwnedProcesses()
+                  owner.handles[(500, "parent")] = (50, 51)
+                  owner.handles[(501, "parent")] = (52, 53)
+                  owner.candidate(600, baseline, {500: (1, "parent", "S")})
+                  children = iter(values)
+                  changes = changes or {}
+                  parents = iter(changes.get("identities", [(1, "parent", "R")] * 6))
+                  reads, closed = [], []
+                  def identity(fd):
+                      reads.append(fd)
+                      if fd == 60:
+                          return next(children)
+                      if changes.get("replace"):
+                          owner.handles[(500, "parent")] = (52, 53)
+                      return next(parents)
+                  if changes.get("self_birth"):
+                      owner.self_birth = "different"
+                  with patch.object(os, "open", return_value=60) as opened, \
+                       patch.object(os, "pidfd_open", return_value=61) as pidfd, \
+                       patch.object(os, "close", side_effect=closed.append), \
+                       patch.object(owner, "identity", side_effect=identity), \
+                       patch.object(owner, "exited", side_effect=parent_exit if isinstance(parent_exit, list) else None,
+                                    return_value=parent_exit), \
+                       patch.object(signal, "pidfd_send_signal") as sent:
+                      result = owner.bind(600, baseline)
+                      require(result is accepted and not sent.called, "Tentative authority or wrong acquisition verdict")
+                      require(opened.call_count == 1 and pidfd.call_count <= 1 and set(reads) <= {50, 52, 60}, "Acquisition replaced handle generation")
+                      expected_closed = [] if accepted else [60, 61] if pidfd.called else [60]
+                      require(closed == expected_closed, "Tentative descriptors closed incorrectly")
+                  return owner
+              for boundary in range(4):
+                  values = [baseline] * boundary + [adopted] * (6 - boundary)
+                  owner = scenario(values, True)
+                  attempt = owner.acquisitions[(600, "child")]["last_attempt"]
+                  require(attempt["expected"] == baseline and "before" in attempt and "after" in attempt and
+                          attempt["proof"]["final"] == adopted and owner.handles[(600, "child")] == (60, 61), "Adoption proof lost observations/handle")
+                  changed = (500, "replacement", "S")
+                  owner = scenario([baseline] * boundary + [changed] * (6 - boundary), False)
+                  record = owner.acquisitions[(600, "child")]
+                  require(record["reused"] and record["birth_mismatch"]["actual"][1] == "replacement", "Birth mismatch lacks immutable witness")
+                  with patch.object(os, "open", side_effect=AssertionError("Sticky key reopened")):
+                      require(not owner.bind(600, baseline) and not owner.resolve((600, "child"), "bound") and
+                              not owner.resolve((600, "child"), "vanished"), "Sticky key bypassed resolution")
+                  owner.handles[(600, "child")] = (60, 61)
+                  with patch.dict(globals(), processes=lambda: {600: baseline}):
+                      owner.discover()
+                      owner.reconcile({})
+                  require((600, "child") in owner.unresolved, "Already-bound shortcut cleared sticky key")
+              scenario([baseline] * 4, False, parent_exit=True)
+              scenario([baseline] * 4, False, parent_exit=[False, True])
+              scenario([baseline] * 4, False, changes={"replace": True})
+              scenario([baseline] * 4, False, changes={"identities": [(1, "parent", "S"), (1, "different", "S")]})
+              scenario([adopted] * 4, False, changes={"self_birth": True})
+              owner = scenario([baseline] * 4, True)
+              require(owner.acquisitions[(600, "child")]["last_attempt"]["proof"]["parent_after"]["same_handle"], "Parent pidfd not bracketed")
+              transferred = (501, "child", "R")
+              owner = scenario([baseline] * 3 + [transferred] * 3, True)
+              proof = owner.acquisitions[(600, "child")]["last_attempt"]["proof"]
+              require(proof["final"] == transferred and proof["parent_after"]["parent_handle"] == [52, 53],
+                      "New owned parent lacked fresh exact-handle proof")
+              scenario([baseline] * 2 + [(777, "child", "S")] * 2, False)
+              unstable = [baseline, baseline, baseline, adopted, adopted, baseline, baseline, adopted]
+              owner = scenario(unstable, False)
+              require(len(owner.acquisitions[(600, "child")]["last_attempt"]["rounds"]) == 3, "Ownership rounds unbounded")
+              for boundary in range(4):
+                  for failure in (PermissionError(13, "unreadable"), ValueError("malformed"), TimeoutError("deadline")):
+                      owner = OwnedProcesses()
+                      owner.candidate(600, adopted, {})
+                      closed = []
+                      with patch.object(os, "open", return_value=60), patch.object(os, "pidfd_open", return_value=61), \
+                           patch.object(os, "close", side_effect=closed.append), \
+                           patch.object(owner, "identity", side_effect=[adopted] * boundary + [failure]):
+                          try:
+                              result = owner.bind(600, adopted)
+                          except TimeoutError:
+                              require(isinstance(failure, TimeoutError), "Wrong deadline exception")
+                          else:
+                              require(result is False, "Uncertain acquisition accepted")
+                      require(closed == ([60] if boundary == 0 else [60, 61]) and
+                              not owner.handles and (600, "child") in owner.unresolved,
+                              "Exception lost descriptor/unresolved truth")
+              for point in ("resolve", "publication", "sticky"):
+                  owner = OwnedProcesses()
+                  owner.candidate(600, adopted, {})
+                  closed = []
+                  resolve = owner.resolve
+                  class Publication(dict):
+                      def __setitem__(self, key, value):
+                          super().__setitem__(key, value)
+                          raise TimeoutError("publication boundary")
+                  if point == "publication":
+                      owner.handles = Publication()
+                  def interrupt(key, status):
+                      result = resolve(key, status)
+                      if point == "sticky":
+                          owner.observe(key, (os.getpid(), "replacement", "S"), "publication_fixture")
+                          return result
+                      if point == "resolve":
+                          raise TimeoutError("resolution boundary")
+                      return result
+                  with patch.object(os, "open", return_value=60), patch.object(os, "pidfd_open", return_value=61), \
+                       patch.object(os, "close", side_effect=closed.append), \
+                       patch.object(owner, "identity", return_value=adopted), \
+                       patch.object(owner, "resolve", side_effect=interrupt):
+                      try:
+                          require(owner.bind(600, adopted) is False and point == "sticky", "Sticky publication accepted")
+                      except TimeoutError:
+                          require(point != "sticky", "Sticky publication raised wrong exception")
+                  require(closed == ([] if point == "publication" else [60, 61]), "Publication double-closed or leaked handles")
+                  require((600, "child") in owner.handles if point == "publication" else
+                          (600, "child") in owner.unresolved, "Publication lost descriptor ownership")
+              for opening in ("open", "pidfd_open"):
+                  owner = OwnedProcesses()
+                  owner.candidate(600, adopted, {})
+                  closed = []
+                  with patch.object(os, "open", return_value=60), patch.object(os, "pidfd_open", return_value=61), \
+                       patch.object(owner, "identity", return_value=adopted), \
+                       patch.object(os, "close", side_effect=closed.append), \
+                       patch.object(os, opening, side_effect=PermissionError(13, "opening")):
+                      require(not owner.bind(600, adopted), "Descriptor opening failure accepted")
+                  require(closed == ([] if opening == "open" else [60]), "Opening failure closed wrong handles")
+              owner = OwnedProcesses()
+              owner.candidate(600, adopted, {})
+              with patch.object(owner, "acquisition_deadline", side_effect=TimeoutError("deadline")), \
+                   patch.object(os, "open") as opened:
+                  try:
+                      owner.bind(600, adopted)
+                  except TimeoutError:
+                      pass
+                  else:
+                      raise AssertionError("Acquisition ignored deadline")
+                  require(not opened.called, "Expired acquisition opened descriptor")
+              owner.acquisitions = dict.fromkeys(range(20000))
+              try:
+                  owner.candidate(601, adopted, {})
+              except AssertionError as error:
+                  require(str(error) == "Acquisition evidence capacity exceeded", "Wrong acquisition capacity failure")
+              else:
+                  raise AssertionError("Acquisition capacity ignored")
+              owner = OwnedProcesses()
+              owner.candidate(600, adopted, {})
+              owner.observe((600, "child"), (os.getpid(), "replacement", "S"), "old_key_fixture")
+              replacement = (os.getpid(), "replacement", "R")
+              owner.candidate(600, replacement, {})
+              with patch.object(os, "open", return_value=60), patch.object(os, "pidfd_open", return_value=61), \
+                   patch.object(os, "close"), patch.object(owner, "identity", return_value=replacement):
+                  require(owner.bind(600, replacement) and (600, "child") in owner.unresolved,
+                          "New incarnation resolved sticky old key")
+              from unittest.mock import Mock
+              root = OwnedProcesses()
+              process = Mock(pid=600, returncode=0)
+              def sticky_root(pid, identity):
+                  root.observe((pid, identity[1]), (os.getpid(), "replacement", "S"), "root_fixture")
+                  return True
+              with patch.dict(globals(), processes=lambda: {600: adopted}), \
+                   patch.dict(globals(), OwnedProcesses=lambda: root), \
+                   patch.object(subprocess, "Popen", return_value=process), \
+                   patch.object(root, "bind", side_effect=sticky_root), \
+                   patch.object(root, "cleanup", return_value=False):
+                  try:
+                      command("fixture-root-sticky", ["fixture"], limit=5)
+                  except SystemExit as error:
+                      require(error.code == 125, "Root sticky changed supervisor status")
+                  else:
+                      raise AssertionError("Root sticky bypassed command guard")
+              result = json.loads((OUT / "fixture-root-sticky/result.json").read_text())
+              require(result["error"] == "Root birth mismatch" and result["unresolved_processes"] == [[600, "child"]],
+                      "Root sticky guard lost failure evidence")
+              save("ownership-fixtures.json", dict(status="PASS", rounds=3, boundary_parent_and_birth=8,
+                   child_read_errors=12, parent_rejections=6, publication_boundaries=3,
+                   sticky_paths=["bind", "bound", "discover", "vanished", "root", "new_birth"], tentative_signals=0))
 
           def finalize():
               diagnostics(OUT / "final-diagnostics")
