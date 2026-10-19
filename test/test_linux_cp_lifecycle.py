@@ -8,6 +8,7 @@ import unittest
 from config import config
 from framework import VppTestCase
 from asfframework import VppTestRunner
+from test_linux_cp import TestLinuxCPNetNSBase
 from vpp_papi import VppEnum
 from vpp_qemu_utils import (
     create_namespace,
@@ -254,6 +255,122 @@ class TestLinuxCPLifecycle(VppTestCase):
                 if sub in self._pairs():
                     self._delete_pair(sub)
                 self.vapi.delete_subif(sw_if_index=sub)
+
+
+@unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
+@unittest.skipIf("linux-cp" in config.excluded_plugins, "Exclude linux-cp plugin tests")
+class TestLinuxCPNamespaceOwnership(TestLinuxCPNetNSBase):
+    """Linux CP namespace-scoped interface index ownership"""
+
+    def test_equal_ifindex_namespace_delete(self):
+        """Deleting another namespace's pair preserves Linux address updates"""
+        self.create_pg_interfaces(range(2))
+        other_ns = create_namespace(self.ns_history_name)
+        self.vapi.cli("lcp lcp-auto-subint off")
+        parents = []
+        subinterfaces = []
+        paired_subinterfaces = []
+        try:
+            for pg, ns, host in zip(
+                self.pg_interfaces,
+                (self.ns_name, other_ns),
+                ("howner", "hother"),
+            ):
+                self.vapi.lcp_itf_pair_add_del_v3(
+                    is_add=True,
+                    sw_if_index=pg.sw_if_index,
+                    host_if_name=host,
+                    netns=ns,
+                )
+                parents.append(pg.sw_if_index)
+                sub = self.vapi.create_vlan_subif(
+                    sw_if_index=pg.sw_if_index, vlan_id=100
+                ).sw_if_index
+                subinterfaces.append(sub)
+                subprocess.run(
+                    [
+                        "ip",
+                        "-n",
+                        ns,
+                        "link",
+                        "add",
+                        "link",
+                        host,
+                        "name",
+                        "hshared",
+                        "index",
+                        "5000",
+                        "type",
+                        "vlan",
+                        "id",
+                        "100",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                reply = self.vapi.lcp_itf_pair_add_del_v3(
+                    is_add=True,
+                    sw_if_index=sub,
+                    host_if_name="hshared",
+                    netns=ns,
+                )
+                paired_subinterfaces.append(sub)
+                self.assertEqual(reply.vif_index, 5000)
+            owner, other = subinterfaces
+            pairs = {
+                pair.phy_sw_if_index: pair
+                for pair in self.vapi.vpp.details_iter(self.vapi.lcp_itf_pair_get)
+            }
+            self.assertEqual(pairs[owner].vif_index, pairs[other].vif_index)
+            self.assertNotEqual(
+                pairs[owner].host_sw_if_index, pairs[other].host_sw_if_index
+            )
+            for prefix in ("198.18.10.1/24", "198.18.11.1/24"):
+                subprocess.run(
+                    [
+                        "ip",
+                        "-n",
+                        self.ns_name,
+                        "address",
+                        "add",
+                        prefix,
+                        "dev",
+                        "hshared",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.poll_for(
+                    f"owner receives {prefix}",
+                    lambda: prefix
+                    in {
+                        str(address.prefix)
+                        for address in self.vapi.ip_address_dump(
+                            sw_if_index=owner, is_ipv6=False
+                        )
+                    },
+                    True,
+                )
+                if prefix == "198.18.10.1/24":
+                    self.vapi.lcp_itf_pair_add_del_v3(is_add=False, sw_if_index=other)
+                    paired_subinterfaces.remove(other)
+                    self.assertTrue(interface_exists(self.ns_name, "hshared"))
+                    self.assertFalse(interface_exists(other_ns, "hshared"))
+            remaining = {
+                pair.phy_sw_if_index
+                for pair in self.vapi.vpp.details_iter(self.vapi.lcp_itf_pair_get)
+            }
+            self.assertIn(owner, remaining)
+            self.assertNotIn(other, remaining)
+        finally:
+            for sub in reversed(paired_subinterfaces):
+                self.vapi.lcp_itf_pair_add_del_v3(is_add=False, sw_if_index=sub)
+            for sub in reversed(subinterfaces):
+                self.vapi.delete_subif(sw_if_index=sub)
+            for parent in reversed(parents):
+                self.vapi.lcp_itf_pair_add_del_v3(is_add=False, sw_if_index=parent)
 
 
 if __name__ == "__main__":

@@ -510,7 +510,8 @@ lcp_itf_pair_del (u32 phy_sw_if_index)
     }
   lip_db_by_phy[phy_sw_if_index] = INDEX_INVALID;
   lip_db_by_host[lip->lip_host_sw_if_index] = INDEX_INVALID;
-  hash_unset (lip_db_by_vif, lip->lip_vif_index);
+  if (lcp_itf_pair_find_by_vif (lip->lip_vif_index) == lipi)
+    hash_unset (lip_db_by_vif, lip->lip_vif_index);
 
   vec_free (lip->lip_host_name);
   vec_free (lip->lip_namespace);
