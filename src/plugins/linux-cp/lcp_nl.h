@@ -141,3 +141,4 @@ extern int lcp_nl_drain_messages (void);
 extern void lcp_nl_set_buffer_size (u32 buf_size);
 extern void lcp_nl_set_batch_size (u32 batch_size);
 extern void lcp_nl_set_batch_delay (u32 batch_delay_ms);
+extern void lcp_nl_test_set_sync_pause (u8 enable);

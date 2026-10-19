@@ -83,6 +83,7 @@ typedef struct nl_main
   u64 sync_attempts;
   u64 sync_completed;
   u64 sync_failed;
+  u8 test_sync_pause;
 
 } nl_main_t;
 
@@ -614,6 +615,10 @@ nl_route_process (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  nm->sync_attempts++;
 	  NL_INFO ("Starting synchronization attempt %lu", nm->sync_attempts);
 
+	  /* The unittest plugin holds recovery after notification ownership ends. */
+	  while (nm->test_sync_pause)
+	    vlib_process_suspend (vm, 1e-3);
+
 	  /* Wait some time before next synchronization attempt. Allows to
 	   * reduce the number of failed attempts that stall the main thread by
 	   * waiting out the notification storm
@@ -794,6 +799,9 @@ lcp_nl_pair_add_cb (lcp_itf_pair_t *pair)
 {
   nl_main_t *nm = &nl_main;
 
+  if (nm->nl_status == NL_STATUS_SYNC)
+    return;
+
   if (!nm->sk_route)
     {
       NL_INFO ("pair_add_cb: Opening netlink socket, LCP pairs %u", lcp_itf_num_pairs ());
@@ -867,6 +875,12 @@ lcp_nl_get_cache (lcp_nl_obj_t t)
   nl_main_t *nm = &nl_main;
 
   return nm->nl_caches[t];
+}
+
+void
+lcp_nl_test_set_sync_pause (u8 enable)
+{
+  nl_main.test_sync_pause = enable;
 }
 
 /* Set the RX buffer size to be used on the netlink socket */
