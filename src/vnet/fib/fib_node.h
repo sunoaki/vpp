@@ -386,7 +386,7 @@ __clib_export extern void fib_node_child_remove(fib_node_type_t parent_type,
                                   fib_node_index_t parent_index,
                                   fib_node_index_t sibling_index);
 
-extern fib_node_back_walk_rc_t fib_node_back_walk_one(fib_node_ptr_t *ptr,
+__clib_export extern fib_node_back_walk_rc_t fib_node_back_walk_one(fib_node_ptr_t *ptr,
                                                       fib_node_back_walk_ctx_t *ctx);
 
 extern u8* fib_node_children_format(fib_node_list_t list,
