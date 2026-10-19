@@ -104,6 +104,7 @@ jobs:
         timeout-minutes: 5
         run: |
           set -euo pipefail
+          export STEP_DEADLINE="$(( $(date +%s) + 240 ))"
           cp .github/workflows/integration-regression-control.yml "$EVIDENCE/workflow.yml"
           cat > "$TOOLS/sitecustomize.py" <<'PY'
           import json
@@ -287,7 +288,9 @@ jobs:
           CALLBACK = re.compile(r"--- (add\w+)\(\) (\w+)\.(\w+)\(")
           INFRA = re.compile(r"VppTransportSocketIOError|VppDiedError|Vpp dead|VPP subprocess died unexpectedly|"
                              r"VPP died shortly after startup|Exception connecting to (?:vapi|VPP)|PUMP THREAD TIMEOUT|"
-                             r"SIGSEGV|segmentation fault|Core was generated|Core file present,|AddressSanitizer|"
+                             r"\bSIG(?:SEGV|ABRT|BUS|ILL|FPE)\b|\bAborted\b|\bBus error\b|"
+                             r"\bIllegal instruction\b|\bFloating point exception\b|"
+                             r"segmentation fault|Core was generated|Core file present,|AddressSanitizer|"
                              r"timed out|TimeoutError|not enough cpus|Skipping tests due to setup failure|"
                              r"(?:^|\n)SKIP:|OK \(skipped=", re.I)
 
@@ -625,13 +628,17 @@ jobs:
                           for fd in handle:
                               os.close(fd)
 
+          def work_deadline():
+              return min(float(os.environ["WORK_DEADLINE"]),
+                         float(os.environ.get("STEP_DEADLINE", os.environ["WORK_DEADLINE"])))
+
           def command(label, args, environment=None, limit=1200):
               directory = OUT / label
               directory.mkdir(exist_ok=True)
               start = time.time()
-              seconds = min(limit, max(0, float(os.environ["WORK_DEADLINE"]) - start - 10))
+              seconds = min(limit, max(0, work_deadline() - start - 10))
               result = dict(command=args, cwd=str(Path.cwd()), start=start, rc=None, status="running",
-                            deadline=float(os.environ["WORK_DEADLINE"]), allowed_seconds=seconds)
+                            deadline=work_deadline(), allowed_seconds=seconds)
               target = directory / "result.json"
               target.write_text(json.dumps(result, indent=2))
               tail, records, owned = bytearray(), [], OwnedProcesses()
@@ -677,6 +684,7 @@ jobs:
                       result.update(rc=process.wait(), status="completed")
                       if buffer and INFRA.search(buffer.decode(errors="replace")):
                           records.append(buffer.decode(errors="replace"))
+                          require(sum(len(x) for x in records) <= 1024 * 1024, "Infrastructure evidence overflow")
               except BaseException as error:
                   result.update(status="execution_error", error=str(error))
                   raise
@@ -799,7 +807,8 @@ jobs:
           def common(evidence):
               events, console, rc, logs, callbacks = evidence
               traces = "\n".join(e.get("traceback", "") for e in events)
-              require(not INFRA.search(console + logs + traces), "Caught dead-VPP, infrastructure, timeout, crash or skip evidence")
+              require(not any(INFRA.search(channel) for channel in (console, logs, traces)),
+                      "Caught dead-VPP, infrastructure, timeout, crash or skip evidence")
               require(rc in (0, 2), f"Unexpected command exit {rc}")
               loaded = [event["pid"] for event in events if event["kind"] == "loaded"]
               require(loaded and len(loaded) == len(set(loaded)), "Observer load provenance missing/duplicate")
@@ -1074,6 +1083,7 @@ jobs:
                           pass
                       else:
                           raise AssertionError(f"Accepted unrelated negative {name}")
+              infrastructure_fixtures()
               observer_fixtures()
               process_fixtures()
               scheduling_fixtures()
@@ -1082,6 +1092,72 @@ jobs:
               deadline_fixtures()
               save("classifier-fixtures.json", dict(status="PASS", runtime="synthetic unittest/processes only"))
               print("Pure recipe/blob/roundtrip, classifier, observer and descendant fixtures passed")
+
+          def infrastructure_fixtures():
+              import copy
+              from unittest.mock import patch
+              identity = "test_gre.TestGRE.test_example"
+              events = [dict(kind="loaded", pid=1), dict(kind="selected", pid=1, test=identity),
+                        dict(kind="startTest", pid=1, test=identity, netns=False, workers=0, excluded=[], cmdline=["vpp"]),
+                        dict(kind="addSuccess", pid=1, test=identity), dict(kind="stopTest", pid=1, test=identity),
+                        dict(kind="completed", pid=1, tests=1, errors=0, failures=0, skips=0, expected=0, unexpected=0)]
+              callbacks = [dict(text="--- addSuccess() TestGRE.test_example(doc) called")]
+              console = "Ran 1 test in 0.1s\nOK"
+              entry, _ = recipe("lifecycle-flags")
+              identity = "test_" + entry["selector"]
+              failures = copy.deepcopy(events)
+              for event in failures:
+                  if "test" in event:
+                      event["test"] = identity
+              failures[3].update(kind="addFailure", exception="AssertionError",
+                                 traceback="\n".join(failure_witnesses()["lifecycle-flags"]))
+              failures[-1]["failures"] = 1
+              cls, method = identity.split(".")[-2:]
+              failed_callbacks = [dict(text=f"--- addFailure() {cls}.{method}(doc) called")]
+              def classify(sample, summary, rc, logs, raw):
+                  value = RunEvidence(sample, summary, rc, logs, raw)
+                  return positive("gre", value) if rc == 0 else negative("lifecycle-flags", value)
+              markers = ("SIGABRT", "SIGBUS", "SIGILL", "SIGFPE", "Aborted", "Bus error",
+                         "Illegal instruction", "Floating point exception", "SKIP: infrastructure substituted")
+              for source, summary, rc, raw in ((events, console, 0, callbacks),
+                                             (failures, "Ran 1 test in 0.1s\nFAILED (failures=1)", 2, failed_callbacks)):
+                  classify(source, summary, rc, "SIGTERM: normal shutdown", raw)
+                  for marker in markers:
+                      for channel in range(3):
+                          sample = copy.deepcopy(source)
+                          text, logs = summary, ""
+                          if channel == 0:
+                              text += "\n" + marker
+                          elif channel == 1:
+                              logs = marker
+                          else:
+                              sample[3]["traceback"] = marker + "\n" + sample[3].get("traceback", "")
+                          try:
+                              classify(sample, text, rc, logs, raw)
+                          except AssertionError:
+                              pass
+                          else:
+                              raise AssertionError(f"Accepted infrastructure {marker} in channel {channel}, rc {rc}")
+              rc, tail = command("fixture-fatal-tail", [sys.executable, "-c",
+                  "import sys; print('SIGABRT: Aborted', file=sys.stderr, flush=True); "
+                  "sys.stdout.write(('x'*8191+'\\n')*1153)"], limit=30)
+              result = json.loads((OUT / "fixture-fatal-tail/result.json").read_text())
+              require(rc == 0 and result["cleanup_complete"] and "SIGABRT" not in tail and
+                      result["console_bytes"] == 8 * 1024 * 1024 and result["infrastructure"] == ["SIGABRT: Aborted"],
+                      "Early fatal evidence lost after console tail eviction")
+              fixture_root = OUT / "fixture-fatal-gate"
+              directory = fixture_root / "runtime"
+              directory.mkdir(parents=True, exist_ok=True)
+              publish(directory / "result.json", result)
+              with patch.dict(globals(), CASE="fixed-gre", OUT=fixture_root, verify=lambda: {},
+                              command=lambda *args, **kwargs: (rc, tail + "\n" + console),
+                              evidence=lambda path: (events, "", dict(callbacks=callbacks))):
+                  try:
+                      tests()
+                  except AssertionError as error:
+                      require("full console" in str(error), "Sticky evidence rejected for an unrelated reason")
+                  else:
+                      raise AssertionError("Runtime accepted fatal evidence outside retained console")
 
           def observer_fixtures():
               import tempfile
@@ -1152,6 +1228,26 @@ jobs:
                       pass
               require(json.loads(path.read_text()) == original, "Interrupted publication damaged prior result")
               try:
+                  with patch.dict(os.environ, WORK_DEADLINE=str(time.time() + 120),
+                                  STEP_DEADLINE=str(time.time() + 10.3)):
+                      command("fixture-step-first", [sys.executable, "-c", "import time; time.sleep(0.08)"], limit=30)
+                      try:
+                          command("fixture-step-second", [sys.executable, "-c", "import time; time.sleep(2)"], limit=30)
+                      except AssertionError:
+                          result = json.loads((OUT / "fixture-step-second/result.json").read_text())
+                          require(result["cleanup_complete"] and result["rc"] is None and
+                                  result["allowed_seconds"] < 0.3 and result["deadline"] == float(os.environ["STEP_DEADLINE"]),
+                                  "Second command reset step budget or lost cleanup/raw exit")
+                      else:
+                          raise AssertionError("Sequential command exceeded shared step deadline")
+                  with patch.dict(os.environ, WORK_DEADLINE=str(time.time() + 120), STEP_DEADLINE=str(time.time() + 0.05)), \
+                       patch.dict(globals(), binaries=lambda: time.sleep(0.5)):
+                      try:
+                          phase("binaries", [])
+                      except TimeoutError:
+                          pass
+                      else:
+                          raise AssertionError("Postprocessing exceeded external step budget")
                   os.environ["WORK_DEADLINE"] = str(time.time() + 0.05)
                   with patch.dict(globals(), binaries=lambda: time.sleep(0.5)):
                       try:
@@ -1343,7 +1439,8 @@ jobs:
               def expired(signum, frame):
                   raise TimeoutError("Phase work deadline exhausted, including postprocessing")
               previous = signal.signal(signal.SIGALRM, expired)
-              budget = 75 if action == "finalize" else float(os.environ["WORK_DEADLINE"]) - time.time()
+              caps = dict(prepare=240, mutate=240, binaries=60, environment=240, tests=3060, build=2460)
+              budget = 75 if action == "finalize" else min(caps.get(action, 1500), work_deadline() - time.time())
               try:
                   require(budget > 0, "Shared phase deadline exhausted")
                   signal.setitimer(signal.ITIMER_REAL, budget)
@@ -1376,12 +1473,15 @@ jobs:
 
       - name: Install dependencies on the exact clean integrated checkout
         timeout-minutes: 27
-        run: python3 "$TOOLS/control.py" dependencies make UNATTENDED=yes install-dep
+        run: |
+          export STEP_DEADLINE="$(( $(date +%s) + 1560 ))"
+          python3 "$TOOLS/control.py" dependencies make UNATTENDED=yes install-dep
 
       - name: Execute clean integrated C API feature and pinned formatter checks
         timeout-minutes: 30
         run: |
           set -euo pipefail
+          export STEP_DEADLINE="$(( $(date +%s) + 1740 ))"
           test -z "$(git status --porcelain -uno)"
           python3 "$TOOLS/control.py" feature-list make checkfeaturelist
           python3 "$TOOLS/control.py" c-style make checkstyle
@@ -1395,12 +1495,15 @@ jobs:
 
       - name: Select only the immutable owner restoration
         timeout-minutes: 5
-        run: python3 "$TOOLS/control.py" mutate
+        run: |
+          export STEP_DEADLINE="$(( $(date +%s) + 240 ))"
+          python3 "$TOOLS/control.py" mutate
 
       - name: Record version and build an independent debug image
         timeout-minutes: 42
         run: |
           set -euo pipefail
+          export STEP_DEADLINE="$(( $(date +%s) + 2460 ))"
           if ! git describe --long --match 'v[0-9]*' 2>/dev/null; then
             printf '0.0.0-release+%s.%s-g%s\n' "$(git log -1 --format=%ct)" \
               "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)" > src/scripts/.version
@@ -1421,6 +1524,7 @@ jobs:
         timeout-minutes: 5
         run: |
           set -euo pipefail
+          export STEP_DEADLINE="$(( $(date +%s) + 240 ))"
           python3 "$TOOLS/control.py" environment bash -euo pipefail -c '
             python3 -c "import os,pathlib; cpus=sorted(os.sched_getaffinity(0)); roots=[pathlib.Path(f\"/sys/devices/system/cpu/cpu{cpu}/topology\") for cpu in cpus]; cores={(p.joinpath(\"physical_package_id\").read_text().strip(),p.joinpath(\"core_id\").read_text().strip()) for p in roots}; required=3 if os.environ[\"CASE\"] == \"fixed-ipsec_esp\" else 2; print(dict(cpus=cpus,physical_cores=sorted(cores),required=required)); assert len(cores) >= required"
             mountpoint /dev/shm
