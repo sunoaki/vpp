@@ -190,6 +190,19 @@ jobs:
           def invalid(path, raw, error):
               return dict(status="invalid_record", rc=None, cleanup_complete=None,
                           raw_result=str(path), raw_sha256=hashlib.sha256(raw).hexdigest(), error=str(error))
+
+          def invalid_ownership(raw, expected_owner, owner_raw):
+              value = json.loads(raw)
+              check(isinstance(value, dict) and set(value) ==
+                    {"status", "rc", "cleanup_complete", "raw_result", "raw_sha256", "error"},
+                    "Invalid ownership diagnostic fields")
+              check(value["status"] == "invalid_record" and value["rc"] is None and
+                    value["cleanup_complete"] is None, "Invalid ownership diagnostic outcome")
+              check(value["raw_result"] == expected_owner and
+                    value["raw_sha256"] == hashlib.sha256(owner_raw).hexdigest(),
+                    "Ownership diagnostic path/hash mismatch")
+              check(identity(value["error"]), "Missing ownership diagnostic error")
+              return dict(value, spawn=None)
           PY
           rm -f /etc/apt/apt.conf.d/docker-clean
           rc=0
@@ -455,9 +468,9 @@ jobs:
               directory.mkdir(exist_ok=True)
               started = time.time()
               work_deadline = float(os.environ["WORK_DEADLINE"])
-              phase_seconds = 1500 if label == "dependencies" else 2400 if label == "build" else (
-                  960 if label == "tests" else 900 if label == "runtime" else
-                  120 if label in ("environment", "fixtures") else 600)
+              phase_seconds = {"dependencies": 1500, "build": 2400, "tests": 960, "runtime": 900,
+                               "environment": 120, "fixtures": 120, "prepare": 240, "mutate": 240,
+                               "collect": 60, "binaries": 240}.get(label, 600)
               seconds = min(phase_seconds, max(0, work_deadline - started))
               identity = os.urandom(16).hex()
               ancestors = json.loads(os.environ.get("HSS_COMMAND_ANCESTORS", "[]"))
@@ -975,7 +988,10 @@ jobs:
         run: |
           set -euo pipefail
           python3 "$TOOLS/control.py" build make UNATTENDED=yes VPP_EXCLUDED_PLUGINS= build
-          python3 "$TOOLS/control.py" binaries
+
+      - name: Record exact binaries and build configuration
+        timeout-minutes: 5
+        run: python3 "$TOOLS/control.py" binaries
 
       - name: Prepare namespace runtime
         id: namespace
@@ -1071,6 +1087,17 @@ jobs:
                       phases[name] = evidence_schema.initial_interruption(raw, owner_raw, f"{name}/result.json")
                   except (ValueError, UnicodeDecodeError, OSError) as error:
                       phases[name] = evidence_schema.invalid(failed_path.relative_to(root), raw, error)
+              elif (root / name / "invalid-ownership.json").is_file():
+                  diagnostic = root / name / "invalid-ownership.json"
+                  raw = b""
+                  try:
+                      raw = diagnostic.read_bytes()
+                      owner_path = diagnostic.with_name("ownership.json")
+                      owner_raw = owner_path.read_bytes()
+                      phases[name] = evidence_schema.invalid_ownership(
+                          raw, str(owner_path.relative_to(root)), owner_raw)
+                  except (ValueError, UnicodeDecodeError, OSError) as error:
+                      phases[name] = dict(evidence_schema.invalid(diagnostic.relative_to(root), raw, error), spawn=None)
               elif name in outcomes:
                   outcome = os.environ.get(outcomes[name], "skipped")
                   phases[name] = dict(status="not_run" if outcome == "skipped" else outcome,
