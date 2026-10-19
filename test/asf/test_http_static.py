@@ -456,6 +456,17 @@ else:
         self.assertEqual(list(states.values()), [0], listener_output)
         self.assertNotIn("path ", session_output, session_output)
 
+    def test_http_static_pending_accept_identity(self):
+        """Synthetic queued callbacks retain identity across listener reuse."""
+        if config.vpp_tag != "vpp_debug":
+            self.skipTest("synthetic queued accept selftest requires debug VPP")
+        reply = self.vapi.cli_return_response("test http static pending accept")
+        self.assertEqual(reply.retval, 0, reply.reply)
+        self.assertIn(
+            "synthetic queued accept: 129 events, batches 128+1, 130 old owners released",
+            reply.reply,
+        )
+
     def test_http_static_listener_delete_reuse(self):
         """Accepted sessions retain their listener through delete and readd."""
         self.vapi.cli("http static server")

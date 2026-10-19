@@ -168,7 +168,7 @@ typedef struct hss_listener_
   u32 l_index;
   /** Listener session handle */
   session_handle_t session_handle;
-  /** Active listener and accepted session references */
+  /** Active listener, queued accepts and accepted session references */
   u32 ref_count;
   u8 retiring;
   u8 flags;

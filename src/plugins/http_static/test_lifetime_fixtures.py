@@ -447,9 +447,17 @@ class TestDestroyDispatchContract(unittest.TestCase):
         self.assertIn("vlib_node_set_interrupt_pending", destroy)
         self.assertNotIn("session_send_rpc", destroy)
         self.assertNotIn("while (", destroy)
-        self.assertIn("hss_destroy_sessions (*ctx);", consumer)
-        self.assertGreater(
-            consumer.index("vec_reset_length"), consumer.index("hss_destroy_sessions")
+        self.assertIn("if (!hss_destroy_sessions (*ctx))", consumer)
+        self.assertIn("pending[remaining++] = *ctx;", consumer)
+        self.assertIn("vec_set_len (pending, remaining);", consumer)
+        self.assertIn("vlib_node_set_interrupt_pending", consumer)
+        self.assertIn("for (i = 0;", destroy)
+        self.assertLess(
+            cleanup.index("app_wrk_flush_wrk_events"),
+            cleanup.index("hss_session_cleanup"),
+        )
+        self.assertLess(
+            cleanup.index("if (pending)"), cleanup.index("pool_foreach (hs")
         )
         self.assertGreater(
             cleanup.index("clib_atomic_sub_fetch"), cleanup.index("hss_session_cleanup")
@@ -461,7 +469,8 @@ class TestDestroyDispatchContract(unittest.TestCase):
         for workers in (0, 1, 3):
             for mq_failure in ("locked", "full"):
                 with self.subTest(workers=workers, mq_failure=mq_failure):
-                    pending = [[] for _ in range(workers)]
+                    pending = [[] for _ in range(workers + 1)]
+                    queues = {}
                     remaining = {}
                     cleaned = set()
                     detached = []
@@ -480,27 +489,129 @@ class TestDestroyDispatchContract(unittest.TestCase):
                             detached.append(generation)
 
                     def consume(thread):
-                        for generation in pending[thread - 1]:
-                            ack(generation, thread)
-                        pending[thread - 1].clear()
+                        retained = []
+                        for generation in pending[thread]:
+                            key = (generation, thread)
+                            queues[key] = max(0, queues[key] - 128)
+                            if queues[key]:
+                                retained.append(generation)
+                            else:
+                                ack(generation, thread)
+                        pending[thread] = retained
 
                     for generation in range(3):
                         remaining[generation] = workers + 1
-                        for thread, queue in enumerate(pending, 1):
+                        for thread, queue in enumerate(pending):
                             queue.append(generation)
+                            queues[generation, thread] = 129
                             interrupts.add(thread)
-                        ack(generation, 0)
                     session_mq.assert_not_called()
-                    self.assertEqual(detached, [] if workers else [0, 1, 2])
-                    self.assertEqual(interrupts, set(range(1, workers + 1)))
+                    self.assertEqual(detached, [])
+                    self.assertEqual(interrupts, set(range(workers + 1)))
                     for thread in sorted(interrupts):
                         consume(thread)
+                        self.assertTrue(pending[thread])
+                        self.assertFalse(any(owner == thread for _, owner in cleaned))
+                        consume(thread)
+                        self.assertEqual(pending[thread], [])
                         acknowledged = len(cleaned)
                         consume(thread)
                         self.assertEqual(len(cleaned), acknowledged)
                     self.assertEqual(detached, [0, 1, 2])
                     self.assertEqual(len(cleaned), 3 * (workers + 1))
                     self.assertTrue(all(value == 0 for value in remaining.values()))
+
+
+class TestPendingAcceptWitness(unittest.TestCase):
+    def test_actual_method_rejects_failed_or_incomplete_selftest(self):
+        method = helper("test_http_static_pending_accept_identity")
+        method.__globals__["config"] = types.SimpleNamespace(vpp_tag="vpp_debug")
+        success = (
+            "synthetic queued accept: 129 events, batches 128+1, "
+            "130 old owners released"
+        )
+        for retval, reply in ((0, success), (-1, "snapshot failed"), (0, "")):
+            with self.subTest(retval=retval, reply=reply):
+                case_type = type(
+                    "PendingAcceptFixture",
+                    (unittest.TestCase,),
+                    {method.__name__: method},
+                )
+                case = case_type(method.__name__)
+                case.vapi = types.SimpleNamespace(
+                    cli_return_response=unittest.mock.Mock(
+                        return_value=types.SimpleNamespace(retval=retval, reply=reply)
+                    )
+                )
+                result = unittest.TestResult()
+                case.run(result)
+                self.assertEqual(result.errors, [])
+                self.assertEqual(result.skipped, [])
+                self.assertEqual(len(result.failures), int(retval != 0 or not reply))
+                case.vapi.cli_return_response.assert_called_once_with(
+                    "test http static pending accept"
+                )
+
+    def test_source_captures_before_unlisten_and_transfers_once(self):
+        source = (ROOT / "src/plugins/http_static/static_server.c").read_text()
+        deletion = source.split("\nhss_listener_del (hss_listener_t *l_cfg)", 1)[
+            1
+        ].split("\nint\n", 1)[0]
+        callback = source.split("\nhss_ts_accept_callback (session_t *ts)", 1)[1].split(
+            "\nstatic void", 1
+        )[0]
+        self.assertLess(
+            deletion.index("hss_preserve_pending_accepts"),
+            deletion.index("vnet_unlisten (&args)"),
+        )
+        self.assertIn("if (pending)", callback)
+        self.assertIn("vec_del1 (hss_pending_accepts", callback)
+        self.assertIn("else\n    clib_atomic_add_fetch", callback)
+        self.assertNotIn("listener_handle", callback)
+        witness = source.split("\nhss_test_pending_accept_command_fn (", 1)[1].split(
+            "\nVLIB_CLI_COMMAND", 1
+        )[0]
+        self.assertLess(
+            witness.index("hss_listener_del (&cfg)"),
+            witness.index("hss_preserve_pending_accepts"),
+        )
+        self.assertIn("if (error)\n    hss_test_accept_recover", witness)
+        self.assertLess(
+            witness.index("pending accept cleanup queue retained"),
+            witness.index("hss_test_accept_free (handles[i])"),
+        )
+        self.assertNotIn("hss_ts_accept_callback", witness)
+        self.assertNotIn("clib_fifo_advance_head", witness)
+
+    def test_model_129_callbacks_survive_listener_handle_reuse(self):
+        # This model verifies the ownership protocol, not C execution or HTTP scheduling.
+        for preserve in (False, True):
+            with self.subTest(preserve=preserve):
+                active = {7: 2}
+                references = {2: 1}
+                queue = list(range(129))
+                pending = {}
+                if preserve:
+                    for session in queue:
+                        pending[session] = active[7]
+                        references[2] += 1
+                references[2] -= 1
+                active[7] = 3
+                owners = []
+                for size in (128, 1):
+                    batch, queue = queue[:size], queue[size:]
+                    owners.extend(pending.pop(session, active[7]) for session in batch)
+                self.assertEqual(queue, [])
+                self.assertEqual(pending, {})
+                if preserve:
+                    self.assertEqual(owners, [2] * 129)
+                    self.assertEqual(references[2], 129)
+                    for listener in owners:
+                        references[listener] -= 1
+                    self.assertEqual(references[2], 0)
+                else:
+                    with self.assertRaises(AssertionError):
+                        self.assertEqual(owners, [2] * 129)
 
 
 if __name__ == "__main__":
