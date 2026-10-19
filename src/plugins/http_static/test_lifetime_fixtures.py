@@ -144,7 +144,12 @@ class TestClientWitnesses(unittest.TestCase):
                     {method.__name__: method},
                 )
                 case = case_type(method.__name__)
-                case.vapi = types.SimpleNamespace(cli=unittest.mock.Mock())
+                case.vapi = types.SimpleNamespace(
+                    cli=unittest.mock.Mock(),
+                    cli_return_response=unittest.mock.Mock(
+                        return_value=types.SimpleNamespace(retval=0, reply="")
+                    ),
+                )
                 case._client = unittest.mock.Mock(return_value=object())
                 case._response = unittest.mock.Mock(return_value={"status": 200})
                 case._stop_client = unittest.mock.Mock()
@@ -175,6 +180,11 @@ class TestClientWitnesses(unittest.TestCase):
                 self.assertEqual(case._response.call_count, len(secure_calls))
                 self.assertEqual(case._refused.call_count, len(secure_calls))
                 commands = [call.args[0] for call in case.vapi.cli.call_args_list]
+                deletions = [
+                    call.args[0]
+                    for call in case.vapi.cli_return_response.call_args_list
+                ]
+                self.assertEqual(len(deletions), len(secure_calls))
                 protocols = (
                     ("tcp", "http") if excluded else ("tcp", "http", "tls", "https")
                 )
@@ -187,8 +197,43 @@ class TestClientWitnesses(unittest.TestCase):
                         2,
                     )
                     self.assertEqual(
-                        commands.count(f"http static listener del uri {uri}"), 2
+                        deletions.count(f"http static listener del uri {uri}"), 2
                     )
+
+    def test_uri_identity_rejects_failed_delete_reply(self):
+        method = helper("test_http_static_listener_uri_identity")
+        method.__globals__["config"] = types.SimpleNamespace(excluded_plugins=[])
+        case_type = type(
+            "IdentityDeleteFixture", (unittest.TestCase,), {method.__name__: method}
+        )
+        case = case_type(method.__name__)
+        message = "http static listener: Listener with given endpoint not found"
+
+        def delete(command):
+            if command == "http static listener del uri tcp://10.10.1.2:8085":
+                return types.SimpleNamespace(retval=-1, reply=message)
+            return types.SimpleNamespace(retval=0, reply="")
+
+        case.vapi = types.SimpleNamespace(
+            cli=unittest.mock.Mock(),
+            cli_return_response=unittest.mock.Mock(side_effect=delete),
+        )
+        case._client = unittest.mock.Mock(return_value=object())
+        case._response = unittest.mock.Mock(return_value={"status": 200})
+        case._stop_client = unittest.mock.Mock()
+        case._refused = unittest.mock.Mock()
+        result = unittest.TestResult()
+        case.run(result)
+        self.assertEqual(result.testsRun, 1)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.skipped, [])
+        self.assertEqual(len(result.failures), 1)
+        failed_subtest, traceback = result.failures[0]
+        self.assertIn("protocol='tcp'", str(failed_subtest))
+        self.assertIn("AssertionError: -1 != 0", traceback)
+        self.assertIn(message, traceback)
+        self.assertEqual(case._client.call_count, 7)
+        self.assertEqual(case._refused.call_count, 6)
 
 
 class TestDestroyDispatchContract(unittest.TestCase):

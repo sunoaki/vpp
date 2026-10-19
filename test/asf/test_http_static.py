@@ -540,7 +540,10 @@ else:
                     client = self._client(8085, secure=protocol in ("tls", "https"))
                     self.assertEqual(self._response(client)["status"], 200)
                     self._stop_client(client)
-                    self.vapi.cli(f"http static listener del uri {uri}")
+                    reply = self.vapi.cli_return_response(
+                        f"http static listener del uri {uri}"
+                    )
+                    self.assertEqual(reply.retval, 0, reply.reply)
                     self._refused(8085)
 
     def test_http_static_listener_ipv6_identity(self):
@@ -554,12 +557,18 @@ else:
                 self.assertIn(
                     "8086", self.vapi.cli("show http static server listeners")
                 )
-                self.vapi.cli(f"http static listener del uri {uri}")
+                reply = self.vapi.cli_return_response(
+                    f"http static listener del uri {uri}"
+                )
+                self.assertEqual(reply.retval, 0, reply.reply)
                 self._wait_released()
         self.vapi.cli("http static server disable")
         self.vapi.cli("http static server uri tcp://[::]:8086 url-handlers")
         self.assertEqual(self.vapi.http_static_get().uri, "http://[::]:8086")
-        self.vapi.cli("http static listener del uri tcp://[::]:8086")
+        reply = self.vapi.cli_return_response(
+            "http static listener del uri tcp://[::]:8086"
+        )
+        self.assertEqual(reply.retval, 0, reply.reply)
         self._empty_default()
 
     @unittest.skipIf("quic" in config.excluded_plugins, "QUIC plugin is excluded")
@@ -575,7 +584,10 @@ else:
             listeners = self.vapi.cli(command)
             self.assertEqual(listeners.count("[Q]"), original + 1, listeners)
             self.assertIn("h3", listeners)
-            self.vapi.cli(f"http static listener del uri {uri} http3")
+            reply = self.vapi.cli_return_response(
+                f"http static listener del uri {uri} http3"
+            )
+            self.assertEqual(reply.retval, 0, reply.reply)
             self._wait_released()
             self.assertEqual(self.vapi.cli(command).count("[Q]"), original)
 
