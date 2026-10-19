@@ -1,0 +1,626 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Temporary DTLS cleanup controls
+
+on:
+  push:
+    branches: [feat/dtls-runtime-controls-ff49-october19]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dtls-controls-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dtls:
+    name: DTLS / ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fixed, restored]
+    container:
+      image: debian:trixie
+      options: >-
+        --shm-size=2g
+        --cap-add=SYS_ADMIN
+        --cap-add=NET_ADMIN
+        --security-opt=apparmor=unconfined
+        --device-cgroup-rule="c 10:200 rwm"
+        --device-cgroup-rule="c 10:238 rwm"
+    defaults:
+      run:
+        shell: bash
+    env:
+      CANDIDATE_SHA: b4c80425f766147c1e6412b013cbcd3892e53741
+      FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
+      WORKFLOW_SHA: ${{ github.sha }}
+      CONTROL_VARIANT: ${{ matrix.variant }}
+      CLANG_FORMAT_VER: "19"
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: ${{ github.workspace }}
+    steps:
+      - name: Install base tools
+        run: |
+          set -euo pipefail
+          printf 'CONTROL_DIR=%s/dtls-tools\nEVIDENCE_DIR=%s/dtls-evidence\n' \
+            "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/dtls-tools" "$RUNNER_TEMP/dtls-evidence"
+          rm -f /etc/apt/apt.conf.d/docker-clean
+          apt-get update -qq
+          apt-get install -y -qq sudo make git bash iproute2 python3
+
+      - name: Check out immutable workflow
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Prepare external observer and control tools
+        run: |
+          set -euo pipefail
+          cp .github/workflows/dtls-regression-control.yml "$EVIDENCE_DIR/workflow.yml"
+          cat > "$CONTROL_DIR/sitecustomize.py" <<'PY'
+          import json
+          import os
+          import sys
+          import threading
+          import traceback
+          import unittest
+          from pathlib import Path
+
+          destination = os.environ.get("DTLS_EVENTS")
+          if destination:
+              state = threading.local()
+              provider = os.environ["DTLS_PROVIDER"]
+
+              def emit(record):
+                  record["pid"] = os.getpid()
+                  data = (json.dumps(record, sort_keys=True) + "\n").encode()
+                  if len(data) > 256 * 1024:
+                      raise RuntimeError("DTLS observer record exceeds 256 KiB")
+                  fd = os.open(destination, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+                  try:
+                      if os.fstat(fd).st_size + len(data) > 4 * 1024 * 1024:
+                          raise RuntimeError("DTLS observer exceeds 4 MiB")
+                      if os.write(fd, data) != len(data):
+                          raise RuntimeError("Incomplete DTLS observer write")
+                  finally:
+                      os.close(fd)
+
+              def wrap(name):
+                  original = getattr(unittest.TestResult, name)
+
+                  def observed(self, test, *args):
+                      if name == "startTest":
+                          state.test = test.id()
+                      record = {"kind": name, "test": test.id()}
+                      if name == "startTest":
+                          record["workers"] = test.get_vpp_worker_count()
+                      if name in ("addFailure", "addError"):
+                          record["exception"] = args[0][0].__name__
+                          record["traceback"] = "".join(traceback.format_exception(*args[0]))
+                      if name == "addSkip":
+                          record["reason"] = str(args[0])
+                      emit(record)
+                      result = original(self, test, *args)
+                      if name == "stopTest":
+                          state.test = None
+                      return result
+
+                  setattr(unittest.TestResult, name, observed)
+
+              for method in ("startTest", "stopTest", "addSuccess", "addFailure", "addError",
+                             "addSkip", "addExpectedFailure", "addUnexpectedSuccess", "addSubTest"):
+                  wrap(method)
+
+              def profile(frame, event, response):
+                  if (event == "return" and frame.f_code.co_filename == provider
+                          and frame.f_code.co_name == "cli_return_response"
+                          and frame.f_locals.get("cli", "").strip() == "test session dtls-cleanup"):
+                      emit({"kind": "cli", "test": getattr(state, "test", None),
+                            "retval": getattr(response, "retval", None),
+                            "reply": getattr(response, "reply", None)})
+
+              if sys.getprofile() is not None:
+                  raise RuntimeError("DTLS observer requires an unused profile hook")
+              sys.setprofile(profile)
+              emit({"kind": "loaded"})
+          PY
+          cat > "$CONTROL_DIR/control.py" <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import stat
+          import subprocess
+          import sys
+          import time
+          from pathlib import Path
+
+          SOURCE = "src/vnet/tls/tls.c"
+          TESTS = ["src/plugins/tlsopenssl/tls_openssl.c", "src/plugins/unittest/session_test.c",
+                   "test/asf/test_tls.py", "test/vpp_papi_provider.py", "test/asf/asfframework.py",
+                   "test/Makefile", "test/requirements.txt", "test/requirements-3.txt"]
+          WORKFLOW = ".github/workflows/dtls-regression-control.yml"
+          WITNESS = ("DTLS immediate failure retained hostname/async ownership "
+                     "(named 1, async 0, iteration 0)")
+          BEFORE = (b"  cargs->sep_ext.transport_flags = TRANSPORT_CFG_F_CONNECTED;\n"
+                    b"  if ((rv = vnet_connect (cargs)))\n    {\n"
+                    b"      tls_ctx_free (ctx);\n      return rv;\n    }")
+          AFTER = BEFORE.replace(b"tls_ctx_free (ctx)", b"tls_ctx_half_open_free (ctx_handle)")
+
+          def require(condition, message):
+              if not condition:
+                  raise AssertionError(message)
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          def blob(ref, path):
+              return git("rev-parse", f"{ref}:{path}")
+
+          def restored(data):
+              require(data.count(BEFORE) == 1, "Restoration anchor is missing or ambiguous")
+              return data.replace(BEFORE, AFTER, 1)
+
+          def validate(variant, cls, workers, rc, console, logs, stderr, events):
+              identity = f"test_tls.{cls}.test_dtls_cleanup"
+              loaded = [e["pid"] for e in events if e["kind"] == "loaded"]
+              records = [e for e in events if e["kind"] != "loaded"]
+              require(loaded and len(set(loaded)) == len(loaded), "Missing/duplicate observer load")
+              require(all(e["pid"] in loaded and e["test"] == identity for e in records),
+                      "Unexpected test or missing observer load")
+              expected = ["startTest", "cli", "addSuccess" if variant == "fixed" else "addFailure",
+                          "stopTest"]
+              require([e["kind"] for e in records] == expected,
+                      f"Unexpected observer lifecycle: {[e['kind'] for e in records]}")
+              require(len({e["pid"] for e in records}) == 1, "Lifecycle spans different processes")
+              require(records[0]["workers"] == workers, "Wrong actual worker configuration")
+              callbacks = re.findall(r"--- (add\w+)\(\) (\w+)\.(\w+)\(", logs)
+              require(callbacks == [(expected[2], cls, "test_dtls_cleanup")],
+                      f"Wrong framework callbacks: {callbacks}")
+              console = re.sub(r"\x1b\[[0-9;]*m", "", console)
+              require(len(re.findall(r"(?m)^Ran 1 tests? in [0-9.]+s\s*$", console)) == 1,
+                      "Missing normal single-test completion")
+              require(not re.search(r"SIGSEGV|segmentation fault|Core was generated|"
+                                    r"timed out|TimeoutError|VPP.*(?:died|crashed)|"
+                                    r"(?m:^)(?:ERROR|SKIP):|OK \(skipped=", console, re.I),
+                      "Crash, timeout, setup error, or skipped test")
+              reply = records[1]["reply"]
+              require(isinstance(reply, str), "Missing real CLI reply")
+              success = f"DTLS cleanup: 4 modes passed on thread {workers}"
+              if variant == "fixed":
+                  require(rc == 0 and records[1]["retval"] == 0, "Fixed run or CLI failed")
+                  require(re.search(r"(?m)^OK\s*$", console), "Missing successful unittest summary")
+                  require(reply.count(success) == 1 and "SUCCESS" in reply,
+                          "Missing four-mode/thread success in actual CLI reply")
+                  require(not re.search(r"FAIL:\d+:|DTLS .*retained|Session unit test failed", reply + stderr),
+                          "Fixed run contains a C failure")
+              else:
+                  require(rc == 2, f"Expected ordinary make failure rc=2, got {rc}")
+                  require(records[1]["retval"] == -1, "Wrong actual CLI failure status")
+                  require(re.search(r"(?m)^FAILED \(failures=1\)\s*$", console),
+                          "Missing assertion-only unittest completion")
+                  failure = records[2]
+                  require(failure["exception"] == "AssertionError", "Non-assertion failure")
+                  trace = failure["traceback"]
+                  require("self.assertEqual(response.retval, 0, response.reply)" in trace
+                          and "AssertionError: -1 != 0 :" in trace and WITNESS in trace,
+                          "Wrong ordinary assertion location or message")
+                  require(reply.count(WITNESS) == 1 and "Session unit test failed" in reply,
+                          "Missing exact retained-hostname CLI witness")
+                  require("Session unit test failed" in trace, "Missing CLI failure in actual assertion")
+                  require(not re.search(r"SIGSEGV|segmentation fault|Core was generated|"
+                                        r"AddressSanitizer|runtime error:|assertion.*fails", stderr, re.I),
+                          "Raw VPP stderr contains a crash or C assertion")
+                  require("DTLS cleanup: 4 modes passed" not in reply,
+                          "Restored cleanup unexpectedly reported success")
+                  require(not re.search(r"DTLS (?:expected immediate route failure|immediate failure retained "
+                                        r"connection state|failures grew heap|migration)", reply),
+                          "Unrelated DTLS failure")
+
+          def collect(destination):
+              destination.mkdir(parents=True, exist_ok=True)
+              report = ["24 MiB total, 2 MiB/file, 200 files; text tails; no symlinks or cores."]
+              candidates = []
+              for root in [*sorted(Path("/tmp").glob("vpp-unittest-*")), Path("build-root/test-logs")]:
+                  if root.is_symlink() or not root.is_dir():
+                      continue
+                  for directory, subdirs, names in os.walk(root, followlinks=False):
+                      subdirs[:] = sorted(n for n in subdirs if not (Path(directory) / n).is_symlink())
+                      for name in sorted(names):
+                          path = Path(directory) / name
+                          if path.suffix not in (".txt", ".log", ".pcap", ".pcapng"):
+                              continue
+                          if stat.S_ISREG(path.lstat().st_mode):
+                              priority = 0 if name in ("log.txt", "vpp_stderr.txt") else 1
+                              candidates.append((path.suffix in (".pcap", ".pcapng"), priority, path))
+              remaining, count = 24 * 1024 * 1024, 0
+              for binary, _, path in sorted(candidates):
+                  if count == 200:
+                      report.append("Stopped at 200 files")
+                      break
+                  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                  with os.fdopen(fd, "rb") as reader:
+                      info = os.fstat(reader.fileno())
+                      if not stat.S_ISREG(info.st_mode):
+                          continue
+                      size = info.st_size
+                      length = min(size, 2 * 1024 * 1024)
+                      if length > remaining or binary and size > length:
+                          if len(report) < 1000:
+                              report.append(f"SKIP {str(path)[:500]!r}: {size}")
+                          continue
+                      reader.seek(size - length)
+                      data = reader.read(length)
+                      target = destination / f"{count:04d}{path.suffix}"
+                      target.write_bytes(data)
+                  report.append(f"{str(path)[:500]!r} -> {target.name}: {len(data)}/{size}")
+                  remaining -= len(data)
+                  count += 1
+              (destination / "collection.txt").write_text("\n".join(report) + "\n")
+
+          def command(label, args, env=None):
+              directory = Path(os.environ["EVIDENCE_DIR"]) / label
+              directory.mkdir()
+              result = {"command": args, "start": time.time(), "rc": None}
+              status = directory / "result.json"
+              status.write_text(json.dumps(result, indent=2))
+              tail = bytearray()
+              try:
+                  process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                             env=env)
+                  with (directory / "console.log").open("w+b") as stream:
+                      for chunk in iter(lambda: process.stdout.read1(65536), b""):
+                          print(chunk.decode(errors="replace"), end="", flush=True)
+                          tail.extend(chunk)
+                          del tail[:-8 * 1024 * 1024]
+                          stream.seek(0)
+                          stream.write(tail)
+                          stream.truncate()
+                          stream.flush()
+                  result["rc"] = process.wait()
+              finally:
+                  result["end"] = time.time()
+                  status.write_text(json.dumps(result, indent=2))
+              return directory, result["rc"], tail.decode(errors="replace")
+
+          def verify(variant):
+              candidate = os.environ["CANDIDATE_SHA"]
+              require(git("rev-parse", "HEAD") == candidate, "Candidate HEAD changed")
+              original = subprocess.check_output(["git", "show", f"{candidate}:{SOURCE}"])
+              expected = restored(original) if variant == "restored" else original
+              require(Path(SOURCE).read_bytes() == expected, "Unexpected TLS source bytes")
+              require(git("diff", "--name-only").splitlines() == ([SOURCE] if variant == "restored" else []),
+                      "Unexpected tracked tree changes")
+              require(not git("diff", "--cached", "--name-only"), "Unexpected staged changes")
+              for path in TESTS:
+                  require(git("hash-object", path) == blob(candidate, path), f"Changed test/tool: {path}")
+
+          def prepare():
+              output = Path(os.environ["EVIDENCE_DIR"])
+              candidate = os.environ["CANDIDATE_SHA"]
+              workflow_sha = os.environ["WORKFLOW_SHA"]
+              require(git("rev-parse", "HEAD") == workflow_sha, "Workflow checkout mismatch")
+              manifest = {"workflow_sha": workflow_sha, "workflow_blob": blob(workflow_sha, WORKFLOW),
+                          "candidate_sha": candidate, "candidate_tree": git("rev-parse", f"{candidate}^{{tree}}"),
+                          "frozen_sha": os.environ["FROZEN_SHA"], "variant": os.environ["CONTROL_VARIANT"],
+                          "tests": {p: blob(candidate, p) for p in TESTS},
+                          "tools_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                                           for p in sorted(Path(os.environ["CONTROL_DIR"]).glob("*.py"))},
+                          "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                          "job": os.environ["GITHUB_JOB"],
+                          "artifact_name": f"dtls-{os.environ['CONTROL_VARIANT']}-"
+                                           f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
+                          "run_url": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+                                     f"/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+                          "expected_negative_witness": WITNESS,
+                          "limits": {"successful_handshake": "unproven", "cross_worker_migration": "unproven",
+                                     "isolated_unnamed_async1_negative": "pending: named async0 returns first"}}
+              (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+              subprocess.run(["git", "checkout", "--detach", candidate], check=True)
+              require(not git("status", "--porcelain", "--untracked-files=all"), "Dirty candidate checkout")
+              for path in ("build-root/build-vpp_debug-native", "build-root/install-vpp_debug-native",
+                           "build-root/test/venv", "build-root/.ccache"):
+                  require(not Path(path).exists(), f"Build is not independent: {path}")
+              verify("fixed")
+              (output / "assessment.txt").write_text(
+                  "Fixed gates both original ASF classes and their four-mode OpenSSL loops.\n"
+                  "Restored source differs only at the immediate nested UDP error cleanup call.\n"
+                  "Migration flags, detach/attach code, and all product tests remain unchanged.\n"
+                  "Restored named async0 iteration0 returns before unnamed async1.\n"
+                  "Isolated unnamed async1 retained-pointer runtime witness remains pending.\n"
+                  "Successful DTLS handshake and actual cross-worker migration remain unproven.\n")
+
+          def select_variant():
+              verify("fixed")
+              if os.environ["CONTROL_VARIANT"] == "restored":
+                  Path(SOURCE).write_bytes(restored(Path(SOURCE).read_bytes()))
+              verify(os.environ["CONTROL_VARIANT"])
+              output = Path(os.environ["EVIDENCE_DIR"])
+              manifest_path = output / "manifest.json"
+              manifest = json.loads(manifest_path.read_text())
+              index = Path(os.environ["CONTROL_DIR"]) / "tree-index"
+              environment = dict(os.environ, GIT_INDEX_FILE=str(index))
+              subprocess.run(["git", "read-tree", os.environ["CANDIDATE_SHA"]], env=environment, check=True)
+              subprocess.run(["git", "add", SOURCE], env=environment, check=True)
+              manifest["built_tree"] = subprocess.check_output(
+                  ["git", "write-tree"], env=environment, text=True).strip()
+              manifest["source"] = {"path": SOURCE, "candidate_blob": blob(os.environ["CANDIDATE_SHA"], SOURCE),
+                                    "built_blob": git("hash-object", SOURCE)}
+              manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+              (output / "restoration.diff").write_text(git("diff", "--", SOURCE) + "\n")
+
+          def bounded_text(paths):
+              chunks = []
+              remaining = 8 * 1024 * 1024
+              for path in sorted(paths):
+                  if path.is_symlink() or not path.is_file():
+                      continue
+                  size = path.stat().st_size
+                  require(size <= remaining, "Classifier input exceeds 8 MiB; refusing partial evidence")
+                  chunks.append(path.read_text(errors="replace"))
+                  remaining -= size
+              return "\n".join(chunks)
+
+          def tests():
+              output = Path(os.environ["EVIDENCE_DIR"])
+              variant = os.environ["CONTROL_VARIANT"]
+              errors = []
+              for cls, workers in (("TestDTLSCleanup", 0), ("TestDTLSCleanupWorker", 1)):
+                  verify(variant)
+                  label = f"test-{cls}"
+                  events_path = output / f"{label}-events.jsonl"
+                  environment = dict(os.environ, DTLS_EVENTS=str(events_path),
+                                     DTLS_PROVIDER=str(Path("test/vpp_papi_provider.py").resolve()),
+                                     PYTHONPATH=os.environ["CONTROL_DIR"] + os.pathsep + os.environ.get("PYTHONPATH", ""))
+                  args = ["make", "UNATTENDED=yes", "UV=", "TEST_JOBS=1", "FORCE_FOREGROUND=1",
+                          "RETRIES=0", "FAILFAST=0", "SKIP_TESTS=", "VPP_EXCLUDED_PLUGINS=", "COREDUMP_SIZE=0",
+                          "COMPRESS_FAILED_TEST_LOGS=no", "DECODE_PCAPS=none", "RND_SEED=49",
+                          f"TEST=tls.{cls}.test_dtls_cleanup", "test-debug"]
+                  directory, rc, console = command(label, args, environment)
+                  collect(directory / "diagnostics")
+                  try:
+                      verify(variant)
+                      logs = bounded_text(Path("/tmp").glob("vpp-unittest-*/log.txt"))
+                      stderr = bounded_text(Path("/tmp").glob("vpp-unittest-*/vpp_stderr.txt"))
+                      events = [json.loads(line) for line in events_path.read_text().splitlines()]
+                      validate(variant, cls, workers, rc, console, logs, stderr, events)
+                  except (AssertionError, OSError, ValueError, KeyError, TypeError) as error:
+                      errors.append(f"{cls}: {error}")
+                      (directory / "validation.txt").write_text(f"FAIL: {error}\n")
+                  else:
+                      (directory / "validation.txt").write_text("PASS\n")
+              require(not errors, "\n".join(errors))
+
+          def fixtures():
+              for cls, workers in (("TestDTLSCleanup", 0), ("TestDTLSCleanupWorker", 1)):
+                  for variant in ("fixed", "restored"):
+                      identity = f"test_tls.{cls}.test_dtls_cleanup"
+                      reply = (f"DTLS cleanup: 4 modes passed on thread {workers}\nSUCCESS\n"
+                               if variant == "fixed" else WITNESS + "\nSession unit test failed")
+                      callback = "addSuccess" if variant == "fixed" else "addFailure"
+                      trace = ("self.assertEqual(response.retval, 0, response.reply)\n"
+                               "AssertionError: -1 != 0 : " + reply)
+                      events = [{"kind": "loaded", "pid": 1},
+                                {"kind": "startTest", "pid": 1, "test": identity, "workers": workers},
+                                {"kind": "cli", "pid": 1, "test": identity,
+                                 "retval": 0 if variant == "fixed" else -1, "reply": reply},
+                                {"kind": callback, "pid": 1, "test": identity,
+                                 "exception": "AssertionError", "traceback": trace},
+                                {"kind": "stopTest", "pid": 1, "test": identity}]
+                      rc = 0 if variant == "fixed" else 2
+                      console = "Ran 1 test in 0.1s\n" + ("OK\n" if variant == "fixed" else "FAILED (failures=1)\n")
+                      logs = f"--- {callback}() {cls}.test_dtls_cleanup(doc) called"
+                      stderr = "" if variant == "fixed" else "test session: Session unit test failed"
+                      validate(variant, cls, workers, rc, console, logs, stderr, events)
+                      mutations = [events[:-1], events + [events[3]], events[:2] + events[3:]]
+                      for index, key, value in ((1, "workers", 1 - workers),
+                                                (2, "reply", "unrelated error"),
+                                                (2, "retval", -156),
+                                                (3, "kind", "addError"),
+                                                (3, "kind", "addSkip"),
+                                                (3, "exception", "CliFailedCommandError"),
+                                                (3, "traceback", "AssertionError: unrelated")):
+                          if variant == "fixed" and key in ("exception", "traceback"):
+                              continue
+                          bad = [dict(event) for event in events]
+                          bad[index][key] = value
+                          mutations.append(bad)
+                      for bad in mutations:
+                          try:
+                              validate(variant, cls, workers, rc, console, logs, stderr, bad)
+                          except AssertionError:
+                              pass
+                          else:
+                              raise AssertionError("Accepted incomplete or duplicate lifecycle")
+                      for bad_console in ("", console + "SIGSEGV", console + "timed out"):
+                          try:
+                              validate(variant, cls, workers, rc, bad_console, logs, stderr, events)
+                          except AssertionError:
+                              pass
+                          else:
+                              raise AssertionError("Accepted invalid completion")
+                      for bad_rc in (-11, 124, 137):
+                          try:
+                              validate(variant, cls, workers, bad_rc, console, logs, stderr, events)
+                          except AssertionError:
+                              pass
+                          else:
+                              raise AssertionError("Accepted signal or timeout status")
+              require(restored(BEFORE).count(AFTER) == 1, "Restoration fixture failed")
+              print("DTLS classifier lifecycle, status, crash, timeout, and restoration fixtures passed")
+
+          def observer_fixtures():
+              import io
+              import tempfile
+              import unittest
+              from types import SimpleNamespace
+
+              with tempfile.TemporaryDirectory(dir=os.environ["CONTROL_DIR"]) as directory:
+                  path = Path(directory) / "events.jsonl"
+                  provider = str(Path(directory) / "provider.py")
+                  environment = dict(os.environ, DTLS_EVENTS=str(path), DTLS_PROVIDER=provider)
+                  script = '''
+          import io
+          import unittest
+          from types import SimpleNamespace
+          provider = compile('def cli_return_response(cli):\\n return SimpleNamespace(retval=-1, reply="actual reply")\\n',
+                             __import__('os').environ['DTLS_PROVIDER'], 'exec')
+          namespace = {'SimpleNamespace': SimpleNamespace}
+          exec(provider, namespace)
+          class Example(unittest.TestCase):
+              def get_vpp_worker_count(self):
+                  return 1
+              def test_success(self):
+                  response = namespace['cli_return_response']('test session dtls-cleanup')
+                  self.assertEqual(response.retval, -1)
+                  self.assertEqual(response.reply, 'actual reply')
+              def test_failure(self):
+                  self.assertEqual(1, 0, 'original failure')
+              def test_error(self):
+                  raise ValueError('original error')
+          result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.defaultTestLoader.loadTestsFromTestCase(Example))
+          assert result.testsRun == 3
+          assert len(result.failures) == 1 and 'AssertionError: 1 != 0 : original failure' in result.failures[0][1]
+          assert len(result.errors) == 1 and 'ValueError: original error' in result.errors[0][1]
+          '''
+                  subprocess.run([sys.executable, "-c", script], env=dict(
+                      environment, PYTHONPATH=os.environ["CONTROL_DIR"]), check=True)
+                  events = [json.loads(line) for line in path.read_text().splitlines()]
+                  kinds = [event["kind"] for event in events]
+                  require(kinds.count("startTest") == kinds.count("stopTest") == 3,
+                          "Observer changed lifecycle")
+                  require(all(kinds.count(kind) == 1 for kind in ("addSuccess", "addFailure", "addError", "cli")),
+                          "Observer changed actual unittest outcomes")
+                  reply = next(event for event in events if event["kind"] == "cli")
+                  require(reply["retval"] == -1 and reply["reply"] == "actual reply",
+                          "Observer changed actual CLI response")
+              print("Delegated observer preserved actual success, failure, exception, and CLI reply")
+
+          if __name__ == "__main__":
+              action = sys.argv[1]
+              if action == "prepare":
+                  prepare()
+              elif action == "select":
+                  select_variant()
+              elif action == "verify":
+                  verify(os.environ["CONTROL_VARIANT"])
+              elif action == "tests":
+                  tests()
+              elif action == "collect":
+                  collect(Path(os.environ["EVIDENCE_DIR"]) / "final-diagnostics")
+              elif action == "fixtures":
+                  fixtures()
+                  observer_fixtures()
+              else:
+                  _, rc, _ = command(action, sys.argv[2:])
+                  raise SystemExit(rc)
+          PY
+          python3 "$CONTROL_DIR/control.py" fixtures
+          python3 "$CONTROL_DIR/control.py" prepare
+
+      - name: Install build and checkstyle dependencies on clean candidate
+        run: python3 "$CONTROL_DIR/control.py" dependencies make UNATTENDED=yes install-dep
+
+      - name: Run source-clean C style and API checks
+        run: |
+          set -euo pipefail
+          trap 'git checkout --quiet --detach "$CANDIDATE_SHA"' EXIT
+          for commit in $(git rev-list --reverse --no-merges "$FROZEN_SHA..$CANDIDATE_SHA"); do
+            git checkout --quiet --detach "$commit"
+            python3 "$CONTROL_DIR/control.py" "style-$commit" make checkstyle
+            python3 "$CONTROL_DIR/control.py" "api-$commit" make checkstyle-api
+            python3 "$CONTROL_DIR/control.py" "message-$commit" extras/scripts/check_commit_msg.sh
+            test -z "$(git status --porcelain --untracked-files=all)"
+          done
+          git checkout --quiet --detach "$CANDIDATE_SHA"
+          trap - EXIT
+
+      - name: Run pinned Python checks before any source restoration
+        run: |
+          set -euo pipefail
+          touch test/requirements-3.txt
+          python3 "$CONTROL_DIR/control.py" python-style make UV= checkstyle-python
+          test -z "$(git status --porcelain --untracked-files=all)"
+          python3 "$CONTROL_DIR/control.py" python-tools \
+            build-root/test/venv/bin/python -m pip freeze --all
+
+      - name: Select only the immediate error cleanup variant
+        run: python3 "$CONTROL_DIR/control.py" select
+
+      - name: Supply and record build version
+        run: |
+          set -euo pipefail
+          if ! git describe --long --match 'v[0-9]*' 2>/dev/null; then
+            printf '0.0.0-release+%s.%s-g%s\n' "$(git log -1 --format=%ct)" \
+              "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)" > src/scripts/.version
+          fi
+          if [ -f src/scripts/.version ]; then
+            cp src/scripts/.version "$EVIDENCE_DIR/version.txt"
+          fi
+          python3 "$CONTROL_DIR/control.py" toolchain bash -c \
+            'uname -a; python3 --version; make --version; clang --version; git --version; dpkg-query -W'
+
+      - name: Build debug variant independently
+        run: |
+          set -euo pipefail
+          python3 "$CONTROL_DIR/control.py" verify
+          python3 "$CONTROL_DIR/control.py" build make UNATTENDED=yes build
+          python3 "$CONTROL_DIR/control.py" verify
+
+      - name: Prepare test runtime
+        uses: ./.github/actions/vpp-docker-runtime-setup
+        with:
+          WORKSPACE: ${{ github.workspace }}
+          SHM_SIZE: 2G
+          LOG_DIR: ${{ runner.temp }}/dtls-evidence/runtime
+
+      - name: Run unchanged main and worker regression methods
+        run: |
+          set -euo pipefail
+          mountpoint /dev/shm
+          test "$(df -B1 --output=size /dev/shm | tail -n 1)" -ge 2147483648
+          python3 "$CONTROL_DIR/control.py" tests
+
+      - name: Retain bounded diagnostics and tools on every outcome
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          if [ -d "$CONTROL_DIR" ]; then
+            for tool in "$CONTROL_DIR/"*.py; do
+              [ ! -f "$tool" ] || cp "$tool" "$EVIDENCE_DIR/"
+            done
+          fi
+          if [ -f "$CONTROL_DIR/control.py" ]; then
+            python3 "$CONTROL_DIR/control.py" collect
+          fi
+          git status --short > "$EVIDENCE_DIR/final-git-status.txt"
+          git diff -- src/vnet/tls/tls.c > "$EVIDENCE_DIR/final-restoration.diff"
+
+      - name: Upload immutable run evidence
+        id: evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtls-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dtls-evidence/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 6
+
+      - name: Record artifact identity and pending coverage
+        if: always()
+        env:
+          ARTIFACT_ID: ${{ steps.evidence.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.evidence.outputs.artifact-url }}
+        run: |
+          printf 'Artifact ID: %s\nArtifact URL: %s\n' "$ARTIFACT_ID" "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' 'Successful handshake, cross-worker migration, and isolated restored unnamed async1 pointer witness remain unproven.' >> "$GITHUB_STEP_SUMMARY"
