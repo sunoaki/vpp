@@ -272,13 +272,16 @@ jobs:
 
           def regular(parent, name, flags):
               descriptor = os.open(name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
-              info = os.fstat(descriptor)
-              if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+              try:
+                  info = os.fstat(descriptor)
+                  if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                      raise ValueError("Nonregular diagnostic file")
+                  return descriptor
+              except BaseException:
                   os.close(descriptor)
-                  raise ValueError("Nonregular diagnostic file")
-              return descriptor
+                  raise
 
-          def file_hash(root, relative):
+          def source_file(root, relative):
               parts = Path(relative).parts
               if not parts or any(part in ("..", "/") for part in parts):
                   raise ValueError("Invalid source path")
@@ -289,18 +292,32 @@ jobs:
                                       dir_fd=parent)
                       os.close(parent)
                       parent = child
-                  descriptor = regular(parent, parts[-1], os.O_RDONLY)
-                  try:
-                      value = hashlib.sha256()
-                      while True:
-                          chunk = os.read(descriptor, 65536)
-                          if not chunk:
-                              return value.hexdigest()
-                          value.update(chunk)
-                  finally:
-                      os.close(descriptor)
+                  return regular(parent, parts[-1], os.O_RDONLY)
               finally:
                   os.close(parent)
+
+          def descriptor_hash(descriptor):
+              value = hashlib.sha256()
+              while True:
+                  chunk = os.read(descriptor, 65536)
+                  if not chunk:
+                      return value.hexdigest()
+                  value.update(chunk)
+
+          def file_hash(root, relative):
+              descriptor = source_file(root, relative)
+              try:
+                  return descriptor_hash(descriptor)
+              finally:
+                  os.close(descriptor)
+
+          def unavailable(stage, error):
+              raw = ("HSS diagnostic unavailable: " + stage + ": " + type(error).__name__ +
+                     ": " + str(error)[:128]).encode("utf-8", errors="backslashreplace")[:512] + b"\n"
+              try:
+                  os.write(2, raw)
+              except OSError:
+                  pass
 
           def encoded_record(value):
               def encode(item):
@@ -356,6 +373,7 @@ jobs:
                   self.tempdir = None
                   self.lock = threading.Lock()
                   self.streams, self.once, self.frozen, self.query_active = {}, False, False, False
+                  self.capture_stopped, self.incomplete, self.allocated = False, False, False
                   self.record = dict(slot=name, observer_pid=self.observer_pid, vpp_pid=self.pid,
                                      status="pending", query_status="not_triggered", rc=None,
                                      cleanup_complete=None, event_seq=None, identity=owner.identity,
@@ -365,17 +383,21 @@ jobs:
                   if not self.lock.acquire(blocking=False):
                       return False
                   try:
-                      if self.frozen or self.observer_pid != os.getpid():
+                      if self.capture_stopped or self.frozen or self.observer_pid != os.getpid():
                           return False
                       return self.streams[index].write(raw)
                   finally:
                       self.lock.release()
 
               def finish(self):
+                  if self.observer_pid != os.getpid() or self.query_active or self.record["query_status"] == "running":
+                      return
+                  self.capture_stopped = True
                   if not self.lock.acquire(blocking=False):
+                      self.incomplete = True
                       return
                   try:
-                      if self.frozen or self.observer_pid != os.getpid() or self.query_active or self.record["query_status"] == "running":
+                      if self.frozen or self.incomplete or not self.allocated or self.query_active:
                           return
                       self.frozen = True
                       self.record.update(snapshot_at=time.time(), observed_until=time.time(), status="frozen",
@@ -407,7 +429,9 @@ jobs:
                   if self.pending is not None:
                       os.close(self.pending)
                       self.pending = None
-                  os.close(self.descriptor)
+                  if self.descriptor is not None:
+                      os.close(self.descriptor)
+                      self.descriptor = None
 
           class Diagnostics:
               def __init__(self, config):
@@ -416,26 +440,37 @@ jobs:
                   self.pid = os.getpid()
                   self.root_path = config["directory"]
                   self.source_path = config["root"]
-                  self.source_fd = directory(self.source_path)
-                  self.root_fd = directory(self.root_path)
-                  self.root_inode = stamp(self.root_fd)
-                  self.slots, self.frames = {}, {}
-                  self.guard = threading.Lock()
-                  self.identity = {key: config[key] for key in ("workflow", "candidate", "variant", "runtime")}
-                  parents = json.loads(os.environ.get("HSS_COMMAND_PARENTS", "[]"))
-                  runtime = next((item for item in reversed(parents) if item.get("result") == "runtime/result.json"), None)
-                  self.identity["command"] = runtime
-                  self.provenance = config["sources"]
-                  for path, value in self.provenance.items():
-                      if file_hash(self.source_fd, path) != value["sha256"]:
-                          raise ValueError("Diagnostic source mismatch")
-                  alias = os.path.join(self.source_path, "test/asfframework.py")
-                  if os.readlink(alias) != "asf/asfframework.py":
-                      raise ValueError("Unknown framework alias")
-                  self.tool = config["vppctl"]
-                  if self.tool != os.path.join(self.source_path, "build-root/install-vpp_debug-native/vpp/bin/vppctl"):
-                      raise ValueError("Unexpected diagnostic executable")
-                  atexit.register(self.finish)
+                  self.source_fd, self.root_fd = None, None
+                  try:
+                      self.source_fd = directory(self.source_path)
+                      self.root_fd = directory(self.root_path)
+                      self.source_inode = stamp(self.source_fd)
+                      self.root_inode = stamp(self.root_fd)
+                      self.slots, self.frames = {}, {}
+                      self.guard = threading.Lock()
+                      self.identity = {key: config[key] for key in ("workflow", "candidate", "variant", "runtime")}
+                      parents = json.loads(os.environ.get("HSS_COMMAND_PARENTS", "[]"))
+                      runtime = next((item for item in reversed(parents) if item.get("result") == "runtime/result.json"), None)
+                      self.identity["command"] = runtime
+                      self.provenance = config["sources"]
+                      for path, value in self.provenance.items():
+                          if file_hash(self.source_fd, path) != value["sha256"]:
+                              raise ValueError("Diagnostic source mismatch: " + path)
+                      alias_parent = directory(os.path.join(self.source_path, "test"))
+                      try:
+                          if os.readlink("asfframework.py", dir_fd=alias_parent) != "asf/asfframework.py":
+                              raise ValueError("Unknown framework alias")
+                      finally:
+                          os.close(alias_parent)
+                      self.tool = config["vppctl"]
+                      if self.tool != os.path.join(self.source_path, "build-root/install-vpp_debug-native/vpp/bin/vppctl"):
+                          raise ValueError("Unexpected diagnostic executable")
+                      atexit.register(self.finish)
+                  except BaseException:
+                      for descriptor in (self.root_fd, self.source_fd):
+                          if descriptor is not None:
+                              os.close(descriptor)
+                      raise
 
               def after_fork(self):
                   if self.pid == os.getpid():
@@ -444,10 +479,14 @@ jobs:
                       slot.close()
                   self.slots, self.frames = {}, {}
                   os.close(self.root_fd)
-                  self.root_fd = directory(self.root_path)
-                  self.root_inode = stamp(self.root_fd)
+                  self.root_fd = None
                   self.pid = os.getpid()
                   self.guard = threading.Lock()
+                  reopened = directory(self.root_path)
+                  if stamp(reopened) != self.root_inode:
+                      os.close(reopened)
+                      raise ValueError("Diagnostic root replaced after fork")
+                  self.root_fd = reopened
 
               def code(self, module_name, function, code):
                   module = sys.modules.get(module_name)
@@ -474,7 +513,7 @@ jobs:
                   if name not in CLASSES or cls.__module__ != "test_http_static":
                       return None
                   module = sys.modules.get("test_http_static")
-                  if module is None or getattr(module, name, None) is not cls:
+                  if module is None or getattr(module, name, None) is not cls or self.root_fd is None:
                       return None
                   if not self.guard.acquire(blocking=False):
                       return None
@@ -509,12 +548,18 @@ jobs:
                               for index, filename in enumerate(FILES):
                                   fd = regular(descriptor, filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
                                   slot.streams[index] = Stream(fd, (2 if index < 2 else 1) * 1024 * 1024)
+                              slot.allocated = True
                               return slot
-                          except BaseException:
+                          except BaseException as error:
                               if slot is None:
                                   if pending is not None:
                                       os.close(pending)
                                   os.close(descriptor)
+                              else:
+                                  slot.capture_stopped, slot.incomplete = True, True
+                                  slot.record.update(query_status="unavailable", error=type(error).__name__[:64])
+                                  slot.close()
+                              unavailable("stream allocation", error)
                               raise
                       finally:
                           fcntl.flock(self.root_fd, fcntl.LOCK_UN)
@@ -582,7 +627,7 @@ jobs:
                       if slot is None or slot.process is not getattr(cls, "vpp", None) or not slot.lock.acquire(blocking=False):
                           return
                       try:
-                          if slot.once or slot.frozen:
+                          if slot.once or slot.frozen or slot.capture_stopped or not slot.allocated:
                               return
                           slot.once, slot.query_active = True, True
                           slot.record.update(query_status="running", event_seq=sequence,
@@ -631,14 +676,37 @@ jobs:
                               raise ValueError("Invalid CLI socket")
                       finally:
                           os.close(socket_parent)
+                      source_check = directory(self.source_path)
+                      try:
+                          if stamp(source_check) != self.source_inode:
+                              raise ValueError("Diagnostic source root replaced")
+                      finally:
+                          os.close(source_check)
                       relative = "build-root/install-vpp_debug-native/vpp/bin/vppctl"
-                      if file_hash(self.source_fd, relative) != self.config["vppctl_sha256"]:
-                          raise ValueError("Diagnostic executable mismatch")
-                      if time.monotonic() >= execution:
-                          raise TimeoutError("Diagnostic preparation budget")
-                      args = [self.tool, "-s", socket, "show", "logging"]
-                      process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                                 stderr=subprocess.PIPE, shell=False, cwd=self.source_path)
+                      executable = source_file(self.source_fd, relative)
+                      try:
+                          if descriptor_hash(executable) != self.config["vppctl_sha256"]:
+                              raise ValueError("Diagnostic executable mismatch")
+                          source_check = directory(self.source_path)
+                          try:
+                              if stamp(source_check) != self.source_inode:
+                                  raise ValueError("Diagnostic source root replaced")
+                              checked = source_file(source_check, relative)
+                              try:
+                                  if stamp(checked) != stamp(executable):
+                                      raise ValueError("Diagnostic executable replaced")
+                              finally:
+                                  os.close(checked)
+                          finally:
+                              os.close(source_check)
+                          if time.monotonic() >= execution:
+                              raise TimeoutError("Diagnostic preparation budget")
+                          args = [self.tool, "-s", socket, "show", "logging"]
+                          process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, shell=False, executable=f"/proc/self/fd/{executable}",
+                              cwd=f"/proc/self/fd/{self.source_fd}", pass_fds=(executable, self.source_fd))
+                      finally:
+                          os.close(executable)
                       result.update(query_pid=process.pid, query_status="completed")
                       with selectors.DefaultSelector() as selector:
                           for index, pipe in ((2, process.stdout), (3, process.stderr)):
@@ -690,7 +758,8 @@ jobs:
                   if not raw or len(raw) > 16384:
                       return None
                   return Diagnostics(json.loads(raw))
-              except Exception:
+              except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+                  unavailable("initialization", error)
                   return None
           PY
           cat > "$TOOLS/sitecustomize.py" <<'PY'
@@ -716,6 +785,7 @@ jobs:
                       raise RuntimeError("HSS observer exceeds 4 MiB/process")
                   with path.open("a") as stream:
                       stream.write(json.dumps(record, sort_keys=True) + "\n")
+                  return record["seq"]
 
               def identity(test):
                   return test.id()
@@ -788,10 +858,10 @@ jobs:
                       if name == "cli" and isinstance(value, str):
                           emit("cli", command=frame.f_locals["cli"], reply=value[:65536])
                       elif name == "cli_return_response" and value is not None:
-                          emit("cli_reply", command=frame.f_locals["cli"].strip(),
-                               retval=value.retval, reply=str(value.reply)[:65536])
+                          emitted = emit("cli_reply", command=frame.f_locals["cli"].strip(),
+                                         retval=value.retval, reply=str(value.reply)[:65536])
                           if diagnostics is not None:
-                              diagnostics.failure(frame, value, sequence)
+                              diagnostics.failure(frame, value, emitted)
               sys.setprofile(profile)
               threading.setprofile(profile)
               emit("loaded")
@@ -1370,8 +1440,10 @@ jobs:
                       vppctl=str((ROOT / tool).absolute()), vppctl_sha256=digest(tool),
                       sources=manifest["diagnostic_sources"], workflow=manifest["workflow_sha"],
                       candidate=CANDIDATE, variant=VARIANT, runtime="runtime")
-              except Exception:
-                  pass
+              except (OSError, ValueError, TypeError, KeyError, ImportError, AssertionError) as error:
+                  detail = ("HSS diagnostic configuration unavailable: " + type(error).__name__ +
+                            ": " + str(error)[:128]).encode("utf-8", errors="backslashreplace")[:512]
+                  print(detail.decode("utf-8", errors="replace"), file=sys.stderr)
               env = dict(os.environ, HSS_EVENTS=str(event_base),
                          HSS_DIAGNOSTIC_CONFIG=json.dumps(diagnostic_config) if diagnostic_config else "",
                          PYTHONPATH=str(TOOLS) + os.pathsep + os.environ.get("PYTHONPATH", ""))
