@@ -1252,8 +1252,8 @@ hss_destroy (vlib_main_t *vm)
 
   ctx = clib_mem_alloc (sizeof (*ctx));
   *ctx = (hss_destroy_ctx_t) { .app_index = hsm->app_index,
-			     .ckpair_index = hsm->ckpair_index,
-			     .pending_threads = vec_len (hsm->sessions) };
+			       .ckpair_index = hsm->ckpair_index,
+			       .pending_threads = vec_len (hsm->sessions) };
   clib_memset (&hsm->default_listener, 0, sizeof (hsm->default_listener));
   hsm->default_listener_index = ~0;
   hsm->have_default_listener = 0;
@@ -1611,11 +1611,10 @@ format_hss_listener (u8 *s, va_list *args)
   hss_listener_t *l = va_arg (*args, hss_listener_t *);
   int __clib_unused verbose = va_arg (*args, int);
 
-  s = format (
-    s, "listener %d, uri %U:%u, www-root %s, cache-size %U url-handlers %d retiring %d",
-    l->l_index, format_ip46_address, &l->sep.ip, l->sep.is_ip4,
-    clib_net_to_host_u16 (l->sep.port), l->www_root ? (char *) l->www_root : "",
-    format_memory_size, l->cache_size, l->enable_url_handlers, l->retiring);
+  s = format (s, "listener %d, uri %U:%u, www-root %s, cache-size %U url-handlers %d retiring %d",
+	      l->l_index, format_ip46_address, &l->sep.ip, l->sep.is_ip4,
+	      clib_net_to_host_u16 (l->sep.port), l->www_root ? (char *) l->www_root : "",
+	      format_memory_size, l->cache_size, l->enable_url_handlers, l->retiring);
   return s;
 }
 

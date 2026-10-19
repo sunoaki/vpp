@@ -160,8 +160,8 @@ vl_api_http_static_get_t_handler (vl_api_http_static_get_t *mp)
   REPLY_MACRO2 (VL_API_HTTP_STATIC_GET_REPLY, {
     u8 *addr = 0;
 
-    hss_listener_t *l = hsm->default_listener_index == (u32) ~0 ?
-			 0 : hss_listener_get (hsm->default_listener_index);
+    hss_listener_t *l =
+      hsm->default_listener_index == (u32) ~0 ? 0 : hss_listener_get (hsm->default_listener_index);
 
     if (!l || l->retiring)
       {
@@ -187,8 +187,7 @@ vl_api_http_static_get_t_handler (vl_api_http_static_get_t *mp)
 	snprintf ((char *) rmp->www_root, sizeof (rmp->www_root), "%s",
 		  l->www_root ? (char *) l->www_root : "");
 	snprintf ((char *) rmp->uri, sizeof (rmp->uri), "http%s://%s:%d",
-		  l->flags & HSS_LISTENER_F_NEED_CRYPTO ? "s" : "", addr,
-		  ntohs (l->sep.port));
+		  l->flags & HSS_LISTENER_F_NEED_CRYPTO ? "s" : "", addr, ntohs (l->sep.port));
 	rmp->max_age = htonl (l->max_age);
 	rmp->keepalive_timeout = htonl (l->keepalive_timeout);
 	rmp->max_body_size = htonl (l->max_req_body_size);
