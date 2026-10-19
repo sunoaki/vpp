@@ -419,11 +419,15 @@ jobs:
                   assert Path(path).read_bytes() == original, f"Candidate invariant failed: {path}"
               return candidate_bytes, frozen_bytes, expected, headers
 
-          def process_identity(pid):
+          def process_identity(pid, strict=False):
               try:
                   fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
                   return int(fields[1]), int(fields[19])
+              except (FileNotFoundError, ProcessLookupError):
+                  return None
               except (OSError, ValueError, IndexError):
+                  if strict:
+                      raise
                   return None
 
           def process_table():
@@ -437,6 +441,20 @@ jobs:
 
           def descendants(tracked, baseline, unresolved):
               table = process_table()
+              for pid, birth in tracked.items():
+                  if pid in table:
+                      continue
+                  try:
+                      identity = process_identity(pid, strict=True)
+                  except (OSError, ValueError, IndexError) as error:
+                      if (pid, birth) not in unresolved and len(unresolved) >= 2048:
+                          raise RuntimeError("Unresolved PID identity evidence limit exceeded")
+                      unresolved.setdefault((pid, birth), {
+                          "pid": pid, "birth": birth, "error": repr(error)[:500],
+                          "reason": "Tracked process identity could not be verified"})
+                  else:
+                      if identity is not None:
+                          table[pid] = identity
               changed = True
               while changed:
                   changed = False
@@ -464,7 +482,7 @@ jobs:
               except ProcessLookupError:
                   return False, None
               try:
-                  current = process_identity(pid)
+                  current = process_identity(pid, strict=True)
                   if current is None or current[1] != birth:
                       return False, None
                   sent = False
@@ -495,7 +513,7 @@ jobs:
 
           def process_evidence(pid, birth):
               result = {"pid": pid, "birth": birth, "state": None, "comm": None, "cmdline": None}
-              current = process_identity(pid)
+              current = process_identity(pid, strict=True)
               if current is None or current[1] != birth:
                   result["identity_matches"] = False
                   return result
@@ -509,33 +527,43 @@ jobs:
                       result[f"{name}_truncated"] = len(data) > limit
               except (OSError, ValueError, IndexError) as error:
                   result["error"] = str(error)[:500]
-              current = process_identity(pid)
+              current = process_identity(pid, strict=True)
               if current is None or current[1] != birth:
                   return {"pid": pid, "birth": birth, "identity_matches": False,
                           "state": None, "comm": None, "cmdline": None}
               result["identity_matches"] = True
               return result
 
-          def reap_completed(tracked, baseline, unresolved, result):
+          def reap_completed(tracked, baseline, unresolved, result, command_deadline):
               observed = set()
-              deadline = time.monotonic() + 5
+              deadline = min(command_deadline, time.monotonic() + 5)
+
+              def check_deadline():
+                  if time.monotonic() >= deadline:
+                      raise TimeoutError("Completion reap deadline exceeded")
+
               while True:
+                  check_deadline()
+                  live = descendants(tracked, baseline, unresolved)
+                  check_deadline()
                   progress = False
-                  for pid in sorted(descendants(tracked, baseline, unresolved)):
-                      if time.monotonic() >= deadline:
-                          raise TimeoutError("Completion reap deadline exceeded")
+                  for pid in sorted(live):
+                      check_deadline()
                       birth = tracked[pid]
                       if (pid, birth) not in observed:
                           if len(observed) >= 2048:
                               raise RuntimeError("Completion process evidence limit exceeded")
                           result["processes"].append(process_evidence(pid, birth))
                           observed.add((pid, birth))
+                          check_deadline()
                       _, reaped = inspect_process(pid, birth)
                       if reaped is not None:
                           if len(result["reaped"]) >= 2048:
                               raise RuntimeError("Completion reap evidence limit exceeded")
                           result["reaped"].append([reaped.si_pid, birth, reaped.si_status, reaped.si_code])
                           progress = True
+                      check_deadline()
+                  check_deadline()
                   if not progress:
                       return
 
@@ -576,7 +604,7 @@ jobs:
                                            descendants(tracked, baseline, unresolved))
               result["unresolved_identities"] = list(unresolved.values())
               if unresolved:
-                  result["error"] = "Proven owned PID reuse remains unresolved"
+                  result["error"] = "Owned process identity remains unresolved"
               return result
 
           def command(label, args, env=None, seconds=900, evidence=False):
@@ -636,8 +664,12 @@ jobs:
                               stream.truncate()
                               stream.flush()
                       result["rc"] = process.returncode
-                  reap_completed(tracked, baseline, unresolved, result["completion"])
-                  if descendants(tracked, baseline, unresolved):
+                  completion_deadline = min(deadline, time.monotonic() + 5)
+                  reap_completed(tracked, baseline, unresolved, result["completion"], completion_deadline)
+                  live = descendants(tracked, baseline, unresolved)
+                  if time.monotonic() >= completion_deadline:
+                      raise TimeoutError("Completion deadline exceeded during final scan")
+                  if live:
                       raise RuntimeError("Command left descendant processes after completion")
                   result["outcome"] = "success" if result["rc"] == 0 else "nonzero"
               except BaseException as error:
@@ -654,7 +686,7 @@ jobs:
                       result["cleanup"] = {"error": repr(error), "survivors": sorted(tracked)}
                   result["cleanup"]["unresolved_identities"] = list(unresolved.values())
                   if unresolved:
-                      result["cleanup"].setdefault("error", "Proven owned PID reuse remains unresolved")
+                      result["cleanup"].setdefault("error", "Owned process identity remains unresolved")
                   if process is not None:
                       result["rc"] = process.returncode
                   try:
