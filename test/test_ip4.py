@@ -437,6 +437,91 @@ class TestIPv4IfAddrRoute(VppTestCase):
         self.assertFalse(find_route(self, "10.10.10.255", 32))
         self.assertFalse(find_route(self, "10.10.10.0", 32))
 
+    def _fib_pool_counts(self):
+        counts = {}
+        for line in self.vapi.cli("show fib memory").splitlines():
+            fields = line.split()
+            if fields and fields[0] in ("Entry", "Path", "Path-list"):
+                if fields[0] == "Entry" and not fields[1].isdigit():
+                    continue
+                counts[fields[0]] = int(fields[2])
+        self.assertEqual(set(counts), {"Entry", "Path", "Path-list"})
+        return counts
+
+    def _assert_local_export(self, address):
+        self.assertTrue(find_route(self, address.addr, 32, table_id=11))
+        detail = self.vapi.cli(f"show ip fib table 11 {address.addr}/32 detail")
+        self.assertIn("attached_export", detail)
+        self.assertIn("receive", detail)
+
+    def _test_ipv4_local_export_withdraw(self, remove_index):
+        original_prefixes = {
+            str(entry.route.prefix) for entry in self.vapi.ip_route_dump(0)
+        }
+        original_pools = self._fib_pool_counts()
+        table = VppIpTable(self, 11).add_vpp_config()
+        table_prefixes = {str(entry.route.prefix) for entry in table.dump()}
+        addresses = [
+            VppIpInterfaceAddress(self, self.pg0, "10.10.10.1", 24),
+            VppIpInterfaceAddress(self, self.pg0, "10.10.10.2", 24),
+        ]
+        for address in addresses:
+            address.add_vpp_config()
+        importer = VppIpRoute(
+            self,
+            "10.10.10.0",
+            24,
+            [VppRoutePath("0.0.0.0", self.pg0.sw_if_index)],
+            table_id=11,
+        ).add_vpp_config()
+        for address in addresses:
+            self._assert_local_export(address)
+        configured_pools = self._fib_pool_counts()
+        removed = addresses[remove_index]
+        retained = addresses[1 - remove_index]
+
+        for _ in range(2):
+            removed.remove_vpp_config()
+            self.assertFalse(removed.query_vpp_config())
+            self.assertFalse(find_route(self, removed.addr, 32))
+            self.assertFalse(find_route(self, removed.addr, 32, table_id=11))
+            self.assertTrue(retained.query_vpp_config())
+            self._assert_local_export(retained)
+            self.assertTrue(find_route(self, "10.10.10.0", 24))
+            self.assertTrue(importer.query_vpp_config())
+
+            removed.add_vpp_config()
+            self.assertTrue(removed.query_vpp_config())
+            for address in addresses:
+                self._assert_local_export(address)
+            self.assertEqual(self._fib_pool_counts(), configured_pools)
+
+        for address in addresses:
+            address.remove_vpp_config()
+            self.assertFalse(find_route(self, address.addr, 32))
+            self.assertFalse(find_route(self, address.addr, 32, table_id=11))
+        self.assertFalse(find_route(self, "10.10.10.0", 24))
+        self.assertTrue(importer.query_vpp_config())
+        importer.remove_vpp_config()
+        self.assertEqual(
+            {str(entry.route.prefix) for entry in table.dump()}, table_prefixes
+        )
+        table.remove_vpp_config()
+        self.assertFalse(table.query_vpp_config())
+        self.assertEqual(
+            {str(entry.route.prefix) for entry in self.vapi.ip_route_dump(0)},
+            original_prefixes,
+        )
+        self.assertEqual(self._fib_pool_counts(), original_pools)
+
+    def test_ipv4_local_export_withdraw_glean(self):
+        """Withdraw an imported local route providing the connected glean"""
+        self._test_ipv4_local_export_withdraw(0)
+
+    def test_ipv4_local_export_withdraw_non_glean(self):
+        """Withdraw an imported local route not providing the connected glean"""
+        self._test_ipv4_local_export_withdraw(1)
+
     def test_ipv4_ifaddr_route(self):
         """IPv4 Interface Address Route test
 
