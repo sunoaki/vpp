@@ -477,6 +477,9 @@ jobs:
           ip netns add "${namespace}"
           ip netns exec "${namespace}" ip link set lo up
           ip netns exec "${namespace}" ip link show lo
+          ip netns exec "${namespace}" cat /proc/net/netlink
+          ip netns exec "${namespace}" sh -c \
+            'test -r /proc/self/fdinfo/0 && test -d /proc/self/fd'
           # VPP's TAP backend opens both devices when it creates an LCP pair.
           mkdir -p /dev/net
           if [ ! -e /dev/net/tun ]; then
@@ -546,6 +549,15 @@ jobs:
           git config --global --add safe.directory "$PWD"
           set -eu
           suites=(${{ steps.tests.outputs.suites }})
+          for suite in "${suites[@]}"; do
+            if [ "${suite}" = linux_cp ]; then
+              for companion in linux_cp_lifecycle linux_cp_netlink; do
+                if [ -f "test/test_${companion}.py" ]; then
+                  suites+=("${companion}")
+                fi
+              done
+            fi
+          done
           if [ '${{ steps.tests.outputs.tunnel_regression }}' = true ]; then
             case " ${suites[*]} " in
               *' ipsec_esp '*) ;;
@@ -554,9 +566,36 @@ jobs:
           fi
           for suite in "${suites[@]}"; do
             echo "Running TEST=${suite}"
-            if [ "${suite}" = linux_cp ]; then
-              recovery_log=/tmp/vpp-unittest-TestLinuxCPNetlinkRecovery/log.txt
-              rm -f "${recovery_log}"
+            required_class=""
+            required_methods=()
+            case "${suite}" in
+              linux_cp)
+                required_class=TestLinuxCPNetlinkRecovery
+                required_methods=(test_netlink_poll_error_recovery
+                                  test_netlink_poll_error_invalid_fd)
+                ;;
+              linux_cp_lifecycle)
+                required_class=TestLinuxCPLifecycle
+                required_methods=(test_default_namespace_resources
+                                  test_default_namespace_failure
+                                  test_pair_replace_resend
+                                  test_pair_flags_pool_reuse
+                                  test_vlan_resources)
+                ;;
+              linux_cp_netlink)
+                required_class=TestLinuxCPNetlinkSocketOwnership
+                required_methods=(test_pair_add_during_netlink_recovery)
+                ;;
+              ipsec_esp)
+                if [ '${{ steps.tests.outputs.tunnel_regression }}' = true ]; then
+                  required_class=TestIpsecEspTun
+                  required_methods=(test_tun_df44)
+                fi
+                ;;
+            esac
+            if [ -n "${required_class}" ]; then
+              result_log="/tmp/vpp-unittest-${required_class}/log.txt"
+              rm -f "${result_log}"
             fi
             if [ "${suite}" = ipsec_esp ] && [ '${{ needs.test-plan.outputs.tunnel_control }}' = true ]; then
               rm -f /tmp/vpp-unittest-TestIpsecEspTun/log.txt
@@ -583,28 +622,32 @@ jobs:
             else
               make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST="${suite}" test-debug
             fi
-            if [ "${suite}" = linux_cp ]; then
-              python3 - "${recovery_log}" <<'PY'
+            if [ -n "${required_class}" ]; then
+              python3 - "${result_log}" "${required_class}" "${required_methods[@]}" <<'PY'
           import re
           import sys
           from pathlib import Path
 
-          path = Path(sys.argv[1])
-          if not path.is_file():
-              sys.exit(f"::error::Missing recovery test results: {path}")
-          results = {}
-          # VppTestResult.log_result records the callback and exact test name.
-          pattern = (r" --- (add\w+)\(\) TestLinuxCPNetlinkRecovery\."
-                     r"(\w+)\(")
-          for callback, method in re.findall(pattern, path.read_text()):
-              results.setdefault(method, []).append(callback)
-          for method in ("test_netlink_poll_error_recovery",
-                         "test_netlink_poll_error_invalid_fd"):
-              callbacks = results.get(method, [])
-              if callbacks != ["addSuccess"]:
-                  sys.exit(f"::error::{method}: expected addSuccess, "
-                           f"got {callbacks}; see {path}")
-              print(f"Verified {method}: addSuccess")
+          def verify_results(path, test_class, methods):
+              if not path.is_file():
+                  sys.exit(f"::error::Missing required test results: {path}")
+              results = {}
+              # VppTestResult.log_result records the callback and exact test name.
+              pattern = (r" --- (add\w+)\(\) " + re.escape(test_class) + r"\.(\w+)\(")
+              for callback, method in re.findall(pattern, path.read_text()):
+                  results.setdefault(method, []).append(callback)
+              for method in methods:
+                  callbacks = results.get(method, [])
+                  if callbacks != ["addSuccess"]:
+                      sys.exit(f"::error::{test_class}.{method}: expected addSuccess, "
+                               f"got {callbacks}; see {path}")
+                  print(f"Verified {test_class}.{method}: addSuccess")
+
+          verify_results(Path(sys.argv[1]), sys.argv[2], sys.argv[3:])
+          if sys.argv[2] == "TestLinuxCPLifecycle":
+              namespace_class = "TestLinuxCPNamespaceOwnership"
+              verify_results(Path(f"/tmp/vpp-unittest-{namespace_class}/log.txt"),
+                             namespace_class, ("test_equal_ifindex_namespace_delete",))
           PY
             fi
             # A later make test-debug resets /tmp/vpp-unittest-* and FAILED_DIR.
@@ -614,7 +657,8 @@ jobs:
           import sys
 
           failed = Path("/tmp/vpp-failed-unittests")
-          history = Path(os.environ["RUNNER_TEMP"]) / "vpp-test-history" / sys.argv[1]
+          history = (Path("/tmp") / ("vpp-ci-test-history-" + os.environ["GITHUB_RUN_ID"]
+                                    + "-" + os.environ["GITHUB_RUN_ATTEMPT"])) / sys.argv[1]
           if failed.is_dir() and not failed.is_symlink():
               for link in sorted(failed.iterdir()):
                   if not link.is_symlink():
@@ -773,7 +817,8 @@ jobs:
                       report.append(f"LINK {link} -> {target}")
                       failed_names.add(Path(target).name)
           test_dirs.sort(key=lambda path: (path.name not in failed_names, path.name))
-          history = Path(os.environ["RUNNER_TEMP"]) / "vpp-test-history"
+          history = (Path("/tmp") / ("vpp-ci-test-history-" + os.environ["GITHUB_RUN_ID"]
+                                    + "-" + os.environ["GITHUB_RUN_ATTEMPT"]))
           roots = [failed, *test_dirs, history, Path("build-root/test-logs").absolute()]
           candidates = []
           for root in roots:
