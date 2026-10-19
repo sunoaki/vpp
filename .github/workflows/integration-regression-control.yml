@@ -516,6 +516,55 @@ jobs:
                   self.handles = {}
                   self.observed = []
                   self.unresolved = set()
+                  self.acquisitions = {}
+                  self.self_birth = Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]
+
+              def candidate(self, pid, identity, table):
+                  key = (pid, identity[1])
+                  if key not in self.acquisitions:
+                      require(len(self.acquisitions) < 20000, "Acquisition evidence capacity exceeded")
+                      self.acquisitions[key] = dict(pid=pid, birth=identity[1], parent=identity[0],
+                          parent_birth=self.self_birth if identity[0] == os.getpid() else table[identity[0]][1],
+                          state=identity[2], status="pending", bind_attempts=0, absence_checks=0,
+                          reused=False, first_seen=time.monotonic())
+                  self.unresolved.add(key)
+
+              def acquisition(self, key, **values):
+                  if key in self.acquisitions:
+                      self.acquisitions[key].update(values, updated=time.monotonic())
+
+              def reconcile(self, table):
+                  for key in list(self.unresolved):
+                      pid, birth = key
+                      record = self.acquisitions[key]
+                      if record["reused"]:
+                          continue
+                      current = table.get(pid)
+                      if current is not None:
+                          record["absence_checks"] = 0
+                          self.acquisition(key, last_identity=current, state=current[2],
+                                           reused=current[1] != birth, reason="snapshot_present")
+                          continue
+                      directory = None
+                      try:
+                          directory = os.open(f"/proc/{pid}", os.O_RDONLY | os.O_DIRECTORY)
+                          current = self.identity(directory)
+                          self.acquisition(key, last_identity=current, state=current[2],
+                                           absence_checks=0, reused=current[1] != birth,
+                                           reason="direct_probe_present")
+                      except (FileNotFoundError, ProcessLookupError) as error:
+                          record["absence_checks"] += 1
+                          self.acquisition(key, reason="direct_probe_absent", absence_errno=error.errno,
+                                           absence_time=time.monotonic())
+                          if record["absence_checks"] >= 2:
+                              self.acquisition(key, status="vanished")
+                              self.unresolved.discard(key)
+                      except (OSError, ValueError, IndexError, UnicodeError) as error:
+                          self.acquisition(key, reason="direct_probe_uncertain", absence_checks=0,
+                                           probe_error=type(error).__name__, probe_errno=getattr(error, "errno", None))
+                      finally:
+                          if directory is not None:
+                              os.close(directory)
 
               @staticmethod
               def identity(directory):
@@ -535,33 +584,53 @@ jobs:
 
               def bind(self, pid, expected):
                   directory = descriptor = None
+                  key = (pid, expected[1])
+                  record = self.acquisitions.get(key)
+                  if record is not None:
+                      record["bind_attempts"] += 1
+                  stage = "open_proc"
                   try:
                       directory = os.open(f"/proc/{pid}", os.O_RDONLY | os.O_DIRECTORY)
                       before = self.identity(directory)
+                      self.acquisition(key, last_identity=before, state=before[2])
                       if before[:2] != expected[:2]:
+                          self.acquisition(key, reason="initial_identity_changed", reused=before[1] != expected[1])
                           return False
+                      stage = "open_pidfd"
                       descriptor = os.pidfd_open(pid)
+                      stage = "verify_identity"
                       after = self.identity(directory)
                       if after[:2] != before[:2]:
+                          self.acquisition(key, reason="binding_identity_changed", reused=after[1] != expected[1])
                           return False
                       parent = before[0]
                       ancestors = [(key, handle) for key, handle in self.handles.items() if key[0] == parent]
+                      stage = "verify_ancestor"
                       owned = parent == os.getpid() or any(
                           not self.exited(handle) and self.identity(handle[0])[1] == key[1]
                           for key, handle in ancestors)
-                      if not owned or self.identity(directory)[:2] != before[:2]:
+                      if not owned:
+                          self.acquisition(key, reason="ancestor_unverified")
+                          return False
+                      if self.identity(directory)[:2] != before[:2]:
+                          self.acquisition(key, reason="final_identity_changed", reused=True)
                           return False
                       if parent != os.getpid() and not any(not self.exited(handle) for _, handle in ancestors):
+                          self.acquisition(key, reason="ancestor_exited")
                           return False
-                      key = (pid, before[1])
                       if key not in self.handles:
                           self.handles[key] = (directory, descriptor)
                           self.observed.append(dict(pid=pid, birth=before[1], parent=parent))
                           directory = descriptor = None
+                      self.acquisition(key, status="bound", reason="pidfd_bound", pidfd_bound=True)
                       return True
-                  except (ProcessLookupError, FileNotFoundError):
+                  except OSError as error:
+                      self.acquisition(key, reason="bind_oserror", bind_stage=stage,
+                                       bind_error=type(error).__name__, bind_errno=error.errno)
                       return False
                   finally:
+                      if record is not None:
+                          self.acquisition(key, bind_reason=record.get("reason"), bind_stage=stage)
                       for fd in (directory, descriptor):
                           if fd is not None:
                               os.close(fd)
@@ -590,18 +659,20 @@ jobs:
                               self.unresolved.discard(key)
                               continue
                           if self.attributable(identity, table):
-                              self.unresolved.add(key)
+                              self.candidate(pid, identity, table)
                           if self.bind(pid, identity):
                               self.unresolved.discard(key)
+                      self.reconcile(table)
                       if len(self.handles) == count:
                           break
 
               def signal(self, sig):
-                  for handle in self.handles.values():
+                  for key, handle in self.handles.items():
                       try:
                           signal.pidfd_send_signal(handle[1], sig)
+                          self.acquisition(key, last_signal=int(sig), signal_result="sent")
                       except ProcessLookupError:
-                          pass
+                          self.acquisition(key, last_signal=int(sig), signal_result="already_exited")
 
               def cleanup(self, root):
                   try:
@@ -610,23 +681,28 @@ jobs:
                           while time.monotonic() < stop:
                               self.discover()
                               self.signal(sig)
-                              for (pid, _), handle in self.handles.items():
-                                  if pid == root:
+                              for key, handle in self.handles.items():
+                                  if key[0] == root:
                                       continue
                                   try:
-                                      os.waitid(os.P_PIDFD, handle[1], os.WEXITED | os.WNOHANG)
+                                      reaped = os.waitid(os.P_PIDFD, handle[1], os.WEXITED | os.WNOHANG)
+                                      self.acquisition(key, reap_result="reaped" if reaped else "not_ready",
+                                                       reap_status=reaped.si_status if reaped else None)
                                   except ChildProcessError:
-                                      pass
+                                      self.acquisition(key, reap_result="not_child_or_already_reaped")
                               if all(self.exited(handle) for handle in self.handles.values()):
                                   self.discover()
-                                  if all(self.exited(handle) for handle in self.handles.values()):
-                                      return not self.unresolved
+                                  if all(self.exited(handle) for handle in self.handles.values()) and not self.unresolved:
+                                      return True
                               time.sleep(0.03)
                       return False
                   finally:
-                      for handle in self.handles.values():
-                          for fd in handle:
-                              os.close(fd)
+                      for key, handle in self.handles.items():
+                          try:
+                              self.acquisition(key, pidfd_exited=self.exited(handle))
+                          finally:
+                              for fd in handle:
+                                  os.close(fd)
 
           def work_deadline():
               return min(float(os.environ["WORK_DEADLINE"]),
@@ -649,7 +725,10 @@ jobs:
                   process = subprocess.Popen(args, env=environment, stdout=subprocess.PIPE,
                                              stderr=subprocess.STDOUT, start_new_session=True)
                   result["pid"] = process.pid
-                  require(owned.bind(process.pid, processes()[process.pid]), "Root identity unavailable")
+                  table = processes()
+                  owned.candidate(process.pid, table[process.pid], table)
+                  require(owned.bind(process.pid, table[process.pid]), "Root identity unavailable")
+                  owned.unresolved.discard((process.pid, table[process.pid][1]))
                   root = next(handle for key, handle in owned.handles.items() if key[0] == process.pid)
                   deadline = time.monotonic() + seconds
                   os.set_blocking(process.stdout.fileno(), False)
@@ -704,7 +783,8 @@ jobs:
                       if not result["cleanup_complete"]:
                           result.update(status="cleanup_incomplete", supervisor_rc=125)
                   result.update(end=time.time(), console_bytes=len(tail), infrastructure=records,
-                                observed_processes=owned.observed, unresolved_processes=sorted(owned.unresolved))
+                                observed_processes=owned.observed, unresolved_processes=sorted(owned.unresolved),
+                                acquisition_evidence=list(owned.acquisitions.values()))
                   publish(target, result)
                   if result.get("cleanup_complete") is False:
                       raise SystemExit(125)
@@ -1087,6 +1167,7 @@ jobs:
               observer_fixtures()
               process_fixtures()
               scheduling_fixtures()
+              acquisition_fixtures()
               first_failure_fixtures()
               observation_fixtures()
               deadline_fixtures()
@@ -1228,36 +1309,44 @@ jobs:
                       pass
               require(json.loads(path.read_text()) == original, "Interrupted publication damaged prior result")
               try:
-                  with patch.dict(os.environ, WORK_DEADLINE=str(time.time() + 120),
-                                  STEP_DEADLINE=str(time.time() + 10.3)):
-                      command("fixture-step-first", [sys.executable, "-c", "import time; time.sleep(0.08)"], limit=30)
+                  with patch.dict(os.environ, WORK_DEADLINE="500", STEP_DEADLINE="130"), \
+                       patch.object(time, "time", return_value=100) as clock:
+                      command("fixture-step-first", [sys.executable, "-c", "pass"], limit=30)
+                      clock.return_value = 119.9
                       try:
-                          command("fixture-step-second", [sys.executable, "-c", "import time; time.sleep(2)"], limit=30)
-                      except AssertionError:
+                          command("fixture-step-second", [sys.executable, "-c", "import time; time.sleep(20)"], limit=30)
+                      except AssertionError as error:
+                          require(str(error) == "Command deadline exhausted", "Unrelated command fixture failure")
                           result = json.loads((OUT / "fixture-step-second/result.json").read_text())
                           require(result["cleanup_complete"] and result["rc"] is None and
-                                  result["allowed_seconds"] < 0.3 and result["deadline"] == float(os.environ["STEP_DEADLINE"]),
+                                  0 < result["allowed_seconds"] < 0.11 and result["deadline"] == 130,
                                   "Second command reset step budget or lost cleanup/raw exit")
                       else:
                           raise AssertionError("Sequential command exceeded shared step deadline")
-                  with patch.dict(os.environ, WORK_DEADLINE=str(time.time() + 120), STEP_DEADLINE=str(time.time() + 0.05)), \
-                       patch.dict(globals(), binaries=lambda: time.sleep(0.5)):
-                      try:
-                          phase("binaries", [])
-                      except TimeoutError:
-                          pass
-                      else:
-                          raise AssertionError("Postprocessing exceeded external step budget")
-                  os.environ["WORK_DEADLINE"] = str(time.time() + 0.05)
-                  with patch.dict(globals(), binaries=lambda: time.sleep(0.5)):
-                      try:
-                          phase("binaries", [])
-                      except TimeoutError:
-                          pass
-                      else:
-                          raise AssertionError("Postprocessing exceeded phase deadline")
-                  value = json.loads((OUT / "phase-binaries.json").read_text())
-                  require(value["status"] == "FAIL" and value["rc"] is None, "Deadline invented successful phase/exit status")
+                  for limiting in ("WORK_DEADLINE", "STEP_DEADLINE"):
+                      for expired_before_arm in (True, False):
+                          environment = dict(WORK_DEADLINE="500", STEP_DEADLINE="500")
+                          environment[limiting] = "99" if expired_before_arm else "105"
+                          entered = []
+                          def body():
+                              entered.append(True)
+                              signal.raise_signal(signal.SIGALRM)
+                          with patch.dict(os.environ, **environment), patch.object(time, "time", return_value=100), \
+                               patch.object(signal, "setitimer") as arm, patch.dict(globals(), binaries=body):
+                              try:
+                                  phase("binaries", [])
+                              except (AssertionError, TimeoutError) as error:
+                                  expected = "Shared phase deadline exhausted" if expired_before_arm else "Phase work deadline exhausted, including postprocessing"
+                                  require(type(error) is (AssertionError if expired_before_arm else TimeoutError) and
+                                          str(error) == expected, "Wrong deterministic expiration branch")
+                              else:
+                                  raise AssertionError("Phase accepted deterministic expiration")
+                              require(entered == ([] if expired_before_arm else [True]), "Wrong phase body entry")
+                              require(arm.call_args_list == ([((signal.ITIMER_REAL, 0),)] if expired_before_arm else
+                                      [((signal.ITIMER_REAL, 5.0),), ((signal.ITIMER_REAL, 0),)]), "Wrong phase timer budget")
+                          value = json.loads(phase_path.read_text())
+                          require(value["status"] == "FAIL" and value["rc"] is None and value["error"] == expected,
+                                  "Deadline invented successful phase/exit status")
               finally:
                   os.environ["WORK_DEADLINE"] = previous
                   if prior_phase is None:
@@ -1373,6 +1462,29 @@ jobs:
                           any(value["path"] == "phase-z.json" and value["status"] == "running" for value in values), "Malformed shape aborted later phase observations")
                   require(json.loads((root / "phase-finalize.json").read_text())["status"] == "FAIL" and
                           all((root / name).read_text() == data for name, data in raw.items()), "Finalization invented PASS or altered malformed raw records")
+                  def indexed():
+                      index = json.loads((root / "evidence-index.json").read_text())
+                      require("evidence-index.json" not in index, "Index includes stale self snapshot")
+                      for name in ("phase-finalize.json", "phase-observations.json"):
+                          data = (root / name).read_bytes()
+                          require(index[name] == dict(bytes=len(data), sha256=sha(data)), "Index does not bind terminal evidence")
+                  indexed()
+                  for name in raw:
+                      (root / name).unlink()
+                  with patch.dict(globals(), OUT=root, finalize=lambda: None):
+                      phase("finalize", [])
+                  indexed()
+                  require(json.loads((root / "phase-finalize.json").read_text())["status"] == "PASS", "Valid finalization failed")
+                  with patch.dict(globals(), OUT=root, finalize=lambda: None,
+                                  evidence_index=lambda: (_ for _ in ()).throw(OSError("index publication failed"))):
+                      try:
+                          phase("finalize", [])
+                      except OSError as error:
+                          require(str(error) == "index publication failed", "Unexpected publication failure")
+                      else:
+                          raise AssertionError("Index failure published finalization success")
+                  require(not (root / "evidence-index.json").exists() and
+                          json.loads((root / "phase-finalize.json").read_text())["status"] == "FAIL", "Stale index survived failed finalization")
 
           def scheduling_fixtures():
               from unittest.mock import patch
@@ -1407,12 +1519,76 @@ jobs:
                    patch.object(owner, "signal"), patch.object(os, "close"), patch.object(os, "waitid"):
                   require(not owner.cleanup(9) and (7, "22") in owner.unresolved, "Unbound owned child falsely cleaned")
 
+          def acquisition_fixtures():
+              from unittest.mock import patch
+              owner = OwnedProcesses()
+              owner.handles[(9, "root-birth")] = (90, 91)
+              table = {7: (os.getpid(), "short-child", "S")}
+              def vanished(*args, **kwargs):
+                  table.clear()
+                  raise FileNotFoundError(2, "descendant vanished")
+              with patch.dict(globals(), processes=lambda: dict(table)), \
+                   patch.object(os, "open", side_effect=vanished), patch.object(os, "close"), \
+                   patch.object(os, "waitid"), patch.object(owner, "exited", return_value=True), \
+                   patch.object(signal, "pidfd_send_signal"), \
+                   patch.object(os, "kill", side_effect=AssertionError("Numeric signal forbidden")), \
+                   patch.object(os, "killpg", side_effect=AssertionError("Group signal forbidden")):
+                  owner.discover()
+                  require((7, "short-child") in owner.unresolved, "Single snapshot cleared candidate")
+                  require(owner.cleanup(9) and not owner.unresolved, "Verified disappearance stayed unresolved")
+              record = owner.acquisitions[(7, "short-child")]
+              require(record["status"] == "vanished" and record["absence_checks"] >= 2 and
+                      record["bind_error"] == "FileNotFoundError" and record["parent_birth"] == owner.self_birth,
+                      "Disappearance lacks acquisition/parent/absence evidence")
+              for mode in ("live", "uncertain", "reuse"):
+                  owner = OwnedProcesses()
+                  identity = (os.getpid(), "candidate", "S")
+                  owner.candidate(7, identity, {7: identity})
+                  if mode == "live":
+                      table = {7: identity}
+                  elif mode == "reuse":
+                      table = {7: (os.getpid(), "replacement", "R")}
+                  else:
+                      table = {}
+                  with patch.object(os, "open", side_effect=PermissionError(13, "uncertain")):
+                      owner.reconcile(table)
+                  with patch.object(os, "open", side_effect=FileNotFoundError(2, "later absent")):
+                      if mode == "reuse":
+                          owner.reconcile({})
+                          owner.reconcile({})
+                  owner.handles[(9, "root-birth")] = (90, 91)
+                  with patch.dict(globals(), processes=lambda: dict(table)), \
+                       patch.object(os, "open", side_effect=PermissionError(13, "uncertain")), \
+                       patch.object(owner, "bind", return_value=False), patch.object(owner, "signal"), \
+                       patch.object(owner, "exited", return_value=True), patch.object(os, "close"), \
+                       patch.object(os, "waitid"), patch.object(time, "sleep"), \
+                       patch.object(time, "monotonic", side_effect=iter(range(30))):
+                      require(not owner.cleanup(9), f"Unsafe acquisition cleanup accepted: {mode}")
+                  require((7, "candidate") in owner.unresolved and
+                          owner.acquisitions[(7, "candidate")]["status"] == "pending",
+                          f"Unsafe acquisition accepted: {mode}")
+              for error in (ValueError("malformed stat"), IndexError("short stat")):
+                  owner = OwnedProcesses()
+                  identity = (os.getpid(), "candidate", "S")
+                  owner.candidate(7, identity, {7: identity})
+                  with patch.object(os, "open", return_value=70), patch.object(os, "close"), \
+                       patch.object(owner, "identity", side_effect=error):
+                      owner.reconcile({})
+                  require((7, "candidate") in owner.unresolved and
+                          owner.acquisitions[(7, "candidate")]["reason"] == "direct_probe_uncertain",
+                          "Malformed identity became verified disappearance")
+              save("acquisition-fixtures.json", dict(status="PASS", vanished=True,
+                   rejected=["live", "uncertain", "reuse", "malformed"], signals="mocked pidfd only"))
+
           def finalize():
               diagnostics(OUT / "final-diagnostics")
               for path in TOOLS.glob("*.py"):
                   (OUT / path.name).write_bytes(path.read_bytes())
+
+          def evidence_index():
               save("evidence-index.json", {str(p.relative_to(OUT)): dict(bytes=p.stat().st_size, sha256=sha(p.read_bytes()))
-                                          for p in OUT.rglob("*") if p.is_file() and not p.is_symlink()})
+                                          for p in OUT.rglob("*") if p.is_file() and not p.is_symlink() and
+                                          p.name != "evidence-index.json" and not p.name.endswith(".pending")})
 
           def phase_observations():
               observations = []
@@ -1461,10 +1637,20 @@ jobs:
                   status.update(status="FAIL", error=str(error))
                   raise
               finally:
-                  signal.setitimer(signal.ITIMER_REAL, 0)
-                  signal.signal(signal.SIGALRM, previous)
-                  status["end"] = time.time()
-                  save(f"phase-{action}.json", status)
+                  try:
+                      status["end"] = time.time()
+                      save(f"phase-{action}.json", status)
+                      if action == "finalize":
+                          evidence_index()
+                  except BaseException as error:
+                      if action == "finalize":
+                          (OUT / "evidence-index.json").unlink(missing_ok=True)
+                          status.update(status="FAIL", error=str(error), end=time.time())
+                          save("phase-finalize.json", status)
+                      raise
+                  finally:
+                      signal.setitimer(signal.ITIMER_REAL, 0)
+                      signal.signal(signal.SIGALRM, previous)
 
           if __name__ == "__main__":
               phase(sys.argv[1], sys.argv[2:])
@@ -1637,7 +1823,8 @@ jobs:
                   callback = json.loads((directory / 'runtime/callbacks.json').read_text())
                   assert callback['complete'] and callback['sources'] and callback['event_sources']
                   index = json.loads((directory / 'evidence-index.json').read_text())
-                  for path in ['manifest.json', 'acceptance.json', 'runtime/callbacks.json', 'runtime/result.json']:
+                  for path in ['manifest.json', 'acceptance.json', 'runtime/callbacks.json', 'runtime/result.json',
+                               'phase-finalize.json', 'phase-observations.json']:
                       data = (directory / path).read_bytes()
                       assert index[path] == dict(bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
                   for source in callback['event_sources']:
