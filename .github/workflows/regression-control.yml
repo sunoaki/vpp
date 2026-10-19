@@ -258,7 +258,7 @@ jobs:
                           "Fixed run has a subtest failure")
                   require(not re.search(r"\bFAIL:[0-9]+:", logs), "C assertion failed")
               else:
-                  require(rc != 0, "Restored source unexpectedly passed")
+                  require(rc == 2, f"Expected make test-failure exit status 2, got {rc}")
                   require(re.search(r"FAILED \(failures=[1-9][0-9]*\)", console),
                           "Expected completed assertion-only failure summary")
                   require(not actual, "Restored exact method unexpectedly succeeded")
