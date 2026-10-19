@@ -8,6 +8,7 @@ import http.client
 import io
 import json
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -26,7 +27,7 @@ CLI = next(
 
 def helper(name):
     node = next(node for node in CLI.body if getattr(node, "name", None) == name)
-    namespace = {"subprocess": subprocess, "sys": sys}
+    namespace = {"subprocess": subprocess, "sys": sys, "re": re}
     exec(
         compile(ast.Module(body=[node], type_ignores=[]), "hss-helper", "exec"),
         namespace,
@@ -234,6 +235,199 @@ class TestClientWitnesses(unittest.TestCase):
         self.assertIn(message, traceback)
         self.assertEqual(case._client.call_count, 7)
         self.assertEqual(case._refused.call_count, 6)
+
+
+class TestLifecycleObservations(unittest.TestCase):
+    def test_diagnostic_parsers_preserve_resource_identity(self):
+        listeners = (
+            "listener 2, uri 10.10.1.2:8080, www-root , cache-size 10m url-handlers 1 retiring 1\n"
+            "listener 3, uri 10.10.1.2:8080, www-root /tmp, cache-size 10m url-handlers 0 retiring 0\n"
+        )
+        self.vapi = types.SimpleNamespace(
+            cli=unittest.mock.Mock(return_value=listeners)
+        )
+        self.assertEqual(helper("_listener_states")(self), ({2: 1, 3: 0}, listeners))
+        apps = (
+            f"{5:<10}{'http_static_server_9':<20}{'default':<40}\n"
+            f"{7:<10}{'http_static_server_10':<20}{'default':<40}\n"
+        )
+        self.vapi.cli.return_value = apps
+        self.assertEqual(
+            helper("_hss_apps")(self),
+            ({("5", "http_static_server_9"), ("7", "http_static_server_10")}, apps),
+        )
+
+    def test_destroy_observer_rejects_each_retained_resource(self):
+        old_app = ("5", "http_static_server_9")
+        new_app = ("7", "http_static_server_10")
+        method = helper("_wait_destroyed")
+        clock = types.SimpleNamespace(
+            monotonic=unittest.mock.Mock(side_effect=[0, 11]),
+            sleep=unittest.mock.Mock(),
+        )
+        method.__globals__["time"] = clock
+        self._hss_apps = unittest.mock.Mock(return_value=({new_app}, "new app"))
+        self._listener_states = unittest.mock.Mock(
+            return_value=({3: 0}, "new listener")
+        )
+        self.vapi = types.SimpleNamespace(cli=unittest.mock.Mock(return_value=""))
+        method(self, old_app)
+        for resource in ("app", "listener", "session"):
+            with self.subTest(resource=resource):
+                clock.monotonic.side_effect = [0, 11]
+                self._hss_apps.return_value = ({new_app}, "new app")
+                self._listener_states.return_value = ({3: 0}, "new listener")
+                self.vapi.cli.return_value = ""
+                if resource == "app":
+                    self._hss_apps.return_value = (
+                        {old_app, new_app},
+                        "old app retained",
+                    )
+                elif resource == "listener":
+                    self._listener_states.return_value = (
+                        {2: 1, 3: 0},
+                        "old listener retained",
+                    )
+                else:
+                    self.vapi.cli.return_value = "path /tmp/large.txt retained"
+                with self.assertRaisesRegex(AssertionError, "retained"):
+                    method(self, old_app)
+        clock.sleep.assert_not_called()
+
+    def test_delete_reuse_requires_old_listener_before_next_request(self):
+        method = helper("test_http_static_listener_delete_reuse")
+        for retired in ({4: 1}, {}):
+            with self.subTest(retired=retired):
+                case_type = type(
+                    "RetirementFixture", (unittest.TestCase,), {method.__name__: method}
+                )
+                case = case_type(method.__name__)
+                case.vapi = types.SimpleNamespace(cli=unittest.mock.Mock())
+                case._listener_states = unittest.mock.Mock(
+                    side_effect=[
+                        ({4: 0}, "active"),
+                        (retired, "after deletion"),
+                        ({4: 1, 5: 0}, "after readd"),
+                    ]
+                )
+                case._client = unittest.mock.Mock(return_value=object())
+                case._response = unittest.mock.Mock(
+                    side_effect=[
+                        {"status": 200, "body": "original"},
+                        {"body": "original"},
+                        {"body": "original"},
+                        {"status": 404},
+                    ]
+                )
+                case._refused = unittest.mock.Mock()
+                case._stop_client = unittest.mock.Mock()
+                case._wait_listener_gone = unittest.mock.Mock()
+                case._wait_released = unittest.mock.Mock()
+                result = unittest.TestResult()
+                case.run(result)
+                self.assertEqual(result.errors, [])
+                self.assertEqual(len(result.failures), 0 if retired else 1)
+                self.assertEqual(case._response.call_count, 4 if retired else 1)
+                if retired:
+                    case._wait_listener_gone.assert_called_once_with(4)
+                else:
+                    self.assertIn("after deletion", result.failures[0][1])
+                    case._refused.assert_not_called()
+
+    def test_cached_listener_distinguishes_disk_replacement(self):
+        import os
+        import tempfile
+
+        method = helper("test_http_static_cached_listener_retirement")
+        method.__globals__.update(os=os, tempfile=tempfile)
+        case_type = type(
+            "CacheFixture", (unittest.TestCase,), {method.__name__: method}
+        )
+        case = case_type(method.__name__)
+        files = []
+
+        def cli(command):
+            if "listener add" in command:
+                files.append(
+                    Path(command.split("www-root ")[1].split()[0]) / "file.txt"
+                )
+                expected = (
+                    "original listener" if len(files) == 1 else "replacement listener"
+                )
+                self.assertEqual(files[-1].read_text(), expected)
+
+        case.vapi = types.SimpleNamespace(cli=unittest.mock.Mock(side_effect=cli))
+        case._client = unittest.mock.Mock(return_value=object())
+        case._response = unittest.mock.Mock(
+            side_effect=[
+                {"body": "original listener"},
+                {"body": "original listener", "cache": "max-age=123"},
+                {"body": "replacement listener", "cache": "max-age=456"},
+            ]
+        )
+        case._listener_states = unittest.mock.Mock(
+            side_effect=[({4: 0}, "active"), ({4: 1}, "retired")]
+        )
+        case._stop_client = unittest.mock.Mock()
+        case._wait_released = unittest.mock.Mock()
+        result = unittest.TestResult()
+        case.run(result)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.failures, [])
+        self.assertEqual(len(files), 2)
+
+    def test_destroy_observation_precedes_new_client_and_old_drain(self):
+        import os
+        import tempfile
+
+        method = helper("test_http_static_destroy_ownership")
+        method.__globals__.update(os=os, tempfile=tempfile)
+        case_type = type(
+            "DestroyFixture", (unittest.TestCase,), {method.__name__: method}
+        )
+        case = case_type(method.__name__)
+        calls = unittest.mock.Mock()
+        calls.cli.return_value = ""
+        calls.client.side_effect = range(6)
+        calls.response.side_effect = [
+            response
+            for _ in range(3)
+            for response in (
+                {"status": 200},
+                {"status": 200},
+                {"closed": "IncompleteRead"},
+            )
+        ]
+        case.vapi = types.SimpleNamespace(cli=calls.cli)
+        case._client = calls.client
+        case._response = calls.response
+        case._hss_apps = unittest.mock.Mock(
+            side_effect=[
+                ({(str(index), f"http_static_server_{index}")}, "old app")
+                for index in range(3)
+            ]
+        )
+        case._wait_destroyed = calls.observe
+        case._assert_closed = helper("_assert_closed").__get__(case)
+        case._stop_client = calls.stop
+        case._wait_released = unittest.mock.Mock()
+        result = unittest.TestResult()
+        case.run(result)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.failures, [])
+        ordered = calls.mock_calls
+        for iteration in range(3):
+            observed = ordered.index(
+                unittest.mock.call.observe(
+                    (str(iteration), f"http_static_server_{iteration}")
+                )
+            )
+            new_client = ordered.index(unittest.mock.call.response(2 * iteration + 1))
+            drained = ordered.index(unittest.mock.call.response(2 * iteration, "drain"))
+            stopped = ordered.index(unittest.mock.call.stop(2 * iteration))
+            self.assertLess(observed, new_client)
+            self.assertLess(observed, drained)
+            self.assertLess(observed, stopped)
 
 
 class TestDestroyDispatchContract(unittest.TestCase):

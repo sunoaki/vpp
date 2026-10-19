@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import os
 import json
+import re
 import select
 import sys
 import time
@@ -410,6 +411,51 @@ else:
             time.sleep(0.05)
         self.fail(f"HSS ownership retained: {sessions}\n{listeners}")
 
+    def _listener_states(self):
+        output = self.vapi.cli("show http static server listeners")
+        states = {
+            int(index): int(retiring)
+            for index, retiring in re.findall(
+                r"^listener (\d+), .* retiring ([01])$", output, re.MULTILINE
+            )
+        }
+        self.assertEqual(len(states), output.count("listener "), output)
+        return states, output
+
+    def _hss_apps(self):
+        output = self.vapi.cli("show app")
+        apps = set(
+            re.findall(r"^\s*(\d+)\s+(http_static_server_\d+)", output, re.MULTILINE)
+        )
+        self.assertEqual(len(apps), output.count("http_static_server_"), output)
+        return apps, output
+
+    def _wait_listener_gone(self, index):
+        deadline = time.monotonic() + 10
+        while True:
+            states, output = self._listener_states()
+            if index not in states or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        self.assertNotIn(index, states, output)
+
+    def _wait_destroyed(self, old_app):
+        deadline = time.monotonic() + 10
+        while True:
+            apps, app_output = self._hss_apps()
+            states, listener_output = self._listener_states()
+            session_output = self.vapi.cli("show http static server sessions")
+            cleared = old_app not in apps and len(apps) == 1
+            cleared = cleared and list(states.values()) == [0]
+            cleared = cleared and "path " not in session_output
+            if cleared or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        self.assertNotIn(old_app, apps, app_output)
+        self.assertEqual(len(apps), 1, app_output)
+        self.assertEqual(list(states.values()), [0], listener_output)
+        self.assertNotIn("path ", session_output, session_output)
+
     def test_http_static_listener_delete_reuse(self):
         """Accepted sessions retain their listener through delete and readd."""
         self.vapi.cli("http static server")
@@ -419,14 +465,26 @@ else:
         client = self._client(8080)
         first = self._response(client)
         self.assertEqual(first["status"], 200)
+        states, output = self._listener_states()
+        self.assertEqual(list(states.values()), [0], output)
+        old_index = next(iter(states))
         self.vapi.cli(f"http static listener del uri {uri}")
+        states, output = self._listener_states()
+        self.assertEqual(states, {old_index: 1}, output)
         self._refused(8080)
         self.assertEqual(self._response(client, "next")["body"], first["body"])
         self.vapi.cli(f"http static listener add uri {uri} www-root /tmp")
+        states, output = self._listener_states()
+        self.assertEqual(states.get(old_index), 1, output)
+        active_indices = [index for index, retiring in states.items() if not retiring]
+        self.assertEqual(len(active_indices), 1, output)
+        self.assertNotEqual(active_indices[0], old_index, output)
+        self.assertEqual(len(states), 2, output)
         self.assertEqual(self._response(client, "next")["body"], first["body"])
         replacement = self._client(8080)
         self.assertEqual(self._response(replacement)["status"], 404)
         self._stop_client(client)
+        self._wait_listener_gone(old_index)
         self._stop_client(replacement)
         self.vapi.cli(f"http static listener del uri {uri}")
         self._wait_released()
@@ -444,7 +502,14 @@ else:
             )
             client = self._client(8081, "/file.txt")
             self.assertEqual(self._response(client)["body"], "original listener")
+            states, output = self._listener_states()
+            self.assertEqual(list(states.values()), [0], output)
+            old_index = next(iter(states))
+            with open(os.path.join(root, "file.txt"), "w") as output:
+                output.write("replacement listener")
             self.vapi.cli(f"http static listener del uri {uri}")
+            states, output = self._listener_states()
+            self.assertEqual(states, {old_index: 1}, output)
             self.vapi.cli(
                 f"http static listener add uri {uri} www-root {root} max-age 456"
             )
@@ -452,7 +517,9 @@ else:
             self.assertEqual(old["body"], "original listener")
             self.assertEqual(old["cache"], "max-age=123")
             replacement = self._client(8081, "/file.txt")
-            self.assertEqual(self._response(replacement)["cache"], "max-age=456")
+            new = self._response(replacement)
+            self.assertEqual(new["body"], "replacement listener")
+            self.assertEqual(new["cache"], "max-age=456")
             self._stop_client(client)
             self._stop_client(replacement)
             self.vapi.cli(f"http static listener del uri {uri}")
@@ -470,10 +537,14 @@ else:
                 )
                 pending = self._client(8082, "/large.txt", pending=True)
                 self.assertEqual(self._response(pending)["status"], 200)
+                apps, output = self._hss_apps()
+                self.assertEqual(len(apps), 1, output)
+                old_app = next(iter(apps))
                 self.vapi.cli("http static server disable")
                 self.vapi.cli(
                     "http static server uri http://10.10.1.2:8082 url-handlers"
                 )
+                self._wait_destroyed(old_app)
                 active = self._client(8082)
                 self.assertEqual(self._response(active)["status"], 200)
                 self._assert_closed(self._response(pending, "drain"))
