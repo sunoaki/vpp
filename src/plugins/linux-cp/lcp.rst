@@ -124,6 +124,26 @@ An active attempt can make attempts exceed completed plus failed by one.
 The logger records each attempt's start and result. Associated error
 messages provide further details where available.
 
+Route ownership
+^^^^^^^^^^^^^^^
+
+Each mirrored unicast prefix and route source retains one router table
+reference. Replacing or replaying a route preserves that reference; a
+partial path deletion releases it only when the source loses its last
+path. MPLS end-of-stack and non-end-of-stack entries each retain one
+reference. Synchronization releases references for stale sources removed
+by the route sweep, including the last route in a table with no paired
+interface bound to it. Static, dynamic, and independent API route sources
+retain separate ownership.
+
+The permanent IPv4 limited-broadcast receive contribution uses the
+``lcp-rt-special`` source. It remains installed once for the router table's
+lifetime, independently of learned routes and synchronization sweeps.
+A learned static route at that prefix takes priority over the permanent
+contribution; the permanent contribution takes priority over learned
+dynamic routes. Withdrawing a learned route preserves the permanent
+receive contribution.
+
 Limits
 ^^^^^^
 
