@@ -139,7 +139,7 @@ jobs:
                                     r"poll failed:|socket poll error:|PUMP THREAD TIMEOUT|"
                                     r"Exception connecting to (?:vapi|VPP):|Core file present,|"
                                     r"timed out|TimeoutError|AssertionError|(?:^|\n)SKIP:|"
-                                    r"OK \(skipped=", console + logs + stderr, re.IGNORECASE),
+                                    r"OK \(skipped=", "\n".join((console, logs, stderr)), re.IGNORECASE),
                       "FIB infrastructure error or skipped test")
               require(re.findall(r"(?m)^(?:ERROR|FAIL|SKIP):[^\n]*", console) ==
                       ["ERROR: FIB Unit Tests"], "Unexpected FIB error heading")
@@ -242,7 +242,7 @@ jobs:
                                     r"\bAborted\b|\bBus error\b|Core was generated|timed out|TimeoutError|"
                                     r"VppTransportSocketIOError|VppDiedError|Vpp dead|"
                                     r"VPP subprocess died unexpectedly|PUMP THREAD TIMEOUT",
-                                    console + logs + stderr,
+                                    "\n".join((console, logs, stderr)),
                                     re.IGNORECASE), "Infrastructure error or skipped test")
               require(re.search(r"Ran [1-9][0-9]* tests? in ", console),
                       "Missing completed unittest summary")
