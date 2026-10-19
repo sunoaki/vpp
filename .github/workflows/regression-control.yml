@@ -129,6 +129,10 @@ jobs:
               require(rc == 2 and callbacks == [("addError", "TestFIB", "test_fib")] and not subtests,
                       "Unexpected FIB negative result")
               require(not re.search(r"SIGSEGV|segmentation fault|Core was generated|"
+                                    r"VppTransportSocketIOError|VppDiedError|Vpp dead|"
+                                    r"VPP subprocess died unexpectedly|VPP died shortly after startup|"
+                                    r"poll failed:|socket poll error:|PUMP THREAD TIMEOUT|"
+                                    r"Exception connecting to (?:vapi|VPP):|Core file present,|"
                                     r"timed out|TimeoutError|AssertionError|(?:^|\n)SKIP:|"
                                     r"OK \(skipped=", console + logs + stderr, re.IGNORECASE),
                       "FIB infrastructure error or skipped test")
@@ -178,6 +182,23 @@ jobs:
               positions = [logs.find(token) for token in lifecycle]
               require(all(logs.count(token) == 1 for token in lifecycle) and
                       positions == sorted(positions), "Incomplete or duplicate FIB lifecycle")
+              cleanup = logs[positions[-2]:positions[-1]]
+              shutdown = ["Disconnecting class vapi client on TestFIB",
+                          "Sending TERM to vpp", "Waiting for vpp to die",
+                          "Deleting class vpp attribute on TestFIB"]
+              require(all(cleanup.count(token) == 1 for token in shutdown) and
+                      [cleanup.index(token) for token in shutdown] ==
+                      sorted(cleanup.index(token) for token in shutdown),
+                      "Missing normal live-VPP class shutdown")
+              shutdown_times = []
+              for token in shutdown[2:]:
+                  match = re.search(r"(?m)^(\d{2}):(\d{2}):(\d{2}),(\d{3}) " +
+                                    re.escape(token) + r"$", cleanup)
+                  require(match, "Missing shutdown timestamp")
+                  hour, minute, second, millisecond = map(int, match.groups())
+                  shutdown_times.append(((hour * 60 + minute) * 60 + second) * 1000 + millisecond)
+              require((shutdown_times[1] - shutdown_times[0]) % 86400000 < 5000,
+                      "VPP shutdown reached the caught five-second communicate timeout")
               require(console.index(exception) < console.index("Ran 1 test in ") <
                       console.index("FAILED (errors=1)"), "FIB summary precedes the failure")
               marker = ("FAIL:5809: special update purges import delegate"
@@ -341,7 +362,7 @@ jobs:
           import time
           from pathlib import Path
           from collect import collect
-          from validate import METHODS, validate
+          from validate import CALLBACK, METHODS, validate
 
           output = Path(os.environ["EVIDENCE_DIR"])
           tools = Path(os.environ["CONTROL_DIR"])
@@ -477,6 +498,37 @@ jobs:
               (output / "restoration.diff").write_text(git("diff", "--", source) + "\n")
               (output / "expected-source").write_text(expected_source)
 
+          def retain_callbacks(directory, log_paths, events_path):
+              assert len(log_paths) <= 200, "Callback source-file limit exceeded"
+              sources, records, texts = [], [], []
+              for path in log_paths:
+                  assert path.is_file() and not path.is_symlink(), "Invalid callback source"
+                  data = path.read_bytes()
+                  text = data.decode(errors="replace")
+                  texts.append(text)
+                  sources.append({"path": str(path), "bytes": len(data),
+                                  "sha256": hashlib.sha256(data).hexdigest()})
+                  for number, line in enumerate(text.splitlines(), 1):
+                      if CALLBACK.search(line):
+                          assert len(line.encode()) <= 16384, "Callback line limit exceeded"
+                          records.append({"source": str(path), "line": number, "text": line})
+                          assert len(records) <= 1024, "Callback record limit exceeded"
+              logs = "\n".join(texts)
+              excerpt = "\n".join(record["text"] for record in records)
+              assert CALLBACK.findall(excerpt) == CALLBACK.findall(logs), "Incomplete callbacks"
+              provenance = [output / "manifest.json", directory / "result.json",
+                            directory / "console.log", events_path]
+              evidence = {"complete": True, "pattern": CALLBACK.pattern,
+                          "sources": sources, "records": records,
+                          "provenance": {str(path.relative_to(output)): {
+                              "bytes": path.stat().st_size,
+                              "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                              for path in provenance}}
+              encoded = (json.dumps(evidence, indent=2) + "\n").encode()
+              assert len(encoded) <= 1024 * 1024, "Callback evidence limit exceeded"
+              (directory / "callbacks.json").write_bytes(encoded)
+              return logs
+
           def run_tests():
               assert git("hash-object", source) == (output / "expected-source").read_text()
               assert all(git("hash-object", path) == blob(candidate, path) for path in tests)
@@ -505,12 +557,11 @@ jobs:
                   collect(directory / "diagnostics")
                   log_paths = sorted(Path("/tmp").glob("vpp-unittest-*/log.txt"))
                   stderr_paths = sorted(Path("/tmp").glob("vpp-unittest-*/vpp_stderr.txt"))
-                  logs = "\n".join(path.read_text(errors="replace") for path in log_paths
-                                   if path.is_file() and not path.is_symlink())
                   stderr = "\n".join(path.read_text(errors="replace") for path in stderr_paths
                                      if path.is_file() and not path.is_symlink())
                   expected = all_methods if selector == feature else [tuple(selector.split(".")[1:])]
                   try:
+                      logs = retain_callbacks(directory, log_paths, events_path)
                       events = [json.loads(line) for line in events_path.read_text().splitlines()]
                       validate(feature, variant, selector, rc, console, logs, events, expected, stderr)
                   except (AssertionError, OSError, ValueError) as error:
