@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [fixed, cache-limit, api-protocol, original-endpoint]
+        variant: [fixed, cache-limit, api-protocol, original-endpoint, read-error-unlock]
     # Independent Debian 13 builds, OpenSSL TLS/QUIC, two CPUs and namespace access.
     # IPv6 and HTTP/3 checks establish control-plane identity only.
     # These narrow API negatives do not cover lifecycle/reset/cleanup/ack mutations.
@@ -41,7 +41,9 @@ jobs:
     env:
       VARIANT_NAME: ${{ matrix.variant }}
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: 248af3e671dd23ec257f561458f757ac5951e936
+      CANDIDATE_SHA: 2a1cfb13333b43a0f64123a497e001ba314701a4
+      CHECK_BASE_SHA: f9d4c2e78f4bed10f732a75f04484856416fe5a1
+      CANDIDATE_TREE: 4c6b1c1458286f02f2834e45fda506c7921e201f
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
@@ -59,18 +61,18 @@ jobs:
           printf 'TOOLS=%s\nEVIDENCE=%s\nWORK_DEADLINE=%s\n' \
             "$TOOLS" "$EVIDENCE" "$WORK_DEADLINE" >> "$GITHUB_ENV"
           cat > "$EVIDENCE/manifest.json" <<JSON
-          {"workflow_sha":"$WORKFLOW_SHA","candidate_sha":"$CANDIDATE_SHA","frozen_sha":"$FROZEN_SHA",
+          {"workflow_sha":"$WORKFLOW_SHA","candidate_sha":"$CANDIDATE_SHA","check_base_sha":"$CHECK_BASE_SHA","frozen_sha":"$FROZEN_SHA",
            "variant":"$VARIANT_NAME","run_id":"$GITHUB_RUN_ID","attempt":"$GITHUB_RUN_ATTEMPT",
            "work_deadline":$WORK_DEADLINE,"status":"before_bootstrap",
            "workflow_blob":null,"candidate_tree":null,"tools":null,
            "unavailable_reason":"Bootstrap/checkout has not completed; hashes unavailable",
-           "source":{"path":"src/plugins/http_static/$(if [ "$VARIANT_NAME" = original-endpoint ]; then printf static_server.c; else printf http_static.c; fi)","candidate_blob":null,"frozen_blob":null},
-           "tests":{"test/asf/test_http_static.py":{"blob":null,"sha256":null},"src/plugins/http_static/test_lifetime_fixtures.py":{"blob":null,"sha256":null}}}
+           "source":{"path":"src/plugins/http_static/$(if [ "$VARIANT_NAME" = original-endpoint ]; then printf static_server.c; elif [ "$VARIANT_NAME" = read-error-unlock ]; then printf http_cache.c; else printf http_static.c; fi)","candidate_blob":null,"frozen_blob":null},
+           "tests":{"test/asf/test_http_static.py":{"blob":null,"sha256":null},"src/plugins/http_static/test_lifetime_fixtures.py":{"blob":null,"sha256":null},"test/asf/test_http.py":{"blob":null,"sha256":null}}}
           JSON
           printf '%s\n' bootstrap checkout prepare dependencies feature-list pinned-python black-version \
-            fixture-python-style fixtures mutate fallback-version build binaries namespace environment runtime tests collect \
+            fixture-python-style fixtures mutate fallback-version build binaries namespace environment runtime tests http-name http-name-runtime collect \
             > "$EVIDENCE/planned-phases.txt"
-          for commit in 248af3e671dd23ec257f561458f757ac5951e936; do
+          for commit in 2a1cfb13333b43a0f64123a497e001ba314701a4; do
             printf 'style-%s\napi-%s\nmessage-%s\n' "$commit" "$commit" "$commit" >> "$EVIDENCE/planned-phases.txt"
           done
           {
@@ -961,16 +963,22 @@ jobs:
           OUT = Path(os.environ["EVIDENCE"])
           TOOLS = Path(os.environ["TOOLS"])
           CANDIDATE = os.environ["CANDIDATE_SHA"]
+          CHECK_BASE = os.environ["CHECK_BASE_SHA"]
           FROZEN = os.environ["FROZEN_SHA"]
           VARIANT = os.environ["VARIANT_NAME"]
           SOURCE = "src/plugins/http_static/" + (
-              "static_server.c" if VARIANT == "original-endpoint" else "http_static.c")
+              "static_server.c" if VARIANT == "original-endpoint" else
+              "http_cache.c" if VARIANT == "read-error-unlock" else "http_static.c")
           TEST = "test/asf/test_http_static.py"
           FIXTURE = "src/plugins/http_static/test_lifetime_fixtures.py"
+          HTTP_TEST = "test/asf/test_http.py"
+          TEST_BLOBS = {TEST: "95e44ccdc1f9c3de3b53e1ee492c7e8573bdc9f8",
+                        FIXTURE: "9db639142e08c58b6fa249f4b1cca22496344f24",
+                        HTTP_TEST: "0a7353040c8323e3ec2f4500d2ce72c1f2a94934"}
           CLASSES = ("TestHttpStaticCli", "TestHttpStaticCliWorker")
           RECIPES = {
-              "cache-limit": ("rmp->cache_size_limit = htonl (l->cache.cache_limit);",
-                              "rmp->cache_size_limit = htonl (hsm->default_listener.cache.cache_limit);"),
+              "cache-limit": ("rmp->cache_size_limit = htonl (l->cache ? l->cache->cache_limit : 0);",
+                              "rmp->cache_size_limit = htonl (hsm->default_listener.cache ? hsm->default_listener.cache->cache_limit : 0);"),
               "original-endpoint": (
                   "  clib_memcpy (&a->sep_ext, &l->sep, sizeof (l->sep));\n"
                   "  a->sep_ext.transport_proto = TRANSPORT_PROTO_HTTP;",
@@ -1081,7 +1089,7 @@ jobs:
               work_deadline = float(os.environ["WORK_DEADLINE"])
               phase_seconds = {"dependencies": 1500, "build": 2400, "tests": 960, "runtime": 900,
                                "environment": 120, "fixtures": 120, "prepare": 240, "mutate": 240,
-                               "collect": 60, "binaries": 240}.get(label, 600)
+                               "collect": 60, "binaries": 240, "http-name": 150, "http-name-runtime": 120}.get(label, 600)
               seconds = min(phase_seconds, max(0, work_deadline - started))
               identity = os.urandom(16).hex()
               ancestors = json.loads(os.environ.get("HSS_COMMAND_ANCESTORS", "[]"))
@@ -1269,17 +1277,32 @@ jobs:
               finally:
                   save(f"dependency-{label}.json", report)
 
+          def source_identity():
+              require(git("rev-list", "--parents", "-n", "1", CANDIDATE).split() == [CANDIDATE, CHECK_BASE],
+                      "Candidate must have exactly the reviewed check-base parent")
+              require(git("rev-parse", f"{CANDIDATE}^{{tree}}") == os.environ["CANDIDATE_TREE"],
+                      "Candidate tree differs from reviewed integration")
+              for path, blob in TEST_BLOBS.items():
+                  require(git("rev-parse", f"{CANDIDATE}:{path}") == blob, "Reviewed test blob differs: " + path)
+              fixtures = ast.parse(content(CANDIDATE, FIXTURE))
+              require(sum(isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
+                          for cls in fixtures.body if isinstance(cls, ast.ClassDef) for node in cls.body) == 21,
+                      "Reviewed standalone fixture inventory differs")
+              require(content(CANDIDATE, HTTP_TEST) == content(CHECK_BASE, HTTP_TEST),
+                      "HTTP name regression differs from integrated master")
+
           def prepare():
               workflow = os.environ["WORKFLOW_SHA"]
               initial = json.loads((OUT / "manifest.json").read_text())
               initial["status"] = "preparing"
               save("manifest.json", initial)
+              source_identity()
               planned = (OUT / "planned-phases.txt").read_text().splitlines()
-              commits = git("rev-list", "--reverse", "--no-merges", f"{FROZEN}..{CANDIDATE}").splitlines()
+              commits = git("rev-list", "--reverse", "--no-merges", f"{CHECK_BASE}..{CANDIDATE}").splitlines()
               require([name for name in planned if name.startswith(("style-", "api-", "message-"))] ==
                       [f"{kind}-{commit}" for commit in commits for kind in ("style", "api", "message")],
                       "Planned commit checks differ from immutable history")
-              manifest = dict(workflow_sha=workflow, candidate_sha=CANDIDATE, frozen_sha=FROZEN,
+              manifest = dict(workflow_sha=workflow, candidate_sha=CANDIDATE, check_base_sha=CHECK_BASE, frozen_sha=FROZEN,
                               workflow_blob=git("rev-parse", f"{workflow}:.github/workflows/hss-regression-control.yml"),
                               candidate_tree=git("rev-parse", f"{CANDIDATE}^{{tree}}"), variant=VARIANT,
                               run_id=os.environ["GITHUB_RUN_ID"], attempt=os.environ["GITHUB_RUN_ATTEMPT"],
@@ -1294,12 +1317,15 @@ jobs:
                               ipv6_http3_scope="control-plane identity and QUIC listener/ALPN; no IPv6 request or HTTP3 transfer")
               manifest["tests"] = {path: dict(blob=git("rev-parse", f"{CANDIDATE}:{path}"),
                                              sha256=hashlib.sha256(content(CANDIDATE, path)).hexdigest())
-                                   for path in (TEST, FIXTURE)}
+                                   for path in TEST_BLOBS}
               manifest["python_dependencies"] = {path: dict(blob=git("rev-parse", f"{CANDIDATE}:{path}"),
                       sha256=hashlib.sha256(content(CANDIDATE, path)).hexdigest()) for path in
                       ("test/requirements.txt", "test/requirements-3.txt")}
               manifest["source"] = dict(path=SOURCE, candidate_blob=git("rev-parse", f"{CANDIDATE}:{SOURCE}"),
                                         frozen_blob=git("rev-parse", f"{FROZEN}:{SOURCE}"))
+              manifest["http_name_sources"] = {path: dict(blob=git("rev-parse", f"{CANDIDATE}:{path}"),
+                      sha256=hashlib.sha256(content(CANDIDATE, path)).hexdigest()) for path in
+                      ("src/plugins/http/http.c", "src/plugins/http/http_private.h", "src/plugins/http/test/http_test.c")}
               manifest["diagnostic_sources"] = {path: dict(blob=git("rev-parse", f"{CANDIDATE}:{path}"),
                       sha256=hashlib.sha256(content(CANDIDATE, path)).hexdigest()) for path in
                       ("test/asf/asfframework.py", "test/vpp_papi_provider.py", TEST)}
@@ -1316,7 +1342,7 @@ jobs:
               for path in ("build-root/build-vpp_debug-native", "build-root/install-vpp_debug-native", "build-root/test/venv"):
                   require(not Path(path).exists(), f"Not an independent clean build: {path}")
               manifest["tests"] = {path: dict(blob=git("rev-parse", f"{CANDIDATE}:{path}"), sha256=digest(path))
-                                   for path in (TEST, FIXTURE)}
+                                   for path in TEST_BLOBS}
               save("manifest.json", manifest)
 
           def mutate():
@@ -1336,8 +1362,17 @@ jobs:
                              indent + 'tp_vfts[l->sep.transport_proto].transport_options.name, addr,')
                   frozen = content(FROZEN, SOURCE).decode()
                   witness = ("tp_vfts[hsm->default_listener.sep.transport_proto].transport_options.name"
-                             if VARIANT == "api-protocol" else new)
-                  require(witness in frozen, "Restoration has no frozen-source provenance")
+                             if VARIANT == "api-protocol" else
+                             "rmp->cache_size_limit = htonl (hsm->default_listener.cache.cache_limit);"
+                             if VARIANT == "cache-limit" else new)
+                  if VARIANT == "read-error-unlock":
+                      old = ('      clib_warning ("Error reading \'%s\'", path);\n'
+                             '      clib_error_report (error);\n      hss_cache_unlock (hc);\n      return ~0;')
+                      new = old.replace("      hss_cache_unlock (hc);\n", "")
+                      require(new in frozen and old not in frozen,
+                              "Read-error unlock removal lacks frozen-source provenance")
+                  else:
+                      require(witness in frozen, "Restoration has no frozen-source provenance")
                   require(original.count(old.encode()) == 1, "Ambiguous restoration hunk")
                   Path(SOURCE).write_bytes(original.replace(old.encode(), new.encode(), 1))
               require(git("diff", "--name-only").splitlines() == ([] if VARIANT == "fixed" else [SOURCE]),
@@ -1444,8 +1479,10 @@ jobs:
                              "test_http_static_listener_uri_identity", "test_http_static_listener_ipv6_identity",
                              "test_http_static_listener_http3_identity")
               require(collections.Counter(methods["TestHttpStaticCli"]) == collections.Counter(
-                      (*regressions, "test_http_static_cli", "test_http_static_pending_accept_identity")),
-                      "Reviewed seven regressions or separate synthetic test changed")
+                      (*regressions, "test_http_static_cli", "test_http_static_pending_accept_identity",
+                       "test_http_static_cache_owners", "test_http_static_cache_read_error",
+                       "test_http_static_cache_pressure", "test_http_static_cache_relocation")),
+                      "Reviewed thirteen methods or separate synthetic test changed")
               require(methods["TestHttpStaticCliWorker"] == [] and
                       methods["TestHttpStaticVapi"] == ["test_http_static_vapi"], "Reviewed suite classes changed")
               return [f"test_http_static.{cls}.{method}" for cls in (*CLASSES, "TestHttpStaticVapi")
@@ -1478,7 +1515,7 @@ jobs:
                   text = rendering.sub(lambda match: match.group().replace(benign, "\n"), text)
               return text
 
-          def validate(events, console, rc, expected, variant, logs):
+          def execution_evidence(events, console, expected, variant, logs):
               require(evidence_schema.FATAL.search("\n".join((console, logs, json.dumps(events)))) is None,
                       "Fatal process diagnostic evidence")
               forbidden = ("addError", "addSkip", "addExpectedFailure", "addUnexpectedSuccess")
@@ -1509,10 +1546,59 @@ jobs:
                   cmdline = " ".join(event.get("vpp_cmdline", []))
                   require(cmdline and not re.search(r"(?:tlsopenssl|quic|http_static)_plugin.so\s*\{\s*disable", cmdline),
                           "Missing startup command or required plugin disabled")
+              return starts, stops, complete, wanted
+
+          def test_interval(events, test):
+              start = next(event for event in events if event["kind"] == "startTest" and event["test"] == test)
+              stop = next(event for event in events if event["kind"] == "stopTest" and event["test"] == test)
+              require(start["pid"] == stop["pid"] and start["seq"] < stop["seq"], "Test lifecycle crosses processes")
+              return [event for event in events if event["pid"] == start["pid"] and
+                      start["seq"] < event["seq"] < stop["seq"]]
+
+          def read_error_evidence(events, expected, negative=False):
+              for test in expected:
+                  active = test_interval(events, test)
+                  replies = [event for event in active if event["kind"] == "cli_reply" and
+                             event["command"].startswith("test http static cache read-error ")]
+                  subs = [event for event in active if event["kind"] == "addSubTest" and event["test"] == test]
+                  require(len(replies) == len(subs) == 2, "Both read-error path witnesses required")
+                  valid_paths = []
+                  for index, (reply, sub) in enumerate(zip(replies, subs)):
+                      paths = reply["command"].removeprefix("test http static cache read-error ").split()
+                      require(len(paths) == 2 and os.path.isabs(paths[1]) and
+                              Path(paths[1]).name == "valid.txt", "Invalid read-error command paths")
+                      invalid, valid = paths
+                      require(invalid == (str(Path(valid).with_name("missing.txt")) if index == 0 else valid + "/child") and
+                              sub["params"] == {"invalid": invalid} and reply["seq"] < sub["seq"],
+                              "Read-error path/subtest ordering mismatch")
+                      valid_paths.append(valid)
+                      if negative:
+                          require(reply["retval"] == -1 and "cache read error retained lock" in reply["reply"] and
+                                  sub.get("error") == "AssertionError" and
+                                  "self.assertEqual(reply.retval, 0, reply.reply)" in sub.get("traceback", "") and
+                                  "AssertionError: -1 != 0" in sub["traceback"] and
+                                  "cache read error retained lock" in sub["traceback"], "Wrong retained-lock assertion witness")
+                      else:
+                          require(reply["retval"] == 0 and not sub.get("error") and
+                                  "cache read error: lock released, valid owner reused and cleared" in reply["reply"],
+                                  "Missing real read-error recovery witness")
+                  require(valid_paths[0] == valid_paths[1], "Read-error paths belong to different fixtures")
+
+          def validate(events, console, rc, expected, variant, logs):
+              starts, stops, complete, wanted = execution_evidence(events, console, expected, variant, logs)
               subs = [event for event in events if event["kind"] == "addSubTest"]
               outcomes = [event for event in events if event["kind"] in ("addSuccess", "addFailure")]
               callbacks = re.findall(r"--- (add\w+)\(\) (\w+)\.(\w+)\(", logs)
-              if variant == "fixed":
+              if variant == "read-error-unlock":
+                  require(rc > 0 and rc != 124 and not outcomes and not callbacks,
+                          "Read-error control did not complete with only subtest failures")
+                  require(len(subs) == 4 and sum(event["failures"] for event in complete) == 4,
+                          "Wrong read-error assertion summary")
+                  read_error_evidence(events, expected, negative=True)
+                  require("self.assertEqual(reply.retval, 0, reply.reply)" in logs and
+                          "AssertionError: -1 != 0" in logs and "cache read error retained lock" in logs and
+                          "cache read error retained lock" in console, "Missing raw retained-lock diagnostic")
+              elif variant == "fixed":
                   require(rc == 0, f"Fixed test command failed: {rc}")
                   require(collections.Counter(event["test"] for event in outcomes if event["kind"] == "addSuccess") == wanted,
                           "Missing actual successes")
@@ -1521,6 +1607,7 @@ jobs:
                   require(collections.Counter(f"test_http_static.{cls}.{method}" for kind, cls, method in callbacks
                                               if kind == "addSuccess") == wanted and
                           all(kind == "addSuccess" for kind, _, _ in callbacks), "Framework callbacks mismatch")
+                  read_error_evidence(events, [f"test_http_static.{cls}.test_http_static_cache_read_error" for cls in CLASSES])
                   for cls in CLASSES:
                       synthetic = f"test_http_static.{cls}.test_http_static_pending_accept_identity"
                       start = next(event for event in starts if event["test"] == synthetic)
@@ -1591,6 +1678,7 @@ jobs:
               for path, provenance in manifest["tests"].items():
                   require(digest(path) == provenance["sha256"], "Candidate tests changed")
               method = ("test_http_static_listener_ipv6_identity" if VARIANT == "original-endpoint" else
+                        "test_http_static_cache_read_error" if VARIANT == "read-error-unlock" else
                         "test_http_static_default_get_states")
               selector = "http_static" if VARIANT == "fixed" else ",".join(
                   f"http_static.{cls}.{method}" for cls in CLASSES)
@@ -1640,16 +1728,90 @@ jobs:
                   save("acceptance.json", dict(status="FAIL", error=str(error), expected=expected))
                   raise
               save("acceptance.json", dict(status="PASS", expected=expected,
-                                           claims="full19 fixed successes:14 original regressions,2 main-queue synthetic,3 existing" if VARIANT == "fixed" else
-                                           "narrow restored API field only; lifecycle negative gaps remain"))
+                                           claims="full27 fixed successes:14 original regressions,2 main-queue synthetic,8 cache,3 existing" if VARIANT == "fixed" else
+                                           "narrow restored field/unlock only; lifecycle negative gaps remain"))
+
+          def validate_http_name(events, console, rc, logs):
+              test = "test_http.TestHttpNameOwnership.test_app_name_ownership"
+              _, _, complete, _ = execution_evidence(events, console, [test], "http-name", logs)
+              outcomes = [event for event in events if event["kind"] in ("addSuccess", "addFailure", "addSubTest")]
+              require(rc == 0 and len(outcomes) == 1 and outcomes[0]["kind"] == "addSuccess" and
+                      outcomes[0]["test"] == test and all(event["failures"] == 0 for event in complete),
+                      "Missing normal HTTP name ownership success")
+              active = test_interval(events, test)
+              require(outcomes[0] in active, "HTTP name success outside owned test lifecycle")
+              start = next(event for event in events if event["kind"] == "startTest")
+              require(not set(start["excluded"]) & {"http", "http_unittest"} and
+                      "http_unittest_plugin.so { enable }" in " ".join(start["vpp_cmdline"]) and
+                      not re.search(r"(?:http|http_unittest)_plugin.so\s*\{\s*disable", " ".join(start["vpp_cmdline"])),
+                      "HTTP name test plugin excluded or disabled")
+              replies = [event for event in active if event["kind"] == "cli_reply" and
+                         event["command"] == "test http app-name-ownership"]
+              rendered = [event for event in active if event["kind"] == "cli" and
+                          event["command"] == "test http app-name-ownership"]
+              require(len(replies) == len(rendered) == 1 and replies[0]["retval"] == 0 and
+                      replies[0]["seq"] + 1 == rendered[0]["seq"] and replies[0]["reply"] == rendered[0]["reply"],
+                      "Missing actual HTTP name command reply")
+              markers = ("accepted connections own separate names", "empty names can be copied and disposed", "SUCCESS")
+              require(all(marker in replies[0]["reply"] and marker in logs for marker in markers) and
+                      "FAIL" not in replies[0]["reply"], "Missing HTTP name ownership success witnesses")
+              require(re.findall(r"--- (add\w+)\(\) (\w+)\.(\w+)\(", logs) ==
+                      [("addSuccess", "TestHttpNameOwnership", "test_app_name_ownership")],
+                      "HTTP name framework callback mismatch")
+
+          def http_name():
+              dependency_checkpoint("before-http-name")
+              manifest = json.loads((OUT / "manifest.json").read_text())
+              require(VARIANT == "fixed" and git("hash-object", SOURCE) == manifest["source"]["built_blob"],
+                      "HTTP name requires the exact fixed build")
+              build = json.loads((OUT / "build/result.json").read_text())
+              require(build["status"] == "completed" and build["rc"] == 0 and build.get("cleanup_complete") is True,
+                      "HTTP name requires a successful independently cleaned build")
+              for label in ("tests", "runtime"):
+                  record = OUT / label / "result.json"
+                  if record.exists():
+                      previous_run = json.loads(record.read_text())
+                      require(previous_run["status"] == "completed" and previous_run.get("cleanup_complete") is True,
+                              "Prior HSS process cleanup incomplete")
+              binary_hashes = json.loads((OUT / "binaries.json").read_text())
+              for path, expected_hash in binary_hashes.items():
+                  require(digest(path) == expected_hash, "Exact build binary changed: " + path)
+              for path, provenance in manifest["tests"].items():
+                  require(digest(path) == provenance["sha256"], "Candidate tests changed")
+              previous = {str(root) for root in runtime_roots()}
+              destination = OUT / "http-name-events"
+              destination.mkdir()
+              env = dict(os.environ, HSS_EVENTS=str(destination / "events"), HSS_DIAGNOSTIC_CONFIG="",
+                         PYTHONPATH=str(TOOLS) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+              args = ["make", "UNATTENDED=yes", "TEST_JOBS=1", "FORCE_FOREGROUND=1", "VPP_WORKER_COUNT=0",
+                      "RETRIES=0", "FAILFAST=0", "SKIP_TESTS=", "VPP_EXCLUDED_PLUGINS=", "V=2",
+                      "COREDUMP_SIZE=0", "DECODE_PCAPS=none", "RND_SEED=48",
+                      "TEST=http.TestHttpNameOwnership.test_app_name_ownership", "test-debug"]
+              try:
+                  rc, console = command("http-name-runtime", args, env)
+              finally:
+                  dependency_checkpoint("after-http-name")
+              try:
+                  runtime = json.loads((OUT / "http-name-runtime/result.json").read_text())
+                  require(runtime["status"] == "completed" and runtime.get("cleanup_complete") is True and
+                          not (OUT / "http-name-runtime/fatal-diagnostic.json").exists(), "HTTP name command incomplete/fatal")
+                  events = [json.loads(line) for line in read_evidence(sorted(destination.glob("events.*.jsonl"))).splitlines() if line]
+                  paths = [root / name for root in runtime_roots() if str(root) not in previous
+                           for name in ("log.txt", "vpp_stderr.txt") if (root / name).is_file()]
+                  logs = read_evidence(paths)
+                  validate_http_name(events, console, rc, logs)
+              except Exception as error:
+                  save("http-name-acceptance.json", dict(status="FAIL", error=str(error)))
+                  raise
+              save("http-name-acceptance.json", dict(status="PASS", expected=["test_http.TestHttpNameOwnership.test_app_name_ownership"],
+                   claims="actual production copy/free helper regression; callback fault injection remains uncovered"))
 
           def binaries():
-              paths = [*Path("build-root/install-vpp_debug-native").rglob("vpp"),
-                       *Path("build-root/install-vpp_debug-native").rglob("http_static_plugin.so"),
-                       *Path("build-root/install-vpp_debug-native").rglob("tlsopenssl_plugin.so"),
-                       *Path("build-root/install-vpp_debug-native").rglob("quic_plugin.so")]
+              names = ("vpp", "http_static_plugin.so", "tlsopenssl_plugin.so", "quic_plugin.so",
+                       "http_plugin.so", "http_unittest_plugin.so")
+              paths = [path for name in names for path in Path("build-root/install-vpp_debug-native").rglob(name)]
               files = {str(path): digest(path) for path in paths if path.is_file()}
-              for name in ("vpp", "http_static_plugin.so", "tlsopenssl_plugin.so", "quic_plugin.so"):
+              for name in names:
                   require(any(Path(path).name == name for path in files), f"Required binary/plugin missing: {name}")
               tool = Path("build-root/install-vpp_debug-native/vpp/bin/vppctl")
               if tool.is_file():
@@ -1682,7 +1844,7 @@ jobs:
           if __name__ == "__main__":
               action = sys.argv[1]
               operations = {"prepare": prepare, "mutate": mutate, "tests": tests,
-                            "binaries": binaries, "collect": final_collect}
+                            "binaries": binaries, "collect": final_collect, "http-name": http_name}
               if action == "dependency-check":
                   label = sys.argv[2]
                   require(label in ("before-python", "after-python", "final"), "Unknown dependency checkpoint")
@@ -1711,7 +1873,7 @@ jobs:
           set -euo pipefail
           test -z "$(git status --porcelain -uno)"
           python3 "$TOOLS/control.py" feature-list make checkfeaturelist
-          for commit in $(git rev-list --reverse --no-merges "$FROZEN_SHA..$CANDIDATE_SHA"); do
+          for commit in $(git rev-list --reverse --no-merges "$CHECK_BASE_SHA..$CANDIDATE_SHA"); do
             git checkout --detach "$commit"
             test -z "$(git status --porcelain -uno)"
             CHECKSTYLE_COMMIT="$commit" python3 "$TOOLS/control.py" "style-$commit" make checkstyle
@@ -1731,7 +1893,7 @@ jobs:
           python3 "$TOOLS/control.py" fixture-python-style build-root/test/venv/bin/black --check -t py39 \
             src/plugins/http_static/test_lifetime_fixtures.py test/asf/test_http_static.py
 
-      - name: Execute exactly seventeen standalone fixtures
+      - name: Execute exactly twenty-one standalone fixtures
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1740,7 +1902,7 @@ jobs:
           import os
           from pathlib import Path
           text = (Path(os.environ["EVIDENCE"]) / "fixtures/console.log").read_text()
-          assert "Ran 17 tests in " in text and "\nOK\n" in text, text
+          assert "Ran 21 tests in " in text and "\nOK\n" in text, text
           PY
 
       - name: Restore narrow source field and identify build tree
@@ -1777,6 +1939,7 @@ jobs:
           LOG_DIR: ${{ runner.temp }}/hss-evidence/runtime-setup
 
       - name: Record and require CPU namespace and OpenSSL environment
+        id: environment
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1799,6 +1962,11 @@ jobs:
       - name: Run full fixed suite or exact restored assertions
         timeout-minutes: 17
         run: python3 "$TOOLS/control.py" tests
+
+      - name: Run exact HTTP name ownership regression
+        if: ${{ !cancelled() && matrix.variant == 'fixed' && steps.environment.outcome == 'success' }}
+        timeout-minutes: 4
+        run: python3 "$TOOLS/control.py" http-name
 
       - name: Always retain tools diagnostics and provenance
         if: always()
