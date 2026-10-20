@@ -81,7 +81,7 @@ typedef struct _segment_manager
 
 #define SEGMENT_MANAGER_INVALID_APP_INDEX ((u32) ~0)
 
-segment_manager_t *segment_manager_alloc (void);
+__clib_export segment_manager_t *segment_manager_alloc (void);
 int segment_manager_init (segment_manager_t * sm);
 int segment_manager_init_first (segment_manager_t * sm);
 
@@ -90,7 +90,7 @@ int segment_manager_init_first (segment_manager_t * sm);
  *
  * @param sm	segment manager to be freed
  */
-void segment_manager_free (segment_manager_t * sm);
+__clib_export void segment_manager_free (segment_manager_t *sm);
 void segment_manager_free_safe (segment_manager_t *sm);
 
 /**
@@ -101,7 +101,7 @@ void segment_manager_free_safe (segment_manager_t *sm);
 void segment_manager_init_free (segment_manager_t * sm);
 __clib_export segment_manager_t *segment_manager_get (u32 index);
 segment_manager_t *segment_manager_get_if_valid (u32 index);
-u32 segment_manager_index (segment_manager_t * sm);
+__clib_export u32 segment_manager_index (segment_manager_t *sm);
 
 /**
  * Add segment without lock
@@ -143,8 +143,10 @@ int segment_manager_alloc_session_fifos_ct (session_t *s,
 					    svm_fifo_t **tx_fifo);
 __clib_export void segment_manager_dealloc_fifos (svm_fifo_t *rx_fifo, svm_fifo_t *tx_fifo);
 void segment_manager_dealloc_fifos_ct (svm_fifo_t *rx_fifo, svm_fifo_t *tx_fifo, u32 is_client);
-void segment_manager_detach_fifo (svm_fifo_t **f);
-int segment_manager_attach_fifo (svm_fifo_t **f, session_t *s);
+__clib_export void segment_manager_detach_fifo (svm_fifo_t **f);
+__clib_export int segment_manager_attach_fifo (svm_fifo_t **f, session_t *s);
+__clib_export void segment_manager_abort_fifo_attach (svm_fifo_t *of, svm_fifo_t **f,
+						    u32 old_slice_index);
 
 void segment_manager_set_watermarks (segment_manager_t * sm,
 				     u8 high_watermark, u8 low_watermark);
@@ -158,7 +160,7 @@ svm_msg_q_t *segment_manager_event_queue (segment_manager_t * sm);
 u32 segment_manager_evt_q_expected_size (u32 q_size);
 
 u8 segment_manager_app_detached (segment_manager_t * sm);
-void segment_manager_app_detach (segment_manager_t * sm);
+__clib_export void segment_manager_app_detach (segment_manager_t *sm);
 
 /**
  * Cleanup segment manager sessions

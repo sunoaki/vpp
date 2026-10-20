@@ -965,6 +965,22 @@ segment_manager_detach_fifo (svm_fifo_t **f)
   segment_manager_segment_reader_unlock (sm);
 }
 
+void
+segment_manager_abort_fifo_attach (svm_fifo_t *of, svm_fifo_t **f,
+				   u32 old_slice_index)
+{
+  segment_manager_t *sm;
+  fifo_segment_t *fs;
+
+  sm = segment_manager_get_if_valid (of->segment_manager);
+  if (PREDICT_FALSE (!sm))
+    return;
+
+  fs = segment_manager_get_segment_w_lock (sm, of->segment_index);
+  fifo_segment_abort_fifo_attach (fs, of, f, old_slice_index);
+  segment_manager_segment_reader_unlock (sm);
+}
+
 int
 segment_manager_attach_fifo (svm_fifo_t **f, session_t *s)
 {
