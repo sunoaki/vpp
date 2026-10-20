@@ -4,6 +4,12 @@ name: Temporary HSS runtime controls
 on:
   push:
     branches: [feat/hss-runtime-validation-ff48-october19]
+  workflow_dispatch:
+    inputs:
+      product_controls:
+        description: Run the preserved product control matrix
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -14,6 +20,7 @@ concurrency:
 
 jobs:
   control:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.product_controls }}
     name: HSS / ${{ matrix.variant }}
     runs-on: ubuntu-24.04
     timeout-minutes: 100
@@ -25,7 +32,7 @@ jobs:
     # IPv6 and HTTP/3 checks establish control-plane identity only.
     # These narrow API negatives do not cover lifecycle/reset/cleanup/ack mutations.
     # Default AF_PACKET V3 RX 10 MiB + TX 66 MiB; 256 MiB bounds each process with headroom.
-    container:
+    container: &hss_container
       image: debian:trixie
       options: >-
         --shm-size=2g
@@ -50,16 +57,18 @@ jobs:
       GIT_CONFIG_KEY_0: safe.directory
       GIT_CONFIG_VALUE_0: ${{ github.workspace }}
     steps:
-      - name: Install base tools
+      - &hss_bootstrap
+        name: Install base tools
         id: bootstrap
         timeout-minutes: 6
         run: |
           set -euo pipefail
           export TOOLS="$RUNNER_TEMP/hss-tools" EVIDENCE="$RUNNER_TEMP/hss-evidence"
+          export HSS_CONTROL="$RUNNER_TEMP/hss-collection-control"
           export WORK_DEADLINE="$(( $(date +%s) + 4800 ))"
-          mkdir -p "$TOOLS" "$EVIDENCE"
-          printf 'TOOLS=%s\nEVIDENCE=%s\nWORK_DEADLINE=%s\n' \
-            "$TOOLS" "$EVIDENCE" "$WORK_DEADLINE" >> "$GITHUB_ENV"
+          mkdir -m 700 -p "$TOOLS" "$EVIDENCE" "$HSS_CONTROL"
+          printf 'TOOLS=%s\nEVIDENCE=%s\nWORK_DEADLINE=%s\nHSS_CONTROL=%s\n' \
+            "$TOOLS" "$EVIDENCE" "$WORK_DEADLINE" "$HSS_CONTROL" >> "$GITHUB_ENV"
           cat > "$EVIDENCE/manifest.json" <<JSON
           {"workflow_sha":"$WORKFLOW_SHA","candidate_sha":"$CANDIDATE_SHA","check_base_sha":"$CHECK_BASE_SHA","frozen_sha":"$FROZEN_SHA",
            "variant":"$VARIANT_NAME","run_id":"$GITHUB_RUN_ID","attempt":"$GITHUB_RUN_ATTEMPT",
@@ -219,7 +228,8 @@ jobs:
           mv "$RUNNER_TEMP/hss-evidence/bootstrap-tail.log" "$RUNNER_TEMP/hss-evidence/bootstrap.log"
           exit "$rc"
 
-      - name: Check out exact workflow
+      - &hss_checkout
+        name: Check out exact workflow
         id: checkout
         timeout-minutes: 5
         uses: actions/checkout@v4
@@ -229,7 +239,8 @@ jobs:
           fetch-tags: true
           persist-credentials: false
 
-      - name: Prepare external evidence tools
+      - &hss_generate
+        name: Prepare external evidence tools
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -941,6 +952,256 @@ jobs:
               sys.setprofile(profile)
               threading.setprofile(profile)
               emit("loaded")
+          PY
+          cat > "$TOOLS/hss_collection.py" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import signal
+          import stat
+          import subprocess
+          import sys
+          import time
+          import evidence_schema
+
+          LIMIT = 256 * 1024
+          SCHEMA = "hss-collection-v1"
+
+          def bounded_json(path):
+              descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+              try:
+                  if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                      raise ValueError("Nonregular control record")
+                  raw = os.read(descriptor, LIMIT + 1)
+                  if len(raw) > LIMIT:
+                      raise ValueError("Control record exceeds cap")
+                  return json.loads(raw)
+              finally:
+                  os.close(descriptor)
+
+          def supervise(control, request, seconds=45, adapter=None):
+              healthy = Path(os.path.abspath(os.environ["HSS_CONTROL"]))
+              request = dict(request)
+              for key in ("root", "destination"):
+                  path = Path(os.path.abspath(request[key]))
+                  if path == healthy or healthy in path.parents or path in healthy.parents:
+                      raise ValueError("Collector and control roots overlap")
+                  request[key] = str(path)
+              identity = os.urandom(16).hex()
+              directory = healthy / identity
+              directory.mkdir(mode=0o700)
+              start = time.monotonic()
+              deadline = start + min(seconds, max(0, float(os.environ["WORK_DEADLINE"]) - time.time()))
+              request.update(schema=SCHEMA, identity=identity, deadline=deadline, control=str(directory),
+                             module_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+              args = [sys.executable, __file__, "worker", str(directory / "request.json")]
+              owner = dict(identity=identity, parent=os.getpid(), command=args,
+                  ancestors=json.loads(os.environ.get("HSS_COMMAND_ANCESTORS", "[]")),
+                  parents=json.loads(os.environ.get("HSS_COMMAND_PARENTS", "[]")),
+                  module_sha256=request["module_sha256"], absolute_deadline=deadline)
+              control.publish(directory / "request.json", request)
+              control.publish(directory / "ownership.json", owner)
+              result = dict(schema=SCHEMA, identity=identity, control=str(directory), status="running",
+                            complete=False, rc=None, cleanup_complete=None, safety_cleanup=None,
+                            entries=None, bytes=None, index=None, worker=None, elapsed=None)
+              control.publish(directory / "result.json", result)
+              process = None
+              try:
+                  if deadline <= time.monotonic():
+                      raise TimeoutError("Collector budget unavailable")
+                  libc = control.ctypes.CDLL(None, use_errno=True)
+                  if libc.prctl(36, 1, 0, 0, 0) != 0:
+                      raise OSError(control.ctypes.get_errno(), "Collector subreaper")
+                  spawn = subprocess.Popen if adapter is None else adapter
+                  process = spawn(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, close_fds=True)
+                  result["pid"] = process.pid
+                  control.publish(directory / "result.json", result)
+                  while process.poll() is None and time.monotonic() < deadline:
+                      time.sleep(min(.02, max(0, deadline - time.monotonic())))
+                  result["status"] = "completed" if process.poll() is not None else "collector_timeout"
+                  result["cleanup_complete"] = control.cleanup(process, 2)
+                  result["rc"] = process.returncode
+                  if not result["cleanup_complete"]:
+                      result["status"] = "collector_cleanup_incomplete"
+                  worker = bounded_json(directory / "worker.json")
+                  if (not isinstance(worker, dict) or worker.get("schema") != SCHEMA or
+                          worker.get("identity") != identity or worker.get("pid") != process.pid or
+                          worker.get("module_sha256") != request["module_sha256"] or
+                          worker.get("deadline") != deadline or type(worker.get("complete")) is not bool or
+                          type(worker.get("entries")) is not int or not 0 <= worker["entries"] <= 4000 or
+                          type(worker.get("bytes")) is not int or not 0 <= worker["bytes"] <= 256 * 1024 * 1024):
+                      raise ValueError("Malformed, foreign or stale collector result")
+                  result["worker"] = worker
+                  result["complete"] = (result["status"] == "completed" and result["rc"] == 0 and
+                      result["cleanup_complete"] is True and worker["complete"] and "error" not in worker)
+                  if result["complete"]:
+                      index = worker["index"]
+                      if (not isinstance(index, dict) or set(index) != {"path", "bytes", "sha256"} or
+                              index["path"] != str(Path(request["destination"]) / "evidence-index.json") or
+                              type(index["bytes"]) is not int or not 0 < index["bytes"] <= 2 * 1024 * 1024 or
+                              not isinstance(index["sha256"], str) or len(index["sha256"]) != 64 or
+                              any(char not in "0123456789abcdef" for char in index["sha256"])):
+                          raise ValueError("Invalid collector index receipt")
+                      result.update(entries=worker["entries"], bytes=worker["bytes"], index=index)
+              except (OSError, ValueError, KeyError, TypeError, TimeoutError) as error:
+                  if result["status"] == "running" or result["status"] == "completed":
+                      result["status"] = "collector_error"
+                  result.update(complete=False, error=f"{type(error).__name__}: {error}"[:512])
+              finally:
+                  if process is not None and result["cleanup_complete"] is not True:
+                      try:
+                          result["safety_cleanup"] = control.cleanup(process, 2)
+                          result["rc"] = process.returncode
+                      except OSError as error:
+                          result.update(safety_cleanup=False, cleanup_error=type(error).__name__)
+                      result["complete"] = False
+                  result["elapsed"] = time.monotonic() - start
+                  control.publish(directory / "result.json", result)
+              return result
+
+          def phase_records(root):
+              phases = {}
+              outcomes = {"bootstrap": "BOOTSTRAP_OUTCOME", "checkout": "CHECKOUT_OUTCOME",
+                          "fallback-version": "VERSION_OUTCOME", "namespace": "NAMESPACE_OUTCOME"}
+              for name in (root / "planned-phases.txt").read_text().splitlines():
+                  paths = (root / name / "result.json", root / f"{name}-result.json")
+                  found = next((path for path in paths if path.is_file()), None)
+                  if found is not None:
+                      raw = found.read_bytes()
+                      try:
+                          child = evidence_schema.record(raw, command=found.name == "result.json")
+                          interruption = root / name / "interruption.json"
+                          if interruption.is_file():
+                              child = dict(raw_result=str(found.relative_to(root)),
+                                  **evidence_schema.interruption(interruption.read_bytes(), child, raw))
+                          phases[name] = child
+                      except (ValueError, UnicodeDecodeError, OSError) as error:
+                          phases[name] = evidence_schema.invalid(found.relative_to(root), raw, error)
+                  elif (root / name / "interruption.json").is_file():
+                      sidecar = root / name / "interruption.json"
+                      raw = sidecar.read_bytes()
+                      try:
+                          phases[name] = evidence_schema.initial_interruption(raw,
+                              sidecar.with_name("ownership.json").read_bytes(), f"{name}/result.json")
+                      except (ValueError, UnicodeDecodeError, OSError) as error:
+                          phases[name] = evidence_schema.invalid(sidecar.relative_to(root), raw, error)
+                  elif (root / name / "invalid-ownership.json").is_file():
+                      path = root / name / "invalid-ownership.json"
+                      raw = path.read_bytes()
+                      try:
+                          phases[name] = evidence_schema.invalid_ownership(raw, f"{name}/ownership.json",
+                              path.with_name("ownership.json").read_bytes())
+                      except (ValueError, UnicodeDecodeError, OSError) as error:
+                          phases[name] = dict(evidence_schema.invalid(path.relative_to(root), raw, error), spawn=None)
+                  elif name in outcomes:
+                      outcome = os.environ.get(outcomes[name], "skipped")
+                      phases[name] = dict(status="not_run" if outcome == "skipped" else outcome,
+                                          rc=0 if outcome == "success" else None, action_outcome=outcome)
+                  else:
+                      phases[name] = dict(status="not_run", rc=None, reason="No phase result; inspect earlier failure")
+              return phases
+
+          def worker(request, adapter=None):
+              import control
+              directory = Path(request["control"])
+              result = dict(schema=SCHEMA, identity=request["identity"], deadline=request["deadline"],
+                            pid=os.getpid(), module_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                            complete=False, entries=0, bytes=0, index=None)
+              control.work_remaining = lambda: remaining(request["deadline"])
+              original = control.OUT
+              control.OUT = Path(request["root"])
+              try:
+                  if request["schema"] != SCHEMA or result["module_sha256"] != request["module_sha256"]:
+                      raise ValueError("Collector module identity changed")
+                  if adapter is not None:
+                      adapter(request)
+                  if request["mode"] == "runtime":
+                      control.collect(Path(request["destination"]))
+                      paths = [root / name for root in control.runtime_roots()
+                               for name in ("log.txt", "vpp_stderr.txt") if (root / name).is_file()]
+                      text = control.read_evidence(paths)
+                      raw = text.encode("utf-8")
+                      if len(raw) > 96 * 1024 * 1024:
+                          raise ValueError("Validation payload cap")
+                      (directory / "validation.log").write_bytes(raw)
+                      result["validation"] = dict(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                  elif request["mode"] == "final":
+                      for source in control.TOOLS.glob("*.py"):
+                          (control.OUT / source.name).write_bytes(source.read_bytes())
+                      for name, args in (("final-status.txt", ["git", "status", "--short"]),
+                                         ("final.diff", ["git", "diff", "--binary"])):
+                          with (control.OUT / name).open("wb") as stream:
+                              subprocess.run(args, stdout=stream, stderr=subprocess.STDOUT,
+                                             check=True, timeout=max(.01, remaining(request["deadline"])))
+                      control.dependency_checkpoint("final")
+                      control.collect(control.OUT / "final-diagnostics")
+                      control.publish(control.OUT / "phase-status.json", phase_records(control.OUT))
+                  elif request["mode"] != "fixture":
+                      raise ValueError("Unknown collection operation")
+                  files = {}
+                  for path in control.bounded_paths(Path(request["destination"])):
+                      if path.name == "evidence-index.json":
+                          continue
+                      remaining(request["deadline"])
+                      size = path.stat().st_size
+                      if len(files) >= 4000 or result["bytes"] + size > 256 * 1024 * 1024:
+                          raise ValueError("Collector index cap")
+                      digest = hashlib.sha256()
+                      descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                      try:
+                          info = os.fstat(descriptor)
+                          if not stat.S_ISREG(info.st_mode):
+                              raise ValueError("Nonregular index input")
+                          observed = 0
+                          while True:
+                              remaining(request["deadline"])
+                              chunk = os.read(descriptor, 65536)
+                              if not chunk:
+                                  break
+                              digest.update(chunk)
+                              observed += len(chunk)
+                          if observed != size or os.fstat(descriptor).st_mtime_ns != info.st_mtime_ns:
+                              raise ValueError("Index input changed")
+                      finally:
+                          os.close(descriptor)
+                      files[str(path.relative_to(request["destination"]))] = dict(bytes=size, sha256=digest.hexdigest())
+                      result["bytes"] += observed
+                      result["entries"] = len(files)
+                  target = Path(request["destination"]) / "evidence-index.json"
+                  raw = (json.dumps(files, indent=2, sort_keys=True) + "\n").encode("utf-8")
+                  if len(raw) > 2 * 1024 * 1024:
+                      raise ValueError("Collector index metadata cap")
+                  pending = target.with_name("evidence-index.pending")
+                  descriptor = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                  try:
+                      if os.write(descriptor, raw) != len(raw):
+                          raise OSError("Collector index short_write")
+                  finally:
+                      os.close(descriptor)
+                  os.replace(pending, target)
+                  if target.read_bytes() != raw:
+                      raise ValueError("Collector index publication changed")
+                  result["index"] = dict(path=str(target), bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                  result["complete"] = True
+              except Exception as error:
+                  result["error"] = f"{type(error).__name__}: {error}"[:512]
+              finally:
+                  control.OUT = original
+                  control.publish(directory / "worker.json", result)
+              return result
+
+          def remaining(deadline):
+              seconds = deadline - time.monotonic()
+              if seconds <= 0:
+                  raise TimeoutError("Collector absolute deadline")
+              return seconds
+
+          if __name__ == "__main__":
+              request = bounded_json(sys.argv[2])
+              result = worker(request)
+              raise SystemExit(0 if result["complete"] else 1)
           PY
           cat > "$TOOLS/control.py" <<'PY'
           import ast
@@ -1771,13 +2032,17 @@ jobs:
                   rc, console = command("runtime", args, env)
               finally:
                   dependency_checkpoint("after-runtime")
-              collect(OUT / "runtime" / "diagnostics")
+              collection = supervise_collection("runtime", OUT / "runtime" / "diagnostics")
+              require(collection["complete"], "Runtime collection incomplete")
               event_paths = [path for path in bounded_paths(OUT, recursive=False)
                              if path.name.startswith("events.") and path.suffix == ".jsonl"]
               events = [json.loads(line) for line in read_evidence(event_paths).splitlines() if line]
-              paths = [root / name for root in runtime_roots() for name in ("log.txt", "vpp_stderr.txt")
-                       if (root / name).is_file()]
-              logs = read_evidence(paths)
+              validation = collection["worker"]["validation"]
+              with (Path(collection["control"]) / "validation.log").open("rb") as stream:
+                  raw = stream.read(96 * 1024 * 1024 + 1)
+              require(len(raw) <= 96 * 1024 * 1024 and len(raw) == validation["bytes"] and
+                      hashlib.sha256(raw).hexdigest() == validation["sha256"], "Invalid validation payload")
+              logs = raw.decode("utf-8")
               work_remaining()
               try:
                   runtime = json.loads((OUT / "runtime/result.json").read_text())
@@ -1903,17 +2168,25 @@ jobs:
                   result["end"] = time.time()
                   save(f"{action}-result.json", result)
 
+          def supervise_collection(mode, destination):
+              import hss_collection
+              return hss_collection.supervise(sys.modules[__name__], dict(mode=mode,
+                  root=str(OUT.absolute()), destination=str(destination.absolute())))
+
           def final_collect():
-              try:
-                  dependency_checkpoint("final")
-              finally:
-                  collect(OUT / "final-diagnostics")
+              result = supervise_collection("final", OUT)
+              require(result["complete"], "Final collection/index incomplete; inspect healthy control records")
 
           if __name__ == "__main__":
               action = sys.argv[1]
               operations = {"prepare": prepare, "mutate": mutate, "tests": tests,
-                            "binaries": binaries, "collect": final_collect, "http-name": http_name}
-              if action == "dependency-check":
+                            "binaries": binaries, "http-name": http_name}
+              if action == "collect":
+                  final_collect()
+              elif action == "diagnostic-contract":
+                  import diagnostic_contract
+                  raise SystemExit(diagnostic_contract.supervise_contract())
+              elif action == "dependency-check":
                   label = sys.argv[2]
                   require(label in ("before-python", "after-python", "final"), "Unknown dependency checkpoint")
                   dependency_checkpoint(label, normalize=label == "before-python", clean=label != "final")
@@ -1929,9 +2202,571 @@ jobs:
                   status, _ = command(action, sys.argv[2:])
                   raise SystemExit(status)
           PY
+          cat > "$TOOLS/diagnostic_contract.py" <<'PY'
+          import contextlib
+          import ctypes
+          import errno
+          import hashlib
+          import importlib
+          import json
+          import os
+          from pathlib import Path
+          import selectors
+          import signal
+          import subprocess
+          import sys
+          import tempfile
+          import time
+          import traceback
+          import types
+          import unittest
+          from unittest.mock import patch
+          import control
+          import hss_collection
+          import hss_diagnostics as diagnostics
+
+          SCHEMA = "hss-diagnostic-contract-v1"
+          CASES = ("test_live_setup_failure_query_once", "test_query_term_kill_reap",
+                   "test_query_permission_denied_is_incomplete", "test_diagnostic_disk_full_is_incomplete",
+                   "test_collector_blocked_is_bounded")
+          ROOT = Path(os.environ["HSS_CONTROL"]) / "diagnostic-contract"
+          FAULTS = control.OUT / "diagnostic-faults"
+          FAULTS.mkdir(mode=0o700, exist_ok=True)
+          OBSERVATIONS = {}
+
+          def require(value, message):
+              if not value:
+                  raise AssertionError(message)
+
+          def provenance():
+              return dict(workflow=os.environ["WORKFLOW_SHA"], candidate=control.CANDIDATE,
+                  fixture_sha256=control.digest(__file__),
+                  modules={path.name: control.digest(path) for path in control.TOOLS.glob("*.py")},
+                  tests=control.TEST_BLOBS, binaries="CI hash records only; binary bytes not uploaded")
+
+          def helper(mode):
+              if mode == "exit":
+                  return
+              if mode in ("ignore", "descendant"):
+                  signal.signal(signal.SIGTERM, signal.SIG_IGN)
+              if mode == "descendant":
+                  child = subprocess.Popen([sys.executable, __file__, "helper", "ignore"])
+                  print(child.pid, flush=True)
+              if mode == "output":
+                  while True:
+                      os.write(1, b"o" * 256)
+                      os.write(2, b"e" * 256)
+                      time.sleep(.01)
+              while True:
+                  time.sleep(.05)
+
+          def direct_reaped(process):
+              try:
+                  os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+              except ChildProcessError:
+                  return process.returncode is not None
+              return False
+
+          def query_case(mode, denied=False, omit_cleanup=False):
+              directory = ROOT / (mode + os.urandom(4).hex())
+              directory.mkdir()
+              socket = directory / "cli.sock"
+              import socket as sockets
+              server = sockets.socket(sockets.AF_UNIX)
+              server.bind(str(socket))
+              streams = {}
+              for index in (2, 3):
+                  descriptor = os.open(directory / f"stream{index}", os.O_CREAT | os.O_RDWR, 0o600)
+                  streams[index] = diagnostics.Stream(descriptor, 1024)
+              process = None
+              real_spawn = subprocess.Popen
+              timing = {}
+              class Process:
+                  def __init__(self, child):
+                      self.child = child
+                  def __getattr__(self, name):
+                      return getattr(self.child, name)
+                  def terminate(self):
+                      timing["term"] = time.monotonic()
+                      if denied == "terminate":
+                          raise PermissionError(errno.EPERM, "injected owned helper TERM")
+                      if not omit_cleanup:
+                          self.child.terminate()
+                  def kill(self):
+                      timing["kill"] = time.monotonic()
+                      if denied == "kill":
+                          raise PermissionError(errno.EPERM, "injected owned helper KILL")
+                      if not omit_cleanup:
+                          self.child.kill()
+                  def wait(self, timeout=None):
+                      if denied == "wait":
+                          raise PermissionError(errno.EPERM, "injected owned helper wait")
+                      if omit_cleanup:
+                          raise subprocess.TimeoutExpired("negative cleanup adapter", timeout)
+                      answer = self.child.wait(timeout=timeout)
+                      timing["reap"] = time.monotonic()
+                      return answer
+              def spawn(args, **kwargs):
+                  nonlocal process
+                  require(args[-2:] == ["show", "logging"], "Query command changed")
+                  timing["spawn"] = time.monotonic()
+                  process = real_spawn([sys.executable, __file__, "helper", mode],
+                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                  return Process(process)
+              slot = types.SimpleNamespace(record={}, process=types.SimpleNamespace(poll=lambda: None),
+                  tempdir=str(directory), process_metadata=lambda deadline: None,
+                  write=lambda index, raw: streams[index].write(raw))
+              cls = types.SimpleNamespace(vpp=slot.process, tempdir=str(directory),
+                                          get_cli_sock_path=lambda: str(socket))
+              source = diagnostics.directory(str(control.ROOT))
+              owner = types.SimpleNamespace(source_path=str(control.ROOT), source_inode=diagnostics.stamp(source),
+                  source_fd=source, tool=str(control.ROOT / "build-root/install-vpp_debug-native/vpp/bin/vppctl"),
+                  config={"vppctl_sha256": control.digest("build-root/install-vpp_debug-native/vpp/bin/vppctl")})
+              start = time.monotonic()
+              safety = None
+              try:
+                  with patch.object(diagnostics.subprocess, "Popen", spawn):
+                      diagnostics.Diagnostics.query(owner, slot, cls, start)
+                  require(process is not None, "Actual query did not reach helper spawn")
+                  timing["finish"] = time.monotonic()
+                  observed = dict(slot.record, query_direct_cleanup=slot.record.get("cleanup_complete"),
+                      direct_reaped=direct_reaped(process), alive_before_safety=process.poll() is None,
+                      owned_children_before_safety=control.children(),
+                      timing={key: value - start for key, value in timing.items()},
+                      streams={str(index): stream.freeze() for index, stream in streams.items()},
+                      helper=dict(mode=mode, argv=[sys.executable, __file__, "helper", mode],
+                                  sha256=control.digest(__file__)), actual_vppctl=False)
+                  return observed
+              finally:
+                  if process is not None:
+                      safety = control.cleanup(process, 2)
+                  OBSERVATIONS.setdefault("outer_cleanup", []).append(dict(mode=mode, safety_cleanup=safety,
+                      children_after=control.children(), separate_from_query=True))
+                  for stream in streams.values():
+                      if stream.descriptor is not None:
+                          stream.freeze()
+                  os.close(source)
+                  server.close()
+
+          def setup_probe(mode):
+              import threading
+              sys.argv = [__file__, "--vpp-ws-dir", str(control.ROOT), "--vpp-tag", "vpp_debug",
+                          "--vpp-worker-count", "0", "--rnd-seed", "48", "--coredump-size", "0"]
+              sys.path[:0] = [str(control.ROOT / "test"), str(control.ROOT / "test/asf")]
+              module = importlib.import_module("test_http_static")
+              config = importlib.import_module("config")
+              case = module.TestHttpStaticCli
+              case.assign_cores(config.physical_cores[:case.get_cores_required()])
+              original = module.create_host_interface
+              name = "hsdiag_missing"
+              require(not Path("/sys/class/net", name).exists(), "Fault device is present")
+              require(not config.config.skip_netns_tests, "Namespaces unavailable")
+              record = dict(mode=mode, error=None, calls=[], teardown_called=False, resource_cleanup=False,
+                            addSuccess=0, callbacks=[])
+              def absent(*args, **kwargs):
+                  host, device = original(*args, **kwargs)
+                  record["calls"].append(dict(host=host, actual_device=device, returned_device=name))
+                  return host, name
+              active = diagnostics.configure() if mode == "observed" else None
+              require(mode == "baseline" or active is not None, "Live diagnostics unavailable")
+              sequence = 0
+              def profile(frame, event, value):
+                  nonlocal sequence
+                  if active is not None:
+                      active.observe(frame, event, value)
+                  if event == "return" and frame.f_code.co_name == "cli_return_response" and value is not None:
+                      command = frame.f_locals.get("cli", "").strip()
+                      if command == f"create host-interface name {name}":
+                          sequence += 1
+                          record.update(retval=value.retval, reply=str(value.reply), seq=sequence,
+                              provider_pid=os.getpid(), original_command=command)
+                          if active is not None:
+                              active.failure(frame, value, sequence)
+                              active.failure(frame, value, sequence)
+              class Result(unittest.TestResult):
+                  def addError(self, test, error):
+                      record["callbacks"].append(dict(kind="addError", test=test.id()))
+                      record["error"] = dict(type=error[0].__name__, message=str(error[1]),
+                          traceback="".join(traceback.format_exception(*error)),
+                          frames=[dict(file=frame.filename, name=frame.name, line=frame.lineno)
+                                  for frame in traceback.extract_tb(error[2])])
+                      super().addError(test, error)
+                  def addSuccess(self, test):
+                      record["addSuccess"] += 1
+                      super().addSuccess(test)
+              result = Result()
+              process = None
+              real_spawn = subprocess.Popen
+              record["logging_queries"] = []
+              def spawn(args, **kwargs):
+                  child = real_spawn(args, **kwargs)
+                  if isinstance(args, list) and args[-2:] == ["show", "logging"]:
+                      record["logging_queries"].append(dict(pid=child.pid, argv=args,
+                          executable=kwargs.get("executable"), socket=case.get_cli_sock_path()))
+                  return child
+              try:
+                  sys.setprofile(profile)
+                  threading.setprofile(profile)
+                  with patch.object(module, "create_host_interface", absent), patch.object(subprocess, "Popen", spawn):
+                      method = unittest.defaultTestLoader.getTestCaseNames(case)[0]
+                      unittest.TestSuite([case(method)]).run(result)
+                  record.update(methods=result.testsRun, setup_errors=len(result.errors),
+                                skips=len(result.skipped), failures=len(result.failures))
+                  require(record.get("retval", 0) != 0 and len(record["calls"]) == 1 and
+                          len(result.errors) == 1 and result.testsRun == 0 and not result.skipped,
+                          "Missing actual unittest absent-device setup failure")
+                  require(any(frame["name"] == "setUpClass" and frame["line"] == 199
+                              for frame in record["error"]["frames"]), "Original setup frame absent")
+              finally:
+                  sys.setprofile(None)
+                  threading.setprofile(None)
+                  process = getattr(case, "vpp", None)
+                  try:
+                      case.tearDownClass()
+                      record["teardown_called"] = True
+                      record["resource_cleanup"] = (process is not None and process.poll() is not None and
+                          all(not Path("/sys/class/net", call["actual_device"]).exists()
+                              for call in record["calls"]))
+                  finally:
+                      if active is not None:
+                          active.finish()
+              if active is not None:
+                  record["slots"] = [hss_collection.bounded_json(Path(active.config["directory"]) / name / "record.json")
+                                     for name in active.slots]
+              os.chdir(control.ROOT)
+              control.publish(ROOT / f"setup-{mode}.json", record)
+              return 0
+
+          class Contract(unittest.TestCase):
+              def test_live_setup_failure_query_once(self):
+                  config = json.loads((control.OUT / "manifest.json").read_text())
+                  directory = ROOT / "live"
+                  directory.mkdir()
+                  live = dict(directory=str(directory), root=str(control.ROOT),
+                      vppctl=str(control.ROOT / "build-root/install-vpp_debug-native/vpp/bin/vppctl"),
+                      vppctl_sha256=control.digest("build-root/install-vpp_debug-native/vpp/bin/vppctl"),
+                      sources=config["diagnostic_sources"], workflow=config["workflow_sha"],
+                      candidate=control.CANDIDATE, variant="fixed", runtime="diagnostic-contract")
+                  results = []
+                  for mode in ("baseline", "observed"):
+                      env = dict(os.environ, HSS_EVENTS="", HSS_DIAGNOSTIC_CONFIG=json.dumps(live),
+                          PYTHONPATH=str(control.TOOLS) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+                      process = subprocess.Popen([str(control.ROOT / "build-root/test/venv/bin/python"),
+                          __file__, "setup", mode], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                      with (ROOT / f"setup-{mode}.log").open("w+b") as stream:
+                          _, timeout = control.capture(process, time.monotonic() + 90, stream)
+                      cleanup = control.cleanup(process, 2)
+                      self.assertFalse(timeout)
+                      self.assertTrue(cleanup)
+                      self.assertEqual(process.returncode, 0)
+                      results.append(hss_collection.bounded_json(ROOT / f"setup-{mode}.json"))
+                  before, after = results
+                  self.assertEqual((before["retval"], before["reply"], before["error"]),
+                                   (after["retval"], after["reply"], after["error"]))
+                  self.assertTrue(all(result["resource_cleanup"] and result["methods"] == 0 and
+                                      result["addSuccess"] == 0 for result in results))
+                  self.assertEqual(before["logging_queries"], [])
+                  self.assertEqual(len(after["logging_queries"]), 1)
+                  self.assertEqual(len(after["slots"]), 1)
+                  slot = after["slots"][0]
+                  self.assertEqual(slot["observer_pid"], after["provider_pid"])
+                  self.assertEqual(slot["query_pid"], after["logging_queries"][0]["pid"])
+                  self.assertEqual(slot["event_seq"], after["seq"])
+                  self.assertEqual(slot["reply_sha256"], hashlib.sha256(after["reply"].encode()).hexdigest())
+                  self.assertEqual(slot["query_status"], "completed")
+                  self.assertTrue(slot["cleanup_complete"])
+                  self.assertIsNotNone(slot.get("query_pid"))
+                  self.assertIn(slot.get("process_metadata", {}).get("status"), ("captured", "unavailable"))
+                  OBSERVATIONS[self._testMethodName] = dict(baseline=before, observed=after,
+                      actual_vppctl=True, original_setup_failure_preserved=True)
+
+              def test_query_term_kill_reap(self):
+                  records = {}
+                  for mode in ("exit", "silent", "output", "ignore", "descendant"):
+                      result = query_case(mode)
+                      self.assertTrue(result["query_direct_cleanup"])
+                      self.assertTrue(result["direct_reaped"])
+                      self.assertFalse(result["alive_before_safety"])
+                      expected = ("completed" if mode == "exit" else
+                                  "output_limit_or_write_error" if mode == "output" else "timeout")
+                      self.assertEqual(result["query_status"], expected)
+                      if mode in ("ignore", "descendant"):
+                          self.assertIn("kill", result["timing"])
+                      if mode == "descendant":
+                          self.assertTrue(result["owned_children_before_safety"], "No adopted descendant witness")
+                      if mode == "output":
+                          self.assertTrue(all(stream["bytes"] == 1024
+                                              for stream in result["streams"].values()))
+                          self.assertTrue(any(stream["observed_bytes"] > 1024
+                                              for stream in result["streams"].values()))
+                      self.assertIn("reap", result["timing"])
+                      self.assertLess(result["query_elapsed"], 4, "Real deadline plus scheduling allowance")
+                      records[mode] = result
+                  negative = query_case("ignore", omit_cleanup=True)
+                  with self.assertRaises(AssertionError):
+                      self.assertTrue(negative["query_direct_cleanup"] and negative["direct_reaped"])
+                  self.assertTrue(negative["alive_before_safety"])
+                  self.assertTrue(all(record["safety_cleanup"] and not record["children_after"]
+                                      for record in OBSERVATIONS["outer_cleanup"]))
+                  OBSERVATIONS[self._testMethodName] = dict(cases=records, negative=negative)
+
+              def test_query_permission_denied_is_incomplete(self):
+                  records = {}
+                  for seam in ("terminate", "kill", "wait"):
+                      result = query_case("ignore", denied=seam)
+                      self.assertFalse(result["query_direct_cleanup"])
+                      self.assertTrue(result["alive_before_safety"])
+                      self.assertFalse(result["direct_reaped"])
+                      self.assertLess(result["query_elapsed"], 4)
+                      records[seam] = result
+                  self.assertTrue(all(record["safety_cleanup"] and not record["children_after"]
+                                      for record in OBSERVATIONS["outer_cleanup"]))
+                  OBSERVATIONS[self._testMethodName] = records
+
+              def test_diagnostic_disk_full_is_incomplete(self):
+                  records = []
+                  real_write = os.write
+                  for fault in ("short_write", "enospc"):
+                      path = ROOT / (fault + ".bin")
+                      descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+                      stream = diagnostics.Stream(descriptor, 128)
+                      calls = 0
+                      def write(fd, raw):
+                          nonlocal calls
+                          if fd != descriptor:
+                              return real_write(fd, raw)
+                          calls += 1
+                          if calls == 1:
+                              return real_write(fd, raw[:3])
+                          raise OSError(errno.ENOSPC, "finite disk-full adapter")
+                      with patch.object(diagnostics.os, "write", write):
+                          if fault == "enospc":
+                              self.assertTrue(stream.write(b"abc"))
+                          self.assertFalse(stream.write(b"abcdefgh"))
+                      record = stream.freeze()
+                      self.assertEqual(path.read_bytes(), b"abc")
+                      self.assertEqual(record["bytes"], 3)
+                      self.assertEqual(record["sha256"], hashlib.sha256(b"abc").hexdigest())
+                      self.assertEqual(record["error"], "short_write" if fault == "short_write" else "write_error")
+                      self.assertFalse(record["truncated"])
+                      records.append(record)
+                  for stage in ("pending_short", "pending_enospc", "rename"):
+                      result = slot_case(stage)
+                      self.assertFalse(result["complete"])
+                      self.assertTrue(result["pending_exists"])
+                      self.assertFalse(result["record_exists"])
+                      self.assertGreater(result["bytes"], 0)
+                      records.append(result)
+                  for stage in ("index", "copy", "collection"):
+                      result = collection_case(stage)
+                      self.assertFalse(result["complete"])
+                      self.assertTrue(result["ready"])
+                      self.assertEqual(result["rc"], 1)
+                      self.assertIn("OSError", result["worker"]["error"])
+                      retained = result["fault_receipt"]["retained"]
+                      self.assertEqual(retained["bytes"], 7)
+                      self.assertEqual(len(retained["sha256"]), 64)
+                      self.assertTrue(result["outer_children_empty"])
+                      records.append(result)
+                  OBSERVATIONS[self._testMethodName] = records
+
+              def test_collector_blocked_is_bounded(self):
+                  records = []
+                  for stage in ("scandir", "open", "read", "write", "ignore"):
+                      result = collection_case(stage)
+                      self.assertFalse(result["complete"])
+                      self.assertTrue(result["cleanup_complete"])
+                      self.assertLess(result["elapsed"], 7)
+                      self.assertTrue(result["ready"])
+                      self.assertEqual(result["status"], "collector_timeout")
+                      self.assertEqual(result["fault_receipt"]["pid"], result["pid"])
+                      self.assertTrue(result["outer_children_empty"])
+                      self.assertIn(result["rc"], (-signal.SIGTERM, -signal.SIGKILL))
+                      if stage == "ignore":
+                          self.assertEqual(result["rc"], -signal.SIGKILL)
+                      with self.assertRaises(AssertionError):
+                          self.assertTrue(result["complete"])
+                      misrouted = dict(result, pid=result["pid"] + 1)
+                      with self.assertRaises(AssertionError):
+                          self.assertEqual(misrouted["fault_receipt"]["pid"], misrouted["pid"])
+                      records.append(result)
+                  forged = dict(records[0], complete=True)
+                  with self.assertRaises(AssertionError):
+                      self.assertTrue(forged["complete"] and forged["status"] == "completed" and
+                                      forged["rc"] == 0 and forged["worker"]["complete"])
+                  OBSERVATIONS[self._testMethodName] = records
+
+          def slot_case(stage):
+              directory = ROOT / stage
+              directory.mkdir()
+              descriptor = diagnostics.directory(str(directory))
+              pending = os.open("record.pending", os.O_CREAT | os.O_RDWR, 0o600, dir_fd=descriptor)
+              owner = types.SimpleNamespace(identity={}, provenance={})
+              slot = diagnostics.Slot(owner, stage, types.SimpleNamespace(pid=os.getpid(), poll=lambda: None),
+                                      descriptor, pending)
+              slot.allocated = True
+              real_write, real_rename = os.write, os.rename
+              def write(fd, raw):
+                  if fd != pending:
+                      return real_write(fd, raw)
+                  count = real_write(fd, raw[:7])
+                  if stage == "pending_enospc":
+                      raise OSError(errno.ENOSPC, "pending prefix written")
+                  return count
+              def rename(source, destination, **kwargs):
+                  require(source == "record.pending" and destination == "record.json", "Wrong rename seam")
+                  raise OSError(errno.ENOSPC, "pending rename denied")
+              try:
+                  with patch.object(os, "write", real_write if stage == "rename" else write), \
+                          patch.object(os, "rename", rename if stage == "rename" else real_rename):
+                      slot.finish()
+              finally:
+                  slot.close()
+              raw = (directory / "record.pending").read_bytes()
+              return dict(stage=stage, complete=False, pending_exists=(directory / "record.pending").exists(),
+                  record_exists=(directory / "record.json").exists(), bytes=len(raw),
+                  sha256=hashlib.sha256(raw).hexdigest(), expected_fault=stage)
+
+          def collection_case(stage):
+              directory = ROOT / ("collect-" + stage + os.urandom(4).hex())
+              directory.mkdir()
+              target = Path(tempfile.mkdtemp(prefix="collector-", dir=FAULTS))
+              (target / "prefix.log").write_bytes(b"retained prefix\n")
+              ready = directory / "ready"
+              real_spawn = subprocess.Popen
+              def spawn(args, **kwargs):
+                  return real_spawn([sys.executable, __file__, "collector", args[-1], stage, str(ready)], **kwargs)
+              mode = "runtime" if stage in ("copy", "collection") else "fixture"
+              measured = hss_collection.supervise(control, dict(mode=mode, root=str(target),
+                  destination=str(target)), seconds=2, adapter=spawn)
+              measured["ready"] = ready.exists()
+              measured["fault_receipt"] = hss_collection.bounded_json(ready) if ready.exists() else None
+              measured["retained_prefix"] = dict(path=str(target / "prefix.log"), bytes=16,
+                  sha256=hashlib.sha256(b"retained prefix\n").hexdigest(), verified_by="pre-fault real write")
+              measured["outer_children_empty"] = not control.children()
+              measured["expected_fault"] = stage
+              return measured
+
+          def collector_probe(request_path, stage, ready):
+              request = hss_collection.bounded_json(request_path)
+              root = Path(request["destination"])
+              real_scandir, real_open, real_read, real_write = os.scandir, os.open, os.read, os.write
+              real_bytes, real_text = Path.write_bytes, Path.write_text
+              descriptors = set()
+              if stage in ("copy", "collection"):
+                  source = root / "input"
+                  source.mkdir()
+                  (source / "source.log").write_bytes(b"source prefix\n")
+                  control.runtime_roots = lambda: [source]
+              def fault(prefix=None):
+                  receipt = dict(stage=stage, pid=os.getpid(), retained=None)
+                  if prefix is not None:
+                      raw = prefix.read_bytes()
+                      receipt["retained"] = dict(path=str(prefix), bytes=len(raw),
+                          sha256=hashlib.sha256(raw).hexdigest())
+                  real_text(Path(ready), json.dumps(receipt))
+                  if stage in ("index", "copy", "collection"):
+                      raise OSError(errno.ENOSPC, "collector finite fault " + stage)
+                  if stage == "ignore":
+                      signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                  while True:
+                      time.sleep(.05)
+              def scandir(path):
+                  if stage in ("scandir", "ignore") and Path(path) == root:
+                      fault()
+                  return real_scandir(path)
+              def opened(path, flags, *args, **kwargs):
+                  if stage == "open" and str(path).startswith(str(root)):
+                      fault()
+                  fd = real_open(path, flags, *args, **kwargs)
+                  if str(path).startswith(str(root)):
+                      descriptors.add(fd)
+                  return fd
+              def read(fd, length):
+                  if stage == "read" and fd in descriptors:
+                      fault()
+                  return real_read(fd, length)
+              def write(fd, raw):
+                  if fd in descriptors and stage == "write":
+                      fault()
+                  if fd in descriptors and stage == "index":
+                      real_write(fd, raw[:7])
+                      fault(root / "evidence-index.pending")
+                  return real_write(fd, raw)
+              def write_bytes(path, raw):
+                  if stage == "copy" and path.parent == root and path.name == "0000.log":
+                      real_bytes(path, raw[:7])
+                      fault(path)
+                  return real_bytes(path, raw)
+              def write_text(path, text, *args, **kwargs):
+                  if stage == "collection" and path == root / "collection.json":
+                      real_text(path, text[:7], *args, **kwargs)
+                      fault(path)
+                  return real_text(path, text, *args, **kwargs)
+              with patch.object(os, "scandir", scandir), patch.object(os, "open", opened), \
+                      patch.object(os, "read", read), patch.object(os, "write", write), \
+                      patch.object(Path, "write_bytes", write_bytes), patch.object(Path, "write_text", write_text):
+                  result = hss_collection.worker(request)
+              return 0 if result["complete"] else 1
+
+          def supervise_contract():
+              ROOT.mkdir(mode=0o700, exist_ok=True)
+              libc = ctypes.CDLL(None, use_errno=True)
+              require(libc.prctl(36, 1, 0, 0, 0) == 0, "Diagnostic watchdog subreaper unavailable")
+              start = time.monotonic()
+              process = subprocess.Popen([sys.executable, __file__, "suite"], stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT)
+              with (ROOT / "suite-console.log").open("w+b") as stream:
+                  _, timed_out = control.capture(process, start + 300, stream)
+              cleanup = control.cleanup(process, 2)
+              report = dict(schema=SCHEMA, role="external_watchdog", timeout=timed_out,
+                  rc=process.returncode, cleanup_complete=cleanup, elapsed=time.monotonic() - start,
+                  scheduling_allowance_seconds=4, complete=False, product_acceptance=False)
+              try:
+                  inner = hss_collection.bounded_json(ROOT / "diagnostic-contract.json")
+                  report["complete"] = (not timed_out and cleanup and process.returncode == 0 and
+                                        inner.get("schema") == SCHEMA and inner.get("complete") is True)
+              except (OSError, ValueError):
+                  pass
+              control.publish(ROOT / "watchdog.json", report)
+              return 0 if report["complete"] else 1
+
+          def main():
+              ROOT.mkdir(mode=0o700, exist_ok=True)
+              libc = ctypes.CDLL(None, use_errno=True)
+              require(libc.prctl(36, 1, 0, 0, 0) == 0, "Diagnostic contract subreaper unavailable")
+              started = time.time()
+              result = unittest.TestResult()
+              unittest.TestSuite(Contract(name) for name in CASES).run(result)
+              failed = {test._testMethodName for test, error in result.failures + result.errors}
+              cases = [dict(case=name, expected_fault=name.removeprefix("test_"),
+                  observed_fault=OBSERVATIONS.get(name), owner_cleanup=OBSERVATIONS.get("outer_cleanup", []),
+                  assertion_outcome="FAIL" if name in failed else "PASS") for name in CASES]
+              report = dict(schema=SCHEMA, provenance=provenance(), start=started, end=time.time(),
+                  cases=cases, tests=result.testsRun, failures=[(test.id(), error) for test, error in result.failures],
+                  errors=[(test.id(), error) for test, error in result.errors], skips=result.skipped,
+                  observations=OBSERVATIONS, complete=result.wasSuccessful() and result.testsRun == 5,
+                  product_acceptance=False, limits="Interruptible faults only; arbitrary observer FS stalls, D-state, persistent EPERM and upload failure remain limitations")
+              control.publish(ROOT / "diagnostic-contract.json", report)
+              return 0 if report["complete"] else 1
+
+          if __name__ == "__main__":
+              if len(sys.argv) > 1 and sys.argv[1] == "helper":
+                  helper(sys.argv[2])
+              elif len(sys.argv) > 1 and sys.argv[1] == "setup":
+                  ROOT.mkdir(exist_ok=True)
+                  raise SystemExit(setup_probe(sys.argv[2]))
+              elif len(sys.argv) > 1 and sys.argv[1] == "collector":
+                  raise SystemExit(collector_probe(*sys.argv[2:]))
+              elif len(sys.argv) > 1 and sys.argv[1] == "suite":
+                  raise SystemExit(main())
+              else:
+                  raise SystemExit(supervise_contract())
+          PY
           python3 "$TOOLS/control.py" prepare
 
-      - name: Install exact candidate dependencies
+      - &hss_dependencies
+        name: Install exact candidate dependencies
         timeout-minutes: 27
         run: python3 "$TOOLS/control.py" dependencies make UNATTENDED=yes install-dep
 
@@ -2225,11 +3060,13 @@ jobs:
           print(f"QUIC fixtures passed: both worker classes and two exact listener iterations; {rejected} invalid inputs rejected")
           PY
 
-      - name: Restore narrow source field and identify build tree
+      - &hss_mutate
+        name: Restore narrow source field and identify build tree
         timeout-minutes: 5
         run: python3 "$TOOLS/control.py" mutate
 
-      - name: Supply reproducible fallback version
+      - &hss_version
+        name: Supply reproducible fallback version
         id: version
         timeout-minutes: 5
         run: |
@@ -2239,17 +3076,20 @@ jobs:
           fi
           if [ -f src/scripts/.version ]; then cp src/scripts/.version "$EVIDENCE/version.txt"; fi
 
-      - name: Build independent debug variant with TLS and QUIC
+      - &hss_build
+        name: Build independent debug variant with TLS and QUIC
         timeout-minutes: 42
         run: |
           set -euo pipefail
           python3 "$TOOLS/control.py" build make UNATTENDED=yes VPP_EXCLUDED_PLUGINS= build
 
-      - name: Record exact binaries and build configuration
+      - &hss_binaries
+        name: Record exact binaries and build configuration
         timeout-minutes: 5
         run: python3 "$TOOLS/control.py" binaries
 
-      - name: Prepare namespace runtime
+      - &hss_namespace
+        name: Prepare namespace runtime
         id: namespace
         timeout-minutes: 3
         uses: ./.github/actions/vpp-docker-runtime-setup
@@ -2258,7 +3098,8 @@ jobs:
           SHM_SIZE: 2G
           LOG_DIR: ${{ runner.temp }}/hss-evidence/runtime-setup
 
-      - name: Record and require CPU namespace and OpenSSL environment
+      - &hss_environment
+        name: Record and require CPU namespace and OpenSSL environment
         id: environment
         timeout-minutes: 5
         run: |
@@ -2288,7 +3129,8 @@ jobs:
         timeout-minutes: 4
         run: python3 "$TOOLS/control.py" http-name
 
-      - name: Always retain tools diagnostics and provenance
+      - &hss_retain
+        name: Always retain tools diagnostics and provenance
         if: always()
         timeout-minutes: 5
         env:
@@ -2298,99 +3140,44 @@ jobs:
           NAMESPACE_OUTCOME: ${{ steps.namespace.outcome }}
         run: |
           set -uo pipefail
-          EVIDENCE="${EVIDENCE:-$RUNNER_TEMP/hss-evidence}"
-          TOOLS="${TOOLS:-$RUNNER_TEMP/hss-tools}"
-          export EVIDENCE TOOLS
-          mkdir -p "$EVIDENCE"
-          for path in "$TOOLS/"*.py; do
-            if [ -f "$path" ]; then cp "$path" "$EVIDENCE/"; fi
-          done
-          collection_status=1
-          if [ -f "$TOOLS/control.py" ]; then
-            timeout --signal=TERM --kill-after=5s 90s python3 "$TOOLS/control.py" collect \
-              > "$EVIDENCE/collection-console.log" 2>&1
-            collection_status=$?
-            printf 'rc=%s\n' "$collection_status" > "$EVIDENCE/collection-status.txt"
-          fi
-          timeout 15s git status --short > "$EVIDENCE/final-status.txt" 2>&1
-          timeout 15s git diff --binary > "$EVIDENCE/final.diff" 2>&1
-          python3 - <<'PY'
-          import hashlib, json, os, sys
-          from pathlib import Path
-          sys.path.insert(0, os.environ["TOOLS"])
-          import evidence_schema
-          root = Path(os.environ["EVIDENCE"])
-          phases = {}
-          names = (root / "planned-phases.txt").read_text().splitlines()
-          outcomes = {"bootstrap": "BOOTSTRAP_OUTCOME", "checkout": "CHECKOUT_OUTCOME",
-                      "fallback-version": "VERSION_OUTCOME", "namespace": "NAMESPACE_OUTCOME"}
-          for name in names:
-              paths = (root / name / "result.json", root / f"{name}-result.json")
-              found = next((path for path in paths if path.is_file()), None)
-              if found:
-                  raw, failed_path = b"", found
-                  try:
-                      raw = found.read_bytes()
-                      child_raw = raw
-                      child = evidence_schema.record(raw, command=found.name == "result.json")
-                      phases[name] = child
-                      interruption = root / name / "interruption.json"
-                      if interruption.is_file():
-                          failed_path = interruption
-                          raw = interruption.read_bytes()
-                          checked = evidence_schema.interruption(raw, child, child_raw)
-                          phases[name] = dict(raw_result=str(found.relative_to(root)), **checked)
-                  except (ValueError, UnicodeDecodeError, OSError) as error:
-                      phases[name] = evidence_schema.invalid(failed_path.relative_to(root), raw, error)
-              elif (root / name / "interruption.json").is_file():
-                  sidecar = root / name / "interruption.json"
-                  raw, failed_path = b"", sidecar
-                  try:
-                      raw = sidecar.read_bytes()
-                      owner_path = sidecar.with_name("ownership.json")
-                      owner_raw = owner_path.read_bytes()
-                      phases[name] = evidence_schema.initial_interruption(raw, owner_raw, f"{name}/result.json")
-                  except (ValueError, UnicodeDecodeError, OSError) as error:
-                      phases[name] = evidence_schema.invalid(failed_path.relative_to(root), raw, error)
-              elif (root / name / "invalid-ownership.json").is_file():
-                  diagnostic = root / name / "invalid-ownership.json"
-                  raw = b""
-                  try:
-                      raw = diagnostic.read_bytes()
-                      owner_path = diagnostic.with_name("ownership.json")
-                      owner_raw = owner_path.read_bytes()
-                      phases[name] = evidence_schema.invalid_ownership(
-                          raw, str(owner_path.relative_to(root)), owner_raw)
-                  except (ValueError, UnicodeDecodeError, OSError) as error:
-                      phases[name] = dict(evidence_schema.invalid(diagnostic.relative_to(root), raw, error), spawn=None)
-              elif name in outcomes:
-                  outcome = os.environ.get(outcomes[name], "skipped")
-                  phases[name] = dict(status="not_run" if outcome == "skipped" else outcome,
-                                      rc=0 if outcome == "success" else None, action_outcome=outcome)
-              else:
-                  phases[name] = dict(status="not_run", rc=None, reason="No phase result; inspect earlier failure")
-          (root / "phase-status.json").write_text(json.dumps(phases, indent=2) + "\n")
-          files = {str(path.relative_to(root)): {"bytes": path.stat().st_size,
-                   "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-                   for path in sorted(root.rglob("*")) if path.is_file() and not path.is_symlink()}
-          (root / "evidence-index.json").write_text(json.dumps(files, indent=2) + "\n")
-          PY
-          index_status=$?
-          test "$index_status" -eq 0 && test "$collection_status" -eq 0
+          export EVIDENCE="${EVIDENCE:-$RUNNER_TEMP/hss-evidence}"
+          export TOOLS="${TOOLS:-$RUNNER_TEMP/hss-tools}"
+          export HSS_CONTROL="${HSS_CONTROL:-$RUNNER_TEMP/hss-collection-control}"
+          mkdir -m 700 -p "$HSS_CONTROL"
+          timeout --signal=TERM --kill-after=5s 65s python3 "$TOOLS/control.py" collect \
+            > "$HSS_CONTROL/final-console.log" 2>&1
+          collection_status=$?
+          printf 'rc=%s\n' "$collection_status" > "$HSS_CONTROL/final-status.txt"
+          exit "$collection_status"
 
-      - name: Upload bounded HSS evidence on every outcome
+      - &hss_upload
+        name: Upload bounded HSS evidence on every outcome
         timeout-minutes: 8
         id: evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hss-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: hss-${{ env.VARIANT_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/hss-evidence/
           retention-days: 7
           if-no-files-found: error
           compression-level: 6
 
-      - name: Report artifact identity
+      - &hss_control_upload
+        name: Upload healthy collection control records
+        timeout-minutes: 8
+        id: healthy
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hss-control-${{ env.VARIANT_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hss-collection-control/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 6
+
+      - &hss_report
+        name: Report artifact identity
         if: always()
         env:
           ARTIFACT_ID: ${{ steps.evidence.outputs.artifact-id }}
@@ -2400,3 +3187,52 @@ jobs:
         run: |
           printf 'Artifact ID: %s\nArtifact URL: %s\nArtifact digest: %s\n' \
             "$ARTIFACT_ID" "$ARTIFACT_URL" "$ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+  diagnostic:
+    name: HSS / diagnostic contract
+    if: ${{ github.event_name == 'push' || !inputs.product_controls }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    container: *hss_container
+    defaults:
+      run:
+        shell: bash
+    env:
+      VARIANT_NAME: fixed
+      WORKFLOW_SHA: ${{ github.sha }}
+      CANDIDATE_SHA: 6459dbc8f8c82f18e00e72bc9e4676bbada62484
+      CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
+      CANDIDATE_TREE: 82cefc33393c2484423b4668dcaf542d3d1bdcd4
+      FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
+      CLANG_FORMAT_VER: "19"
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: ${{ github.workspace }}
+      VPP_TEARDOWN_TIMEOUT: "5"
+    steps:
+      - *hss_bootstrap
+      - *hss_checkout
+      - *hss_generate
+      - name: Plan independent diagnostic phases
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          printf '%s\n' bootstrap checkout prepare dependencies diagnostic-dependencies mutate fallback-version build binaries namespace environment diagnostic-contract collect > "$EVIDENCE/planned-phases.txt"
+          printf '{"product_controls":"NOT_RUN","historical_run":"39494180264","diagnostic_acceptance":"independent"}\n' > "$HSS_CONTROL/task-map.json"
+      - *hss_dependencies
+      - name: Prepare pinned diagnostic Python environment
+        timeout-minutes: 15
+        run: python3 "$TOOLS/control.py" diagnostic-dependencies make UNATTENDED=yes test-dep
+      - *hss_mutate
+      - *hss_version
+      - *hss_build
+      - *hss_binaries
+      - *hss_namespace
+      - *hss_environment
+      - name: Execute unique D1 through D5 diagnostic contract
+        timeout-minutes: 7
+        run: python3 "$TOOLS/control.py" diagnostic-contract
+      - *hss_retain
+      - *hss_upload
+      - *hss_control_upload
+      - *hss_report
