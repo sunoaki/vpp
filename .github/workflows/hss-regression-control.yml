@@ -41,9 +41,9 @@ jobs:
     env:
       VARIANT_NAME: ${{ matrix.variant }}
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: c18fcfb4fa93138c133a63ea222404ebbe6cc959
-      CHECK_BASE_SHA: f9d4c2e78f4bed10f732a75f04484856416fe5a1
-      CANDIDATE_TREE: 017f16a469a45cdf2baf514195c709ffcf531022
+      CANDIDATE_SHA: 2ff4cf5eb2a84522213e1182ff1b3934153645d7
+      CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
+      CANDIDATE_TREE: 665b7c899566aac80f64af3a9b23f75cb3d26be4
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
@@ -72,7 +72,7 @@ jobs:
           printf '%s\n' bootstrap checkout prepare dependencies feature-list pinned-python black-version \
             fixture-python-style fixtures mutate fallback-version build binaries namespace environment runtime tests http-name http-name-runtime collect \
             > "$EVIDENCE/planned-phases.txt"
-          for commit in c18fcfb4fa93138c133a63ea222404ebbe6cc959; do
+          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 2ff4cf5eb2a84522213e1182ff1b3934153645d7; do
             printf 'style-%s\napi-%s\nmessage-%s\n' "$commit" "$commit" "$commit" >> "$EVIDENCE/planned-phases.txt"
           done
           {
@@ -972,8 +972,8 @@ jobs:
           TEST = "test/asf/test_http_static.py"
           FIXTURE = "src/plugins/http_static/test_lifetime_fixtures.py"
           HTTP_TEST = "test/asf/test_http.py"
-          TEST_BLOBS = {TEST: "575a8c4b8501b2d6fbc55a4cdfb5d4cdec8aa330",
-                        FIXTURE: "c19c80e5af807a7aeff1a4d94b483964bb1b2306",
+          TEST_BLOBS = {TEST: "0fc100669099cc0c7c30bc22b7d0b639bd82bf15",
+                        FIXTURE: "94ae04eb6da7930b9522b97b8a4f43e9acd4fc18",
                         HTTP_TEST: "0a7353040c8323e3ec2f4500d2ce72c1f2a94934"}
           CLASSES = ("TestHttpStaticCli", "TestHttpStaticCliWorker")
           RECIPES = {
@@ -1278,8 +1278,9 @@ jobs:
                   save(f"dependency-{label}.json", report)
 
           def source_identity():
-              require(git("rev-list", "--parents", "-n", "1", CANDIDATE).split() == [CANDIDATE, CHECK_BASE],
-                      "Candidate must have exactly the reviewed check-base parent")
+              require(git("rev-list", "--parents", "-n", "1", CANDIDATE).split() ==
+                      [CANDIDATE, "40b52275db082d350158684cdb117e9f43450418"],
+                      "Candidate must have exactly the reviewed composition parent")
               require(git("rev-parse", f"{CANDIDATE}^{{tree}}") == os.environ["CANDIDATE_TREE"],
                       "Candidate tree differs from reviewed integration")
               for path, blob in TEST_BLOBS.items():
