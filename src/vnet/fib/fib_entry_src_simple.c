@@ -36,10 +36,12 @@ fib_entry_src_simple_add (fib_entry_src_t *src,
                           dpo_proto_t proto,
                           const dpo_id_t *dpo)
 {
-    src->fes_pl =
-	fib_path_list_create_special(proto,
-                                     fib_entry_src_flags_2_path_list_flags(flags),
-                                     dpo);
+    fib_path_list_flags_t pl_flags;
+
+    pl_flags = (src->fes_src == FIB_SOURCE_AE ?
+                FIB_PATH_LIST_FLAG_EXCLUSIVE :
+                fib_entry_src_flags_2_path_list_flags(flags));
+    src->fes_pl = fib_path_list_create_special(proto, pl_flags, dpo);
 }
 
 static void
