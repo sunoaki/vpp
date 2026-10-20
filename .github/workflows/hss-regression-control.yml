@@ -41,9 +41,9 @@ jobs:
     env:
       VARIANT_NAME: ${{ matrix.variant }}
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: 2183421bcf1cb159b7eaff11763eccf855f6be02
+      CANDIDATE_SHA: c18fcfb4fa93138c133a63ea222404ebbe6cc959
       CHECK_BASE_SHA: f9d4c2e78f4bed10f732a75f04484856416fe5a1
-      CANDIDATE_TREE: ae648f2417104fd266b423db32030fee642151bd
+      CANDIDATE_TREE: 017f16a469a45cdf2baf514195c709ffcf531022
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
@@ -72,7 +72,7 @@ jobs:
           printf '%s\n' bootstrap checkout prepare dependencies feature-list pinned-python black-version \
             fixture-python-style fixtures mutate fallback-version build binaries namespace environment runtime tests http-name http-name-runtime collect \
             > "$EVIDENCE/planned-phases.txt"
-          for commit in 2183421bcf1cb159b7eaff11763eccf855f6be02; do
+          for commit in c18fcfb4fa93138c133a63ea222404ebbe6cc959; do
             printf 'style-%s\napi-%s\nmessage-%s\n' "$commit" "$commit" "$commit" >> "$EVIDENCE/planned-phases.txt"
           done
           {
