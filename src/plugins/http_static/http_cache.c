@@ -282,6 +282,7 @@ hss_cache_add_and_attach (hss_cache_t *hc, u8 *path, u8 **data, u64 *data_len,
     {
       clib_warning ("Error reading '%s'", path);
       clib_error_report (error);
+      hss_cache_unlock (hc);
       return ~0;
     }
 
@@ -475,7 +476,6 @@ hss_cache_test_pressure (u8 **paths, uword limit)
       indices[i] = hss_cache_add_and_attach (&hc, paths[i], &data, &length, &modified);
       if (indices[i] == ~0)
 	{
-	  hss_cache_unlock (&hc);
 	  error = clib_error_return (0, "pressure fixture could not read file %u", i);
 	  goto done;
 	}
@@ -511,7 +511,6 @@ hss_cache_test_pressure (u8 **paths, uword limit)
   index = hss_cache_add_and_attach (&hc, paths[3], &data, &length, &modified);
   if (index == ~0)
     {
-      hss_cache_unlock (&hc);
       error = clib_error_return (0, "pressure fixture could not read fourth file");
       goto done;
     }
@@ -567,7 +566,6 @@ hss_cache_test_clear (u8 **paths)
 	    index = hss_cache_add_and_attach (&hc, paths[i], &data, &length, &modified);
 	    if (index == ~0)
 	      {
-		hss_cache_unlock (&hc);
 		error = clib_error_return (0, "clear fixture could not read file %u", i);
 		goto failed;
 	      }
@@ -649,5 +647,90 @@ VLIB_CLI_COMMAND (hss_cache_test_command, static) = {
   .path = "test http static cache owners",
   .short_help = "test http static cache owners <pressure|clear> <file-a> <file-b> <file-c> <file-d>",
   .function = hss_cache_test_command_fn,
+};
+
+static clib_error_t *
+hss_cache_test_read_error (u8 *invalid, u8 *valid)
+{
+  hss_cache_t hc = {};
+  u8 *data, *modified, *saved_data, *saved_modified;
+  u64 length, saved_length;
+  u32 index, reused;
+  clib_error_t *error = 0;
+
+  hss_cache_init (&hc, ~0ULL, 0);
+  index = hss_cache_add_and_attach (&hc, invalid, &data, &length, &modified);
+  if (!clib_spinlock_trylock (&hc.cache_lock))
+    {
+      /* Only this fresh, empty fixture owns the retained lock and hash. */
+      pool_free (hc.cache_pool);
+      BV (clib_bihash_free) (&hc.name_to_data);
+      clib_spinlock_free (&hc.cache_lock);
+      return clib_error_return (0, "cache read error retained lock");
+    }
+  hss_cache_unlock (&hc);
+  if (index != ~0)
+    {
+      hss_cache_detach_entry (&hc, index);
+      error = clib_error_return (0, "read-error fixture path must fail to read");
+      goto done;
+    }
+  if (pool_elts (hc.cache_pool) || hc.cache_size ||
+      hss_cache_lookup_and_attach (&hc, invalid, &data, &length, &modified) != ~0 ||
+      hss_cache_clear (&hc) != 0)
+    {
+      error = clib_error_return (0, "failed read changed empty cache");
+      goto done;
+    }
+  index = hss_cache_add_and_attach (&hc, valid, &data, &length, &modified);
+  if (index == ~0)
+    {
+      error = clib_error_return (0, "read-error fixture could not read valid file");
+      goto done;
+    }
+  saved_data = data;
+  saved_modified = modified;
+  saved_length = length;
+  hss_cache_detach_entry (&hc, index);
+  reused = hss_cache_lookup_and_attach (&hc, valid, &data, &length, &modified);
+  if (reused != index || !length || length != saved_length || data != saved_data ||
+      modified != saved_modified || pool_elts (hc.cache_pool) != 1)
+    {
+      error = clib_error_return (0, "valid owner could not be reused after failed read");
+      goto done;
+    }
+  hss_cache_detach_entry (&hc, reused);
+  if (hss_cache_clear (&hc) != 0 || pool_elts (hc.cache_pool) || hc.cache_size)
+    error = clib_error_return (0, "valid owner did not clear after failed read");
+
+done:
+  hss_cache_test_free (&hc);
+  return error;
+}
+
+static clib_error_t *
+hss_cache_test_read_error_command_fn (vlib_main_t *vm, unformat_input_t *input,
+				    vlib_cli_command_t *cmd)
+{
+  u8 *invalid = 0, *valid = 0;
+  clib_error_t *error;
+
+  if (!unformat (input, "%s %s", &invalid, &valid))
+    error = clib_error_return (0, "specify an unreadable path and a valid nonempty file");
+  else
+    {
+      error = hss_cache_test_read_error (invalid, valid);
+      if (!error)
+	vlib_cli_output (vm, "cache read error: lock released, valid owner reused and cleared");
+    }
+  vec_free (invalid);
+  vec_free (valid);
+  return error;
+}
+
+VLIB_CLI_COMMAND (hss_cache_test_read_error_command, static) = {
+  .path = "test http static cache read-error",
+  .short_help = "test http static cache read-error <unreadable-path> <valid-file>",
+  .function = hss_cache_test_read_error_command_fn,
 };
 #endif

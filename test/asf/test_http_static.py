@@ -484,6 +484,25 @@ else:
                     self.assertEqual(reply.retval, 0, reply.reply)
                     self.assertIn(expected, reply.reply)
 
+    def test_http_static_cache_read_error(self):
+        """Failed file reads release the lock and leave the cache usable."""
+        if config.vpp_tag != "vpp_debug":
+            self.skipTest("cache read-error selftest requires debug VPP")
+        with tempfile.TemporaryDirectory() as root:
+            valid = os.path.join(root, "valid.txt")
+            with open(valid, "w") as output:
+                output.write("cache remains usable")
+            for invalid in (os.path.join(root, "missing.txt"), valid + "/child"):
+                with self.subTest(invalid=invalid):
+                    reply = self.vapi.cli_return_response(
+                        f"test http static cache read-error {invalid} {valid}"
+                    )
+                    self.assertEqual(reply.retval, 0, reply.reply)
+                    self.assertIn(
+                        "cache read error: lock released, valid owner reused and cleared",
+                        reply.reply,
+                    )
+
     def test_http_static_cache_pressure(self):
         """Completed and in-flight responses retain distinct cache owners."""
         import hashlib

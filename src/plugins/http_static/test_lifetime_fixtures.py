@@ -624,6 +624,48 @@ class TestPendingAcceptWitness(unittest.TestCase):
 
 
 class TestCacheWitnesses(unittest.TestCase):
+    def test_read_error_method_requires_both_paths_and_success_evidence(self):
+        import os
+        import tempfile
+
+        method = helper("test_http_static_cache_read_error")
+        method.__globals__.update(
+            config=types.SimpleNamespace(vpp_tag="vpp_debug"), os=os, tempfile=tempfile
+        )
+        success = "cache read error: lock released, valid owner reused and cleared"
+        for broken in (None, "missing.txt", "/child", "missing evidence"):
+            with self.subTest(broken=broken):
+                case_type = type(
+                    "CacheReadErrorFixture", (unittest.TestCase,), {method.__name__: method}
+                )
+                case = case_type(method.__name__)
+                seen = []
+
+                def cli(command):
+                    prefix = "test http static cache read-error "
+                    self.assertTrue(command.startswith(prefix))
+                    invalid, valid = command[len(prefix):].split()
+                    self.assertEqual(Path(valid).read_text(), "cache remains usable")
+                    self.assertFalse(Path(invalid).exists())
+                    seen.append(invalid)
+                    return types.SimpleNamespace(
+                        retval=-1 if broken and invalid.endswith(broken) else 0,
+                        reply="" if broken == "missing evidence" else success,
+                    )
+
+                case.vapi = types.SimpleNamespace(cli_return_response=cli)
+                result = unittest.TestResult()
+                case.run(result)
+                self.assertEqual(result.errors, [])
+                self.assertEqual(result.skipped, [])
+                self.assertEqual(
+                    len(result.failures),
+                    2 if broken == "missing evidence" else int(broken is not None),
+                )
+                self.assertEqual(len(seen), 2)
+                self.assertTrue(seen[0].endswith("/missing.txt"))
+                self.assertTrue(seen[1].endswith("/valid.txt/child"))
+
     def test_owner_method_requires_both_real_c_modes(self):
         import os
         import tempfile
