@@ -1105,6 +1105,8 @@ jobs:
                             complete=False, rc=None, cleanup_complete=None, safety_cleanup=None,
                             entries=None, bytes=None, index=None, worker=None, elapsed=None)
               control.publish(directory / "result.json", result)
+              if request["mode"] == "final":
+                  control.publish(healthy / "final-collection.json", result)
               process = None
               try:
                   if deadline <= time.monotonic():
@@ -1144,6 +1146,8 @@ jobs:
                       result["complete"] = False
                   result["elapsed"] = time.monotonic() - start
                   control.publish(directory / "result.json", result)
+                  if request["mode"] == "final":
+                      control.publish(healthy / "final-collection.json", result)
               return result
 
           def phase_records(root):
@@ -1212,6 +1216,8 @@ jobs:
                           raise ValueError("Validation payload cap")
                       result["snapshot"] = freeze_runtime(control, request, directory, raw)
                   elif request["mode"] == "final":
+                      snapshot = dict(authority="provisional/pre-final", phases=phase_records(control.OUT))
+                      control.publish(directory / "phase-pre-final.json", snapshot)
                       healthy = Path(os.environ["HSS_CONTROL"])
                       for relative in ("tests/result.json", "tests/ownership.json", "tests/console.log",
                                        "tests-result.json", "acceptance.json"):
@@ -1233,7 +1239,13 @@ jobs:
                                              check=True, timeout=max(.01, remaining(request["deadline"])))
                       control.dependency_checkpoint("final")
                       control.collect(control.OUT / "final-diagnostics")
-                      control.publish(control.OUT / "phase-status.json", phase_records(control.OUT))
+                      snapshot = dict(authority="provisional/pre-final", phases=phase_records(control.OUT))
+                      control.publish(control.OUT / "phase-status.json", snapshot)
+                      control.publish(directory / "phase-pre-final.json", snapshot)
+                  elif request["mode"] == "upload":
+                      import hss_delivery
+                      result.update(hss_delivery.upload_worker(request, directory))
+                      return result
                   elif request["mode"] != "fixture":
                       raise ValueError("Unknown collection operation")
                   files = {}
@@ -1282,6 +1294,9 @@ jobs:
                   if target.read_bytes() != raw:
                       raise ValueError("Collector index publication changed")
                   result["index"] = dict(path=str(target), bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                  if request["mode"] == "final":
+                      if (directory / "index-receipt.json").write_bytes(raw) != len(raw):
+                          raise OSError("Healthy index receipt short write")
                   result["complete"] = True
               except Exception as error:
                   result["error"] = f"{type(error).__name__}: {error}"[:512]
@@ -1300,6 +1315,302 @@ jobs:
               request = bounded_json(sys.argv[2])
               result = worker(request)
               raise SystemExit(0 if result["complete"] else 1)
+          PY
+          cat > "$TOOLS/hss_delivery.py" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import stat
+          import sys
+          import time
+          import hss_collection as collection
+
+          CAP = 256 * 1024 * 1024
+
+          def encoded(value):
+              return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+
+          def fingerprint(raw):
+              return dict(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+
+          def relative(value):
+              path = PurePosixPath(value)
+              if (not value or len(value.encode()) > 4096 or path.is_absolute() or
+                      any(part in ("", ".", "..") for part in value.split("/"))):
+                  raise ValueError("Invalid inventory relative path")
+              return value
+
+          def terminal(load, workflow, collection_rc, diagnostic=True):
+              summary = dict(schema="hss-terminal-v1", authority="terminal", complete=False,
+                  product_acceptance=False, workflow=workflow, collection_rc=collection_rc,
+                  phases={}, bindings={}, errors=[])
+              def record(name, cap=collection.LIMIT):
+                  raw = load(name, cap)
+                  value = json.loads(raw)
+                  if not isinstance(value, dict):
+                      raise ValueError("Nonobject terminal record")
+                  summary["bindings"][name] = fingerprint(raw)
+                  return value
+              try:
+                  pointer = record("final-collection.json")
+                  identity = pointer["identity"]
+                  if (not isinstance(identity, str) or len(identity) != 32 or
+                          any(char not in "0123456789abcdef" for char in identity)):
+                      raise ValueError("Invalid final collector identity")
+                  request = record(f"{identity}/request.json")
+                  result = record(f"{identity}/result.json")
+                  summary["phases"]["collect"] = result
+                  snapshot = record(f"{identity}/phase-pre-final.json")
+                  if snapshot.get("authority") != "provisional/pre-final" or not isinstance(snapshot.get("phases"), dict):
+                      raise ValueError("Invalid pre-final phase snapshot")
+                  summary["phases"] = dict(snapshot["phases"], collect=result)
+                  worker = record(f"{identity}/worker.json")
+                  if (request.get("mode") != "final" or request.get("identity") != identity or
+                          result.get("identity") != identity or result != pointer or
+                          result.get("worker") != worker or collection_rc != 0 or
+                          result.get("complete") is not True or not collection.receipt_complete(
+                              request, worker, result["pid"], result["status"], result["rc"],
+                              result["cleanup_complete"])):
+                      raise ValueError("Incomplete or foreign final collector receipt")
+                  raw = load(f"{identity}/index-receipt.json", 2 * 1024 * 1024)
+                  if fingerprint(raw) != {key: result["index"][key] for key in ("bytes", "sha256")}:
+                      raise ValueError("Final collector receipt hash mismatch")
+                  summary["bindings"][f"{identity}/index-receipt.json"] = fingerprint(raw)
+                  index = json.loads(raw)
+                  if index.get("phase-status.json") != summary["bindings"][f"{identity}/phase-pre-final.json"]:
+                      raise ValueError("Pre-final snapshot hash mismatch")
+              except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+                  summary["errors"].append(f"collector: {type(error).__name__}: {error}"[:512])
+                  summary["phases"]["collect"] = dict(status="unknown/incomplete", complete=False,
+                      raw_result=summary["phases"].get("collect"))
+              if not diagnostic:
+                  for name, phase in summary["phases"].items():
+                      if not isinstance(phase, dict) or phase.get("status") not in ("completed", "success") or phase.get("rc", 0) != 0:
+                          summary["errors"].append("Phase incomplete or failed: " + name)
+                  summary["complete"] = not summary["errors"]
+                  return summary
+              try:
+                  task = record("task-map.json")
+                  if task.get("diagnostic_acceptance") != "independent" or task.get("product_controls") != "NOT_RUN":
+                      raise ValueError("Invalid diagnostic task identity")
+                  report = record("diagnostic-contract/diagnostic-contract.json")
+                  summary["phases"]["diagnostic-contract"] = dict(status="unknown/incomplete",
+                      report=report, complete=False)
+                  watchdog = record("diagnostic-contract/watchdog.json")
+                  summary["phases"]["diagnostic-contract"]["watchdog"] = watchdog
+                  if (report.get("schema") != "hss-diagnostic-contract-v1" or
+                          watchdog.get("schema") != report["schema"] or
+                          report.get("provenance", {}).get("workflow") != workflow or
+                          report.get("complete") is not True or watchdog.get("complete") is not True or
+                          watchdog.get("role") != "external_watchdog" or watchdog.get("timeout") is not False or
+                          type(watchdog.get("rc")) is not int or watchdog["rc"] != 0 or
+                          watchdog.get("cleanup_complete") is not True or report.get("tests") != 5 or
+                          len(report.get("cases", [])) != 5 or
+                          any(case.get("assertion_outcome") != "PASS" for case in report["cases"]) or
+                          report.get("failures") != [] or report.get("errors") != [] or report.get("skips") != [] or
+                          report.get("product_acceptance") is not False or watchdog.get("product_acceptance") is not False):
+                      raise ValueError("Incomplete or foreign diagnostic terminal evidence")
+                  summary["phases"]["diagnostic-contract"].update(status="completed", complete=True)
+                  summary["product_controls"] = "NOT_RUN"
+              except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+                  summary["errors"].append(f"diagnostic: {type(error).__name__}: {error}"[:512])
+                  summary["phases"].setdefault("diagnostic-contract", dict(status="unknown/incomplete", complete=False))
+              for name, phase in summary["phases"].items():
+                  if (not isinstance(phase, dict) or phase.get("status") not in ("completed", "success") or
+                          phase.get("rc", 0) != 0):
+                      summary["errors"].append("Phase incomplete or failed: " + name)
+              summary["complete"] = not summary["errors"]
+              return summary
+
+          def file_type(mode):
+              for name, predicate in (("regular", stat.S_ISREG), ("directory", stat.S_ISDIR),
+                      ("socket", stat.S_ISSOCK), ("symlink", stat.S_ISLNK), ("fifo", stat.S_ISFIFO),
+                      ("character", stat.S_ISCHR), ("block", stat.S_ISBLK)):
+                  if predicate(mode):
+                      return name
+              return "unsupported"
+
+          def inventory(entries, required, copy, check):
+              rows, errors, seen, consumed, path_bytes = [], [], set(), 0, 0
+              required = {relative(name) for name in required}
+              if len(required) > 4000 or sum(len(name.encode()) for name in required) > 256 * 1024:
+                  return dict(schema="hss-upload-inventory-v1", complete=False, entries=[], bytes=0,
+                      errors=["Required inventory metadata cap"])
+
+              try:
+                  for name, kind, size in entries:
+                      check()
+                      relative(name)
+                      path_bytes += len(name.encode())
+                      if name in seen or len(rows) >= 4000 or path_bytes > 256 * 1024:
+                          raise ValueError("Duplicate path or inventory metadata/entry cap")
+                      seen.add(name)
+                      row = dict(path=name, type=kind, included=False, reason="excluded-special-object")
+                      rows.append(row)
+                      if kind == "directory":
+                          row["reason"] = "excluded-directory-metadata-only"
+                      elif kind == "regular":
+                          row["reason"] = "copy-incomplete"
+                          if type(size) is not int or size < 0 or consumed + size > CAP:
+                              raise ValueError("Upload byte cap")
+                          consumed += size
+                          receipt = copy(name, size)
+                          if (receipt.get("bytes") != size or len(receipt.get("sha256", "")) != 64 or
+                                  any(char not in "0123456789abcdef" for char in receipt["sha256"])):
+                              raise ValueError("Invalid upload copy receipt")
+                          row.update(included=True, reason="included-verified-regular", **receipt)
+                      if name in required and kind != "regular":
+                          raise ValueError("Required evidence is nonregular: " + name)
+                  missing = sorted(required - seen)
+                  for name in missing:
+                      if len(rows) >= 4000:
+                          break
+                      rows.append(dict(path=name, type="missing", included=False, reason="required-missing"))
+                  if missing:
+                      raise ValueError("Required evidence missing: " + ", ".join(missing)[:512])
+              except (OSError, ValueError, TimeoutError) as error:
+                  errors.append(f"{type(error).__name__}: {error}"[:512])
+              return dict(schema="hss-upload-inventory-v1", complete=not errors, entries=rows,
+                  bytes=consumed, errors=errors, scope="snapshot before upload worker terminal receipt; inventory itself is the only unlisted upload file")
+
+          def walk(roots, check, excluded):
+              visited = 0
+              for label, root in roots.items():
+                  pending = [(root, label)]
+                  while pending:
+                      check()
+                      directory, prefix = pending.pop()
+                      info = directory.lstat()
+                      if not stat.S_ISDIR(info.st_mode):
+                          raise ValueError("Upload source directory replaced")
+                      with os.scandir(directory) as entries:
+                          for entry in entries:
+                              check()
+                              visited += 1
+                              if visited > 4000:
+                                  raise ValueError("Upload traversal entry cap")
+                              name = relative(prefix + "/" + entry.name)
+                              info = entry.stat(follow_symlinks=False)
+                              kind = file_type(info.st_mode)
+                              yield name, kind, info.st_size
+                              if kind == "directory" and name not in excluded:
+                                  pending.append((Path(entry.path), name))
+
+          def upload_worker(request, directory):
+              import control
+              roots = {"evidence": Path(request["root"]), "control": Path(os.environ["HSS_CONTROL"])}
+              destination = Path(request["destination"])
+              destination.mkdir(mode=0o700)
+              check = lambda: collection.remaining(request["deadline"])
+              consumed = 0
+              def read(path, cap):
+                  nonlocal consumed
+                  raw = collection.read_regular(path, min(cap, CAP - consumed), request["deadline"])
+                  consumed += len(raw)
+                  return raw
+              expected, setup_errors = {}, []
+              required = {"evidence/evidence-index.json", "control/phase-status.json", "control/final-collection.json"}
+              try:
+                  raw = read(roots["evidence"] / "evidence-index.json", 2 * 1024 * 1024)
+                  expected["evidence/evidence-index.json"] = fingerprint(raw)
+                  index = json.loads(raw)
+                  for name, receipt in index.items():
+                      expected["evidence/" + relative(name)] = receipt
+                  summary = json.loads(read(roots["control"] / "phase-status.json", collection.LIMIT))
+                  for name, receipt in summary["bindings"].items():
+                      expected["control/" + relative(name)] = receipt
+                  required.update(expected)
+              except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+                  setup_errors.append(f"Required inventory: {type(error).__name__}: {error}"[:512])
+              def copy(name, size):
+                  label, suffix = name.split("/", 1)
+                  raw = read(roots[label] / suffix, size)
+                  if len(raw) != size:
+                      raise ValueError("Upload source changed size")
+                  target = destination / name
+                  target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                  pending = directory / "copy.pending"
+                  fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                  try:
+                      if os.write(fd, raw) != size:
+                          raise OSError("Upload copy short write")
+                  finally:
+                      os.close(fd)
+                  check()
+                  if fingerprint(read(pending, size)) != fingerprint(raw):
+                      raise ValueError("Upload copy hash mismatch")
+                  if name in expected and fingerprint(raw) != expected[name]:
+                      raise ValueError("Required evidence hash mismatch: " + name)
+                  os.replace(pending, target)
+                  return fingerprint(raw)
+              if os.environ.get("GITHUB_JOB") == "diagnostic":
+                  required.update(("control/task-map.json", "control/diagnostic-contract/watchdog.json",
+                      "control/diagnostic-contract/diagnostic-contract.json"))
+                  try:
+                      report = json.loads(read(roots["control"] / "diagnostic-contract/diagnostic-contract.json", collection.LIMIT))
+                      observed = report["observations"]["test_live_setup_failure_query_once"]["observed"]
+                      witness = observed["event_witness"]
+                      event = "control/diagnostic-contract/" + relative(Path(witness["path"]).name)
+                      expected[event] = {key: witness[key] for key in ("bytes", "sha256")}
+                      slot = observed["slots"][0]
+                      for name, receipt in observed["verified_streams"].items():
+                          expected["control/diagnostic-contract/live/" + relative(slot["slot"]) + "/" + relative(name)] = receipt
+                      required.update(expected)
+                  except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
+                      setup_errors.append(f"Required D1 evidence: {type(error).__name__}: {error}"[:512])
+              excluded = {"control/" + request["identity"]}
+              manifest = inventory(walk(roots, check, excluded), required, copy, check)
+              for row in manifest["entries"]:
+                  if row["path"] in excluded:
+                      row["reason"] = "excluded-inflight-upload-control-subtree"
+              manifest["errors"].extend(setup_errors)
+              manifest["complete"] = not manifest["errors"]
+              manifest["actual_read_bytes"] = consumed
+              manifest["identity"] = request["identity"]
+              manifest["deadline"] = request["deadline"]
+              manifest["source_roots"] = {name: str(root) for name, root in roots.items()}
+              raw = encoded(manifest)
+              if len(raw) > 2 * 1024 * 1024:
+                  raise ValueError("Upload inventory metadata cap")
+              target = destination / "evidence-index.json"
+              if target.write_bytes(raw) != len(raw):
+                  raise OSError("Upload inventory short write")
+              if collection.read_regular(target, len(raw), request["deadline"]) != raw:
+                  raise ValueError("Upload inventory publication mismatch")
+              control.publish(directory / "upload-inventory.json", manifest)
+              control.publish(directory / "upload-ready.json", dict(identity=request["identity"],
+                  inventory=fingerprint(raw), path=str(target)))
+              return dict(complete=manifest["complete"], entries=len(manifest["entries"]), bytes=manifest["bytes"],
+                  index=dict(path=str(target), **fingerprint(raw)),
+                  **({"error": str(manifest["errors"])[:512]} if manifest["errors"] else {}))
+
+          def finalize(collection_rc):
+              import control
+              healthy = Path(os.environ["HSS_CONTROL"])
+              def load(name, cap):
+                  return collection.read_regular(healthy / relative(name), cap, time.monotonic() + 5)
+              summary = terminal(load, os.environ["WORKFLOW_SHA"], collection_rc,
+                  diagnostic=os.environ.get("GITHUB_JOB") == "diagnostic")
+              control.publish(healthy / "phase-status.json", summary)
+              result = collection.supervise(control, dict(mode="upload", root=os.environ["EVIDENCE"],
+                  destination=str(Path(os.environ["RUNNER_TEMP"]) / "hss-upload")))
+              control.publish(healthy / "upload-collection.json", result)
+              try:
+                  ready = json.loads(load(result["identity"] + "/upload-ready.json", collection.LIMIT))
+                  raw = load(result["identity"] + "/upload-inventory.json", 2 * 1024 * 1024)
+                  if (ready.get("identity") != result["identity"] or ready.get("inventory") != fingerprint(raw) or
+                          ready.get("path") != str(Path(os.environ["RUNNER_TEMP"]) / "hss-upload/evidence-index.json")):
+                      raise ValueError("Upload publication identity mismatch")
+                  with open(os.environ["GITHUB_ENV"], "a") as stream:
+                      stream.write("HSS_UPLOAD_READY=true\n")
+              except (OSError, ValueError, KeyError, TypeError) as error:
+                  control.publish(healthy / "upload-publication-error.json", dict(complete=False, error=str(error)[:512]))
+                  return 1
+              return 0 if summary["complete"] and result["complete"] else 1
+
+          if __name__ == "__main__":
+              raise SystemExit(finalize(int(sys.argv[1])))
           PY
           cat > "$TOOLS/control.py" <<'PY'
           import ast
@@ -3306,17 +3617,26 @@ jobs:
             > "$HSS_CONTROL/final-console.log" 2>&1
           collection_status=$?
           printf 'rc=%s\n' "$collection_status" > "$HSS_CONTROL/final-status.txt"
-          exit "$collection_status"
+          timeout --signal=TERM --kill-after=5s 65s python3 "$TOOLS/hss_delivery.py" "$collection_status" \
+            > "$HSS_CONTROL/delivery-console.log" 2>&1
+          delivery_status=$?
+          printf 'rc=%s\n' "$delivery_status" > "$HSS_CONTROL/delivery-status.txt"
+          if [ ! -f "$HSS_CONTROL/phase-status.json" ]; then
+            printf '{"schema":"hss-terminal-v1","authority":"terminal","complete":false,"product_acceptance":false,"collection_rc":%s,"delivery_rc":%s,"phases":{"collect":{"status":"unknown/incomplete","complete":false}},"errors":["Terminal publisher unavailable; inspect healthy final and delivery records"]}\n' \
+              "$collection_status" "$delivery_status" > "$HSS_CONTROL/phase-status.json"
+          fi
+          if [ "$collection_status" -ne 0 ]; then exit "$collection_status"; fi
+          exit "$delivery_status"
 
       - &hss_upload
         name: Upload bounded HSS evidence on every outcome
         timeout-minutes: 8
         id: evidence
-        if: always()
+        if: ${{ always() && env.HSS_UPLOAD_READY == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: hss-${{ env.VARIANT_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/hss-evidence/
+          path: ${{ runner.temp }}/hss-upload/
           retention-days: 7
           if-no-files-found: error
           compression-level: 6
@@ -3325,11 +3645,11 @@ jobs:
         name: Upload healthy collection control records
         timeout-minutes: 8
         id: healthy
-        if: always()
+        if: ${{ always() && env.HSS_UPLOAD_READY == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: hss-control-${{ env.VARIANT_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/hss-collection-control/
+          path: ${{ runner.temp }}/hss-upload/
           retention-days: 7
           if-no-files-found: error
           compression-level: 6
