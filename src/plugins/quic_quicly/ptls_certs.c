@@ -202,6 +202,8 @@ ptls_load_private_key (const char *pk_data, int pk_len)
   BIO *key_bio;
 
   key_bio = BIO_new_mem_buf (pk_data, pk_len);
+  if (!key_bio)
+    return NULL;
   pkey = PEM_read_bio_PrivateKey (key_bio, NULL, NULL, NULL);
   BIO_free (key_bio);
 
@@ -217,23 +219,44 @@ ptls_load_certificate_chain (const char *cert_data, int cert_len)
 
   cl = clib_mem_alloc (PTLS_MAX_CERTS_IN_CONTEXT * sizeof (ptls_iovec_t) +
 		       sizeof (quic_quicly_ptls_cert_list_t));
+  if (!cl)
+    return 0;
+  cl->count = 0;
   cert_bio = BIO_new_mem_buf (cert_data, cert_len);
+  if (!cert_bio)
+    {
+      ptls_free_cached_certificate_chain (cl);
+      return 0;
+    }
   rv = ptls_load_bio_pem_objects (cert_bio, "CERTIFICATE", cl->certs, PTLS_MAX_CERTS_IN_CONTEXT,
 				  &cl->count);
   BIO_free (cert_bio);
   if (rv)
     {
-      clib_mem_free (cl);
+      ptls_free_cached_certificate_chain (cl);
       return 0;
     }
 
   return cl;
 }
 
+void
+ptls_free_cached_certificate_chain (quic_quicly_ptls_cert_list_t *cl)
+{
+  if (!cl)
+    return;
+
+  for (size_t i = 0; i < cl->count; i++)
+    free (cl->certs[i].base);
+  clib_mem_free (cl);
+}
+
 int
 ptls_assign_private_key (ptls_openssl_sign_certificate_t *sc, ptls_context_t *ctx, EVP_PKEY *pkey)
 {
-  ptls_openssl_init_sign_certificate (sc, pkey);
+  int rv = ptls_openssl_init_sign_certificate (sc, pkey);
+  if (rv)
+    return rv;
 
   ctx->sign_certificate = &sc->super;
   return 0;
@@ -246,36 +269,43 @@ ptls_release_private_key (ptls_openssl_sign_certificate_t *sc)
 }
 
 int
-ptls_assign_certificate_chain (ptls_context_t *ctx,
-			       quic_quicly_ptls_cert_list_t *cl)
+ptls_assign_certificate_chain (ptls_context_t *ctx, const quic_quicly_ptls_cert_list_t *cl)
 {
-  ctx->certificates.list =
-    (ptls_iovec_t *) malloc (cl->count * sizeof (ptls_iovec_t));
-  if (ctx->certificates.list == NULL)
+  ptls_iovec_t *certs = NULL;
+  size_t i;
+
+  if (cl->count)
     {
-      return PTLS_ERROR_NO_MEMORY;
+      certs = malloc (cl->count * sizeof (*certs));
+      if (!certs)
+	return PTLS_ERROR_NO_MEMORY;
     }
 
-  memcpy (ctx->certificates.list, cl->certs,
-	  cl->count * sizeof (ptls_iovec_t));
-  ctx->certificates.count = cl->count;
+  for (i = 0; i < cl->count; i++)
+    {
+      certs[i].len = cl->certs[i].len;
+      certs[i].base = malloc (certs[i].len);
+      if (!certs[i].base)
+	{
+	  while (i)
+	    free (certs[--i].base);
+	  free (certs);
+	  return PTLS_ERROR_NO_MEMORY;
+	}
+      memcpy (certs[i].base, cl->certs[i].base, certs[i].len);
+    }
 
+  ptls_free_certificate_chain (ctx);
+  ctx->certificates.list = certs;
+  ctx->certificates.count = cl->count;
   return 0;
 }
 
 void
 ptls_free_certificate_chain (ptls_context_t *ctx)
 {
-  int i;
-
-  if (ctx->certificates.count == 0)
-    return;
-
-  for (i = 0; i < ctx->certificates.count; i++)
-    {
-      if (ctx->certificates.list[i].base)
-	free (ctx->certificates.list[i].base);
-    }
+  for (size_t i = 0; i < ctx->certificates.count; i++)
+    free (ctx->certificates.list[i].base);
   free (ctx->certificates.list);
   ctx->certificates.list = NULL;
   ctx->certificates.count = 0;
