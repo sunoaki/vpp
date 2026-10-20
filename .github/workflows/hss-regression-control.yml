@@ -1759,11 +1759,19 @@ jobs:
               rendered = [event for event in active if event["kind"] == "cli" and
                           event["command"] == "test http app-name-ownership"]
               require(len(replies) == len(rendered) == 1 and replies[0]["retval"] == 0 and
-                      replies[0]["seq"] + 1 == rendered[0]["seq"] and replies[0]["reply"] == rendered[0]["reply"],
+                      replies[0]["pid"] == rendered[0]["pid"] == start["pid"] and
+                      replies[0]["seq"] + 1 == rendered[0]["seq"] < outcomes[0]["seq"] and
+                      replies[0]["reply"] == rendered[0]["reply"],
                       "Missing actual HTTP name command reply")
-              markers = ("accepted connections own separate names", "empty names can be copied and disposed", "SUCCESS")
-              require(all(marker in replies[0]["reply"] and marker in logs for marker in markers) and
-                      "FAIL" not in replies[0]["reply"], "Missing HTTP name ownership success witnesses")
+              markers = ("accepted connections own separate names", "listener changes do not alter accepted names",
+                         "closing one connection retains its sibling and listener", "accepted name survives listener disposal",
+                         "QUIC streams own names and keep borrowed host pointers",
+                         "stream rollback disposal retains the connection name",
+                         "replacement stream name survives old stream and connection disposal",
+                         "empty names can be copied and disposed")
+              witness = "".join(r"PASS:[1-9][0-9]*: " + re.escape(marker) + r"\n" for marker in markers) + r"SUCCESS\n"
+              require(re.fullmatch(witness, replies[0]["reply"]) is not None,
+                      "Missing HTTP name ownership success witnesses")
               require(re.findall(r"--- (add\w+)\(\) (\w+)\.(\w+)\(", logs) ==
                       [("addSuccess", "TestHttpNameOwnership", "test_app_name_ownership")],
                       "HTTP name framework callback mismatch")
@@ -2024,6 +2032,79 @@ jobs:
               rejects(events, console + marker)
               rejects(events, logs=marker)
           print(f"Raw read-error fixtures passed: exact four correlated frames; {rejected} invalid inputs rejected")
+          test = "test_http.TestHttpNameOwnership.test_app_name_ownership"
+          messages = ("accepted connections own separate names", "listener changes do not alter accepted names",
+                      "closing one connection retains its sibling and listener", "accepted name survives listener disposal",
+                      "QUIC streams own names and keep borrowed host pointers",
+                      "stream rollback disposal retains the connection name",
+                      "replacement stream name survives old stream and connection disposal",
+                      "empty names can be copied and disposed")
+          reply = "".join(f"PASS:{index + 1}: {message}\n" for index, message in enumerate(messages)) + "SUCCESS\n"
+          command = "test http app-name-ownership"
+          events = [dict(kind="loaded", pid=1, seq=1),
+                    dict(kind="startTest", pid=1, seq=2, test=test, workers=0, netns_disabled=False,
+                         excluded=[], vpp_cmdline=["vpp", "http_unittest_plugin.so { enable }"]),
+                    dict(kind="cli_reply", pid=1, seq=3, command=command, retval=0, reply=reply),
+                    dict(kind="cli", pid=1, seq=4, command=command, reply=reply),
+                    dict(kind="addSuccess", pid=1, seq=5, test=test),
+                    dict(kind="stopTest", pid=1, seq=6, test=test),
+                    dict(kind="completed", pid=1, seq=7, tests=1, failures=0, errors=0,
+                         skips=0, expected=0, unexpected=0)]
+          logs = "--- addSuccess() TestHttpNameOwnership.test_app_name_ownership(ownership)"
+          validate_http = control["validate_http_name"]
+          validate_http(events, "", 0, logs)
+          rejected = 0
+          def rejects_http(changed, console="", raw_logs=logs, rc=0):
+              global rejected
+              try:
+                  validate_http(changed, console, rc, raw_logs)
+              except AssertionError:
+                  rejected += 1
+              else:
+                  raise AssertionError("Invalid HTTP name evidence was accepted")
+          for kind in ("cli_reply", "cli", "startTest", "stopTest", "addSuccess", "completed", "loaded"):
+              rejects_http([event for event in events if event["kind"] != kind])
+          for kind in ("cli_reply", "cli", "addSuccess", "completed"):
+              rejects_http(events + [copy.deepcopy(next(event for event in events if event["kind"] == kind))])
+          for kind, key, value in (("cli_reply", "command", "test http other"), ("cli", "command", "test http other"),
+                                   ("cli_reply", "retval", -1), ("cli_reply", "pid", 2), ("cli", "pid", 2),
+                                   ("cli_reply", "seq", 1), ("cli", "seq", 5), ("cli", "reply", "different"),
+                                   ("addSuccess", "seq", 3), ("addSuccess", "test", "wrong.class.method"),
+                                   ("stopTest", "pid", 2), ("completed", "tests", 2),
+                                   ("startTest", "excluded", ["http_unittest"])):
+              changed = copy.deepcopy(events)
+              next(event for event in changed if event["kind"] == kind)[key] = value
+              rejects_http(changed)
+          for kind in ("addFailure", "addError", "addSkip", "addSubTest", "addExpectedFailure", "addUnexpectedSuccess"):
+              changed = copy.deepcopy(events)
+              next(event for event in changed if event["kind"] == "addSuccess")["kind"] = kind
+              rejects_http(changed)
+          for key in ("failures", "errors", "skips", "expected", "unexpected"):
+              changed = copy.deepcopy(events)
+              changed[-1][key] = 1
+              rejects_http(changed)
+          lines = reply.splitlines(keepends=True)
+          for index in range(len(lines)):
+              for altered in ("".join(lines[:index] + lines[index + 1:]),
+                              reply.replace(lines[index], lines[index] * 2, 1),
+                              reply.replace(lines[index], "FAIL\n", 1)):
+                  changed = copy.deepcopy(events)
+                  changed[2]["reply"] = changed[3]["reply"] = altered
+                  rejects_http(changed)
+          for altered in (reply.replace("PASS:1:", "PASS:0:"), reply + "extra\n",
+                          "".join([lines[1], lines[0]] + lines[2:])):
+              changed = copy.deepcopy(events)
+              changed[2]["reply"] = changed[3]["reply"] = altered
+              rejects_http(changed)
+          rejects_http(events, rc=1)
+          rejects_http(events, raw_logs="")
+          rejects_http(events, raw_logs=logs.replace("addSuccess", "addFailure"))
+          for marker in ("SIGSEGV", "Aborted", "Bus error", "core was generated", "TimeoutError",
+                         "operation timed out", "VppTransportSocketIOError", "VPP is dead", "not enough cpus",
+                         "Skipping tests due to setup failure", "ERROR: AddressSanitizer: bad", "Assertion `pointer` failed"):
+              rejects_http(events, console=marker)
+              rejects_http(events, raw_logs=logs + marker)
+          print(f"HTTP name fixtures passed: exact paired eight PASS replies; {rejected} invalid inputs rejected")
           PY
 
       - name: Restore narrow source field and identify build tree
