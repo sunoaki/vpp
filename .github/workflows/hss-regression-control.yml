@@ -1595,9 +1595,18 @@ jobs:
                   require(len(subs) == 4 and sum(event["failures"] for event in complete) == 4,
                           "Wrong read-error assertion summary")
                   read_error_evidence(events, expected, negative=True)
-                  require("self.assertEqual(reply.retval, 0, reply.reply)" in logs and
-                          "AssertionError: -1 != 0" in logs and "cache read error retained lock" in logs and
-                          "cache read error retained lock" in console, "Missing raw retained-lock diagnostic")
+                  frame = (r'  File "([^"\n]*/test/asf/test_http_static\.py)", line ([0-9]+), '
+                           r'in (test_http_static_cache_read_error)\n'
+                           r'    self\.assertEqual\(reply\.retval, 0, reply\.reply\)\n')
+                  raw = re.compile(r'Traceback \(most recent call last\):\n' + frame +
+                                   r'(?:    [~^]+\n)?AssertionError: -1 != 0 : test http static cache read-error: '
+                                   r'cache read error retained lock\n')
+                  observed = [re.findall(frame, event["traceback"]) for event in subs]
+                  require(all(len(frames) == 1 for frames in observed) and
+                          len(raw.findall(console)) == 4 and
+                          collections.Counter(raw.findall(console)) ==
+                          collections.Counter(frames[0] for frames in observed),
+                          "Missing raw retained-lock diagnostic")
               elif variant == "fixed":
                   require(rc == 0, f"Fixed test command failed: {rc}")
                   require(collections.Counter(event["test"] for event in outcomes if event["kind"] == "addSuccess") == wanted,
@@ -1949,6 +1958,72 @@ jobs:
                       else:
                           raise AssertionError("Fatal diagnostic was masked: " + marker)
           print("Counter fixtures passed: 24 variant/count combinations with provenance and fatal checks")
+          import runpy
+          import sys
+          sys.path.insert(0, os.environ["TOOLS"])
+          control = runpy.run_path(str(Path(os.environ["TOOLS"]) / "control.py"))
+          method = "test_http_static_cache_read_error"
+          expected = [f"test_http_static.{cls}.{method}" for cls in control["CLASSES"]]
+          events = [dict(kind="loaded", pid=1, seq=1)]
+          frame = ('  File "/fixture/test/asf/test_http_static.py", line 500, '
+                   'in test_http_static_cache_read_error\n'
+                   '    self.assertEqual(reply.retval, 0, reply.reply)\n')
+          traceback = ("Traceback (most recent call last):\n" + frame +
+                       "    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+                       "AssertionError: -1 != 0 : test http static cache read-error: cache read error retained lock\n")
+          for index, test in enumerate(expected):
+              events.append(dict(kind="startTest", pid=1, seq=len(events) + 1, test=test, workers=index,
+                                 netns_disabled=False, excluded=[], vpp_cmdline=["vpp"]))
+              valid = f"/fixture/{index}/valid.txt"
+              for invalid in (f"/fixture/{index}/missing.txt", valid + "/child"):
+                  events.append(dict(kind="cli_reply", pid=1, seq=len(events) + 1,
+                                     command=f"test http static cache read-error {invalid} {valid}", retval=-1,
+                                     reply="cache read error retained lock"))
+                  events.append(dict(kind="addSubTest", pid=1, seq=len(events) + 1, test=test,
+                                     params={"invalid": invalid}, error="AssertionError", traceback=traceback))
+              events.append(dict(kind="stopTest", pid=1, seq=len(events) + 1, test=test))
+          events.append(dict(kind="completed", pid=1, seq=len(events) + 1, tests=2, failures=4,
+                             errors=0, skips=0, expected=0, unexpected=0))
+          console = traceback * 4
+          validate = control["validate"]
+          validate(events, console, 2, expected, "read-error-unlock", "")
+          rejected = 0
+          def rejects(changed, raw=console, logs=""):
+              global rejected
+              try:
+                  validate(changed, raw, 2, expected, "read-error-unlock", logs)
+              except AssertionError:
+                  rejected += 1
+              else:
+                  raise AssertionError("Invalid read-error evidence was accepted")
+          rejects(events, traceback * 3)
+          rejects(events, traceback * 5)
+          for before, after in (("line 500", "line 501"), ("/fixture/", "/foreign/"),
+                                (method, "test_other"), ("reply.retval, 0", "reply.retval, 1"),
+                                ("AssertionError: -1", "ValueError: -1"),
+                                ("retained lock", "missing diagnostic")):
+              rejects(events, console.replace(before, after, 1))
+          for kind, key, value in (("addSubTest", "test", "wrong.class.method"),
+                                   ("addSubTest", "params", {"invalid": "/wrong"}),
+                                   ("addSubTest", "error", "ValueError"),
+                                   ("cli_reply", "retval", 0), ("cli_reply", "pid", 2),
+                                   ("cli_reply", "seq", 0), ("cli_reply", "reply", "missing diagnostic"),
+                                   ("stopTest", "pid", 2), ("completed", "failures", 3)):
+              changed = copy.deepcopy(events)
+              next(event for event in changed if event["kind"] == kind)[key] = value
+              rejects(changed)
+          for before, after in (("line 500", "line 501"), ("/fixture/", "/foreign/"),
+                                (frame, frame * 2)):
+              changed = copy.deepcopy(events)
+              event = next(event for event in changed if event["kind"] == "addSubTest")
+              event["traceback"] = event["traceback"].replace(before, after)
+              rejects(changed)
+          for kind in ("stopTest", "completed", "cli_reply", "addSubTest"):
+              rejects([event for event in events if event["kind"] != kind])
+          for marker in ("SIGSEGV", "TimeoutError", "operation timed out", "VPP is dead"):
+              rejects(events, console + marker)
+              rejects(events, logs=marker)
+          print(f"Raw read-error fixtures passed: exact four correlated frames; {rejected} invalid inputs rejected")
           PY
 
       - name: Restore narrow source field and identify build tree
