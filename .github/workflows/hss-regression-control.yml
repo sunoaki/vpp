@@ -1248,18 +1248,20 @@ jobs:
                       descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
                       try:
                           info = os.fstat(descriptor)
-                          if not stat.S_ISREG(info.st_mode):
-                              raise ValueError("Nonregular index input")
+                          if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+                              raise ValueError("Nonregular or changed index input")
                           observed = 0
-                          while True:
+                          while observed < size:
                               remaining(request["deadline"])
-                              chunk = os.read(descriptor, read_size(result["bytes"]))
+                              chunk = os.read(descriptor, min(size - observed, read_size(result["bytes"])))
                               if not chunk:
                                   break
                               result["bytes"] += len(chunk)
                               digest.update(chunk)
                               observed += len(chunk)
-                          if observed != size or os.fstat(descriptor).st_mtime_ns != info.st_mtime_ns:
+                          after = os.fstat(descriptor)
+                          if (observed != size or after.st_size != size or
+                                  after.st_mtime_ns != info.st_mtime_ns):
                               raise ValueError("Index input changed")
                       finally:
                           os.close(descriptor)
@@ -2135,6 +2137,7 @@ jobs:
               try:
                   require(collection["complete"], "Runtime collection incomplete")
                   snapshot, payloads = hss_collection.runtime_snapshot(collection)
+                  publish(Path(os.environ["HSS_CONTROL"]) / "runtime-collection.json", collection)
                   events = [json.loads(line) for line in payloads["events.jsonl"].splitlines() if line]
                   runtime = json.loads(payloads["runtime.json"])
                   require(runtime["status"] == "completed", "Runtime command timed out or exceeded work budget")
@@ -2194,13 +2197,19 @@ jobs:
               build = json.loads((OUT / "build/result.json").read_text())
               require(build["status"] == "completed" and build["rc"] == 0 and build.get("cleanup_complete") is True,
                       "HTTP name requires a successful independently cleaned build")
-              for label in ("tests", "runtime"):
-                  record_root = Path(os.environ["HSS_CONTROL"]) if label == "tests" else OUT
-                  record = record_root / label / "result.json"
-                  if record.exists():
-                      previous_run = json.loads(record.read_text())
-                      require(previous_run["status"] == "completed" and previous_run.get("cleanup_complete") is True,
-                              "Prior HSS process cleanup incomplete")
+              healthy = Path(os.environ["HSS_CONTROL"])
+              record = healthy / "tests" / "result.json"
+              if record.exists():
+                  previous_run = json.loads(record.read_text())
+                  require(previous_run["status"] == "completed" and previous_run.get("cleanup_complete") is True,
+                          "Prior HSS process cleanup incomplete")
+              import hss_collection
+              collection = hss_collection.bounded_json(healthy / "runtime-collection.json")
+              require(collection["complete"], "Prior runtime collection incomplete")
+              _, payloads = hss_collection.runtime_snapshot(collection)
+              previous_run = json.loads(payloads["runtime.json"])
+              require(previous_run["status"] == "completed" and previous_run.get("cleanup_complete") is True,
+                      "Prior HSS process cleanup incomplete")
               binary_hashes = json.loads((OUT / "binaries.json").read_text())
               for path, expected_hash in binary_hashes.items():
                   require(digest(path) == expected_hash, "Exact build binary changed: " + path)
