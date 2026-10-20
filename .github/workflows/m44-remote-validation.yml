@@ -275,14 +275,56 @@ jobs:
               return int(fields[1]), fields[19], fields[0]
 
           class OwnedProcesses:
+              capacity, history_count, history_bytes = 20000, 1024, 1024 * 1024
+              error_count, error_bytes = 64, 64 * 1024
+
               def __init__(self):
                   self.birth = identity(os.getpid())[1]
-                  self.handles, self.pending, self.records, self.errors = {}, {}, [], []
+                  self.handles, self.pending = {}, {}
+                  self.history, self.errors = collections.deque(), collections.deque()
+                  self.totals = collections.Counter()
+                  self.sample_bytes = collections.Counter()
+                  self.sequence = self.peak_handles = self.peak_pending = 0
+                  self.incomplete = False
+                  self.root = None
+                  self.root_bound = self.intervened = False
+                  self.natural_rc = None
+                  self.final_live = self.final_pending = None
+                  self.final_active = None
                   self.limit = float('inf')
+
+              def check(self):
+                  require(time.monotonic() < self.limit, 'Process acquisition deadline')
+
+              def sample(self, section, record):
+                  self.sequence += 1
+                  self.totals[section] += 1
+                  encoded = json.dumps(dict(sequence=self.sequence, **record), sort_keys=True)
+                  if len(encoded.encode()) > 8192:
+                      encoded = json.dumps(dict(sequence=self.sequence, detail=encoded[:1024], truncated=True))
+                  entries = getattr(self, section)
+                  entries.append(encoded)
+                  self.sample_bytes[section] += len(encoded.encode())
+                  count = self.error_count if section == 'errors' else self.history_count
+                  size = self.error_bytes if section == 'errors' else self.history_bytes
+                  while len(entries) > count or self.sample_bytes[section] + 2 * len(entries) + 2 > size:
+                      self.sample_bytes[section] -= len(entries.popleft().encode())
+
+              def error(self, reason, **values):
+                  self.incomplete = True
+                  self.sample('errors', dict(reason=str(reason)[:2048], **values))
+
+              def poll_root(self):
+                  if self.root is not None:
+                      value = self.root.poll()
+                      if value is not None and not self.intervened:
+                          self.natural_rc = value
+                      return value
 
               def table(self):
                   result = {}
                   for path in Path('/proc').iterdir():
+                      self.check()
                       if path.name.isdigit():
                           try:
                               result[int(path.name)] = identity(int(path.name))
@@ -303,109 +345,213 @@ jobs:
                   finally:
                       os.close(descriptor)
 
+              def close(self, handle):
+                  for descriptor in handle:
+                      try:
+                          os.close(descriptor)
+                      except OSError as error:
+                          self.error(error, operation='close')
+
+              def retire(self):
+                  self.poll_root()
+                  progress = False
+                  for key, handle in list(self.handles.items()):
+                      self.check()
+                      if not self.exited(handle):
+                          continue
+                      if self.root is None or key[0] != self.root.pid:
+                          try:
+                              os.waitid(os.P_PIDFD, handle[1], os.WEXITED | os.WNOHANG)
+                          except ChildProcessError:
+                              pass
+                          except OSError as error:
+                              self.error(error, operation='reap', pid=key[0])
+                      self.sample('history', dict(pid=key[0], birth=key[1], status='exited'))
+                      self.totals['retired'] += 1
+                      self.close(self.handles.pop(key))
+                      progress = True
+                  return progress
+
               def parent(self, pid, table):
+                  self.check()
                   if pid == os.getpid():
-                      return identity(pid)[1] == self.birth
+                      value = identity(pid)
+                      if value[1] != self.birth:
+                          self.error('controller birth mismatch', pid=pid, expected=self.birth, actual=value)
+                          return False
+                      return True
                   for key, handle in self.handles.items():
+                      self.check()
                       if key[0] != pid or self.exited(handle):
                           continue
                       value = table.get(pid)
                       if value and value[1] != key[1]:
-                          self.errors.append(dict(pid=pid, expected=key[1], actual=value, reason='parent birth mismatch'))
+                          self.error('parent birth mismatch', pid=pid, expected=key[1], actual=value)
                           return False
                       try:
-                          return self.anchored(handle[0])[1] == key[1] and not self.exited(handle)
+                          anchored = self.anchored(handle[0])
+                          if anchored[1] != key[1]:
+                              self.error('anchored parent birth mismatch', pid=pid, expected=key[1], actual=anchored)
+                              return False
+                          return not self.exited(handle)
                       except (FileNotFoundError, ProcessLookupError):
                           return False
                   return False
 
-              def discover(self):
+              def settle(self):
+                  progress = False
+                  for key, record in list(self.pending.items()):
+                      self.check()
+                      try:
+                          value = identity(key[0])
+                          record['absence'] = 0
+                          if value[1] != key[1]:
+                              self.error('pending birth mismatch', pid=key[0], expected=key[1], actual=value)
+                              del self.pending[key]
+                              progress = True
+                          elif value[2] in ('Z', 'X', 'x'):
+                              self.sample('history', dict(pid=key[0], birth=key[1], status='terminal_unbound'))
+                              self.totals['terminal_unbound'] += 1
+                              del self.pending[key]
+                              progress = True
+                      except (FileNotFoundError, ProcessLookupError):
+                          record['absence'] += 1
+                          if record['absence'] >= 2:
+                              self.sample('history', dict(pid=key[0], birth=key[1], status='vanished'))
+                              self.totals['vanished'] += 1
+                              del self.pending[key]
+                              progress = True
+                  return progress
+
+              def discover(self, cleaning=False):
                   for _ in range(8):
-                      require(time.monotonic() < self.limit, 'Process acquisition deadline')
+                      self.check()
+                      progress = self.retire()
+                      progress = self.settle() or progress
                       table = self.table()
-                      before = len(self.handles)
+                      held_pids = set()
                       for key in self.handles:
+                          self.check()
+                          held_pids.add(key[0])
                           value = table.get(key[0])
                           if value and value[1] != key[1]:
-                              self.errors.append(dict(pid=key[0], expected=key[1], actual=value, reason='snapshot birth mismatch'))
+                              self.error('snapshot birth mismatch', pid=key[0], expected=key[1], actual=value)
                       for pid, value in table.items():
+                          self.check()
                           key = pid, value[1]
-                          if key in self.handles:
+                          if value[2] in ('Z', 'X', 'x') or key in self.handles or pid in held_pids:
                               continue
                           if not self.parent(value[0], table):
                               continue
-                          require(len(self.handles) + len(self.pending) < 20000, 'Process evidence capacity')
-                          record = self.pending.setdefault(key, dict(pid=pid, birth=value[1], observed=value, absence=0))
+                          if key not in self.pending:
+                              if len(self.handles) + len(self.pending) >= self.capacity:
+                                  self.error('Process evidence capacity', pid=pid, birth=value[1])
+                                  self.totals['overflow'] += 1
+                                  if not cleaning:
+                                      raise AssertionError('Process evidence capacity')
+                                  continue
+                              self.pending[key] = dict(pid=pid, birth=value[1], absence=0)
+                              self.peak_pending = max(self.peak_pending, len(self.pending))
+                              self.totals['admitted'] += 1
+                              progress = True
+                          if self.pending[key].get('identity_error'):
+                              continue
                           directory = descriptor = None
                           try:
                               directory = os.open(f'/proc/{pid}', os.O_RDONLY | os.O_DIRECTORY)
                               first = self.anchored(directory)
                               require(first[1] == key[1], 'Child birth changed before pidfd')
                               descriptor = os.pidfd_open(pid)
+                              self.check()
                               final = self.anchored(directory)
                               require(final[1] == key[1], 'Child birth changed after pidfd')
                               require(first[0] == final[0] and self.parent(final[0], self.table()), 'Child ownership changed')
-                              require(self.anchored(directory)[:2] == final[:2], 'Child identity changed after parent proof')
-                              record.update(status='bound', first=first, final=final)
+                              require(self.anchored(directory)[:2] == final[:2], 'Child birth/parent changed after parent proof')
+                              require(final[2] not in ('Z', 'X', 'x'), 'Child exited during acquisition')
                               self.handles[key] = (directory, descriptor)
                               directory = descriptor = None
-                              self.records.append(record.copy())
+                              self.sample('history', dict(pid=pid, birth=key[1], status='bound'))
+                              self.totals['acquired'] += 1
+                              self.peak_handles = max(self.peak_handles, len(self.handles))
+                              if self.root is not None and pid == self.root.pid:
+                                  self.root_bound = True
                               del self.pending[key]
+                              progress = True
                           except (FileNotFoundError, ProcessLookupError):
-                              record.update(status='vanished_during_acquisition')
+                              pass
                           except (OSError, AssertionError) as error:
-                              record.update(status='uncertain', error=str(error))
-                              if isinstance(error, AssertionError) and 'birth' in str(error).lower():
-                                  self.errors.append(record.copy())
+                              self.sample('history', dict(pid=pid, birth=key[1], status='uncertain', error=str(error)[:2048]))
+                              if 'birth' in str(error).lower():
+                                  self.pending[key]['identity_error'] = True
+                              if isinstance(error, OSError) or 'birth' in str(error).lower() or 'deadline' in str(error).lower():
+                                  self.error(error, pid=pid)
                           finally:
-                              if directory is not None:
-                                  os.close(directory)
-                              if descriptor is not None:
-                                  os.close(descriptor)
-                      for key, record in list(self.pending.items()):
-                          try:
-                              value = identity(key[0])
-                              record['absence'] = 0
-                              if value[1] != key[1]:
-                                  self.errors.append(dict(record, reason='pending birth mismatch', actual=value))
-                          except (FileNotFoundError, ProcessLookupError):
-                              record['absence'] += 1
-                              if record['absence'] >= 2:
-                                  self.records.append(dict(record, status='vanished'))
-                                  del self.pending[key]
-                      if len(self.handles) == before:
-                          return
+                              self.close(tuple(fd for fd in (directory, descriptor) if fd is not None))
+                      self.poll_root()
+                      if not progress:
+                          break
+                  if self.incomplete and not cleaning:
+                      raise AssertionError('Process ownership incomplete')
+
+              def summary(self):
+                  def section(records, total, size):
+                      retained, used = [], 2
+                      for record in records:
+                          encoded = json.dumps(record, sort_keys=True)
+                          extra = len(encoded.encode()) + (2 if retained else 0)
+                          if len(retained) == 1024 or used + extra > size - 1024:
+                              break
+                          retained.append(record)
+                          used += extra
+                      return dict(records=retained, total=total, dropped=total - len(retained), bytes=used,
+                           first_sequence=retained[0].get('sequence') if retained else None,
+                           last_sequence=retained[-1].get('sequence') if retained else None)
+                  history = [json.loads(value) for value in self.history]
+                  errors = [json.loads(value) for value in self.errors]
+                  return dict(ownership_incomplete=self.incomplete, totals=dict(self.totals), sequence=self.sequence,
+                       peak_handles=self.peak_handles, peak_pending=self.peak_pending,
+                       live=len(self.handles) if self.final_live is None else self.final_live,
+                       unresolved=len(self.pending) if self.final_pending is None else self.final_pending,
+                       root_bound=self.root_bound, natural_rc=self.natural_rc,
+                       history=section(history, self.totals['history'], self.history_bytes),
+                       errors=section(errors, self.totals['errors'], self.error_bytes),
+                       active=self.final_active if self.final_active is not None else section(
+                           (dict(pid=key[0], birth=key[1]) for key in self.handles), len(self.handles), self.history_bytes),
+                       pending=section(self.pending.values(), len(self.pending), self.history_bytes))
 
               def cleanup(self, process):
+                  self.root = process
                   started = time.monotonic()
                   try:
                       for sig, seconds in ((signal.SIGTERM, 3), (signal.SIGKILL, 6)):
                           self.limit = started + seconds
                           while time.monotonic() < self.limit:
-                              for handle in self.handles.values():
-                                  try:
-                                      signal.pidfd_send_signal(handle[1], sig)
-                                  except ProcessLookupError:
-                                      pass
                               try:
-                                  self.discover()
-                              except (OSError, AssertionError) as error:
-                                  self.errors.append(dict(error=str(error)))
-                              for key, handle in self.handles.items():
-                                  if key[0] != process.pid:
+                                  self.discover(cleaning=True)
+                                  self.poll_root()
+                                  for key, handle in list(self.handles.items()):
+                                      self.check()
+                                      if self.exited(handle):
+                                          continue
+                                      if key[0] == process.pid:
+                                          self.intervened = True
                                       try:
-                                          os.waitid(os.P_PIDFD, handle[1], os.WEXITED | os.WNOHANG)
-                                      except ChildProcessError:
+                                          signal.pidfd_send_signal(handle[1], sig)
+                                      except ProcessLookupError:
                                           pass
-                              process.poll()
-                              if all(self.exited(handle) for handle in self.handles.values()) and not self.pending and process.returncode is not None:
-                                  return not self.errors
+                                  self.retire()
+                              except (OSError, AssertionError) as error:
+                                  self.error(error, operation='cleanup')
+                              if not self.handles and not self.pending and process.poll() is not None and not self.incomplete:
+                                  return True
                               time.sleep(min(0.03, max(0, self.limit - time.monotonic())))
+                      self.error('Process cleanup deadline', live=len(self.handles), unresolved=len(self.pending))
                       return False
                   finally:
-                      for handle in self.handles.values():
-                          for descriptor in handle:
-                              os.close(descriptor)
+                      self.final_live, self.final_pending = len(self.handles), len(self.pending)
+                      self.final_active = self.summary()['active']
+                      for key in list(self.handles):
+                          self.close(self.handles.pop(key))
 
           def command(label, args, environment=None, limit=1200):
               directory = OUT / label
@@ -422,8 +568,9 @@ jobs:
                   result['pid'] = process.pid
                   stop = time.monotonic() + allowed
                   owned.limit = stop
+                  owned.root = process
                   owned.discover()
-                  require(any(key[0] == process.pid for key in owned.handles), 'Root process identity unavailable')
+                  require(owned.root_bound or owned.natural_rc is not None, 'Root process identity unavailable')
                   os.set_blocking(process.stdout.fileno(), False)
                   buffer = b''
                   with selectors.DefaultSelector() as poller, (directory / 'console.log').open('w+b') as stream:
@@ -458,7 +605,7 @@ jobs:
                       if buffer and INFRA.search(buffer.decode(errors='replace')):
                           suspicious.append(buffer.decode(errors='replace'))
               except BaseException as error:
-                  result.update(status='execution_error', error=str(error))
+                  result.update(status='execution_error', error=str(error)[:4096])
                   raise
               finally:
                   alarm_started = time.monotonic()
@@ -466,15 +613,22 @@ jobs:
                   try:
                       if process is not None:
                           try:
-                              result['cleanup_complete'] = owned.cleanup(process)
+                              owned.poll_root()
+                              if result['rc'] is None:
+                                  result['rc'] = owned.natural_rc
+                              result['cleanup_complete'] = owned.cleanup(process) and not owned.incomplete
                               result['cleanup_rc'] = process.returncode
+                              if not result['cleanup_complete']:
+                                  result['status'] = 'execution_error'
                           except BaseException as error:
-                              result.update(cleanup_complete=False, cleanup_error=str(error))
+                              result.update(status='execution_error', cleanup_complete=False, cleanup_error=str(error)[:4096])
                           finally:
+                              if result['rc'] is None:
+                                  result['rc'] = owned.natural_rc
                               process.stdout.close()
                       result.update(end=time.time(), retained_console_bytes=len(tail), infrastructure=suspicious,
-                                    processes=owned.records if owned else [], pending=list(owned.pending.values()) if owned else [],
-                                    ownership_errors=owned.errors if owned else [])
+                                    ownership=owned.summary() if owned else None)
+                      require(len(json.dumps(result).encode()) < 8 * 1024 * 1024, 'Command result capacity')
                       save(f'{label}/result.json', result)
                   finally:
                       elapsed = time.monotonic() - alarm_started
