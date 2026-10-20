@@ -691,7 +691,7 @@ jobs:
                       function = getattr(getattr(declared, "setUpClass", None), "__func__", None)
                       if name not in CLASSES or not self.code("test_http_static", function, setup.f_code):
                           return
-                      if setup.f_lineno != (58 if name == CLASSES[0] else 198) or setup.f_locals.get("cls") is not cls:
+                      if setup.f_lineno != (58 if name == CLASSES[0] else 199) or setup.f_locals.get("cls") is not cls:
                           return
                       if caller.f_locals.get("self") is not provider or getattr(cls, "vapi", None) is not provider:
                           return
