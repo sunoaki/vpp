@@ -41,9 +41,9 @@ jobs:
     env:
       VARIANT_NAME: ${{ matrix.variant }}
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: 2ff4cf5eb2a84522213e1182ff1b3934153645d7
+      CANDIDATE_SHA: ca0843b651f6f9c1fca0635c61e6916112759fda
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: 665b7c899566aac80f64af3a9b23f75cb3d26be4
+      CANDIDATE_TREE: af7604aff5a719bf29162ca54463e5c6c24ee7fa
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
@@ -72,7 +72,7 @@ jobs:
           printf '%s\n' bootstrap checkout prepare dependencies feature-list pinned-python black-version \
             fixture-python-style fixtures mutate fallback-version build binaries namespace environment runtime tests http-name http-name-runtime collect \
             > "$EVIDENCE/planned-phases.txt"
-          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 2ff4cf5eb2a84522213e1182ff1b3934153645d7; do
+          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 2ff4cf5eb2a84522213e1182ff1b3934153645d7 ca0843b651f6f9c1fca0635c61e6916112759fda; do
             printf 'style-%s\napi-%s\nmessage-%s\n' "$commit" "$commit" "$commit" >> "$EVIDENCE/planned-phases.txt"
           done
           {
@@ -972,8 +972,8 @@ jobs:
           TEST = "test/asf/test_http_static.py"
           FIXTURE = "src/plugins/http_static/test_lifetime_fixtures.py"
           HTTP_TEST = "test/asf/test_http.py"
-          TEST_BLOBS = {TEST: "0fc100669099cc0c7c30bc22b7d0b639bd82bf15",
-                        FIXTURE: "94ae04eb6da7930b9522b97b8a4f43e9acd4fc18",
+          TEST_BLOBS = {TEST: "e1ac11faedeb125fe0e5991ccaf67686974ad4d0",
+                        FIXTURE: "894e32ad12ae1a0c4e923f0f59a74542ac4e22a7",
                         HTTP_TEST: "0a7353040c8323e3ec2f4500d2ce72c1f2a94934"}
           CLASSES = ("TestHttpStaticCli", "TestHttpStaticCliWorker")
           RECIPES = {
@@ -1279,7 +1279,7 @@ jobs:
 
           def source_identity():
               require(git("rev-list", "--parents", "-n", "1", CANDIDATE).split() ==
-                      [CANDIDATE, "40b52275db082d350158684cdb117e9f43450418"],
+                      [CANDIDATE, "2ff4cf5eb2a84522213e1182ff1b3934153645d7"],
                       "Candidate must have exactly the reviewed composition parent")
               require(git("rev-parse", f"{CANDIDATE}^{{tree}}") == os.environ["CANDIDATE_TREE"],
                       "Candidate tree differs from reviewed integration")
