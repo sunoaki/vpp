@@ -262,7 +262,7 @@ class TestHttpStaticCli(VppAsfTestCase):
 
     def _client(self, port, path="/version.json", secure=False, pending=False):
         script = """
-import http.client, json, socket, ssl, sys
+import hashlib, http.client, json, socket, ssl, sys
 port, path, secure, pending = json.loads(sys.argv[1])
 connection = (http.client.HTTPSConnection(
     "10.10.1.2", port, timeout=5, context=ssl._create_unverified_context())
@@ -272,7 +272,8 @@ if pending:
     connection.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
     connection.request("GET", path)
     response = connection.getresponse()
-    print(json.dumps({"status": response.status}), flush=True)
+    print(json.dumps({"status": response.status,
+                      "server": response.getheader("Server")}), flush=True)
 else:
     def request():
         try:
@@ -281,6 +282,7 @@ else:
             body = response.read()
             print(json.dumps({"status": response.status,
                               "body": body.decode(),
+                              "server": response.getheader("Server"),
                               "cache": response.getheader("Cache-Control")}), flush=True)
         except (ConnectionResetError, BrokenPipeError,
                 http.client.IncompleteRead, http.client.RemoteDisconnected) as error:
@@ -291,13 +293,16 @@ for command in sys.stdin:
         break
     if pending:
         try:
+            connection.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
             remaining = response.length
+            digest = hashlib.sha256()
             while remaining:
                 data = response.read(min(65536, remaining))
                 if not data:
                     raise http.client.IncompleteRead(b"", remaining)
+                digest.update(data)
                 remaining -= len(data)
-            print(json.dumps({"drained": True}), flush=True)
+            print(json.dumps({"drained": True, "sha256": digest.hexdigest()}), flush=True)
         except (ConnectionResetError, BrokenPipeError,
                 http.client.IncompleteRead, http.client.RemoteDisconnected) as error:
             print(json.dumps({"closed": type(error).__name__}), flush=True)
@@ -343,7 +348,10 @@ connection.close()
         self.assertTrue(ready, "persistent client timed out")
         line = client.stdout.readline()
         self.assertTrue(line, f"persistent client exited: {client.poll()}")
-        return json.loads(line)
+        response = json.loads(line)
+        if "status" in response:
+            self.assertRegex(response["server"], r"^http_static_server_\d+$")
+        return response
 
     def _refused(self, port):
         script = """
@@ -456,6 +464,127 @@ else:
         self.assertEqual(list(states.values()), [0], listener_output)
         self.assertNotIn("path ", session_output, session_output)
 
+    def test_http_static_cache_owners(self):
+        """Real cache operations preserve busy owners and count every LRU entry."""
+        if config.vpp_tag != "vpp_debug":
+            self.skipTest("cache owner selftest requires debug VPP")
+        with tempfile.TemporaryDirectory() as root:
+            paths = [os.path.join(root, f"{index}.txt") for index in range(4)]
+            for index, path in enumerate(paths):
+                with open(path, "w") as output:
+                    output.write(f"cache owner {index}")
+            for mode, expected in (
+                ("pressure", "cache pressure: zero/finite owners passed"),
+                ("clear", "cache clear: 121 states passed"),
+            ):
+                with self.subTest(mode=mode):
+                    reply = self.vapi.cli_return_response(
+                        f"test http static cache owners {mode} " + " ".join(paths)
+                    )
+                    self.assertEqual(reply.retval, 0, reply.reply)
+                    self.assertIn(expected, reply.reply)
+
+    def test_http_static_cache_pressure(self):
+        """Completed and in-flight responses retain distinct cache owners."""
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as root:
+            small = "retained completed owner"
+            large = b"retained pointer owner\n" * (1 << 19)
+            for name, body in (
+                ("a.txt", small.encode()),
+                ("b.txt", large),
+                ("c.txt", b"new pressure owner"),
+            ):
+                with open(os.path.join(root, name), "wb") as output:
+                    output.write(body)
+            self.vapi.http_static_enable_v5(www_root=root, uri="http://10.10.1.2:8088")
+            self.addCleanup(self.vapi.http_static_disable)
+            self.assertEqual(self.vapi.http_static_get().cache_size_limit, 0)
+            completed = self._client(8088, "/a.txt")
+            first = self._response(completed)
+            self.assertEqual(first["body"], small)
+            pending = self._client(8088, "/b.txt", pending=True)
+            self.assertEqual(self._response(pending)["status"], 200)
+            pressure = self._client(8088, "/c.txt")
+            self.assertEqual(self._response(pressure)["body"], "new pressure owner")
+            cache = self.vapi.cli("show http static server cache verbose")
+            for name in ("a.txt", "b.txt", "c.txt"):
+                self.assertIn(os.path.join(root, name), cache)
+            self.assertIn("3 busy items", self.vapi.cli("clear http static cache"))
+            with open(os.path.join(root, "a.txt"), "w") as output:
+                output.write("changed backing file")
+            self.assertEqual(self._response(completed, "next")["body"], small)
+            drained = self._response(pending, "drain")
+            self.assertTrue(drained["drained"])
+            self.assertEqual(drained["sha256"], hashlib.sha256(large).hexdigest())
+            for client in (completed, pending, pressure):
+                self._stop_client(client)
+            deadline = time.monotonic() + 10
+            while "path " in self.vapi.cli("show http static server sessions"):
+                self.assertLess(time.monotonic(), deadline, "cache owners did not detach")
+                time.sleep(0.05)
+            self.assertIn("Cache cleared", self.vapi.cli("clear http static cache"))
+            self.vapi.http_static_disable()
+            self.vapi.cli("http static server")
+            self._wait_released()
+
+    def test_http_static_cache_relocation(self):
+        """Actual pool copies preserve cached active and retiring listeners."""
+        if config.vpp_tag != "vpp_debug":
+            self.skipTest("cache relocation selftest requires debug VPP")
+        self.vapi.cli("http static server")
+        self.addCleanup(self.vapi.cli, "http static server disable")
+        baseline = self.vapi.cli("show bihash").count("Hash table 'http cache'")
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "file.txt"), "w") as output:
+                output.write("stable cache")
+            uri = "http://10.10.1.2:8089"
+            self.vapi.cli(f"http static listener add uri {uri} www-root {root}")
+            old = self._client(8089, "/file.txt")
+            self.assertEqual(self._response(old)["body"], "stable cache")
+            self.vapi.cli(f"http static listener del uri {uri}")
+            self.vapi.cli(f"http static listener add uri {uri} www-root {root}")
+            self.vapi.cli(
+                "http static listener add uri http://10.10.1.2:8090 url-handlers"
+            )
+            spare = "http://10.10.1.2:8091"
+            self.vapi.cli(f"http static listener add uri {spare} url-handlers")
+            states, _ = self._listener_states()
+            spare_index = max(states)
+            self.vapi.cli(f"http static listener del uri {spare}")
+            self._wait_listener_gone(spare_index)
+            states, output = self._listener_states()
+            self.assertEqual(sorted(states.values()), [0, 0, 1], output)
+            url_index = next(
+                int(index)
+                for index in re.findall(r"listener (\d+), uri 10\.10\.1\.2:8090,", output)
+            )
+            self.assertIn(
+                "has no file cache",
+                self.vapi.cli(f"show http static server cache {url_index}"),
+            )
+            self.assertIn(
+                "Cache cleared",
+                self.vapi.cli(f"clear http static cache index {url_index}"),
+            )
+            for _ in range(2):
+                reply = self.vapi.cli_return_response("test http static cache relocation")
+                self.assertEqual(reply.retval, 0, reply.reply)
+                self.assertEqual(reply.reply.count("listener pool moved "), 2)
+                self.assertIn("2 explicit pool moves, unique stable hashes", reply.reply)
+                self.assertEqual(
+                    self.vapi.cli("show bihash").count("Hash table 'http cache'"),
+                    baseline + 2,
+                )
+            self._stop_client(old)
+            self.vapi.cli(f"http static listener del uri {uri}")
+            self.vapi.cli("http static listener del uri http://10.10.1.2:8090")
+            self._wait_released()
+            self.assertEqual(
+                self.vapi.cli("show bihash").count("Hash table 'http cache'"), baseline
+            )
+
     def test_http_static_pending_accept_identity(self):
         """Synthetic queued callbacks retain identity across listener reuse."""
         if config.vpp_tag != "vpp_debug":
@@ -476,6 +605,9 @@ else:
         client = self._client(8080)
         first = self._response(client)
         self.assertEqual(first["status"], 200)
+        apps, output = self._hss_apps()
+        self.assertEqual(len(apps), 1, output)
+        self.assertEqual(first["server"], next(iter(apps))[1])
         states, output = self._listener_states()
         self.assertEqual(list(states.values()), [0], output)
         old_index = next(iter(states))
@@ -483,7 +615,9 @@ else:
         states, output = self._listener_states()
         self.assertEqual(states, {old_index: 1}, output)
         self._refused(8080)
-        self.assertEqual(self._response(client, "next")["body"], first["body"])
+        retained = self._response(client, "next")
+        self.assertEqual(retained["body"], first["body"])
+        self.assertEqual(retained["server"], first["server"])
         self.vapi.cli(f"http static listener add uri {uri} www-root /tmp")
         states, output = self._listener_states()
         self.assertEqual(states.get(old_index), 1, output)
@@ -491,9 +625,13 @@ else:
         self.assertEqual(len(active_indices), 1, output)
         self.assertNotEqual(active_indices[0], old_index, output)
         self.assertEqual(len(states), 2, output)
-        self.assertEqual(self._response(client, "next")["body"], first["body"])
+        retained = self._response(client, "next")
+        self.assertEqual(retained["body"], first["body"])
+        self.assertEqual(retained["server"], first["server"])
         replacement = self._client(8080)
-        self.assertEqual(self._response(replacement)["status"], 404)
+        fresh = self._response(replacement)
+        self.assertEqual(fresh["status"], 404)
+        self.assertEqual(fresh["server"], first["server"])
         self._stop_client(client)
         self._wait_listener_gone(old_index)
         self._stop_client(replacement)

@@ -183,7 +183,7 @@ vl_api_http_static_get_t_handler (vl_api_http_static_get_t *mp)
 	vec_add1 (addr, 0);
 
 	rmp->fifo_size = htonl (hsm->fifo_size);
-	rmp->cache_size_limit = htonl (l->cache.cache_limit);
+	rmp->cache_size_limit = htonl (l->cache ? l->cache->cache_limit : 0);
 	snprintf ((char *) rmp->www_root, sizeof (rmp->www_root), "%s",
 		  l->www_root ? (char *) l->www_root : "");
 	snprintf ((char *) rmp->uri, sizeof (rmp->uri), "http%s://%s:%d",

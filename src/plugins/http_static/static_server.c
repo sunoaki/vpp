@@ -36,8 +36,11 @@ hss_listener_free_rpc (void *arg)
 
   ASSERT (vlib_thread_is_main_w_barrier ());
   ASSERT (l && l->retiring && l->ref_count == 0);
-  if (l->www_root)
-    hss_cache_free (&l->cache);
+  if (l->cache)
+    {
+      hss_cache_free (l->cache);
+      clib_mem_free (l->cache);
+    }
   vec_free (l->www_root);
   vec_free (l->max_age_formatted);
   pool_put (hss_main.listeners, l);
@@ -551,8 +554,8 @@ try_file_handler (hss_session_t *hs)
 
   hs->data_offset = 0;
 
-  ce_index = hss_cache_lookup_and_attach (&l->cache, path, &hs->data,
-					  &hs->data_len, &last_modified);
+  ce_index = hss_cache_lookup_and_attach (l->cache, path, &hs->data,
+					&hs->data_len, &last_modified);
   if (ce_index == ~0)
     {
       if (!file_path_is_valid (path))
@@ -571,8 +574,8 @@ try_file_handler (hss_session_t *hs)
 	  sc = try_index_file (l, hs, path);
 	  goto done;
 	}
-      ce_index = hss_cache_add_and_attach (&l->cache, path, &hs->data,
-					   &hs->data_len, &last_modified);
+      ce_index = hss_cache_add_and_attach (l->cache, path, &hs->data,
+					 &hs->data_len, &last_modified);
       if (ce_index == ~0)
 	{
 	  sc = HTTP_STATUS_INTERNAL_ERROR;
@@ -686,7 +689,7 @@ hss_ts_rx_callback (session_t *ts)
 
   if (hs->cache_pool_index != ~0)
     {
-      hss_cache_detach_entry (&hss_listener_get (hs->listener_index)->cache, hs->cache_pool_index);
+      hss_cache_detach_entry (hss_listener_get (hs->listener_index)->cache, hs->cache_pool_index);
       hs->cache_pool_index = ~0;
     }
   if (hs->free_data)
@@ -996,7 +999,7 @@ hss_session_cleanup (hss_session_t *hs)
   u32 l_index = hs->listener_index;
 
   if (hs->cache_pool_index != ~0)
-    hss_cache_detach_entry (&hss_listener_get (l_index)->cache, hs->cache_pool_index);
+    hss_cache_detach_entry (hss_listener_get (l_index)->cache, hs->cache_pool_index);
   if (hs->free_data)
     vec_free (hs->data);
   vec_free (hs->headers_buf);
@@ -1165,6 +1168,7 @@ hss_listener_add (hss_listener_t *l_cfg)
 
   pool_get (hsm->listeners, l);
   *l = *l_cfg;
+  l->cache = 0;
   l->l_index = l - hsm->listeners;
   l->session_handle = lh;
   l->ref_count = 1;
@@ -1177,7 +1181,11 @@ hss_listener_add (hss_listener_t *l_cfg)
   ls->opaque = l->l_index;
 
   if (l->www_root)
-    hss_cache_init (&l->cache, l->cache_size, hsm->debug_level);
+    {
+      l->cache = clib_mem_alloc_aligned (sizeof (*l->cache), CLIB_CACHE_LINE_BYTES);
+      clib_memset (l->cache, 0, sizeof (*l->cache));
+      hss_cache_init (l->cache, l->cache_size, hsm->debug_level);
+    }
   if (l->enable_url_handlers)
     hss_url_handlers_init (hsm);
 
@@ -1659,6 +1667,99 @@ VLIB_CLI_COMMAND (hss_test_pending_accept_command, static) = {
   .short_help = "test http static pending accept",
   .function = hss_test_pending_accept_command_fn,
 };
+
+static clib_error_t *
+hss_test_cache_registry (void)
+{
+  hss_listener_t *l;
+  u32 i, found;
+
+  pool_foreach (l, hss_main.listeners)
+    {
+      if (!l->cache)
+	continue;
+      found = 0;
+      for (i = 0; i < vec_len (clib_all_bihashes); i++)
+	found += clib_all_bihashes[i] == &l->cache->name_to_data;
+      if (found != 1)
+	return clib_error_return (0, "listener %u cache registered %u times", l->l_index, found);
+    }
+  return 0;
+}
+
+static clib_error_t *
+hss_test_cache_relocation_command_fn (vlib_main_t *vm, unformat_input_t *input,
+				      vlib_cli_command_t *cmd)
+{
+  hss_main_t *hsm = &hss_main;
+  hss_listener_t *copy, *old, *l;
+  pool_header_t *old_header, *new_header;
+  clib_error_t *error;
+  uword old_base, registry_count;
+  u32 pass, i, moved = 0;
+
+  ASSERT (vlib_thread_is_main_w_barrier ());
+  if (!pool_elts (hsm->listeners))
+    return clib_error_return (0, "cache relocation test requires live listeners");
+  error = hss_test_cache_registry ();
+  if (error)
+    return error;
+  registry_count = vec_len (clib_all_bihashes);
+  pool_foreach (l, hsm->listeners)
+    if (l->cache)
+      vlib_cli_output (vm, "listener %u cache %llx hash %llx lock %llx retiring %u", l->l_index,
+		       pointer_to_uword (l->cache), pointer_to_uword (&l->cache->name_to_data),
+		       pointer_to_uword (l->cache->cache_lock), l->retiring);
+  for (pass = 0; pass < 2; pass++)
+    {
+      old = hsm->listeners;
+      old_base = pointer_to_uword (old);
+      copy = pool_dup (old);
+      old_header = pool_header (old);
+      new_header = pool_header (copy);
+      if (copy == old || vec_len (copy) != vec_len (old) ||
+	  !clib_bitmap_is_equal (new_header->free_bitmap, old_header->free_bitmap) ||
+	  vec_len (new_header->free_indices) != vec_len (old_header->free_indices))
+	{
+	  pool_free (copy);
+	  return clib_error_return (0, "listener pool copy changed allocation state");
+	}
+      for (i = 0; i < vec_len (old_header->free_indices); i++)
+	if (new_header->free_indices[i] != old_header->free_indices[i])
+	  {
+	    pool_free (copy);
+	    return clib_error_return (0, "listener pool copy changed free-list order");
+	  }
+      pool_foreach (l, old)
+	if (memcmp (l, pool_elt_at_index (copy, l - old), sizeof (*l)))
+	  {
+	    pool_free (copy);
+	    return clib_error_return (0, "listener pool copy changed live ownership");
+	  }
+      hsm->listeners = copy;
+      error = hss_test_cache_registry ();
+      if (!error && vec_len (clib_all_bihashes) != registry_count)
+	error = clib_error_return (0, "pool move changed hash registry count");
+      if (error)
+	{
+	  hsm->listeners = old;
+	  pool_free (copy);
+	  return error;
+	}
+      pool_free (old);
+      moved++;
+      vlib_cli_output (vm, "listener pool moved %llx -> %llx", old_base,
+		       pointer_to_uword (copy));
+    }
+  vlib_cli_output (vm, "cache registry: %u explicit pool moves, unique stable hashes", moved);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (hss_test_cache_relocation_command, static) = {
+  .path = "test http static cache relocation",
+  .short_help = "test http static cache relocation",
+  .function = hss_test_cache_relocation_command_fn,
+};
 #endif
 
 static clib_error_t *
@@ -2025,9 +2126,9 @@ hss_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	;
       else if (unformat (input, "verbose"))
 	verbose = 1;
-      else if (unformat (input, "cache"))
-	show_cache = 1;
       else if (unformat (input, "cache %u", &l_index))
+	show_cache = 1;
+      else if (unformat (input, "cache"))
 	show_cache = 1;
       else if (unformat (input, "sessions"))
 	show_sessions = 1;
@@ -2045,7 +2146,10 @@ hss_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
       hss_listener_t *l = hss_listener_get (l_index);
       if (l == 0)
 	return clib_error_return (0, "listener %d not found", l_index);
-      vlib_cli_output (vm, "%U", format_hss_cache, &l->cache, verbose);
+      if (l->cache)
+	vlib_cli_output (vm, "%U", format_hss_cache, l->cache, verbose);
+      else
+	vlib_cli_output (vm, "listener %d has no file cache", l_index);
     }
 
   if (show_sessions)
@@ -2126,7 +2230,8 @@ hss_clear_cache_command_fn (vlib_main_t *vm, unformat_input_t *input,
   if (l == 0)
     return clib_error_return (0, "listener %d not found", l_index);
 
-  busy_items = hss_cache_clear (&l->cache);
+  if (l->cache)
+    busy_items = hss_cache_clear (l->cache);
 
   if (busy_items > 0)
     vlib_cli_output (vm, "Note: %d busy items still in cache...", busy_items);

@@ -142,8 +142,8 @@ typedef enum hss_listener_flags_
 
 typedef struct hss_listener_
 {
-  /** Path to file hash table */
-  hss_cache_t cache;
+  /** Independently allocated file cache */
+  hss_cache_t *cache;
   /** The bind session endpoint e.g., tcp://0.0.0.0:80 */
   session_endpoint_cfg_t sep;
   /** root path to be served */

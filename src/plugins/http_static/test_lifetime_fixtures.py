@@ -52,7 +52,9 @@ class TestClientWitnesses(unittest.TestCase):
     ns_name = "fixture-only"
 
     def pending_response(self, outcome):
-        response = types.SimpleNamespace(status=200, length=1024)
+        response = types.SimpleNamespace(
+            status=200, length=1024, getheader=lambda name: "http_static_server_0"
+        )
         response.read = lambda size: outcome() if callable(outcome) else outcome
         connection = types.SimpleNamespace(
             connect=lambda: None,
@@ -313,11 +315,18 @@ class TestLifecycleObservations(unittest.TestCase):
                 case._client = unittest.mock.Mock(return_value=object())
                 case._response = unittest.mock.Mock(
                     side_effect=[
-                        {"status": 200, "body": "original"},
-                        {"body": "original"},
-                        {"body": "original"},
-                        {"status": 404},
+                        {
+                            "status": 200,
+                            "body": "original",
+                            "server": "http_static_server_0",
+                        },
+                        {"body": "original", "server": "http_static_server_0"},
+                        {"body": "original", "server": "http_static_server_0"},
+                        {"status": 404, "server": "http_static_server_0"},
                     ]
+                )
+                case._hss_apps = unittest.mock.Mock(
+                    return_value=({("1", "http_static_server_0")}, "app")
                 )
                 case._refused = unittest.mock.Mock()
                 case._stop_client = unittest.mock.Mock()
@@ -612,6 +621,139 @@ class TestPendingAcceptWitness(unittest.TestCase):
                 else:
                     with self.assertRaises(AssertionError):
                         self.assertEqual(owners, [2] * 129)
+
+
+class TestCacheWitnesses(unittest.TestCase):
+    def test_owner_method_requires_both_real_c_modes(self):
+        import os
+        import tempfile
+
+        method = helper("test_http_static_cache_owners")
+        method.__globals__.update(
+            config=types.SimpleNamespace(vpp_tag="vpp_debug"), os=os, tempfile=tempfile
+        )
+        for broken in (None, "pressure", "clear", "missing"):
+            with self.subTest(broken=broken):
+                case_type = type(
+                    "CacheOwnerFixture", (unittest.TestCase,), {method.__name__: method}
+                )
+                case = case_type(method.__name__)
+                seen = []
+
+                def cli(command):
+                    mode = command.split()[5]
+                    seen.append(mode)
+                    message = (
+                        "cache pressure: zero/finite owners passed"
+                        if mode == "pressure" else "cache clear: 121 states passed"
+                    )
+                    return types.SimpleNamespace(
+                        retval=-1 if broken == mode else 0,
+                        reply="" if broken == "missing" else message,
+                    )
+
+                case.vapi = types.SimpleNamespace(cli_return_response=cli)
+                result = unittest.TestResult()
+                case.run(result)
+                self.assertEqual(result.errors, [])
+                self.assertEqual(result.skipped, [])
+                self.assertEqual(
+                    len(result.failures),
+                    2 if broken == "missing" else int(broken is not None),
+                )
+                self.assertEqual(seen, ["pressure", "clear"])
+
+    def test_relocation_method_requires_real_moves_and_registry_baseline(self):
+        import os
+        import tempfile
+
+        method = helper("test_http_static_cache_relocation")
+        method.__globals__.update(
+            config=types.SimpleNamespace(vpp_tag="vpp_debug"),
+            os=os, tempfile=tempfile, re=re,
+        )
+        success = (
+            "listener pool moved 1000 -> 2000\nlistener pool moved 2000 -> 3000\n"
+            "cache registry: 2 explicit pool moves, unique stable hashes"
+        )
+        for retval, reply in ((0, success), (-1, success), (0, "")):
+            with self.subTest(retval=retval, reply=reply):
+                case_type = type(
+                    "RelocationFixture", (unittest.TestCase,), {method.__name__: method}
+                )
+                case = case_type(method.__name__)
+                hashes = iter((0, 2, 2, 0))
+
+                def cli(command):
+                    if command == "show bihash":
+                        return "Hash table 'http cache'\n" * next(hashes)
+                    if command.startswith("show http static server cache"):
+                        return "listener 2 has no file cache"
+                    if command.startswith("clear http static cache"):
+                        return "Cache cleared..."
+                    return ""
+
+                case.vapi = types.SimpleNamespace(
+                    cli=cli,
+                    cli_return_response=lambda command: types.SimpleNamespace(
+                        retval=retval, reply=reply
+                    ),
+                )
+                case._client = unittest.mock.Mock(return_value=object())
+                case._response = unittest.mock.Mock(return_value={"body": "stable cache"})
+                case._listener_states = unittest.mock.Mock(
+                    side_effect=[
+                        ({0: 1, 1: 0, 2: 0, 3: 0}, "before spare delete"),
+                        ({0: 1, 1: 0, 2: 0}, "listener 2, uri 10.10.1.2:8090,"),
+                    ]
+                )
+                case._wait_listener_gone = unittest.mock.Mock()
+                case._stop_client = unittest.mock.Mock()
+                case._wait_released = unittest.mock.Mock()
+                result = unittest.TestResult()
+                case.run(result)
+                self.assertEqual(result.errors, [])
+                self.assertEqual(result.skipped, [])
+                self.assertEqual(len(result.failures), int(retval != 0 or not reply))
+
+    def test_straight_prev_clear_model_and_distinct_restorations(self):
+        from itertools import product
+
+        failures = {"old": 0, "only_remove_next": 0, "fixed": 0}
+        states = 0
+        for count in range(5):
+            for refs in product((-1, 0, 1), repeat=count):
+                states += 1
+                expected = {index for index, ref in enumerate(refs) if ref}
+                for version in failures:
+                    live = list(range(count))
+                    index = live[0] if live else None
+                    busy = 0
+                    visits = 0
+                    while index is not None:
+                        visits += 1
+                        self.assertLessEqual(visits, 2 * count + 1)
+                        position = live.index(index)
+                        previous = (
+                            live[position + 1] if position + 1 < len(live) else None
+                        )
+                        if refs[index]:
+                            busy += 1
+                            if version == "old":
+                                index = live[position - 1] if position else None
+                            else:
+                                index = previous
+                        else:
+                            live.remove(index)
+                            if version == "fixed":
+                                index = previous
+                            else:
+                                index = live[0] if live else None
+                    failures[version] += busy != len(expected) or set(live) != expected
+        self.assertEqual(states, 121)
+        self.assertEqual(failures["fixed"], 0)
+        self.assertGreater(failures["old"], 0)
+        self.assertGreater(failures["only_remove_next"], 0)
 
 
 if __name__ == "__main__":
