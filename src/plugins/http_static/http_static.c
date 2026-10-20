@@ -62,6 +62,12 @@ hss_enable_api (u32 fifo_size, u32 cache_limit, u32 prealloc_fifos,
   hss_main_t *hsm = &hss_main;
   int rv;
 
+  if (hsm->app_index != ~0)
+    return VNET_API_ERROR_APP_ALREADY_ATTACHED;
+  if (!www_root || !www_root[0])
+    return VNET_API_ERROR_INVALID_VALUE;
+  clib_memset (&hsm->default_listener, 0, sizeof (hsm->default_listener));
+
   hsm->fifo_size = fifo_size;
   hsm->prealloc_fifos = prealloc_fifos;
   hsm->private_segment_size = private_segment_size;
@@ -74,12 +80,6 @@ hss_enable_api (u32 fifo_size, u32 cache_limit, u32 prealloc_fifos,
   hsm->default_listener.rx_buff_thresh = rx_buff_thresh;
   hsm->default_listener.keepalive_timeout = keepalive_timeout;
   hsm->have_default_listener = 1;
-
-  if (vec_len (hsm->default_listener.www_root) < 2)
-    return VNET_API_ERROR_INVALID_VALUE;
-
-  if (hsm->app_index != ~0)
-    return VNET_API_ERROR_APP_ALREADY_ATTACHED;
 
   session_enable_disable_args_t args = { .is_en = 1,
 					 .rt_engine_type =
@@ -160,7 +160,10 @@ vl_api_http_static_get_t_handler (vl_api_http_static_get_t *mp)
   REPLY_MACRO2 (VL_API_HTTP_STATIC_GET_REPLY, {
     u8 *addr = 0;
 
-    if (pool_elts (hsm->listeners) == 0)
+    hss_listener_t *l =
+      hsm->default_listener_index == (u32) ~0 ? 0 : hss_listener_get (hsm->default_listener_index);
+
+    if (!l || l->retiring)
       {
 	rmp->fifo_size = 0;
 	rmp->cache_size_limit = 0;
@@ -173,25 +176,22 @@ vl_api_http_static_get_t_handler (vl_api_http_static_get_t *mp)
       }
     else
       {
-	if (hsm->default_listener.sep.is_ip4)
-	  addr = format (addr, "%U", format_ip4_address, &hsm->default_listener.sep.ip.ip4);
+	if (l->sep.is_ip4)
+	  addr = format (addr, "%U", format_ip4_address, &l->sep.ip.ip4);
 	else
-	  addr = format (addr, "[%U]", format_ip6_address, &hsm->default_listener.sep.ip.ip6);
-	/* format() does not NULL terminate; snprintf("%s", addr) would
-	   read past the end of the vector without this NULL termination. */
+	  addr = format (addr, "[%U]", format_ip6_address, &l->sep.ip.ip6);
 	vec_add1 (addr, 0);
 
 	rmp->fifo_size = htonl (hsm->fifo_size);
-	rmp->cache_size_limit = htonl (hsm->default_listener.cache.cache_limit);
-	strncpy ((char *) rmp->www_root, (const char *) hsm->default_listener.www_root,
-		 sizeof (rmp->www_root) - 1);
-	snprintf ((char *) rmp->uri, sizeof (rmp->uri), "%s://%s:%d",
-		  tp_vfts[hsm->default_listener.sep.transport_proto].transport_options.name, addr,
-		  ntohs (hsm->default_listener.sep.port));
-	rmp->max_age = htonl (hsm->default_listener.max_age);
-	rmp->keepalive_timeout = htonl (hsm->default_listener.keepalive_timeout);
-	rmp->max_body_size = htonl (hsm->default_listener.max_req_body_size);
-	rmp->rx_buff_thresh = htonl (hsm->default_listener.rx_buff_thresh);
+	rmp->cache_size_limit = htonl (l->cache ? l->cache->cache_limit : 0);
+	snprintf ((char *) rmp->www_root, sizeof (rmp->www_root), "%s",
+		  l->www_root ? (char *) l->www_root : "");
+	snprintf ((char *) rmp->uri, sizeof (rmp->uri), "http%s://%s:%d",
+		  l->flags & HSS_LISTENER_F_NEED_CRYPTO ? "s" : "", addr, ntohs (l->sep.port));
+	rmp->max_age = htonl (l->max_age);
+	rmp->keepalive_timeout = htonl (l->keepalive_timeout);
+	rmp->max_body_size = htonl (l->max_req_body_size);
+	rmp->rx_buff_thresh = htonl (l->rx_buff_thresh);
 	vec_free (addr);
       }
   });

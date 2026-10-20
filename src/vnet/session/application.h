@@ -385,8 +385,8 @@ __clib_export void app_worker_add_event_custom (app_worker_t *app_wrk,
 __clib_export int app_wrk_flush_wrk_events (app_worker_t *app_wrk,
 					    clib_thread_index_t thread_index);
 void app_worker_del_all_events (app_worker_t *app_wrk);
-segment_manager_t *app_worker_get_listen_segment_manager (app_worker_t *,
-							  session_t *);
+__clib_export segment_manager_t *app_worker_get_listen_segment_manager (app_worker_t *,
+									session_t *);
 __clib_export segment_manager_t *app_worker_get_connect_segment_manager (app_worker_t *);
 void app_worker_add_segment_notify (app_worker_t *app_wrk, u64 segment_handle);
 void app_worker_del_segment_notify (app_worker_t *app_wrk, u64 segment_handle);
