@@ -1693,5 +1693,33 @@ class VCLCutThruTestCaseBAPI(VCLTestCase):
         )
 
 
+@unittest.skipIf(
+    "unittest" in config.excluded_plugins, "Exclude tests requiring unittest plugin"
+)
+class CTListenerIdentityTestCase(VppAsfTestCase):
+    """Queued CT listener replacement without VPP workers"""
+
+    vpp_worker_count = 0
+
+    @classmethod
+    def setUpClass(cls):
+        cls.extra_vpp_config = ["session { poll-main }"]
+        super().setUpClass()
+
+    def test_ct_listener_replacement(self):
+        """Reject queued CT connects after same-index listener replacement"""
+        self.vapi.session_enable_disable(is_enable=1)
+        self.assertIn(
+            "CT listener identity SUCCESS",
+            self.vapi.cli("test session ct-listener"),
+        )
+
+
+class CTListenerIdentityWorkersTestCase(CTListenerIdentityTestCase):
+    """Queued CT listener replacement with two VPP workers"""
+
+    vpp_worker_count = 2
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=VppTestRunner)

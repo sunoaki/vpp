@@ -35,6 +35,7 @@ typedef struct ct_connection_
   u32 server_wrk;
   u32 client_opaque;
   u32 peer_index;
+  u64 listener_id;
   u64 segment_handle;
   u32 seg_ctx_index;
   u32 ct_seg_index;
@@ -44,6 +45,7 @@ typedef struct ct_connection_
   ct_connection_flags_t flags;
 } ct_connection_t;
 
+__clib_export u32 ct_connection_count (void);
 __clib_export session_t *ct_session_get_peer (session_t *s);
 void ct_session_endpoint (session_t * ll, session_endpoint_t * sep);
 int ct_session_connect_notify (session_t *ls, session_error_t err);

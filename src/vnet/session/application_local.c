@@ -27,6 +27,7 @@ typedef struct ct_main_
   ct_worker_t *wrk;			/**< Per-worker state */
   u32 n_workers;			/**< Number of vpp workers */
   u32 n_sessions;			/**< Cumulative sessions counter */
+  u64 listener_id;			/**< Last assigned listener identity */
   u32 *ho_reusable;			/**< Vector of reusable ho indices */
   clib_spinlock_t ho_reuseable_lock;	/**< Lock for reusable ho indices */
   u32 **fwrk_pending_connects;		/**< First wrk pending half-opens */
@@ -115,6 +116,20 @@ ct_half_open_add_reusable (u32 ho_index)
   clib_spinlock_lock (&cm->ho_reuseable_lock);
   vec_add1 (cm->ho_reusable, ho_index);
   clib_spinlock_unlock (&cm->ho_reuseable_lock);
+}
+
+u32
+ct_connection_count (void)
+{
+  ct_main_t *cm = &ct_main;
+  ct_worker_t *wrk;
+  u32 count = 0;
+
+  ASSERT (vlib_thread_is_main_w_barrier ());
+  vec_foreach (wrk, cm->wrk)
+    count += pool_elts (wrk->connections);
+  /* Migrated half-opens stay allocated until the next connect reclaims them. */
+  return count - vec_len (cm->ho_reusable);
 }
 
 session_t *
@@ -286,7 +301,8 @@ ct_accept_one (clib_thread_index_t thread_index, u32 ho_index)
   ll_index = cct->peer_index;
   /* A queued accept may outlive the listener; listen_session_get would assert. */
   ll = session_get_if_valid (ll_index, 0);
-  if (PREDICT_FALSE (!ll || ll->session_state != SESSION_STATE_LISTENING))
+  if (PREDICT_FALSE (!ll || ll->session_state != SESSION_STATE_LISTENING || !cct->listener_id ||
+		     clib_atomic_load_relax_n (&ll->ct_listener_id) != cct->listener_id))
     goto stale_listener;
 
   sct = ct_connection_alloc (thread_index);
@@ -463,8 +479,23 @@ static int
 ct_connect (app_worker_t *client_wrk, session_t *ll,
 	    session_endpoint_cfg_t *sep)
 {
+  ct_main_t *cm = &ct_main;
   ct_connection_t *ho;
-  u32 ho_index;
+  u32 ho_index, ll_index;
+  u64 listener_id;
+
+  ASSERT (session_vlib_thread_is_cl_thread ());
+
+  /* Connects run on the control thread or main with the worker barrier. */
+  listener_id = clib_atomic_load_relax_n (&ll->ct_listener_id);
+  if (!listener_id)
+    {
+      if (PREDICT_FALSE (cm->listener_id == (u64) ~0))
+	return SESSION_E_ALLOC;
+      listener_id = ++cm->listener_id;
+      clib_atomic_store_relax_n (&ll->ct_listener_id, listener_id);
+    }
+  ll_index = ll->session_index;
 
   /*
    * Alloc and init client half-open transport
@@ -477,7 +508,8 @@ ct_connect (app_worker_t *client_wrk, session_t *ll,
   ho->c_is_ip4 = sep->is_ip4;
   ho->client_opaque = sep->opaque;
   ho->client_wrk = client_wrk->wrk_index;
-  ho->peer_index = ll->session_index;
+  ho->peer_index = ll_index;
+  ho->listener_id = listener_id;
   ho->c_proto = TRANSPORT_PROTO_CT;
   ho->c_flags |= TRANSPORT_CONNECTION_F_NO_LOOKUP;
   clib_memcpy (&ho->c_rmt_ip, &sep->ip, sizeof (sep->ip));
