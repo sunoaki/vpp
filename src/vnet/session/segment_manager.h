@@ -100,7 +100,7 @@ void segment_manager_free_safe (segment_manager_t *sm);
  */
 void segment_manager_init_free (segment_manager_t * sm);
 __clib_export segment_manager_t *segment_manager_get (u32 index);
-segment_manager_t *segment_manager_get_if_valid (u32 index);
+__clib_export segment_manager_t *segment_manager_get_if_valid (u32 index);
 u32 segment_manager_index (segment_manager_t * sm);
 
 /**
@@ -127,8 +127,8 @@ __clib_export fifo_segment_t *segment_manager_get_segment_w_lock (segment_manage
 								  u32 segment_index);
 int segment_manager_add_first_segment (segment_manager_t * sm,
 				       u32 segment_size);
-u64 segment_manager_make_segment_handle (u32 segment_manager_index,
-					 u32 segment_index);
+__clib_export u64 segment_manager_make_segment_handle (u32 segment_manager_index,
+						       u32 segment_index);
 u64 segment_manager_segment_handle (segment_manager_t * sm,
 				    fifo_segment_t * segment);
 __clib_export void segment_manager_segment_reader_unlock (segment_manager_t *sm);
