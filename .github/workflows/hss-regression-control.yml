@@ -1206,6 +1206,69 @@ jobs:
                       parent_identity=parent["identity"], raw_sha256=hashlib.sha256(raw).hexdigest(),
                       reason="Child exit status and local cleanup unknown; see parent cleanup result"))
 
+          def dependency_checkpoint(label, normalize=False, clean=False):
+              from contextlib import ExitStack
+              paths = ("test/requirements.txt", "test/requirements-3.txt")
+              report = dict(status="running", candidate_sha=CANDIDATE, variant=VARIANT,
+                            workflow_sha=os.environ["WORKFLOW_SHA"], before={}, after={})
+              def snapshot(descriptor):
+                  info = os.fstat(descriptor)
+                  require(stat.S_ISREG(info.st_mode) and info.st_size <= 256 * 1024,
+                          "Dependency is nonregular or exceeds 256 KiB")
+                  os.lseek(descriptor, 0, os.SEEK_SET)
+                  raw = os.read(descriptor, 256 * 1024 + 1)
+                  require(len(raw) == info.st_size, "Dependency size changed while reading")
+                  return dict(sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw),
+                              mtime_ns=info.st_mtime_ns, atime_ns=info.st_atime_ns,
+                              device=info.st_dev, inode=info.st_ino)
+              try:
+                  manifest = json.loads((OUT / "manifest.json").read_text())
+                  expected = manifest["python_dependencies"]
+                  require(set(expected) == set(paths), "Dependency provenance paths changed")
+                  report["expected"] = expected
+                  with ExitStack() as stack:
+                      descriptors = {}
+                      for path in paths:
+                          descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                          stack.callback(os.close, descriptor)
+                          descriptors[path] = descriptor
+                          report["before"][path] = snapshot(descriptor)
+                      for path in paths:
+                          require(expected[path]["blob"] == git("rev-parse", f"{CANDIDATE}:{path}") and
+                                  expected[path]["sha256"] == hashlib.sha256(content(CANDIDATE, path)).hexdigest(),
+                                  f"Dependency provenance changed: {path}")
+                          require(report["before"][path]["sha256"] == expected[path]["sha256"],
+                                  f"Pinned dependency changed: {path}")
+                      if clean:
+                          require(not git("status", "--porcelain", "-uno"), "Tracked source changed at dependency checkpoint")
+                      for path in paths:
+                          info = os.stat(path, follow_symlinks=False)
+                          before = report["before"][path]
+                          require(stat.S_ISREG(info.st_mode) and
+                                  (info.st_dev, info.st_ino) == (before["device"], before["inode"]),
+                                  f"Dependency path changed: {path}")
+                      if normalize:
+                          source, lock = (report["before"][path] for path in paths)
+                          target = max(source["mtime_ns"], lock["mtime_ns"])
+                          report["target_mtime_ns"] = target
+                          os.utime(descriptors[paths[1]], ns=(lock["atime_ns"], target))
+                      for path in paths:
+                          report["after"][path] = snapshot(descriptors[path])
+                          require(report["after"][path]["sha256"] == expected[path]["sha256"],
+                                  f"Pinned dependency changed during checkpoint: {path}")
+                      if normalize:
+                          require(report["after"][paths[1]]["mtime_ns"] == target and
+                                  report["after"][paths[0]]["mtime_ns"] == source["mtime_ns"],
+                                  "Dependency timestamp normalization lost precision or input changed")
+                      if clean:
+                          require(not git("status", "--porcelain", "-uno"), "Tracked source changed during dependency checkpoint")
+                  report["status"] = "PASS"
+              except (OSError, ValueError, KeyError, TypeError, AssertionError, subprocess.SubprocessError) as error:
+                  report.update(status="FAIL", error=f"{type(error).__name__}: {error}"[:512])
+                  raise
+              finally:
+                  save(f"dependency-{label}.json", report)
+
           def prepare():
               workflow = os.environ["WORKFLOW_SHA"]
               initial = json.loads((OUT / "manifest.json").read_text())
@@ -1232,6 +1295,9 @@ jobs:
               manifest["tests"] = {path: dict(blob=git("rev-parse", f"{CANDIDATE}:{path}"),
                                              sha256=hashlib.sha256(content(CANDIDATE, path)).hexdigest())
                                    for path in (TEST, FIXTURE)}
+              manifest["python_dependencies"] = {path: dict(blob=git("rev-parse", f"{CANDIDATE}:{path}"),
+                      sha256=hashlib.sha256(content(CANDIDATE, path)).hexdigest()) for path in
+                      ("test/requirements.txt", "test/requirements-3.txt")}
               manifest["source"] = dict(path=SOURCE, candidate_blob=git("rev-parse", f"{CANDIDATE}:{SOURCE}"),
                                         frozen_blob=git("rev-parse", f"{FROZEN}:{SOURCE}"))
               manifest["diagnostic_sources"] = {path: dict(blob=git("rev-parse", f"{CANDIDATE}:{path}"),
@@ -1491,6 +1557,7 @@ jobs:
                           for event in replies), "Missing exact failed raw API replies")
 
           def tests():
+              dependency_checkpoint("before-runtime")
               manifest = json.loads((OUT / "manifest.json").read_text())
               require(git("hash-object", SOURCE) == manifest["source"]["built_blob"], "Built source moved")
               for path, provenance in manifest["tests"].items():
@@ -1524,7 +1591,10 @@ jobs:
               args = ["make", "UNATTENDED=yes", "TEST_JOBS=1", "FORCE_FOREGROUND=1", "VPP_WORKER_COUNT=0",
                       "RETRIES=0", "FAILFAST=0", "SKIP_TESTS=", "VPP_EXCLUDED_PLUGINS=", "V=2",
                       "COREDUMP_SIZE=0", "DECODE_PCAPS=none", "RND_SEED=48", f"TEST={selector}", "test-debug"]
-              rc, console = command("runtime", args, env)
+              try:
+                  rc, console = command("runtime", args, env)
+              finally:
+                  dependency_checkpoint("after-runtime")
               collect(OUT / "runtime" / "diagnostics")
               event_paths = [path for path in bounded_paths(OUT, recursive=False)
                              if path.name.startswith("events.") and path.suffix == ".jsonl"]
@@ -1575,11 +1645,21 @@ jobs:
                   result["end"] = time.time()
                   save(f"{action}-result.json", result)
 
+          def final_collect():
+              try:
+                  dependency_checkpoint("final")
+              finally:
+                  collect(OUT / "final-diagnostics")
+
           if __name__ == "__main__":
               action = sys.argv[1]
               operations = {"prepare": prepare, "mutate": mutate, "tests": tests,
-                            "binaries": binaries, "collect": lambda: collect(OUT / "final-diagnostics")}
-              if action.startswith("operation-"):
+                            "binaries": binaries, "collect": final_collect}
+              if action == "dependency-check":
+                  label = sys.argv[2]
+                  require(label in ("before-python", "after-python", "final"), "Unknown dependency checkpoint")
+                  dependency_checkpoint(label, normalize=label == "before-python", clean=label != "final")
+              elif action.startswith("operation-"):
                   name = action.removeprefix("operation-")
                   action_result(name, operations[name])
               elif action in operations:
@@ -1611,7 +1691,13 @@ jobs:
             python3 "$TOOLS/control.py" "message-$commit" bash extras/scripts/check_commit_msg.sh
           done
           git checkout --detach "$CANDIDATE_SHA"
+          python3 "$TOOLS/control.py" dependency-check before-python
+          set +e
           python3 "$TOOLS/control.py" pinned-python make checkstyle-python
+          python_status=$?
+          set -e
+          python3 "$TOOLS/control.py" dependency-check after-python
+          test "$python_status" -eq 0
           python3 "$TOOLS/control.py" black-version build-root/test/venv/bin/python -c \
             'import black; assert black.__version__ == "26.5.1", black.__version__; print(black.__version__)'
           python3 "$TOOLS/control.py" fixture-python-style build-root/test/venv/bin/black --check -t py39 \
@@ -1703,10 +1789,12 @@ jobs:
           for path in "$TOOLS/"*.py; do
             if [ -f "$path" ]; then cp "$path" "$EVIDENCE/"; fi
           done
+          collection_status=1
           if [ -f "$TOOLS/control.py" ]; then
             timeout --signal=TERM --kill-after=5s 90s python3 "$TOOLS/control.py" collect \
               > "$EVIDENCE/collection-console.log" 2>&1
-            printf 'rc=%s\n' "$?" > "$EVIDENCE/collection-status.txt"
+            collection_status=$?
+            printf 'rc=%s\n' "$collection_status" > "$EVIDENCE/collection-status.txt"
           fi
           timeout 15s git status --short > "$EVIDENCE/final-status.txt" 2>&1
           timeout 15s git diff --binary > "$EVIDENCE/final.diff" 2>&1
@@ -1771,6 +1859,8 @@ jobs:
                    for path in sorted(root.rglob("*")) if path.is_file() and not path.is_symlink()}
           (root / "evidence-index.json").write_text(json.dumps(files, indent=2) + "\n")
           PY
+          index_status=$?
+          test "$index_status" -eq 0 && test "$collection_status" -eq 0
 
       - name: Upload bounded HSS evidence on every outcome
         timeout-minutes: 8
