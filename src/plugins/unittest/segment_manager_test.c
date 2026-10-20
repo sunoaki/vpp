@@ -734,182 +734,351 @@ segment_manager_test_prealloc_hdrs (vlib_main_t * vm,
   return 0;
 }
 
-static int
-segment_manager_test_attach_case (u32 failure)
+typedef enum
 {
-  segment_manager_t *sm = segment_manager_alloc ();
+  ATTACH_PAIR_SUCCESS,
+  ATTACH_RX_HEADER_FAILURE,
+  ATTACH_TX_HEADER_FAILURE,
+  ATTACH_TX_FIRST_CHUNK_FAILURE,
+  ATTACH_TX_LATER_CHUNK_FAILURE,
+  ATTACH_N_SCENARIOS,
+} attach_test_scenario_t;
+
+typedef struct
+{
+  segment_manager_t *sm;
   fifo_segment_t *fs;
-  svm_fifo_t *rx, *tx, *new_rx, *new_tx, *held_fifos[2] = { 0 };
-  svm_fifo_chunk_t *held_chunks[2] = { 0 };
+  svm_fifo_t *rx, *tx, *new_rx, *new_tx;
+  svm_fifo_t *held_fifos[2];
+  svm_fifo_chunk_t *held_chunks[2];
   svm_fifo_shared_t rx_shared, tx_shared;
-  session_t target = { 0 };
+  session_t target;
   u8 data[4097], output[4097];
   u8 *private_before, *private_after;
   uword old_vm, new_vm, cached, chunk_bytes, byte_index;
-  u32 free_hdrs, free_chunks, active, n_held_fifos, n_held_chunks, i;
+  u32 free_hdrs, free_chunks, active, n_held_fifos, n_held_chunks;
+  attach_test_scenario_t scenario;
+  u8 mapped, initialized;
+} attach_test_t;
+
+static void
+segment_manager_test_attach_cleanup (attach_test_t *test)
+{
+  vec_free (test->private_before);
+  vec_free (test->private_after);
+  if (test->fs)
+    {
+      /* Destroy the owned arenas even if an unexpected attach left OLD and NEW
+       * sharing a FIFO. Error cleanup must not depend on the failed operation. */
+      if (test->initialized)
+	fifo_segment_cleanup (test->fs);
+      if (test->mapped)
+	ssvm_delete (&test->fs->ssvm);
+      else
+	vec_free (test->fs->ssvm.name);
+      pool_put (test->sm->segments, test->fs);
+    }
+  if (test->sm)
+    {
+      segment_manager_app_detach (test->sm);
+      segment_manager_free (test->sm);
+    }
+}
+
+static int
+segment_manager_test_attach_segment (attach_test_t *test)
+{
+  fifo_segment_t *fs;
   int rv;
 
-  pool_get_zero (sm->segments, fs);
+  test->sm = segment_manager_alloc ();
+  pool_get_zero (test->sm->segments, fs);
+  test->fs = fs;
   fs->ssvm.ssvm_size = 1 << 20;
   fs->ssvm.name = format (0, "attach-abort%c", 0);
   fs->ssvm.requested_va = ~0ULL;
   rv = ssvm_server_init (&fs->ssvm, SSVM_SEGMENT_PRIVATE);
-  SEG_MGR_TEST (!rv, "create private segment for case %u", failure);
+  test->mapped = rv == 0;
+  SEG_MGR_TEST (!rv, "create private segment for case %u", test->scenario);
   fs->n_slices = 2;
   fifo_segment_init (fs);
-  fs->sm_index = segment_manager_index (sm);
-  fs->fs_index = fs - sm->segments;
+  test->initialized = 1;
+  fs->sm_index = segment_manager_index (test->sm);
+  fs->fs_index = fs - test->sm->segments;
+  test->target.thread_index = 1;
+  test->target.session_index = 53;
+  return 0;
+}
 
-  rx = fifo_segment_alloc_fifo_w_slice (fs, 0, 4096, FIFO_SEGMENT_RX_FIFO);
-  tx = fifo_segment_alloc_fifo_w_slice (fs, 0, 8192, FIFO_SEGMENT_TX_FIFO);
-  SEG_MGR_TEST (rx && tx, "allocate original pair");
-  rx->vpp_session_index = tx->vpp_session_index = 37;
-  clib_memset (data, 0xa5, sizeof (data));
-  SEG_MGR_TEST (svm_fifo_enqueue (rx, 128, data) == 128, "seed RX payload");
-  SEG_MGR_TEST (svm_fifo_enqueue (tx, sizeof (data), data) == sizeof (data),
-		"seed two-chunk TX payload");
-  SEG_MGR_TEST (f_start_cptr (tx)->length == 4096 &&
-		  f_start_cptr (tx)->next &&
-		  !f_cptr (tx, f_start_cptr (tx)->next)->next,
+static int
+segment_manager_test_attach_pair (attach_test_t *test)
+{
+  fifo_segment_t *fs = test->fs;
+
+  test->rx = fifo_segment_alloc_fifo_w_slice (fs, 0, 4096, FIFO_SEGMENT_RX_FIFO);
+  test->tx = fifo_segment_alloc_fifo_w_slice (fs, 0, 8192, FIFO_SEGMENT_TX_FIFO);
+  SEG_MGR_TEST (test->rx && test->tx, "allocate original pair");
+  test->rx->vpp_session_index = test->tx->vpp_session_index = 37;
+  clib_memset (test->data, 0xa5, sizeof (test->data));
+  SEG_MGR_TEST (svm_fifo_enqueue (test->rx, 128, test->data) == 128, "seed RX payload");
+  SEG_MGR_TEST (svm_fifo_enqueue (test->tx, sizeof (test->data), test->data) ==
+		  sizeof (test->data), "seed two-chunk TX payload");
+  SEG_MGR_TEST (f_start_cptr (test->tx)->length == 4096 &&
+		  f_start_cptr (test->tx)->next &&
+		  !f_cptr (test->tx, f_start_cptr (test->tx)->next)->next,
 		"TX has exactly two 4KiB chunks");
+  test->new_rx = test->rx;
+  test->new_tx = test->tx;
+  return 0;
+}
+
+static int
+segment_manager_test_attach_pressure (attach_test_t *test)
+{
+  fifo_segment_t *fs = test->fs;
+  u32 i;
+
   SEG_MGR_TEST (!fifo_segment_prealloc_fifo_hdrs (fs, 1, 2),
 		"reserve two destination headers");
   SEG_MGR_TEST (!fifo_segment_prealloc_fifo_chunks (fs, 1, 4096, 3),
 		"reserve three destination chunks");
+  SEG_MGR_TEST (fifo_segment_free_bytes (fs) > 64, "space for bump reservation");
   SEG_MGR_TEST (fifo_segment_alloc (fs, fifo_segment_free_bytes (fs) - 64) != 0,
 		"hold remaining bump space");
   SEG_MGR_TEST (fifo_segment_free_bytes (fs) <= 64,
 		"bump space cannot supply a header batch or chunk");
-
-  n_held_fifos = failure == 1 ? 2 : failure == 2 ? 1 : 0;
-  n_held_chunks = failure == 3 ? 2 : failure == 4 ? 1 : 0;
-  for (i = 0; i < n_held_fifos; i++)
+  switch (test->scenario)
     {
-      held_fifos[i] = fifo_segment_alloc_fifo_w_slice (fs, 1, 4096, FIFO_SEGMENT_RX_FIFO);
-      SEG_MGR_TEST (held_fifos[i] != 0, "hold destination header %u", i);
+    case ATTACH_RX_HEADER_FAILURE:
+      test->n_held_fifos = 2;
+      break;
+    case ATTACH_TX_HEADER_FAILURE:
+      test->n_held_fifos = 1;
+      break;
+    case ATTACH_TX_FIRST_CHUNK_FAILURE:
+      test->n_held_chunks = 2;
+      break;
+    case ATTACH_TX_LATER_CHUNK_FAILURE:
+      test->n_held_chunks = 1;
+      break;
+    default:
+      break;
     }
-  for (i = 0; i < n_held_chunks; i++)
+  for (i = 0; i < test->n_held_fifos; i++)
     {
-      held_chunks[i] = fifo_segment_alloc_chunk_w_slice (fs, 1, 4096);
-      SEG_MGR_TEST (held_chunks[i] != 0, "hold destination chunk %u", i);
+      test->held_fifos[i] =
+	fifo_segment_alloc_fifo_w_slice (fs, 1, 4096, FIFO_SEGMENT_RX_FIFO);
+      SEG_MGR_TEST (test->held_fifos[i] != 0, "hold destination header %u", i);
+    }
+  for (i = 0; i < test->n_held_chunks; i++)
+    {
+      test->held_chunks[i] = fifo_segment_alloc_chunk_w_slice (fs, 1, 4096);
+      SEG_MGR_TEST (test->held_chunks[i] != 0, "hold destination chunk %u", i);
     }
   SEG_MGR_TEST (fs->h->slices[1].n_fl_chunk_bytes ==
-		  (3 - n_held_fifos - n_held_chunks) * 4096,
+		  (3 - test->n_held_fifos - test->n_held_chunks) * 4096,
 		"exact destination chunk availability");
-  old_vm = fs->h->slices[0].virtual_mem;
-  new_vm = fs->h->slices[1].virtual_mem;
-  cached = fifo_segment_cached_bytes (fs);
-  chunk_bytes = fifo_segment_fl_chunk_bytes (fs);
-  free_hdrs = fifo_segment_num_free_fifos (fs);
-  free_chunks = fifo_segment_num_free_chunks (fs, ~0);
-  active = fifo_segment_num_fifos (fs);
-  byte_index = fs->h->byte_index;
-  private_before = format (0, "%U", format_clib_mem_bulk, fs->slices[1].fifos);
-  clib_memcpy (&rx_shared, rx->shr, sizeof (rx_shared));
-  clib_memcpy (&tx_shared, tx->shr, sizeof (tx_shared));
-  target.thread_index = 1;
-  target.session_index = 53;
-  new_rx = rx;
-  new_tx = tx;
-  rv = segment_manager_attach_fifo (&new_rx, &target);
-  SEG_MGR_TEST ((failure == 1 && rv == -1 && new_rx == rx) ||
-		  (failure != 1 && rv == 0 && new_rx != rx),
-		"RX attach result for case %u", failure);
-  if (failure != 1)
+  return 0;
+}
+
+static void
+segment_manager_test_attach_snapshot (attach_test_t *test)
+{
+  fifo_segment_t *fs = test->fs;
+
+  test->old_vm = fs->h->slices[0].virtual_mem;
+  test->new_vm = fs->h->slices[1].virtual_mem;
+  test->cached = fifo_segment_cached_bytes (fs);
+  test->chunk_bytes = fifo_segment_fl_chunk_bytes (fs);
+  test->free_hdrs = fifo_segment_num_free_fifos (fs);
+  test->free_chunks = fifo_segment_num_free_chunks (fs, ~0);
+  test->active = fifo_segment_num_fifos (fs);
+  test->byte_index = fs->h->byte_index;
+  test->private_before = format (0, "%U", format_clib_mem_bulk, fs->slices[1].fifos);
+  clib_memcpy (&test->rx_shared, test->rx->shr, sizeof (test->rx_shared));
+  clib_memcpy (&test->tx_shared, test->tx->shr, sizeof (test->tx_shared));
+}
+
+static int
+segment_manager_test_attach_attempt (attach_test_t *test)
+{
+  fifo_segment_t *fs = test->fs;
+  svm_fifo_t *rx = test->rx;
+  int rv;
+
+  rv = segment_manager_attach_fifo (&test->new_rx, &test->target);
+  if (test->scenario == ATTACH_RX_HEADER_FAILURE)
     {
-      SEG_MGR_TEST (new_rx->vpp_sh == target.handle && rx->vpp_session_index == 37 &&
-		    rx->master_thread_index == 0 && new_rx->shr == rx->shr,
-		    "new owner published; original private owner preserved");
-      SEG_MGR_TEST (svm_fifo_hdr_at_attach (rx) && svm_fifo_chunks_at_attach (rx) &&
-		    !svm_fifo_hdr_at_attach (new_rx) && !svm_fifo_chunks_at_attach (new_rx),
-		    "compensation belongs to old RX");
-      SEG_MGR_TEST ((fs->h->slices[1].free_fifos != 0) == (failure != 2) &&
-		    fs->h->slices[1].n_fl_chunk_bytes ==
-		      (2 - n_held_fifos - n_held_chunks) * 4096,
-		    "TX header/first/later chunk branch preconditions");
-      rv = segment_manager_attach_fifo (&new_tx, &target);
-      SEG_MGR_TEST ((!failure && !rv) || (failure && rv == -1 && new_tx == tx),
-		    "TX attach result for case %u", failure);
-      if (failure)
-	segment_manager_abort_fifo_attach (rx, &new_rx, 0);
+      SEG_MGR_TEST (rv == -1 && test->new_rx == rx, "first RX attach fails");
+      return 0;
     }
-  if (failure)
+  SEG_MGR_TEST (rv == 0 && test->new_rx && test->new_rx != rx, "RX attach succeeds");
+  SEG_MGR_TEST (test->new_rx->vpp_sh == test->target.handle &&
+		  rx->vpp_session_index == 37 && rx->master_thread_index == 0 &&
+		  test->new_rx->shr == rx->shr,
+		"new owner published; original private owner preserved");
+  SEG_MGR_TEST (svm_fifo_hdr_at_attach (rx) && svm_fifo_chunks_at_attach (rx) &&
+		  !svm_fifo_hdr_at_attach (test->new_rx) &&
+		  !svm_fifo_chunks_at_attach (test->new_rx), "compensation belongs to old RX");
+  SEG_MGR_TEST ((fs->h->slices[1].free_fifos != 0) ==
+		  (test->scenario != ATTACH_TX_HEADER_FAILURE) &&
+		  fs->h->slices[1].n_fl_chunk_bytes ==
+		    (2 - test->n_held_fifos - test->n_held_chunks) * 4096,
+		"TX header/first/later chunk branch preconditions");
+  rv = segment_manager_attach_fifo (&test->new_tx, &test->target);
+  if (test->scenario == ATTACH_PAIR_SUCCESS)
     {
-      SEG_MGR_TEST (new_rx == rx && new_tx == tx &&
-		    !memcmp (&rx_shared, rx->shr, sizeof (rx_shared)) &&
-		    !memcmp (&tx_shared, tx->shr, sizeof (tx_shared)),
-		    "rollback restores pointers and shared metadata");
-      SEG_MGR_TEST (!svm_fifo_hdr_at_attach (rx) && !svm_fifo_chunks_at_attach (rx) &&
-		    !svm_fifo_hdr_at_attach (tx) && !svm_fifo_chunks_at_attach (tx),
-		    "rollback clears compensation aliases");
-      SEG_MGR_TEST (fs->slices[0].active_fifos == rx && !rx->next && !rx->prev &&
-		    fs->slices[1].active_fifos ==
-		      (n_held_fifos ? held_fifos[n_held_fifos - 1] : 0),
-		    "rollback preserves both active lists");
-      if (n_held_fifos)
-	SEG_MGR_TEST (!held_fifos[n_held_fifos - 1]->prev,
-		      "destination list head has no stale predecessor");
-      SEG_MGR_TEST (fs->h->slices[0].virtual_mem == old_vm &&
-		    fs->h->slices[1].virtual_mem == new_vm &&
-		    fifo_segment_cached_bytes (fs) == cached &&
-		    fifo_segment_fl_chunk_bytes (fs) == chunk_bytes &&
-		    fifo_segment_num_free_fifos (fs) == free_hdrs &&
-		    fifo_segment_num_free_chunks (fs, ~0) == free_chunks &&
-		    fifo_segment_num_fifos (fs) == active && fs->h->byte_index == byte_index,
-		    "rollback restores accounting and all reserved resources");
-      SEG_MGR_TEST (svm_fifo_max_dequeue (rx) == 128 &&
-		    !memcmp (data, f_start_cptr (rx)->data, 128),
-		    "RX payload survives abort");
-      SEG_MGR_TEST (svm_fifo_max_dequeue (tx) == sizeof (data) &&
-		    !memcmp (data, f_start_cptr (tx)->data, 4096) &&
-		    f_cptr (tx, f_start_cptr (tx)->next)->data[0] == data[4096],
-		    "TX payload survives failure");
-      private_after = format (0, "%U", format_clib_mem_bulk, fs->slices[1].fifos);
-      SEG_MGR_TEST (vec_len (private_before) == vec_len (private_after) &&
-		    !memcmp (private_before, private_after, vec_len (private_before)),
-		    "rollback restores destination private allocator");
-      vec_free (private_after);
+      SEG_MGR_TEST (!rv && test->new_tx && test->new_tx != test->tx,
+		    "TX attach succeeds");
+      return 0;
     }
-  vec_free (private_before);
-  for (i = 0; i < n_held_fifos; i++)
-    fifo_segment_free_fifo (fs, held_fifos[i]);
-  for (i = 0; i < n_held_chunks; i++)
-    fifo_segment_collect_chunk (fs, 1, held_chunks[i]);
-  if (failure)
+  SEG_MGR_TEST (rv == -1 && test->new_tx == test->tx, "TX attach fails");
+  segment_manager_abort_fifo_attach (rx, &test->new_rx, 0);
+  return 0;
+}
+
+static int
+segment_manager_test_attach_restored_state (attach_test_t *test)
+{
+  fifo_segment_t *fs = test->fs;
+  svm_fifo_t *rx = test->rx, *tx = test->tx;
+
+  SEG_MGR_TEST (test->new_rx == rx && test->new_tx == tx &&
+		  !memcmp (&test->rx_shared, rx->shr, sizeof (test->rx_shared)) &&
+		  !memcmp (&test->tx_shared, tx->shr, sizeof (test->tx_shared)),
+		"rollback restores pointers and shared metadata");
+  SEG_MGR_TEST (!svm_fifo_hdr_at_attach (rx) && !svm_fifo_chunks_at_attach (rx) &&
+		  !svm_fifo_hdr_at_attach (tx) && !svm_fifo_chunks_at_attach (tx),
+		"rollback clears compensation aliases");
+  SEG_MGR_TEST (fs->slices[0].active_fifos == rx && !rx->next && !rx->prev &&
+		  fs->slices[1].active_fifos ==
+		    (test->n_held_fifos ? test->held_fifos[test->n_held_fifos - 1] : 0),
+		"rollback preserves both active lists");
+  if (test->n_held_fifos)
+    SEG_MGR_TEST (!test->held_fifos[test->n_held_fifos - 1]->prev,
+		  "destination list head has no stale predecessor");
+  SEG_MGR_TEST (svm_fifo_max_dequeue (rx) == 128 &&
+		  !memcmp (test->data, f_start_cptr (rx)->data, 128), "RX payload survives abort");
+  SEG_MGR_TEST (svm_fifo_max_dequeue (tx) == sizeof (test->data) &&
+		  !memcmp (test->data, f_start_cptr (tx)->data, 4096) &&
+		  f_cptr (tx, f_start_cptr (tx)->next)->data[0] == test->data[4096],
+		"TX payload survives failure");
+  return 0;
+}
+
+static int
+segment_manager_test_attach_restored_resources (attach_test_t *test)
+{
+  fifo_segment_t *fs = test->fs;
+
+  SEG_MGR_TEST (fs->h->slices[0].virtual_mem == test->old_vm &&
+		  fs->h->slices[1].virtual_mem == test->new_vm &&
+		  fifo_segment_cached_bytes (fs) == test->cached &&
+		  fifo_segment_fl_chunk_bytes (fs) == test->chunk_bytes &&
+		  fifo_segment_num_free_fifos (fs) == test->free_hdrs &&
+		  fifo_segment_num_free_chunks (fs, ~0) == test->free_chunks &&
+		  fifo_segment_num_fifos (fs) == test->active &&
+		  fs->h->byte_index == test->byte_index,
+		"rollback restores accounting and all reserved resources");
+  test->private_after = format (0, "%U", format_clib_mem_bulk, fs->slices[1].fifos);
+  SEG_MGR_TEST (vec_len (test->private_before) == vec_len (test->private_after) &&
+		  !memcmp (test->private_before, test->private_after,
+			   vec_len (test->private_before)),
+		"rollback restores destination private allocator");
+  return 0;
+}
+
+static void
+segment_manager_test_attach_release_held (attach_test_t *test)
+{
+  u32 i;
+
+  for (i = 0; i < test->n_held_fifos; i++)
     {
-      SEG_MGR_TEST (!segment_manager_attach_fifo (&new_rx, &target), "retry RX attach");
-      SEG_MGR_TEST (!segment_manager_attach_fifo (&new_tx, &target), "retry TX attach");
+      fifo_segment_free_fifo (test->fs, test->held_fifos[i]);
+      test->held_fifos[i] = 0;
     }
-  SEG_MGR_TEST (fs->slices[1].active_fifos == new_rx && !new_rx->next && !new_rx->prev &&
-		  new_rx->shr->slice_index == 1 && new_tx->shr->slice_index == 1,
+  for (i = 0; i < test->n_held_chunks; i++)
+    {
+      fifo_segment_collect_chunk (test->fs, 1, test->held_chunks[i]);
+      test->held_chunks[i] = 0;
+    }
+}
+
+static int
+segment_manager_test_attach_success (attach_test_t *test)
+{
+  fifo_segment_t *fs = test->fs;
+  svm_fifo_t *rx = test->new_rx, *tx = test->new_tx;
+
+  SEG_MGR_TEST (rx && tx && rx != test->rx && tx != test->tx,
+		"both private FIFOs attached before detach");
+  SEG_MGR_TEST (fs->slices[1].active_fifos == rx && !rx->next && !rx->prev &&
+		  rx->shr->slice_index == 1 && tx->shr->slice_index == 1,
 		"successful migration owns destination list and slices");
-  segment_manager_detach_fifo (&rx);
-  segment_manager_detach_fifo (&tx);
-  SEG_MGR_TEST (!rx && !tx && !fs->slices[0].active_fifos &&
+  segment_manager_detach_fifo (&test->rx);
+  segment_manager_detach_fifo (&test->tx);
+  SEG_MGR_TEST (!test->rx && !test->tx && !fs->slices[0].active_fifos &&
 		  fs->h->slices[0].virtual_mem == 0 &&
 		  fs->h->slices[1].virtual_mem == 12288 && fifo_segment_num_fifos (fs) == 2,
 		"normal detach preserves live pair and active count");
-  SEG_MGR_TEST (svm_fifo_dequeue (new_rx, 128, output) == 128 &&
-		  !memcmp (data, output, 128), "migrated RX payload");
-  SEG_MGR_TEST (svm_fifo_dequeue (new_tx, sizeof (data), output) == sizeof (data) &&
-		  !memcmp (data, output, sizeof (data)), "migrated TX payload");
-  fifo_segment_free_fifo (fs, new_rx);
-  fifo_segment_free_fifo (fs, new_tx);
+  SEG_MGR_TEST (svm_fifo_dequeue (rx, 128, test->output) == 128 &&
+		  !memcmp (test->data, test->output, 128), "migrated RX payload");
+  SEG_MGR_TEST (svm_fifo_dequeue (tx, sizeof (test->data), test->output) ==
+		  sizeof (test->data) && !memcmp (test->data, test->output, sizeof (test->data)),
+		"migrated TX payload");
+  fifo_segment_free_fifo (fs, rx);
+  test->new_rx = 0;
+  fifo_segment_free_fifo (fs, tx);
+  test->new_tx = 0;
   SEG_MGR_TEST (!fifo_segment_num_fifos (fs) && !fs->slices[1].active_fifos &&
 		  !fs->h->slices[1].virtual_mem, "final pair cleanup");
-  segment_manager_app_detach (sm);
-  segment_manager_free (sm);
   return 0;
+}
+
+static int
+segment_manager_test_attach_run (attach_test_t *test)
+{
+  int rv;
+
+  if ((rv = segment_manager_test_attach_segment (test)) ||
+      (rv = segment_manager_test_attach_pair (test)) ||
+      (rv = segment_manager_test_attach_pressure (test)))
+    return rv;
+  segment_manager_test_attach_snapshot (test);
+  if ((rv = segment_manager_test_attach_attempt (test)))
+    return rv;
+  if (test->scenario != ATTACH_PAIR_SUCCESS)
+    {
+      if ((rv = segment_manager_test_attach_restored_state (test)) ||
+	  (rv = segment_manager_test_attach_restored_resources (test)))
+	return rv;
+    }
+  segment_manager_test_attach_release_held (test);
+  if (test->scenario != ATTACH_PAIR_SUCCESS)
+    {
+      SEG_MGR_TEST (!segment_manager_attach_fifo (&test->new_rx, &test->target),
+		    "retry RX attach");
+      SEG_MGR_TEST (!segment_manager_attach_fifo (&test->new_tx, &test->target),
+		    "retry TX attach");
+    }
+  return segment_manager_test_attach_success (test);
 }
 
 static int
 segment_manager_test_attach_abort (void)
 {
-  u32 failure;
+  attach_test_scenario_t scenario;
+  int rv;
 
-  for (failure = 0; failure <= 4; failure++)
-    if (segment_manager_test_attach_case (failure))
-      return 1;
+  for (scenario = ATTACH_PAIR_SUCCESS; scenario < ATTACH_N_SCENARIOS; scenario++)
+    {
+      attach_test_t test = { .scenario = scenario };
+      rv = segment_manager_test_attach_run (&test);
+      segment_manager_test_attach_cleanup (&test);
+      if (rv)
+	return rv;
+    }
   return 0;
 }
 
