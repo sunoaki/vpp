@@ -1489,13 +1489,11 @@ jobs:
                       for method in methods["TestHttpStaticCli" if cls in CLASSES else cls]]
 
           def infrastructure_text(text, events, variant):
-              if variant != "api-protocol":
-                  return text
               require(not re.search(r"ERROR: (?:AddressSanitizer|ASAN):|AddressSanitizer:DEADLYSIGNAL|"
                                     r"\b[Aa]ssertion [`'][^\n]+['`] (?:failed|fails)\b", text),
                       "Fatal sanitizer/C assertion diagnostic")
               header = "   Count                  Node                              Reason               Severity \n"
-              benign = "         2          af-packet-input                    timed out block             error  \n"
+              benign = re.compile(r" +[1-9][0-9]* +af-packet-input +timed out block +error +\n")
               row = re.compile(r" +[0-9]+ +[a-zA-Z0-9_-]+ {2,}[a-zA-Z0-9][a-zA-Z0-9 _/-]*? {2,}"
                                r"(?:error|warning|info) +\n")
               replies = {}
@@ -1509,10 +1507,12 @@ jobs:
                   if not isinstance(reply, str) or replies.get((event["pid"], event["seq"] - 1)) != reply:
                       continue
                   lines = reply.splitlines(keepends=True)
-                  if not lines or lines[0] != header or benign not in lines or not all(row.fullmatch(line) for line in lines[1:]):
+                  if (not lines or lines[0] != header or not any(benign.fullmatch(line) for line in lines) or
+                          not all(row.fullmatch(line) for line in lines[1:])):
                       continue
                   rendering = re.compile(r"(?m)^[0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3} show error\n" + re.escape(reply) + r"\n")
-                  text = rendering.sub(lambda match: match.group().replace(benign, "\n"), text)
+                  text = rendering.sub(lambda match: "".join(
+                      "\n" if benign.fullmatch(line) else line for line in match.group().splitlines(keepends=True)), text)
               return text
 
           def execution_evidence(events, console, expected, variant, logs):
@@ -1899,10 +1899,56 @@ jobs:
           set -euo pipefail
           python3 "$TOOLS/control.py" fixtures python3 src/plugins/http_static/test_lifetime_fixtures.py -v
           python3 - <<'PY'
+          import ast
+          import copy
           import os
           from pathlib import Path
+          import re
           text = (Path(os.environ["EVIDENCE"]) / "fixtures/console.log").read_text()
           assert "Ran 21 tests in " in text and "\nOK\n" in text, text
+          tree = ast.parse((Path(os.environ["TOOLS"]) / "control.py").read_text())
+          functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and
+                       node.name in ("require", "infrastructure_text")]
+          namespace = {"re": re}
+          exec(compile(ast.Module(body=functions, type_ignores=[]), "counter-fixtures", "exec"), namespace)
+          normalize = namespace["infrastructure_text"]
+          header = "   Count                  Node                              Reason               Severity \n"
+          for variant in ("fixed", "cache-limit", "api-protocol", "original-endpoint", "read-error-unlock", "http-name"):
+              for count in (1, 2, 3, 17):
+                  counter = f"         {count}          af-packet-input                    timed out block             error  \n"
+                  other = "         1           ethernet-input                        no error                error  \n"
+                  reply = header + counter + other
+                  rendered = "12:34:56,789 show error\n" + reply + "\n"
+                  events = [dict(kind="cli_reply", command="show error", pid=1, seq=1, retval=0, reply=reply),
+                            dict(kind="cli", command="show error", pid=1, seq=2, reply=reply)]
+                  expected = rendered.replace(counter, "\n")
+                  assert normalize(rendered, events, variant) == expected
+                  assert normalize(counter, events, variant) == counter
+                  assert normalize(rendered, events[1:], variant) == rendered
+                  for key, value in (("retval", -1), ("pid", 2), ("seq", 0), ("reply", "different")):
+                      changed = copy.deepcopy(events)
+                      changed[0][key] = value
+                      assert normalize(rendered, changed, variant) == rendered
+                  for before, after in (("af-packet-input", "other-input"), ("timed out block", "timed out operation"),
+                                        ("error  \n", "warning  \n"), ("Severity \n", "Severity broken\n")):
+                      changed = copy.deepcopy(events)
+                      for event in changed:
+                          event["reply"] = event["reply"].replace(before, after)
+                      altered = rendered.replace(before, after)
+                      assert normalize(altered, changed, variant) == altered
+                  for marker in ("SIGSEGV", "Aborted", "Bus error", "core was generated", "operation timed out",
+                                 "TimeoutError", "VppTransportSocketIOError", "VPP is dead", "not enough cpus",
+                                 "Skipping tests due to setup failure"):
+                      assert normalize(rendered + marker, events, variant) == expected + marker
+                  for marker in ("ERROR: AddressSanitizer: bad", "AddressSanitizer:DEADLYSIGNAL",
+                                 "Assertion `pointer` failed"):
+                      try:
+                          normalize(rendered + marker, events, variant)
+                      except AssertionError:
+                          pass
+                      else:
+                          raise AssertionError("Fatal diagnostic was masked: " + marker)
+          print("Counter fixtures passed: 24 variant/count combinations with provenance and fatal checks")
           PY
 
       - name: Restore narrow source field and identify build tree
