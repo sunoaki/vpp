@@ -25,6 +25,7 @@ typedef struct
   u32 accepted;
   u32 connected;
   u32 errors;
+  u32 submitted;
   session_handle_t client_handle;
   u32 apps[CT_TEST_N_APPS];
   session_endpoint_cfg_t sep;
@@ -251,8 +252,11 @@ ct_test_queue_stale (ct_listener_test_t *state)
   if (free_sessions < CT_TEST_PENDING + 1 || ct_half_open_free_count () < CT_TEST_PENDING + 1)
     return clib_error_return (0, "insufficient half-open capacity for queued burst");
   for (i = 0; i < CT_TEST_PENDING; i++)
-    if (ct_test_connect (state->apps[CT_TEST_CLIENT], &state->sep, i))
-      return clib_error_return (0, "queue stale connect %u", i);
+    {
+      if (ct_test_connect (state->apps[CT_TEST_CLIENT], &state->sep, i))
+	return clib_error_return (0, "queue stale connect %u", i);
+      state->submitted++;
+    }
   state->old_id = listen_session_get (state->old_index)->ct_listener_id;
   if (!state->old_id || state->accepted || state->refused)
     return clib_error_return (0, "listener identity assigned with accepts still queued");
@@ -278,27 +282,42 @@ ct_test_replace_listener (ct_listener_test_t *state, u8 same_endpoint, u8 same_a
     return clib_error_return (0, "replacement identity reset");
   if (ct_test_connect (state->apps[CT_TEST_CLIENT], &state->sep, CT_TEST_FRESH))
     return clib_error_return (0, "queue fresh connect");
+  state->submitted++;
   if (listen_session_get (state->old_index)->ct_listener_id == state->old_id)
     return clib_error_return (0, "distinct listener identity");
   return 0;
 }
 
+static u8
+ct_test_requests_complete (ct_listener_test_t *state)
+{
+  u32 i;
+
+  if (state->apps[CT_TEST_CLIENT] == (u32) ~0)
+    return 1;
+  /* HALF_CLEANUP removes the entry after the RPC and callback complete. */
+  if (pool_elts (ct_test_app_worker (state, CT_TEST_CLIENT)->half_open_table))
+    return 0;
+  /* A connected event can run after the half-open cleanup on another worker. */
+  for (i = 0; i < state->submitted; i++)
+    if (!state->replies[i])
+      return 0;
+  return 1;
+}
+
 static clib_error_t *
-ct_test_wait_half_opens (vlib_main_t *vm, ct_listener_test_t *state)
+ct_test_wait_requests (vlib_main_t *vm, ct_listener_test_t *state)
 {
   u32 attempts;
 
-  if (state->apps[CT_TEST_CLIENT] == (u32) ~0)
-    return 0;
   for (attempts = 0; attempts < 500; attempts++)
     {
-      /* HALF_CLEANUP removes the entry after the RPC and callback complete. */
-      if (!pool_elts (ct_test_app_worker (state, CT_TEST_CLIENT)->half_open_table))
+      if (ct_test_requests_complete (state))
 	return 0;
       ct_test_dispatch (vm);
     }
-  if (pool_elts (ct_test_app_worker (state, CT_TEST_CLIENT)->half_open_table))
-    return clib_error_return (0, "half-open cleanup did not complete");
+  if (!ct_test_requests_complete (state))
+    return clib_error_return (0, "half-open cleanup or connect reply did not complete");
   return 0;
 }
 
@@ -368,7 +387,7 @@ ct_test_cleanup (vlib_main_t *vm, ct_listener_test_t *state)
   clib_error_t *error;
   u32 role;
 
-  if ((error = ct_test_wait_half_opens (vm, state)) ||
+  if ((error = ct_test_wait_requests (vm, state)) ||
       (error = ct_test_close_client (state)))
     return error;
   if (state->unlisten.handle != SESSION_INVALID_HANDLE)
@@ -401,7 +420,7 @@ ct_test_run (vlib_main_t *vm, ct_listener_test_t *state, u8 same_endpoint, u8 sa
 
   if ((error = ct_test_queue_stale (state)) ||
       (error = ct_test_replace_listener (state, same_endpoint, same_app)) ||
-      (error = ct_test_wait_half_opens (vm, state)) ||
+      (error = ct_test_wait_requests (vm, state)) ||
       (error = ct_test_verify_completions (state)) ||
       (error = ct_test_close_client (state)) ||
       (error = ct_test_wait_baseline (vm, state->listening_sessions,
