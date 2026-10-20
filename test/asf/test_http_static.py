@@ -452,7 +452,9 @@ else:
             )
         }
         self.assertEqual(
-            len(apps), sum("http_static_server_" in header for header in headers), output
+            len(apps),
+            sum("http_static_server_" in header for header in headers),
+            output,
         )
         return apps, output
 
