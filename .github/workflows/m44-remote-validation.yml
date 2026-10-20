@@ -275,6 +275,9 @@ jobs:
               return int(fields[1]), fields[19], fields[0]
 
           class OwnedProcesses:
+              class PhaseExpired(Exception):
+                  pass
+
               capacity, history_count, history_bytes = 20000, 1024, 1024 * 1024
               error_count, error_bytes = 64, 64 * 1024
 
@@ -292,9 +295,14 @@ jobs:
                   self.final_live = self.final_pending = None
                   self.final_active = None
                   self.limit = float('inf')
+                  self.cleanup_deadline = None
 
               def check(self):
-                  require(time.monotonic() < self.limit, 'Process acquisition deadline')
+                  now = time.monotonic()
+                  if now >= self.limit and self.cleanup_deadline is not None and self.limit < self.cleanup_deadline:
+                      require(now < self.cleanup_deadline, 'Process acquisition deadline')
+                      raise self.PhaseExpired()
+                  require(now < self.limit, 'Process acquisition deadline')
 
               def sample(self, section, record):
                   self.sequence += 1
@@ -522,6 +530,7 @@ jobs:
               def cleanup(self, process):
                   self.root = process
                   started = time.monotonic()
+                  self.cleanup_deadline = started + 6
                   try:
                       for sig, seconds in ((signal.SIGTERM, 3), (signal.SIGKILL, 6)):
                           self.limit = started + seconds
@@ -540,6 +549,8 @@ jobs:
                                       except ProcessLookupError:
                                           pass
                                   self.retire()
+                              except self.PhaseExpired:
+                                  break
                               except (OSError, AssertionError) as error:
                                   self.error(error, operation='cleanup')
                               if not self.handles and not self.pending and process.poll() is not None and not self.incomplete:
@@ -552,6 +563,7 @@ jobs:
                       self.final_active = self.summary()['active']
                       for key in list(self.handles):
                           self.close(self.handles.pop(key))
+                      self.cleanup_deadline = None
 
           def command(label, args, environment=None, limit=1200):
               directory = OUT / label
