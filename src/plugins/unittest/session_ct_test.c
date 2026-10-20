@@ -9,6 +9,14 @@
 #define CT_TEST_PENDING 16
 #define CT_TEST_FRESH CT_TEST_PENDING
 
+typedef enum
+{
+  CT_TEST_CLIENT,
+  CT_TEST_FIRST_SERVER,
+  CT_TEST_SECOND_SERVER,
+  CT_TEST_N_APPS,
+} ct_test_app_role_t;
+
 typedef struct
 {
   u32 replies[CT_TEST_PENDING + 1];
@@ -18,6 +26,16 @@ typedef struct
   u32 connected;
   u32 errors;
   session_handle_t client_handle;
+  u32 apps[CT_TEST_N_APPS];
+  session_endpoint_cfg_t sep;
+  vnet_unlisten_args_t unlisten;
+  u32 initial_sessions;
+  u32 initial_connections;
+  u32 listening_sessions;
+  u32 listening_connections;
+  u32 old_index;
+  u64 old_id;
+  u8 occupied;
 } ct_listener_test_t;
 
 static ct_listener_test_t ct_listener_test;
@@ -176,143 +194,251 @@ ct_test_connect (u32 client, session_endpoint_cfg_t *sep, u32 opaque)
 }
 
 static clib_error_t *
+ct_test_listen (ct_listener_test_t *state, ct_test_app_role_t server)
+{
+  vnet_listen_args_t args = { .app_index = state->apps[server], .sep_ext = state->sep };
+
+  args.sep.ip.ip4.as_u32 = 0;
+  if (vnet_listen (&args))
+    return clib_error_return (0, "listen server");
+  state->unlisten.app_index = args.app_index;
+  state->unlisten.handle = args.handle;
+  return 0;
+}
+
+static clib_error_t *
+ct_test_setup (ct_listener_test_t *state, u8 local)
+{
+  clib_error_t *error;
+
+  state->initial_sessions = ct_test_session_count ();
+  state->initial_connections = ct_connection_count ();
+  if (ct_test_attach ("ct-listener-client", 1, &state->apps[CT_TEST_CLIENT]))
+    return clib_error_return (0, "attach client");
+  application_get (state->apps[CT_TEST_CLIENT])->flags |= APP_OPTIONS_FLAGS_USE_GLOBAL_SCOPE;
+  if (ct_test_attach ("ct-listener-first", local, &state->apps[CT_TEST_FIRST_SERVER]) ||
+      ct_test_attach ("ct-listener-second", local, &state->apps[CT_TEST_SECOND_SERVER]))
+    return clib_error_return (0, "attach server");
+  state->sep = (session_endpoint_cfg_t) SESSION_ENDPOINT_CFG_NULL;
+  state->sep.is_ip4 = 1;
+  state->sep.transport_proto = TRANSPORT_PROTO_TCP;
+  state->sep.port = clib_host_to_net_u16 (23456);
+  if ((error = ct_test_listen (state, CT_TEST_FIRST_SERVER)))
+    return error;
+  state->old_index = session_index_from_handle (state->unlisten.handle);
+  state->listening_sessions = ct_test_session_count ();
+  state->listening_connections = ct_connection_count ();
+  state->sep.ip.ip4.as_u32 = clib_host_to_net_u32 (local ? 0x7f000001 : 0xc0000201);
+  return 0;
+}
+
+static app_worker_t *
+ct_test_app_worker (ct_listener_test_t *state, ct_test_app_role_t role)
+{
+  return application_get_default_worker (application_get (state->apps[role]));
+}
+
+static clib_error_t *
+ct_test_queue_stale (ct_listener_test_t *state)
+{
+  session_t *sessions = session_main.wrk[transport_cl_thread ()].sessions;
+  u32 free_sessions = sessions ? pool_free_elts (sessions) : POOL_REALLOC_SAFE_ELT_THRESH;
+  u32 i;
+
+  if (pool_elts (ct_test_app_worker (state, CT_TEST_CLIENT)->half_open_table))
+    return clib_error_return (0, "initial half-open table");
+  /* Keep all 17 requests queued without the synchronous pool-growth barrier. */
+  if (free_sessions < CT_TEST_PENDING + 1 || ct_half_open_free_count () < CT_TEST_PENDING + 1)
+    return clib_error_return (0, "insufficient half-open capacity for queued burst");
+  for (i = 0; i < CT_TEST_PENDING; i++)
+    if (ct_test_connect (state->apps[CT_TEST_CLIENT], &state->sep, i))
+      return clib_error_return (0, "queue stale connect %u", i);
+  state->old_id = listen_session_get (state->old_index)->ct_listener_id;
+  if (!state->old_id || state->accepted || state->refused)
+    return clib_error_return (0, "listener identity assigned with accepts still queued");
+  return 0;
+}
+
+static clib_error_t *
+ct_test_replace_listener (ct_listener_test_t *state, u8 same_endpoint, u8 same_app)
+{
+  ct_test_app_role_t server = same_app ? CT_TEST_FIRST_SERVER : CT_TEST_SECOND_SERVER;
+  clib_error_t *error;
+
+  if (vnet_unlisten (&state->unlisten))
+    return clib_error_return (0, "unlisten first server");
+  state->unlisten.handle = SESSION_INVALID_HANDLE;
+  if (!same_endpoint)
+    state->sep.port = clib_host_to_net_u16 (23457);
+  if ((error = ct_test_listen (state, server)))
+    return error;
+  if (session_index_from_handle (state->unlisten.handle) != state->old_index)
+    return clib_error_return (0, "same listener pool index");
+  if (listen_session_get (state->old_index)->ct_listener_id)
+    return clib_error_return (0, "replacement identity reset");
+  if (ct_test_connect (state->apps[CT_TEST_CLIENT], &state->sep, CT_TEST_FRESH))
+    return clib_error_return (0, "queue fresh connect");
+  if (listen_session_get (state->old_index)->ct_listener_id == state->old_id)
+    return clib_error_return (0, "distinct listener identity");
+  return 0;
+}
+
+static clib_error_t *
+ct_test_wait_half_opens (vlib_main_t *vm, ct_listener_test_t *state)
+{
+  u32 attempts;
+
+  if (state->apps[CT_TEST_CLIENT] == (u32) ~0)
+    return 0;
+  for (attempts = 0; attempts < 500; attempts++)
+    {
+      /* HALF_CLEANUP removes the entry after the RPC and callback complete. */
+      if (!pool_elts (ct_test_app_worker (state, CT_TEST_CLIENT)->half_open_table))
+	return 0;
+      ct_test_dispatch (vm);
+    }
+  if (pool_elts (ct_test_app_worker (state, CT_TEST_CLIENT)->half_open_table))
+    return clib_error_return (0, "half-open cleanup did not complete");
+  return 0;
+}
+
+static clib_error_t *
+ct_test_verify_completions (ct_listener_test_t *state)
+{
+  u32 i;
+
+  if (state->errors)
+    return clib_error_return (0, "wrong accepts or connect errors");
+  if (state->refused != CT_TEST_PENDING)
+    return clib_error_return (0, "all stale connects refused");
+  if (state->accepted != 1 || state->connected != 1)
+    return clib_error_return (0, "only fresh connect accepted");
+  for (i = 0; i <= CT_TEST_FRESH; i++)
+    if (state->replies[i] != 1 || state->cleanups[i] != 1)
+      return clib_error_return (0, "exactly one reply and half-open cleanup for connect %u", i);
+  return 0;
+}
+
+static clib_error_t *
+ct_test_close_client (ct_listener_test_t *state)
+{
+  vnet_disconnect_args_t args = {
+    .app_index = state->apps[CT_TEST_CLIENT],
+    .handle = state->client_handle,
+  };
+
+  if (args.handle == SESSION_INVALID_HANDLE)
+    return 0;
+  if (vnet_disconnect_session (&args))
+    return clib_error_return (0, "close fresh connect");
+  state->client_handle = SESSION_INVALID_HANDLE;
+  return 0;
+}
+
+static clib_error_t *
+ct_test_wait_baseline (vlib_main_t *vm, u32 sessions, u32 connections)
+{
+  u32 attempts;
+
+  for (attempts = 0; attempts < 500; attempts++)
+    {
+      if (ct_test_session_count () == sessions && ct_connection_count () == connections)
+	return 0;
+      ct_test_dispatch (vm);
+    }
+  if (ct_test_session_count () != sessions || ct_connection_count () != connections)
+    return clib_error_return (0, "allocation baseline not restored");
+  return 0;
+}
+
+static clib_error_t *
+ct_test_verify_fifos (ct_listener_test_t *state)
+{
+  u32 role;
+
+  for (role = 0; role < CT_TEST_N_APPS; role++)
+    if (state->apps[role] != (u32) ~0 && ct_test_fifo_count (ct_test_app_worker (state, role)))
+      return clib_error_return (0, "application %u still owns FIFOs", role);
+  return 0;
+}
+
+static clib_error_t *
+ct_test_cleanup (vlib_main_t *vm, ct_listener_test_t *state)
+{
+  clib_error_t *error;
+  u32 role;
+
+  if ((error = ct_test_wait_half_opens (vm, state)) ||
+      (error = ct_test_close_client (state)))
+    return error;
+  if (state->unlisten.handle != SESSION_INVALID_HANDLE)
+    {
+      if (vnet_unlisten (&state->unlisten))
+	return clib_error_return (0, "cleanup listener");
+      state->unlisten.handle = SESSION_INVALID_HANDLE;
+    }
+  if ((error = ct_test_wait_baseline (vm, state->initial_sessions, state->initial_connections)) ||
+      (error = ct_test_verify_fifos (state)))
+    return error;
+  for (role = 0; role < CT_TEST_N_APPS; role++)
+    if (state->apps[role] != (u32) ~0)
+      {
+	vnet_app_detach_args_t args = { .app_index = state->apps[role], .api_client_index = ~0 };
+	if (vnet_application_detach (&args))
+	  return clib_error_return (0, "detach application %u", role);
+	state->apps[role] = ~0;
+      }
+  if ((error = ct_test_wait_baseline (vm, state->initial_sessions, state->initial_connections)))
+    return error;
+  state->occupied = 0;
+  return 0;
+}
+
+static clib_error_t *
+ct_test_run (vlib_main_t *vm, ct_listener_test_t *state, u8 same_endpoint, u8 same_app)
+{
+  clib_error_t *error;
+
+  if ((error = ct_test_queue_stale (state)) ||
+      (error = ct_test_replace_listener (state, same_endpoint, same_app)) ||
+      (error = ct_test_wait_half_opens (vm, state)) ||
+      (error = ct_test_verify_completions (state)) ||
+      (error = ct_test_close_client (state)) ||
+      (error = ct_test_wait_baseline (vm, state->listening_sessions,
+				      state->listening_connections)) ||
+      (error = ct_test_verify_fifos (state)))
+    return error;
+  return ct_test_verify_completions (state);
+}
+
+static clib_error_t *
 ct_test_replacement (vlib_main_t *vm, u8 local, u8 same_endpoint, u8 same_app)
 {
   ct_listener_test_t *state = &ct_listener_test;
-  session_endpoint_cfg_t sep = SESSION_ENDPOINT_CFG_NULL;
-  vnet_listen_args_t listen_args = { 0 };
-  vnet_unlisten_args_t unlisten_args = { .handle = SESSION_INVALID_HANDLE };
-  vnet_disconnect_args_t disconnect_args = { 0 };
-  u32 apps[3] = { ~0, ~0, ~0 }, server, old_index, sessions, connections;
-  u32 attempts, i, initial_sessions = ct_test_session_count ();
-  u32 initial_connections = ct_connection_count ();
-  u64 old_id;
-  session_t *ll;
-  app_worker_t *client_wrk;
-  clib_error_t *error = 0;
+  clib_error_t *error, *cleanup_error;
+  u32 role;
 
-#define CT_CHECK(condition, text)                                             \
-  do                                                                          \
-    {                                                                         \
-      if (!(condition))                                                       \
-	{                                                                     \
-	  error = clib_error_return (0, "%s (local %u endpoint %u app %u)", text, \
-				     local, same_endpoint, same_app);          \
-	  goto cleanup;                                                       \
-	}                                                                     \
-    }                                                                         \
-  while (0)
-
+  if (state->occupied)
+    return clib_error_return (0, "CT fixture retained or running; use a fresh VPP process");
   clib_memset (state, 0, sizeof (*state));
-  CT_CHECK (!ct_test_attach ("ct-listener-client", 1, &apps[0]), "attach client");
-  /* Global fallback is allowed after the local lookup misses. */
-  application_get (apps[0])->flags |= APP_OPTIONS_FLAGS_USE_GLOBAL_SCOPE;
-  CT_CHECK (!ct_test_attach ("ct-listener-first", local, &apps[1]), "attach first server");
-  CT_CHECK (!ct_test_attach ("ct-listener-second", local, &apps[2]), "attach second server");
-  client_wrk = application_get_default_worker (application_get (apps[0]));
-  CT_CHECK (!pool_elts (client_wrk->half_open_table), "initial half-open table");
-
-  sep.is_ip4 = 1;
-  sep.transport_proto = TRANSPORT_PROTO_TCP;
-  sep.port = clib_host_to_net_u16 (23456);
-  listen_args.app_index = apps[1];
-  listen_args.sep_ext = sep;
-  CT_CHECK (!vnet_listen (&listen_args), "listen first server");
-  unlisten_args.app_index = apps[1];
-  unlisten_args.handle = listen_args.handle;
-  old_index = session_index_from_handle (listen_args.handle);
-  sessions = ct_test_session_count ();
-  connections = ct_connection_count ();
-  sep.ip.ip4.as_u32 = clib_host_to_net_u32 (local ? 0x7f000001 : 0xc0000201);
-
-  /* The CLI barrier keeps both deferred CT RPC stages queued until replacement. */
-  for (i = 0; i < CT_TEST_PENDING; i++)
-    CT_CHECK (!ct_test_connect (apps[0], &sep, i), "queue stale connect");
-  ll = listen_session_get (old_index);
-  old_id = ll->ct_listener_id;
-  CT_CHECK (old_id != 0, "listener identity assigned");
-  CT_CHECK (!state->accepted && !state->refused, "accepts remain queued");
-  CT_CHECK (!vnet_unlisten (&unlisten_args), "unlisten first server");
-  unlisten_args.handle = SESSION_INVALID_HANDLE;
-  if (!same_endpoint)
-    sep.port = clib_host_to_net_u16 (23457);
-  server = apps[same_app ? 1 : 2];
-  listen_args.app_index = server;
-  listen_args.sep.port = sep.port;
-  CT_CHECK (!vnet_listen (&listen_args), "listen replacement");
-  unlisten_args.app_index = server;
-  unlisten_args.handle = listen_args.handle;
-  CT_CHECK (session_index_from_handle (listen_args.handle) == old_index, "same listener pool index");
-  CT_CHECK (listen_session_get (old_index)->ct_listener_id == 0, "replacement identity reset");
-
-  /* Give the replacement an identity while stale requests are still queued. */
-  CT_CHECK (!ct_test_connect (apps[0], &sep, CT_TEST_FRESH), "queue fresh connect");
-  CT_CHECK (listen_session_get (old_index)->ct_listener_id != old_id, "distinct listener identity");
-  for (attempts = 0; attempts < 500; attempts++)
+  state->occupied = 1;
+  state->client_handle = SESSION_INVALID_HANDLE;
+  state->unlisten.handle = SESSION_INVALID_HANDLE;
+  for (role = 0; role < CT_TEST_N_APPS; role++)
+    state->apps[role] = ~0;
+  error = ct_test_setup (state, local);
+  if (!error)
+    error = ct_test_run (vm, state, same_endpoint, same_app);
+  cleanup_error = ct_test_cleanup (vm, state);
+  if (cleanup_error)
     {
-      ct_test_dispatch (vm);
-      if (state->refused == CT_TEST_PENDING && state->connected == 1 &&
-	  !pool_elts (client_wrk->half_open_table))
-	break;
+      error = clib_error_return (error, "%U; fixture retained until VPP process exit",
+				format_clib_error, cleanup_error);
+      clib_error_free (cleanup_error);
     }
-  CT_CHECK (state->errors == 0, "no wrong accepts or connect errors");
-  CT_CHECK (state->refused == CT_TEST_PENDING, "all stale connects refused");
-  CT_CHECK (state->accepted == 1 && state->connected == 1, "only fresh connect accepted");
-  for (i = 0; i <= CT_TEST_FRESH; i++)
-    {
-      CT_CHECK (state->replies[i] == 1, "exactly one reply per connect");
-      CT_CHECK (state->cleanups[i] == 1, "exactly one half-open cleanup per connect");
-    }
-
-  disconnect_args.app_index = apps[0];
-  disconnect_args.handle = state->client_handle;
-  CT_CHECK (!vnet_disconnect_session (&disconnect_args), "close fresh connect");
-  for (attempts = 0; attempts < 500; attempts++)
-    {
-      ct_test_dispatch (vm);
-      if (ct_test_session_count () == sessions && ct_connection_count () == connections)
-	break;
-    }
-  CT_CHECK (ct_test_session_count () == sessions, "session pool baseline restored");
-  CT_CHECK (ct_connection_count () == connections, "CT pool baseline restored");
-  CT_CHECK (!pool_elts (client_wrk->half_open_table), "no half-open entries");
-  CT_CHECK (!ct_test_fifo_count (client_wrk), "no client FIFOs");
-  CT_CHECK (!ct_test_fifo_count (application_get_default_worker (application_get (server))),
-	    "no server FIFOs");
-  for (i = 0; i <= CT_TEST_FRESH; i++)
-    CT_CHECK (state->replies[i] == 1 && state->cleanups[i] == 1, "no duplicate completion");
-
-cleanup:
-  if (unlisten_args.handle != SESSION_INVALID_HANDLE)
-    vnet_unlisten (&unlisten_args);
-  if (apps[0] != (u32) ~0)
-    {
-      client_wrk = application_get_default_worker (application_get (apps[0]));
-      for (attempts = 0; attempts < 500 && pool_elts (client_wrk->half_open_table); attempts++)
-	ct_test_dispatch (vm);
-    }
-  for (i = 0; i < ARRAY_LEN (apps); i++)
-    if (apps[i] != (u32) ~0)
-      {
-	vnet_app_detach_args_t args = { .app_index = apps[i], .api_client_index = ~0 };
-	vnet_application_detach (&args);
-      }
-  for (attempts = 0; attempts < 500; attempts++)
-    {
-      ct_test_dispatch (vm);
-      if (ct_test_session_count () == initial_sessions &&
-	  ct_connection_count () == initial_connections)
-	break;
-    }
-  if (ct_test_session_count () != initial_sessions ||
-      ct_connection_count () != initial_connections)
-    {
-      if (error)
-	error = clib_error_return (error, "test cleanup did not restore allocation baseline");
-      else
-	error = clib_error_return (0, "test cleanup did not restore allocation baseline");
-    }
-#undef CT_CHECK
+  if (error)
+    error = clib_error_return (error, "local %u endpoint %u app %u", local, same_endpoint,
+			      same_app);
   return error;
 }
 

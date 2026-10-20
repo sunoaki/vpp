@@ -46,6 +46,7 @@ typedef struct ct_connection_
 } ct_connection_t;
 
 __clib_export u32 ct_connection_count (void);
+__clib_export u32 ct_half_open_free_count (void);
 __clib_export session_t *ct_session_get_peer (session_t *s);
 void ct_session_endpoint (session_t * ll, session_endpoint_t * sep);
 int ct_session_connect_notify (session_t *ls, session_error_t err);

@@ -132,6 +132,19 @@ ct_connection_count (void)
   return count - vec_len (cm->ho_reusable);
 }
 
+u32
+ct_half_open_free_count (void)
+{
+  ct_main_t *cm = &ct_main;
+  ct_worker_t *wrk = ct_worker_get (cm->fwrk_thread);
+
+  ASSERT (vlib_thread_is_main_w_barrier ());
+  /* The first allocation initializes an empty pool with the safe threshold. */
+  if (!wrk->connections)
+    return POOL_REALLOC_SAFE_ELT_THRESH;
+  return pool_free_elts (wrk->connections) + vec_len (cm->ho_reusable);
+}
+
 session_t *
 ct_session_get_peer (session_t * s)
 {

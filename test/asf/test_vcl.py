@@ -1703,11 +1703,13 @@ class CTListenerIdentityTestCase(VppAsfTestCase):
 
     @classmethod
     def setUpClass(cls):
+        if config.debug and config.debug.lower() == "attach":
+            raise unittest.SkipTest("CT listener fixture requires its own VPP process")
         cls.extra_vpp_config = ["session { poll-main }"]
         super().setUpClass()
 
     def test_ct_listener_replacement(self):
-        """Reject queued CT connects after same-index listener replacement"""
+        """Class teardown terminates VPP, including any retained callback state."""
         self.vapi.session_enable_disable(is_enable=1)
         self.assertIn(
             "CT listener identity SUCCESS",
