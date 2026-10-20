@@ -334,7 +334,17 @@ class TestLifecycleObservations(unittest.TestCase):
             with self.subTest(generation=generation):
                 name = f"http_static_server_{generation}"
                 summary = f"3         {name[:20]}default\n"
-                records = {"3": f"app:\t {name} app-index 3 ns 0:default\n"}
+                records = {
+                    "3": (
+                        f"app:\t {name} app-index 3 ns 0:default\0\n"
+                        "flags:\t builtin, global-scope\n"
+                        "workers:\n\n"
+                        "  wrk-index 3 app-index 3 map-index 0 api-client-index -1 mq-cong 0\n"
+                        "  segment managers:\n"
+                        f"  [9] {name} app-wrk: 3 segs: 1 max-fifo-sz: 4m wmarks: 80 50 no-tuning flags: connects \n"
+                        f"  [5] {name} app-wrk: 3 segs: 1 max-fifo-sz: 4m wmarks: 80 50 no-tuning flags: listener \n"
+                    )
+                }
                 self.vapi.cli.reset_mock()
                 identities, output = helper("_hss_apps")(self)
                 self.assertEqual(identities, {("3", name)})

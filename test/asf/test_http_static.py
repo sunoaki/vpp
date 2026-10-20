@@ -442,6 +442,7 @@ else:
             self.assertRegex(headers[0], rf"^app:\s+.+ app-index {index} ns ")
             records.append(record)
         output = "\n".join(records)
+        headers = re.findall(r"^app:.*$", output, re.MULTILINE)
         apps = {
             (index, name)
             for name, index in re.findall(
@@ -450,7 +451,9 @@ else:
                 re.MULTILINE,
             )
         }
-        self.assertEqual(len(apps), output.count("http_static_server_"), output)
+        self.assertEqual(
+            len(apps), sum("http_static_server_" in header for header in headers), output
+        )
         return apps, output
 
     def _wait_listener_gone(self, index):
