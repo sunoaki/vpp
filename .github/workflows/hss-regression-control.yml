@@ -1451,6 +1451,33 @@ jobs:
               return [f"test_http_static.{cls}.{method}" for cls in (*CLASSES, "TestHttpStaticVapi")
                       for method in methods["TestHttpStaticCli" if cls in CLASSES else cls]]
 
+          def infrastructure_text(text, events, variant):
+              if variant != "api-protocol":
+                  return text
+              require(not re.search(r"ERROR: (?:AddressSanitizer|ASAN):|AddressSanitizer:DEADLYSIGNAL|"
+                                    r"\b[Aa]ssertion [`'][^\n]+['`] (?:failed|fails)\b", text),
+                      "Fatal sanitizer/C assertion diagnostic")
+              header = "   Count                  Node                              Reason               Severity \n"
+              benign = "         2          af-packet-input                    timed out block             error  \n"
+              row = re.compile(r" +[0-9]+ +[a-zA-Z0-9_-]+ {2,}[a-zA-Z0-9][a-zA-Z0-9 _/-]*? {2,}"
+                               r"(?:error|warning|info) +\n")
+              replies = {}
+              for event in events:
+                  if event["kind"] == "cli_reply" and event.get("command") == "show error" and event.get("retval") == 0:
+                      replies[(event["pid"], event["seq"])] = event.get("reply")
+              for event in events:
+                  if event["kind"] != "cli" or event.get("command") != "show error":
+                      continue
+                  reply = event.get("reply")
+                  if not isinstance(reply, str) or replies.get((event["pid"], event["seq"] - 1)) != reply:
+                      continue
+                  lines = reply.splitlines(keepends=True)
+                  if not lines or lines[0] != header or benign not in lines or not all(row.fullmatch(line) for line in lines[1:]):
+                      continue
+                  rendering = re.compile(r"(?m)^[0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3} show error\n" + re.escape(reply) + r"\n")
+                  text = rendering.sub(lambda match: match.group().replace(benign, "\n"), text)
+              return text
+
           def validate(events, console, rc, expected, variant, logs):
               require(evidence_schema.FATAL.search("\n".join((console, logs, json.dumps(events)))) is None,
                       "Fatal process diagnostic evidence")
@@ -1458,7 +1485,8 @@ jobs:
               require(not any(event["kind"] in forbidden for event in events), "Error/skip/expected failure callback")
               require(not re.search(r"SIGSEGV|segmentation fault|core was generated|timed out|TimeoutError|"
                                     r"VppTransportSocketIOError|VPP(?:\s+is)?\s+dead|"
-                                    r"not enough cpus|Skipping tests due to setup failure", console + logs, re.I),
+                                    r"not enough cpus|Skipping tests due to setup failure",
+                                    infrastructure_text(console, events, variant) + infrastructure_text(logs, events, variant), re.I),
                       "Infrastructure/crash/timeout evidence")
               starts = [event for event in events if event["kind"] == "startTest"]
               stops = [event for event in events if event["kind"] == "stopTest"]
