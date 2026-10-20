@@ -24,10 +24,12 @@ jobs:
     # Independent Debian 13 builds, OpenSSL TLS/QUIC, two CPUs and namespace access.
     # IPv6 and HTTP/3 checks establish control-plane identity only.
     # These narrow API negatives do not cover lifecycle/reset/cleanup/ack mutations.
+    # Default AF_PACKET V3 RX 10 MiB + TX 66 MiB; 256 MiB bounds each process with headroom.
     container:
       image: debian:trixie
       options: >-
         --shm-size=2g
+        --ulimit memlock=268435456:268435456
         --cap-add=SYS_ADMIN
         --cap-add=NET_ADMIN
         --security-opt=apparmor=unconfined
@@ -378,6 +380,73 @@ jobs:
                                      status="pending", query_status="not_triggered", rc=None,
                                      cleanup_complete=None, event_seq=None, identity=owner.identity,
                                      source=owner.provenance, coverage="frozen_prefix_through_snapshot")
+                  self.proc_fd, self.birth = None, None
+                  try:
+                      if process.poll() is not None:
+                          raise ProcessLookupError("Original process exited")
+                      self.proc_fd = directory(f"/proc/{self.pid}")
+                      self.birth = self.proc_read("stat", 4096, time.monotonic() + .05).rsplit(b") ", 1)[1].split()[19].decode("ascii")
+                      if process.poll() is not None:
+                          raise ProcessLookupError("Original process exited")
+                  except (OSError, ValueError, IndexError, UnicodeError, TimeoutError):
+                      self.close_proc()
+                      self.birth = None
+
+              def close_proc(self):
+                  if self.proc_fd is not None:
+                      os.close(self.proc_fd)
+                      self.proc_fd = None
+
+              def proc_read(self, name, limit, deadline):
+                  if time.monotonic() >= deadline:
+                      raise TimeoutError("Process metadata budget")
+                  descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                                       dir_fd=self.proc_fd)
+                  try:
+                      if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                          raise ValueError("Nonregular process metadata")
+                      raw = bytearray()
+                      while True:
+                          if time.monotonic() >= deadline:
+                              raise TimeoutError("Process metadata budget")
+                          chunk = os.read(descriptor, limit + 1 - len(raw))
+                          if time.monotonic() >= deadline:
+                              raise TimeoutError("Process metadata budget")
+                          if not chunk:
+                              return bytes(raw)
+                          raw.extend(chunk)
+                          if len(raw) > limit:
+                              raise ValueError("Process metadata exceeds cap")
+                  finally:
+                      os.close(descriptor)
+
+              def process_metadata(self, deadline):
+                  result = dict(status="unavailable", pid=self.pid, starttime_ticks=self.birth,
+                                limits=None, status_fields=None, raw=None)
+                  self.record["process_metadata"] = result
+                  try:
+                      if self.proc_fd is None or self.birth is None or self.process.poll() is not None:
+                          raise ProcessLookupError("Original process unavailable")
+                      before = self.proc_read("stat", 4096, deadline).rsplit(b") ", 1)[1].split()[19].decode("ascii")
+                      if before != self.birth:
+                          raise ProcessLookupError("Original process identity changed")
+                      limits = self.proc_read("limits", 4096, deadline)
+                      status = self.proc_read("status", 8192, deadline)
+                      after = self.proc_read("stat", 4096, deadline).rsplit(b") ", 1)[1].split()[19].decode("ascii")
+                      if after != self.birth or self.process.poll() is not None:
+                          raise ProcessLookupError("Original process exited or changed")
+                      fields = {}
+                      for line in status.decode("ascii").splitlines():
+                          key, separator, value = line.partition(":")
+                          if separator and key in ("VmLck", "CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"):
+                              fields[key] = value.strip()
+                      if "VmLck" not in fields or "CapEff" not in fields:
+                          raise ValueError("Required process status absent")
+                      result.update(status="captured", limits=limits.decode("ascii"), status_fields=fields,
+                                    raw={name: dict(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                                         for name, raw in (("limits", limits), ("status", status))})
+                  except (OSError, ValueError, IndexError, UnicodeError, TimeoutError) as error:
+                      result["error"] = type(error).__name__[:64]
 
               def write(self, index, raw):
                   if not self.lock.acquire(blocking=False):
@@ -397,7 +466,10 @@ jobs:
                       self.incomplete = True
                       return
                   try:
-                      if self.frozen or self.incomplete or not self.allocated or self.query_active:
+                      if self.query_active:
+                          return
+                      self.close_proc()
+                      if self.frozen or self.incomplete or not self.allocated:
                           return
                       self.frozen = True
                       self.record.update(snapshot_at=time.time(), observed_until=time.time(), status="frozen",
@@ -422,6 +494,7 @@ jobs:
                       self.lock.release()
 
               def close(self):
+                  self.close_proc()
                   for stream in self.streams.values():
                       if stream.descriptor is not None:
                           os.close(stream.descriptor)
@@ -666,6 +739,7 @@ jobs:
                       if slot.process.poll() is not None or getattr(cls, "vpp", None) is not slot.process:
                           result["query_status"] = "not_live"
                           return
+                      slot.process_metadata(min(execution, time.monotonic() + .05))
                       socket = cls.get_cli_sock_path()
                       if cls.tempdir != slot.tempdir or socket != os.path.join(slot.tempdir, "cli.sock") or not os.path.isabs(socket):
                           raise ValueError("Foreign CLI socket")
@@ -1596,6 +1670,7 @@ jobs:
             uname -a
             cat /etc/os-release
             openssl version -a
+            python3 -c "import os,resource; limits=resource.getrlimit(resource.RLIMIT_MEMLOCK); print(dict(pid=os.getpid(),memlock_bytes=limits),flush=True); print(open(\"/proc/self/limits\").read(4096),flush=True); print([line for line in open(\"/proc/self/status\").read(8192).splitlines() if line.startswith((\"VmLck:\",\"CapEff:\"))],flush=True); assert limits == (268435456,268435456), limits"
             python3 -c "import os; print(sorted(os.sched_getaffinity(0))); assert len(os.sched_getaffinity(0)) >= 2"
             mountpoint /dev/shm
             test "$(df -B1 --output=size /dev/shm | tail -n 1)" -ge 2147483648
