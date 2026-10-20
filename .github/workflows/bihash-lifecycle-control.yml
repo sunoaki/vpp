@@ -15,12 +15,13 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_SHA: 1e3ae1a0f54a8a2a7160663bbd50775bcb6b2206
+  SOURCE_SHA: fc19ed379860c1cfaa7462bd31bc05cecbd0077d
+  SOURCE_PARENT_SHA: 1e3ae1a0f54a8a2a7160663bbd50775bcb6b2206
   PARENT_SHA: f9d4c2e78f4bed10f732a75f04484856416fe5a1
   CORE_PARENT_BLOB: 972963da5e09581516561ad115d6e773772d44e6
   CORE_FIXED_BLOB: c3a97cd823d9fab8550b091cd01e46880790c6bf
-  C_TEST_BLOB: 072c1183912740e11d2eaf9314b5f190e4eb131f
-  ASF_TEST_BLOB: 34b3cef50a9d6bce301fe07b048349abe8906447
+  C_TEST_BLOB: 73820c7de894fa0a56bae97c059a869074f14598
+  ASF_TEST_BLOB: c5eaf4b503347fcdd658db2ffc874675ccc9203b
 
 jobs:
   lifecycle:
@@ -70,12 +71,12 @@ jobs:
           set -euo pipefail
           git config --global --add safe.directory "$PWD"
           mkdir -p evidence
-          for pin in "$SOURCE_SHA" "$PARENT_SHA" "$CORE_PARENT_BLOB" \
+          for pin in "$SOURCE_SHA" "$SOURCE_PARENT_SHA" "$PARENT_SHA" "$CORE_PARENT_BLOB" \
                      "$CORE_FIXED_BLOB" "$C_TEST_BLOB" "$ASF_TEST_BLOB"; do
             [[ "$pin" =~ ^[0-9a-f]{40}$ ]]
           done
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          test "$(git rev-parse HEAD^)" = "$PARENT_SHA"
+          test "$(git rev-parse HEAD^)" = "$SOURCE_PARENT_SHA"
           core=src/vppinfra/bihash_template.c
           c_test=src/plugins/unittest/bihash_test.c
           asf_test=test/asf/test_bihash.py
@@ -93,7 +94,8 @@ jobs:
           test "$(git hash-object "$c_test")" = "$C_TEST_BLOB"
           test "$(git hash-object "$asf_test")" = "$ASF_TEST_BLOB"
           {
-            printf 'source=%s\nparent=%s\nvariant=%s\n' "$SOURCE_SHA" "$PARENT_SHA" "$CONTROL_VARIANT"
+            printf 'source=%s\nsource_parent=%s\ncore_baseline=%s\nvariant=%s\n' \
+              "$SOURCE_SHA" "$SOURCE_PARENT_SHA" "$PARENT_SHA" "$CONTROL_VARIANT"
             printf 'workflow_commit=%s\nworkflow_ref=%s\n' "$GITHUB_SHA" "$GITHUB_REF"
             printf 'run=%s\nattempt=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
             git ls-tree HEAD "$core" "$c_test" "$asf_test"
