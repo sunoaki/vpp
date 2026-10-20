@@ -980,6 +980,105 @@ jobs:
               finally:
                   os.close(descriptor)
 
+          def receipt_complete(request, worker, pid, status, rc, cleanup):
+              if (not isinstance(worker, dict) or worker.get("schema") != SCHEMA or
+                      worker.get("identity") != request["identity"] or worker.get("pid") != pid or
+                      worker.get("module_sha256") != request["module_sha256"] or
+                      worker.get("deadline") != request["deadline"] or type(worker.get("complete")) is not bool or
+                      type(worker.get("entries")) is not int or not 0 <= worker["entries"] <= 4000 or
+                      type(worker.get("bytes")) is not int or not 0 <= worker["bytes"] <= 256 * 1024 * 1024):
+                  raise ValueError("Malformed, foreign or stale collector result")
+              complete = (status == "completed" and type(rc) is int and rc == 0 and
+                          cleanup is True and worker["complete"] and "error" not in worker)
+              if complete:
+                  index = worker["index"]
+                  if (not isinstance(index, dict) or set(index) != {"path", "bytes", "sha256"} or
+                          index["path"] != str(Path(request["destination"]) / "evidence-index.json") or
+                          type(index["bytes"]) is not int or not 0 < index["bytes"] <= 2 * 1024 * 1024 or
+                          not isinstance(index["sha256"], str) or len(index["sha256"]) != 64 or
+                          any(char not in "0123456789abcdef" for char in index["sha256"])):
+                      raise ValueError("Invalid collector index receipt")
+              return complete
+
+          def read_size(consumed):
+              available = 256 * 1024 * 1024 - consumed
+              if available <= 0:
+                  raise ValueError("Collector actual read cap reached")
+              return min(65536, available)
+
+          def read_regular(path, limit, deadline):
+              remaining(deadline)
+              descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+              try:
+                  before = os.fstat(descriptor)
+                  if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+                      raise ValueError("Snapshot input invalid or exceeds cap")
+                  raw = bytearray()
+                  while len(raw) < before.st_size:
+                      remaining(deadline)
+                      chunk = os.read(descriptor, min(65536, before.st_size - len(raw)))
+                      if not chunk:
+                          raise ValueError("Snapshot input shortened")
+                      raw.extend(chunk)
+                  after = os.fstat(descriptor)
+                  if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
+                      raise ValueError("Snapshot input changed")
+                  remaining(deadline)
+                  return bytes(raw)
+              finally:
+                  os.close(descriptor)
+
+          def freeze_runtime(control, request, directory, validation):
+              root, deadline = control.OUT, request["deadline"]
+              paths = sorted(path for path in control.bounded_paths(root, recursive=False)
+                             if path.name.startswith("events.") and path.suffix == ".jsonl")
+              events, available = [], 32 * 1024 * 1024
+              for path in paths:
+                  raw = read_regular(path, min(available, 4 * 1024 * 1024 + 65536), deadline)
+                  available -= len(raw)
+                  events.append(raw)
+              runtime = root / "runtime"
+              fatal_path = runtime / "fatal-diagnostic.json"
+              fatal = read_regular(fatal_path, LIMIT, deadline) if fatal_path.exists() else None
+              payloads = {"validation.log": validation, "events.jsonl": b"\n".join(events),
+                  "runtime.json": read_regular(runtime / "result.json", LIMIT, deadline),
+                  "console.log": read_regular(runtime / "console.log", 8 * 1024 * 1024 + 512, deadline)}
+              if fatal is not None:
+                  payloads["fatal.json"] = fatal
+              files = {}
+              for name, raw in payloads.items():
+                  remaining(deadline)
+                  if (directory / name).write_bytes(raw) != len(raw):
+                      raise OSError("Snapshot short write")
+                  files[name] = dict(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+              snapshot = dict(schema="hss-runtime-snapshot-v1", identity=request["identity"],
+                              fatal=fatal is not None, files=files)
+              control.publish(directory / "snapshot.json", snapshot)
+              return snapshot
+
+          def runtime_snapshot(collection):
+              directory = Path(collection["control"])
+              snapshot = bounded_json(directory / "snapshot.json")
+              if (snapshot.get("schema") != "hss-runtime-snapshot-v1" or
+                      snapshot.get("identity") != collection["identity"] or
+                      snapshot != collection["worker"]["snapshot"] or
+                      type(snapshot.get("fatal")) is not bool):
+                  raise ValueError("Invalid runtime snapshot identity")
+              caps = {"validation.log": 96 * 1024 * 1024, "events.jsonl": 33 * 1024 * 1024,
+                      "runtime.json": LIMIT, "console.log": 8 * 1024 * 1024 + 512}
+              if snapshot["fatal"]:
+                  caps["fatal.json"] = LIMIT
+              if set(snapshot["files"]) != set(caps):
+                  raise ValueError("Invalid runtime snapshot inventory")
+              payloads = {}
+              for name, cap in caps.items():
+                  receipt = snapshot["files"][name]
+                  raw = read_regular(directory / name, cap, time.monotonic() + 5)
+                  if len(raw) != receipt["bytes"] or hashlib.sha256(raw).hexdigest() != receipt["sha256"]:
+                      raise ValueError("Runtime snapshot payload mismatch")
+                  payloads[name] = raw
+              return snapshot, payloads
+
           def supervise(control, request, seconds=45, adapter=None):
               healthy = Path(os.path.abspath(os.environ["HSS_CONTROL"]))
               request = dict(request)
@@ -1026,25 +1125,11 @@ jobs:
                   if not result["cleanup_complete"]:
                       result["status"] = "collector_cleanup_incomplete"
                   worker = bounded_json(directory / "worker.json")
-                  if (not isinstance(worker, dict) or worker.get("schema") != SCHEMA or
-                          worker.get("identity") != identity or worker.get("pid") != process.pid or
-                          worker.get("module_sha256") != request["module_sha256"] or
-                          worker.get("deadline") != deadline or type(worker.get("complete")) is not bool or
-                          type(worker.get("entries")) is not int or not 0 <= worker["entries"] <= 4000 or
-                          type(worker.get("bytes")) is not int or not 0 <= worker["bytes"] <= 256 * 1024 * 1024):
-                      raise ValueError("Malformed, foreign or stale collector result")
+                  result["complete"] = receipt_complete(request, worker, process.pid,
+                      result["status"], result["rc"], result["cleanup_complete"])
                   result["worker"] = worker
-                  result["complete"] = (result["status"] == "completed" and result["rc"] == 0 and
-                      result["cleanup_complete"] is True and worker["complete"] and "error" not in worker)
                   if result["complete"]:
-                      index = worker["index"]
-                      if (not isinstance(index, dict) or set(index) != {"path", "bytes", "sha256"} or
-                              index["path"] != str(Path(request["destination"]) / "evidence-index.json") or
-                              type(index["bytes"]) is not int or not 0 < index["bytes"] <= 2 * 1024 * 1024 or
-                              not isinstance(index["sha256"], str) or len(index["sha256"]) != 64 or
-                              any(char not in "0123456789abcdef" for char in index["sha256"])):
-                          raise ValueError("Invalid collector index receipt")
-                      result.update(entries=worker["entries"], bytes=worker["bytes"], index=index)
+                      result.update(entries=worker["entries"], bytes=worker["bytes"], index=worker["index"])
               except (OSError, ValueError, KeyError, TypeError, TimeoutError) as error:
                   if result["status"] == "running" or result["status"] == "completed":
                       result["status"] = "collector_error"
@@ -1125,9 +1210,20 @@ jobs:
                       raw = text.encode("utf-8")
                       if len(raw) > 96 * 1024 * 1024:
                           raise ValueError("Validation payload cap")
-                      (directory / "validation.log").write_bytes(raw)
-                      result["validation"] = dict(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                      result["snapshot"] = freeze_runtime(control, request, directory, raw)
                   elif request["mode"] == "final":
+                      healthy = Path(os.environ["HSS_CONTROL"])
+                      for relative in ("tests/result.json", "tests/ownership.json", "tests/console.log",
+                                       "tests-result.json", "acceptance.json"):
+                          source = healthy / relative
+                          remaining(request["deadline"])
+                          if source.is_file():
+                              raw = read_regular(source, 8 * 1024 * 1024 + 512 if relative.endswith(".log") else LIMIT,
+                                                 request["deadline"])
+                              target = control.OUT / relative
+                              target.parent.mkdir(exist_ok=True)
+                              if target.write_bytes(raw) != len(raw):
+                                  raise OSError("Final tests record short write")
                       for source in control.TOOLS.glob("*.py"):
                           (control.OUT / source.name).write_bytes(source.read_bytes())
                       for name, args in (("final-status.txt", ["git", "status", "--short"]),
@@ -1157,9 +1253,10 @@ jobs:
                           observed = 0
                           while True:
                               remaining(request["deadline"])
-                              chunk = os.read(descriptor, 65536)
+                              chunk = os.read(descriptor, read_size(result["bytes"]))
                               if not chunk:
                                   break
+                              result["bytes"] += len(chunk)
                               digest.update(chunk)
                               observed += len(chunk)
                           if observed != size or os.fstat(descriptor).st_mtime_ns != info.st_mtime_ns:
@@ -1167,7 +1264,6 @@ jobs:
                       finally:
                           os.close(descriptor)
                       files[str(path.relative_to(request["destination"]))] = dict(bytes=size, sha256=digest.hexdigest())
-                      result["bytes"] += observed
                       result["entries"] = len(files)
                   target = Path(request["destination"]) / "evidence-index.json"
                   raw = (json.dumps(files, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -1344,7 +1440,8 @@ jobs:
               return False
 
           def command(label, args, env=None):
-              directory = OUT / label
+              command_root = Path(os.environ["HSS_CONTROL"]) if label == "tests" else OUT
+              directory = command_root / label
               directory.mkdir(exist_ok=True)
               started = time.time()
               work_deadline = float(os.environ["WORK_DEADLINE"])
@@ -1356,7 +1453,7 @@ jobs:
               ancestors = json.loads(os.environ.get("HSS_COMMAND_ANCESTORS", "[]"))
               parents = json.loads(os.environ.get("HSS_COMMAND_PARENTS", "[]"))
               result_path = directory / "result.json"
-              owner = dict(identity=identity, result=str(result_path.relative_to(OUT)), ancestors=ancestors, parents=parents)
+              owner = dict(identity=identity, result=str(result_path.relative_to(command_root)), ancestors=ancestors, parents=parents)
               evidence_schema.ownership(json.dumps(owner))
               with (directory / "ownership.json").open("x") as stream:
                   stream.write(json.dumps(owner, sort_keys=True) + "\n")
@@ -1411,7 +1508,7 @@ jobs:
                   finally:
                       result.update(end=time.time(), retained_bytes=len(tail))
                       publish(result_path, result)
-              if result.get("cleanup_complete") and result["status"] != "completed":
+              if result.get("cleanup_complete") and result["status"] != "completed" and label != "tests":
                   record_interruptions(result, result_path)
               print(f"{label}: {result['status']}, rc={result['rc']}; raw log: {directory / 'console.log'}", flush=True)
               return result["rc"], tail.decode(errors="replace")
@@ -2033,28 +2130,25 @@ jobs:
               finally:
                   dependency_checkpoint("after-runtime")
               collection = supervise_collection("runtime", OUT / "runtime" / "diagnostics")
-              require(collection["complete"], "Runtime collection incomplete")
-              event_paths = [path for path in bounded_paths(OUT, recursive=False)
-                             if path.name.startswith("events.") and path.suffix == ".jsonl"]
-              events = [json.loads(line) for line in read_evidence(event_paths).splitlines() if line]
-              validation = collection["worker"]["validation"]
-              with (Path(collection["control"]) / "validation.log").open("rb") as stream:
-                  raw = stream.read(96 * 1024 * 1024 + 1)
-              require(len(raw) <= 96 * 1024 * 1024 and len(raw) == validation["bytes"] and
-                      hashlib.sha256(raw).hexdigest() == validation["sha256"], "Invalid validation payload")
-              logs = raw.decode("utf-8")
-              work_remaining()
+              import hss_collection
+              acceptance = Path(os.environ["HSS_CONTROL"]) / "acceptance.json"
               try:
-                  runtime = json.loads((OUT / "runtime/result.json").read_text())
+                  require(collection["complete"], "Runtime collection incomplete")
+                  snapshot, payloads = hss_collection.runtime_snapshot(collection)
+                  events = [json.loads(line) for line in payloads["events.jsonl"].splitlines() if line]
+                  runtime = json.loads(payloads["runtime.json"])
                   require(runtime["status"] == "completed", "Runtime command timed out or exceeded work budget")
-                  require(not (OUT / "runtime/fatal-diagnostic.json").exists(), "Fatal diagnostic found before log tail")
-                  validate(events, console, rc, expected, VARIANT, logs)
+                  require(runtime["rc"] == rc, "Runtime snapshot return code changed")
+                  require(not snapshot["fatal"], "Fatal diagnostic found before log tail")
+                  work_remaining()
+                  validate(events, payloads["console.log"].decode(errors="replace"), rc, expected,
+                           VARIANT, payloads["validation.log"].decode("utf-8"))
               except Exception as error:
-                  save("acceptance.json", dict(status="FAIL", error=str(error), expected=expected))
+                  publish(acceptance, dict(status="FAIL", error=str(error), expected=expected))
                   raise
-              save("acceptance.json", dict(status="PASS", expected=expected,
-                                           claims="full27 fixed successes:14 original regressions,2 main-queue synthetic,8 cache,3 existing" if VARIANT == "fixed" else
-                                           "narrow restored field/unlock only; lifecycle negative gaps remain"))
+              publish(acceptance, dict(status="PASS", expected=expected,
+                  claims="full27 fixed successes:14 original regressions,2 main-queue synthetic,8 cache,3 existing" if VARIANT == "fixed" else
+                         "narrow restored field/unlock only; lifecycle negative gaps remain"))
 
           def validate_http_name(events, console, rc, logs):
               test = "test_http.TestHttpNameOwnership.test_app_name_ownership"
@@ -2101,7 +2195,8 @@ jobs:
               require(build["status"] == "completed" and build["rc"] == 0 and build.get("cleanup_complete") is True,
                       "HTTP name requires a successful independently cleaned build")
               for label in ("tests", "runtime"):
-                  record = OUT / label / "result.json"
+                  record_root = Path(os.environ["HSS_CONTROL"]) if label == "tests" else OUT
+                  record = record_root / label / "result.json"
                   if record.exists():
                       previous_run = json.loads(record.read_text())
                       require(previous_run["status"] == "completed" and previous_run.get("cleanup_complete") is True,
@@ -2155,8 +2250,10 @@ jobs:
               (OUT / "CMakeCache.txt").write_text("\n".join(path.read_text() for path in caches))
 
           def action_result(action, operation):
+              path = ((Path(os.environ["HSS_CONTROL"]) if action == "tests" else OUT) /
+                      f"{action}-result.json")
               result = dict(action=action, start=time.time(), status="running", rc=None)
-              save(f"{action}-result.json", result)
+              publish(path, result)
               try:
                   operation()
               except Exception as error:
@@ -2166,7 +2263,7 @@ jobs:
                   result.update(status="completed", rc=0)
               finally:
                   result["end"] = time.time()
-                  save(f"{action}-result.json", result)
+                  publish(path, result)
 
           def supervise_collection(mode, destination):
               import hss_collection
@@ -2196,7 +2293,8 @@ jobs:
               elif action in operations:
                   status, _ = command(action, [sys.executable, __file__, f"operation-{action}"])
                   if action == "tests" and status != 0:
-                      save("acceptance.json", dict(status="FAIL", error=f"Whole runtime action failed: {status}"))
+                      publish(Path(os.environ["HSS_CONTROL"]) / "acceptance.json",
+                              dict(status="FAIL", error=f"Whole runtime action failed: {status}"))
                   raise SystemExit(status)
               else:
                   status, _ = command(action, sys.argv[2:])
@@ -2367,22 +2465,21 @@ jobs:
                   host, device = original(*args, **kwargs)
                   record["calls"].append(dict(host=host, actual_device=device, returned_device=name))
                   return host, name
-              active = diagnostics.configure() if mode == "observed" else None
-              require(mode == "baseline" or active is not None, "Live diagnostics unavailable")
-              sequence = 0
+              observer = sys.modules.get("sitecustomize") if mode == "observed" else None
+              active = getattr(observer, "diagnostics", None)
+              require(mode == "baseline" or active is not None, "Live source observer unavailable")
+              provider = importlib.import_module("vpp_papi_provider").VppPapiProvider
               def profile(frame, event, value):
-                  nonlocal sequence
-                  if active is not None:
-                      active.observe(frame, event, value)
-                  if event == "return" and frame.f_code.co_name == "cli_return_response" and value is not None:
-                      command = frame.f_locals.get("cli", "").strip()
-                      if command == f"create host-interface name {name}":
-                          sequence += 1
-                          record.update(retval=value.retval, reply=str(value.reply), seq=sequence,
-                              provider_pid=os.getpid(), original_command=command)
-                          if active is not None:
-                              active.failure(frame, value, sequence)
-                              active.failure(frame, value, sequence)
+                  if observer is not None:
+                      observer.profile(frame, event, value)
+                  if event != "return" or frame.f_code is not provider.cli_return_response.__code__ or value is None:
+                      return
+                  command = frame.f_locals.get("cli", "").strip()
+                  if command == f"create host-interface name {name}":
+                      record.update(retval=value.retval, reply=str(value.reply),
+                                    provider_pid=os.getpid(), original_command=command)
+                      if active is not None:
+                          active.failure(frame, value, observer.sequence)
               class Result(unittest.TestResult):
                   def addError(self, test, error):
                       record["callbacks"].append(dict(kind="addError", test=test.id()))
@@ -2449,7 +2546,9 @@ jobs:
                       candidate=control.CANDIDATE, variant="fixed", runtime="diagnostic-contract")
                   results = []
                   for mode in ("baseline", "observed"):
-                      env = dict(os.environ, HSS_EVENTS="", HSS_DIAGNOSTIC_CONFIG=json.dumps(live),
+                      env = dict(os.environ,
+                          HSS_EVENTS=str(ROOT / "events") if mode == "observed" else "",
+                          HSS_DIAGNOSTIC_CONFIG=json.dumps(live) if mode == "observed" else "",
                           PYTHONPATH=str(control.TOOLS) + os.pathsep + os.environ.get("PYTHONPATH", ""))
                       process = subprocess.Popen([str(control.ROOT / "build-root/test/venv/bin/python"),
                           __file__, "setup", mode], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -2471,8 +2570,38 @@ jobs:
                   slot = after["slots"][0]
                   self.assertEqual(slot["observer_pid"], after["provider_pid"])
                   self.assertEqual(slot["query_pid"], after["logging_queries"][0]["pid"])
-                  self.assertEqual(slot["event_seq"], after["seq"])
-                  self.assertEqual(slot["reply_sha256"], hashlib.sha256(after["reply"].encode()).hexdigest())
+                  event_path = ROOT / f"events.{after['provider_pid']}.jsonl"
+                  raw_events = hss_collection.read_regular(event_path, 4 * 1024 * 1024 + 65536,
+                                                           time.monotonic() + 5)
+                  events = [json.loads(line) for line in raw_events.splitlines() if line]
+                  replies = [event for event in events if event["kind"] == "cli_reply" and
+                             event["command"] == after["original_command"]]
+                  self.assertEqual(len(replies), 1)
+                  event = replies[0]
+                  self.assertEqual(event["pid"], slot["observer_pid"])
+                  self.assertEqual(event["seq"], slot["event_seq"])
+                  self.assertEqual(event["retval"], after["retval"])
+                  self.assertEqual(event["reply"], after["reply"])
+                  self.assertEqual(slot["event_file"], event_path.name)
+                  self.assertEqual(slot["reply_sha256"], hashlib.sha256(event["reply"].encode()).hexdigest())
+                  self.assertEqual(slot["reply_bytes"], len(event["reply"].encode()))
+                  self.assertTrue(any(item["kind"] == "loaded" and item["pid"] == event["pid"]
+                                      for item in events))
+                  self.assertEqual(sum(item["kind"] == "addError" for item in events), 1)
+                  self.assertFalse(any(item["kind"] in ("startTest", "addSuccess") for item in events))
+                  verified = {}
+                  self.assertEqual(set(slot["files"]), set(diagnostics.FILES))
+                  for name in diagnostics.FILES:
+                      artifact = hss_collection.read_regular(directory / slot["slot"] / name,
+                          2 * 1024 * 1024, time.monotonic() + 5)
+                      receipt = slot["files"][name]
+                      self.assertEqual(len(artifact), receipt["bytes"])
+                      self.assertEqual(hashlib.sha256(artifact).hexdigest(), receipt["sha256"])
+                      self.assertIsNone(receipt["error"])
+                      verified[name] = dict(bytes=len(artifact), sha256=receipt["sha256"])
+                  after["verified_streams"] = verified
+                  after["event_witness"] = dict(path=str(event_path), bytes=len(raw_events),
+                      sha256=hashlib.sha256(raw_events).hexdigest(), event=event)
                   self.assertEqual(slot["query_status"], "completed")
                   self.assertTrue(slot["cleanup_complete"])
                   self.assertIsNotNone(slot.get("query_pid"))
@@ -2584,17 +2713,37 @@ jobs:
                       self.assertIn(result["rc"], (-signal.SIGTERM, -signal.SIGKILL))
                       if stage == "ignore":
                           self.assertEqual(result["rc"], -signal.SIGKILL)
-                      with self.assertRaises(AssertionError):
-                          self.assertTrue(result["complete"])
-                      misrouted = dict(result, pid=result["pid"] + 1)
-                      with self.assertRaises(AssertionError):
-                          self.assertEqual(misrouted["fault_receipt"]["pid"], misrouted["pid"])
                       records.append(result)
-                  forged = dict(records[0], complete=True)
-                  with self.assertRaises(AssertionError):
-                      self.assertTrue(forged["complete"] and forged["status"] == "completed" and
-                                      forged["rc"] == 0 and forged["worker"]["complete"])
-                  OBSERVATIONS[self._testMethodName] = records
+                  measured = records[0]
+                  request = hss_collection.bounded_json(Path(measured["control"]) / "request.json")
+                  worker = dict(schema=hss_collection.SCHEMA, identity=request["identity"],
+                      deadline=request["deadline"], module_sha256=request["module_sha256"],
+                      pid=measured["pid"], complete=True, entries=1, bytes=16,
+                      index=dict(path=str(Path(request["destination"]) / "evidence-index.json"),
+                                 bytes=2, sha256=hashlib.sha256(b"{}").hexdigest()))
+                  validate = hss_collection.receipt_complete
+                  self.assertTrue(validate(request, worker, measured["pid"], "completed", 0, True))
+                  negatives = {}
+                  for field, value in (("pid", measured["pid"] + 1), ("identity", "foreign"),
+                                       ("module_sha256", "foreign"), ("deadline", request["deadline"] + 1)):
+                      with self.assertRaises(ValueError):
+                          validate(request, dict(worker, **{field: value}), measured["pid"], "completed", 0, True)
+                      negatives[field] = "rejected"
+                  for name, status, rc, cleanup in (
+                          ("forged_timeout", measured["status"], measured["rc"], measured["cleanup_complete"]),
+                          ("nonzero_exit", "completed", 1, True),
+                          ("cleanup_failed", "completed", 0, False),
+                          ("cleanup_unknown", "completed", 0, None)):
+                      self.assertFalse(validate(request, worker, measured["pid"], status, rc, cleanup))
+                      negatives[name] = "incomplete"
+                  self.assertFalse(validate(request, dict(worker, error="partial"),
+                                            measured["pid"], "completed", 0, True))
+                  negatives["worker_error"] = "incomplete"
+                  with self.assertRaises(ValueError):
+                      validate(request, dict(worker, index=dict(worker["index"], path="foreign")),
+                               measured["pid"], "completed", 0, True)
+                  negatives["index_path"] = "rejected"
+                  OBSERVATIONS[self._testMethodName] = dict(cases=records, receipt_negatives=negatives)
 
           def slot_case(stage):
               directory = ROOT / stage
