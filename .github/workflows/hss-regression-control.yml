@@ -41,9 +41,9 @@ jobs:
     env:
       VARIANT_NAME: ${{ matrix.variant }}
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: 258d662bd1b18a693afca243a5f7ecc1950da393
+      CANDIDATE_SHA: c14209c263730dc467d6a6ee81200db700bb07d8
       CHECK_BASE_SHA: f9d4c2e78f4bed10f732a75f04484856416fe5a1
-      CANDIDATE_TREE: 1549961263260e74727447a446561a1deb48d34d
+      CANDIDATE_TREE: 0038f211050c2dc51251fb224077fb4c4b636b43
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
@@ -72,7 +72,7 @@ jobs:
           printf '%s\n' bootstrap checkout prepare dependencies feature-list pinned-python black-version \
             fixture-python-style fixtures mutate fallback-version build binaries namespace environment runtime tests http-name http-name-runtime collect \
             > "$EVIDENCE/planned-phases.txt"
-          for commit in 258d662bd1b18a693afca243a5f7ecc1950da393; do
+          for commit in c14209c263730dc467d6a6ee81200db700bb07d8; do
             printf 'style-%s\napi-%s\nmessage-%s\n' "$commit" "$commit" "$commit" >> "$EVIDENCE/planned-phases.txt"
           done
           {
@@ -972,8 +972,8 @@ jobs:
           TEST = "test/asf/test_http_static.py"
           FIXTURE = "src/plugins/http_static/test_lifetime_fixtures.py"
           HTTP_TEST = "test/asf/test_http.py"
-          TEST_BLOBS = {TEST: "95e44ccdc1f9c3de3b53e1ee492c7e8573bdc9f8",
-                        FIXTURE: "9db639142e08c58b6fa249f4b1cca22496344f24",
+          TEST_BLOBS = {TEST: "cbfcbeef59bf45226a92046b4ee0ed1e4df87572",
+                        FIXTURE: "07057eac53e0adce8e029585e42856c34f7d6c49",
                         HTTP_TEST: "0a7353040c8323e3ec2f4500d2ce72c1f2a94934"}
           CLASSES = ("TestHttpStaticCli", "TestHttpStaticCliWorker")
           RECIPES = {
