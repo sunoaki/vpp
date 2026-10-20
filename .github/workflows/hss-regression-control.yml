@@ -1496,7 +1496,7 @@ jobs:
               header = "   Count                  Node                              Reason               Severity \n"
               benign = re.compile(r" +[1-9][0-9]* +af-packet-input +timed out block +error +\n")
               row = re.compile(r" +[0-9]+ +[a-zA-Z0-9_-]+ {2,}[a-zA-Z0-9][a-zA-Z0-9 _/-]*? {2,}"
-                               r"(?:error|warning|info) +\n")
+                               r"(?:error|warning|warn|info) +\n")
               replies = {}
               for event in events:
                   if event["kind"] == "cli_reply" and event.get("command") == "show error" and event.get("retval") == 0:
