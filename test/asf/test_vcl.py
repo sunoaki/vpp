@@ -1703,8 +1703,8 @@ class CTListenerIdentityTestCase(VppAsfTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if config.debug and config.debug.lower() == "attach":
-            raise unittest.SkipTest("CT listener fixture requires its own VPP process")
+        if config.running_vpp or (config.debug and config.debug.lower() == "attach"):
+            raise unittest.SkipTest("CT listener fixture requires a dedicated VPP process")
         cls.extra_vpp_config = ["session { poll-main }"]
         super().setUpClass()
 
