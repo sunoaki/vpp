@@ -1584,6 +1584,58 @@ jobs:
                                   "Missing real read-error recovery witness")
                   require(valid_paths[0] == valid_paths[1], "Read-error paths belong to different fixtures")
 
+          def quic_evidence(events):
+              listing = "show session listeners quic verbose 2"
+              add = "http static listener add uri quic://10.10.1.2:8087 url-handlers http3"
+              delete = "http static listener del uri quic://10.10.1.2:8087 http3"
+              for cls in CLASSES:
+                  test = f"test_http_static.{cls}.test_http_static_listener_http3_identity"
+                  active = test_interval(events, test)
+                  operations = [event for event in active if
+                                (event["kind"] == "cli" and event["command"].startswith(
+                                    ("show session listeners quic", "show session thread ",
+                                     "http static listener add uri quic://"))) or
+                                (event["kind"] == "cli_reply" and event["command"].startswith(
+                                    "http static listener del uri quic://"))]
+                  relevant = [event for event in active if event["kind"] in ("cli", "cli_reply") and
+                              event["command"].startswith(("show session listeners quic", "show session thread ",
+                                  "http static listener add uri quic://", "http static listener del uri quic://"))]
+                  require(len(operations) == 11 and len(relevant) == 20 and
+                          all(left["seq"] < right["seq"] for left, right in zip(relevant, relevant[1:])),
+                          "Incomplete or duplicate QUIC identity queries")
+                  for event in operations:
+                      if event["kind"] == "cli_reply":
+                          require(event["command"] == delete and event["retval"] == 0,
+                                  "QUIC listener deletion failed")
+                          continue
+                      paired = [reply for reply in active if reply["kind"] == "cli_reply" and
+                                reply["pid"] == event["pid"] and reply["seq"] + 1 == event["seq"] and
+                                reply["command"] == event["command"]]
+                      require(len(paired) == 1 and paired[0]["retval"] == 0 and
+                              paired[0]["reply"] == event["reply"], "QUIC query reply provenance differs")
+                  require(operations[0]["command"] == listing, "Missing QUIC listener baseline")
+                  def identities(reply):
+                      found = re.findall(r"\[(\d+):(\d+)\].*\[Q\]", reply)
+                      require(len(found) == len(set(found)) == reply.count("[Q]"),
+                              "Ambiguous QUIC listener identities")
+                      return set(found)
+                  baseline = identities(operations[0]["reply"])
+                  for offset in (1, 6):
+                      created, listed, details, deleted, remaining = operations[offset:offset + 5]
+                      require(created["command"] == add and listed["command"] == remaining["command"] == listing and
+                              deleted["command"] == delete, "QUIC listener operation order differs")
+                      current = identities(listed["reply"])
+                      added = current - baseline
+                      require(baseline <= current and len(added) == 1, "Missing unique added QUIC listener")
+                      thread, index = next(iter(added))
+                      require(details["command"] == f"show session thread {thread} index {index}" and
+                              re.search(r"\bh3\b", details["reply"]) is not None,
+                              "Missing added QUIC listener ALPN evidence")
+                      require(identities(remaining["reply"]) == baseline, "QUIC listener removal differs from baseline")
+                  successes = [event for event in active if event["kind"] == "addSuccess" and event["test"] == test]
+                  require(len(successes) == 1 and operations[-1]["seq"] < successes[0]["seq"],
+                          "QUIC identity queries did not precede test success")
+
           def validate(events, console, rc, expected, variant, logs):
               starts, stops, complete, wanted = execution_evidence(events, console, expected, variant, logs)
               subs = [event for event in events if event["kind"] == "addSubTest"]
@@ -1645,9 +1697,7 @@ jobs:
                       sequence = [event["helper"] for event in helpers]
                       require(sequence == ["_client", "_response", "_refused"] * 8,
                               "HTTP200/delete/refusal sequence differs")
-                  require(any(event["kind"] == "cli" and event["command"] == "show session listeners quic verbose 2"
-                              and "[Q]" in event["reply"] and "h3" in event["reply"] for event in events),
-                          "No real QUIC listener and ALPN evidence")
+                  quic_evidence(events)
               else:
                   require(rc > 0 and rc != 124, "Restored command unexpectedly passed or timed out")
                   require(collections.Counter(event["test"] for event in outcomes) == wanted and
@@ -2105,6 +2155,73 @@ jobs:
               rejects_http(events, console=marker)
               rejects_http(events, raw_logs=logs + marker)
           print(f"HTTP name fixtures passed: exact paired eight PASS replies; {rejected} invalid inputs rejected")
+          events = []
+          listing = "show session listeners quic verbose 2"
+          add = "http static listener add uri quic://10.10.1.2:8087 url-handlers http3"
+          delete = "http static listener del uri quic://10.10.1.2:8087 http3"
+          for worker, cls in enumerate(control["CLASSES"]):
+              test = f"test_http_static.{cls}.test_http_static_listener_http3_identity"
+              pid = worker + 1
+              events.append(dict(kind="startTest", pid=pid, seq=len(events) + 1, test=test))
+              def query(command, reply):
+                  events.append(dict(kind="cli_reply", pid=pid, seq=len(events) + 1,
+                                     command=command, reply=reply, retval=0))
+                  events.append(dict(kind="cli", pid=pid, seq=len(events) + 1, command=command, reply=reply))
+              query(listing, "[0:2][Q] baseline\n")
+              for repeat in range(2):
+                  query(add, "")
+                  query(listing, "[0:2][Q] baseline\n[1:5][Q] http\n")
+                  query("show session thread 1 index 5", "QUIC listener ALPN: h3\n")
+                  events.append(dict(kind="cli_reply", pid=pid, seq=len(events) + 1,
+                                     command=delete, reply="", retval=0))
+                  query(listing, "[0:2][Q] baseline\n")
+              events.append(dict(kind="addSuccess", pid=pid, seq=len(events) + 1, test=test))
+              events.append(dict(kind="stopTest", pid=pid, seq=len(events) + 1, test=test))
+          quic = control["quic_evidence"]
+          quic(events)
+          rejected = 0
+          def rejects_quic(changed):
+              global rejected
+              try:
+                  quic(changed)
+              except AssertionError:
+                  rejected += 1
+              else:
+                  raise AssertionError("Invalid QUIC identity evidence was accepted")
+          for position, event in enumerate(events):
+              if event["kind"] not in ("cli", "cli_reply"):
+                  continue
+              rejects_quic(events[:position] + events[position + 1:])
+              rejects_quic(events[:position] + [copy.deepcopy(event)] + events[position:])
+          for command, key, value in (("show session thread 1 index 5", "command", "show session thread 2 index 5"),
+                                      ("show session thread 1 index 5", "command", "show session thread 1 index 6"),
+                                      ("show session thread 1 index 5", "reply", "unrelated http/1.1"),
+                                      (listing, "retval", -1), (delete, "retval", -1),
+                                      (add, "pid", 9), (add, "seq", 0)):
+              changed = copy.deepcopy(events)
+              next(event for event in changed if event["kind"] == "cli_reply" and
+                   event["command"] == command)[key] = value
+              rejects_quic(changed)
+          for replacement in ("[0:2][Q] baseline\n[1:6][Q] http\n", "[1:5][Q] http\n",
+                              "[0:2][Q] baseline\n[1:5][Q] http\n[1:5][Q] duplicate\n"):
+              changed = copy.deepcopy(events)
+              for event in changed:
+                  if event.get("command") == listing and "[1:5]" in event["reply"]:
+                      event["reply"] = replacement
+              rejects_quic(changed)
+          changed = copy.deepcopy(events)
+          for event in changed:
+              if event.get("command") == "show session thread 1 index 5":
+                  event["reply"] = "http/1.1"
+          changed.append(dict(kind="cli", pid=99, seq=999, command="unrelated", reply="h3"))
+          rejects_quic(changed)
+          changed = copy.deepcopy(events)
+          changed[-3]["seq"] = changed[-2]["seq"] + 1
+          rejects_quic(changed)
+          changed = copy.deepcopy(events)
+          changed[-4]["reply"] = changed[-3]["reply"] = "[0:2][Q] baseline\n[1:5][Q] retained\n"
+          rejects_quic(changed)
+          print(f"QUIC fixtures passed: both worker classes and two exact listener iterations; {rejected} invalid inputs rejected")
           PY
 
       - name: Restore narrow source field and identify build tree
