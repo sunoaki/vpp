@@ -1495,18 +1495,27 @@ typedef struct
 } hss_destroy_ctx_t;
 
 static hss_destroy_ctx_t ***hss_pending_destroys;
+#if CLIB_DEBUG > 0
+static u32 hss_async_pending_detaches;
+#endif
 
 static void
 hss_detach_rpc (void *arg)
 {
   hss_destroy_ctx_t *ctx = *(hss_destroy_ctx_t **) arg;
   vnet_app_detach_args_t da = { .app_index = ctx->app_index, .api_client_index = ~0 };
+  int rv;
 
   ASSERT (vlib_thread_is_main_w_barrier ());
-  if (vnet_application_detach (&da))
+  rv = vnet_application_detach (&da);
+  if (rv)
     clib_warning ("failed to detach http_static app %u", ctx->app_index);
   vnet_app_del_cert_key_pair (ctx->ckpair_index);
   clib_mem_free (ctx);
+#if CLIB_DEBUG > 0
+  if (!rv)
+    hss_async_pending_detaches--;
+#endif
 }
 
 static int
@@ -1609,6 +1618,9 @@ hss_destroy (vlib_main_t *vm)
   hsm->app_index = ~0;
   hsm->is_init = 0;
 
+#if CLIB_DEBUG > 0
+  hss_async_pending_detaches++;
+#endif
   /* The barrier serializes publication with worker consumption and vector growth. */
   vec_validate (hss_pending_destroys, vec_len (hsm->sessions) - 1);
   for (i = 0; i < vec_len (hsm->sessions); i++)
@@ -1763,6 +1775,53 @@ hss_async_recover (hss_async_record_t *record)
   return 0;
 }
 
+static u32
+hss_async_destroy_count (void)
+{
+  u32 i, count = 0;
+
+  for (i = 0; i < vec_len (hss_pending_destroys); i++)
+    count += vec_len (hss_pending_destroys[i]);
+  return count;
+}
+
+static u32
+hss_async_owner_count (void)
+{
+  u32 i, count = 0;
+
+  for (i = 0; i < vec_len (hss_main.sessions); i++)
+    count += pool_elts (hss_main.sessions[i]);
+  for (i = 0; i < vec_len (hss_pending_accepts); i++)
+    count += vec_len (hss_pending_accepts[i]);
+  return count;
+}
+
+static clib_error_t *
+hss_async_abort_unconsumed (void)
+{
+  hss_async_record_t *record;
+  u32 i;
+
+  ASSERT (vlib_thread_is_main_w_barrier ());
+  for (i = 0; i < HSS_ASYNC_RECORDS; i++)
+    {
+      record = &hss_async_test.records[i];
+      if (record->armed && (record->enter_seq || record->async_seq || record->handle ||
+                            record->active || record->pending))
+        return clib_error_return (0, "async abort refuses an associated record");
+    }
+  for (i = 0; i < HSS_ASYNC_RECORDS; i++)
+    {
+      record = &hss_async_test.records[i];
+      if (!record->armed)
+        continue;
+      vec_free (record->response);
+      record->armed = 0;
+    }
+  return 0;
+}
+
 static void
 hss_async_status (vlib_main_t *vm)
 {
@@ -1771,9 +1830,12 @@ hss_async_status (vlib_main_t *vm)
   hss_listener_t *listener;
   u32 i;
 
-  vlib_cli_output (vm, "async-ledger enabled %u overflow %u live %u baseline %u",
+  vlib_cli_output (vm, "async-ledger enabled %u overflow %u live %u baseline %u "
+                       "destroys %u detaches %u owners %u",
                    hss_async_test.enabled, hss_async_test.overflow,
-                   pool_elts (hss_main.listeners), hss_async_test.baseline);
+                   pool_elts (hss_main.listeners), hss_async_test.baseline,
+                   hss_async_destroy_count (), hss_async_pending_detaches,
+                   hss_async_owner_count ());
   for (i = 0; i < HSS_ASYNC_RECORDS; i++)
     {
       record = &hss_async_test.records[i];
@@ -1812,12 +1874,8 @@ hss_async_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command
     {
       if (hss_async_test.enabled || pool_elts (hss_main.listeners) || vlib_num_workers () != 1)
         return clib_error_return (0, "async start requires idle listeners and one worker");
-      for (i = 0; i < vec_len (hss_pending_destroys); i++)
-        if (vec_len (hss_pending_destroys[i]))
-          return clib_error_return (0, "async start requires completed destroys");
-      for (i = 0; i < vec_len (hss_main.sessions); i++)
-        if (pool_elts (hss_main.sessions[i]))
-          return clib_error_return (0, "async start requires no sessions");
+      if (hss_async_destroy_count () || hss_async_pending_detaches || hss_async_owner_count ())
+        return clib_error_return (0, "async start requires completed destroys and owners");
       clib_memset (&hss_async_test, 0, sizeof (hss_async_test));
       hss_async_test.enabled = 1;
       hss_async_test.baseline = pool_elts (hss_main.listeners);
@@ -1830,6 +1888,8 @@ hss_async_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command
       hss_async_status (vm);
       return 0;
     }
+  if (unformat (input, "abort"))
+    return hss_async_abort_unconsumed ();
   if (unformat (input, "clear"))
     {
       if (pool_elts (hss_main.listeners) != hss_async_test.baseline)
@@ -1841,9 +1901,8 @@ hss_async_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command
       for (i = 0; i < hss_async_test.listener_count; i++)
         if (!hss_async_test.listeners[i].pool_puts)
           return clib_error_return (0, "async clear requires completed listener frees");
-      for (i = 0; i < vec_len (hss_pending_destroys); i++)
-        if (vec_len (hss_pending_destroys[i]))
-          return clib_error_return (0, "async clear requires completed destroys");
+      if (hss_async_destroy_count () || hss_async_pending_detaches || hss_async_owner_count ())
+        return clib_error_return (0, "async clear requires completed destroys and owners");
       hss_async_test.enabled = 0;
       return 0;
     }
@@ -1905,7 +1964,7 @@ hss_async_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command
 VLIB_CLI_COMMAND (hss_async_command, static) = {
   .path = "test http static async",
   .short_help = "test http static async start|status|arm <token> listener <index> body <body>|"
-                "release <token>|recover <token>|clear",
+                "release <token>|recover <token>|abort|clear",
   .function = hss_async_command_fn,
 };
 
