@@ -385,6 +385,34 @@ __clib_export void app_worker_add_event_custom (app_worker_t *app_wrk,
 __clib_export int app_wrk_flush_wrk_events (app_worker_t *app_wrk,
 					    clib_thread_index_t thread_index);
 void app_worker_del_all_events (app_worker_t *app_wrk);
+#if CLIB_DEBUG > 0
+typedef enum
+{
+  APP_ACCEPT_GATE_HEAD,
+  APP_ACCEPT_GATE_CALLBACK,
+  APP_ACCEPT_GATE_RX_READY,
+  APP_ACCEPT_GATE_ADVANCED,
+} app_accept_gate_stage_t;
+
+typedef struct
+{
+  session_handle_t handle;
+  u32 app_index;
+  u32 app_worker_index;
+  u32 thread_index;
+  u32 head;
+  u32 queued;
+  u32 protocol;
+  u32 rx_ready;
+  u32 builtin;
+  u32 event_type;
+  int callback_result;
+  app_accept_gate_stage_t stage;
+} app_accept_gate_event_t;
+
+typedef int (*app_accept_gate_fn_t) (const app_accept_gate_event_t *event);
+__clib_export int app_worker_set_accept_gate (app_accept_gate_fn_t gate, u8 enable);
+#endif
 __clib_export segment_manager_t *app_worker_get_listen_segment_manager (app_worker_t *,
 									session_t *);
 __clib_export segment_manager_t *app_worker_get_connect_segment_manager (app_worker_t *);
