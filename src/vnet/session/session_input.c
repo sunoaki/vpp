@@ -6,6 +6,20 @@
 #include <vnet/session/application.h>
 #include <vnet/session/application_local.h>
 
+#if CLIB_DEBUG > 0
+static app_accept_gate_fn_t app_accept_gate;
+
+int
+app_worker_set_accept_gate (app_accept_gate_fn_t gate, u8 enable)
+{
+  ASSERT (vlib_thread_is_main_w_barrier ());
+  if (!gate || (enable ? app_accept_gate != 0 : app_accept_gate != gate))
+    return -1;
+  app_accept_gate = enable ? gate : 0;
+  return 0;
+}
+#endif
+
 static inline int
 mq_try_lock (svm_msg_q_t *mq)
 {
@@ -106,6 +120,30 @@ app_worker_flush_events_inline (app_worker_t *app_wrk,
   for (i = 0; i < n_evts; i++)
     {
       evt = clib_fifo_head (app_wrk->wrk_evts[thread_index]);
+#if CLIB_DEBUG > 0
+      app_accept_gate_event_t gate_event = {};
+      u8 observe_accept = is_builtin && app_accept_gate &&
+			  evt->event_type == SESSION_CTRL_EVT_ACCEPTED;
+      if (observe_accept)
+	{
+	  s = session_get (evt->session_index, thread_index);
+	  gate_event = (app_accept_gate_event_t) {
+	    .handle = session_handle (s),
+	    .app_index = app_wrk->app_index,
+	    .app_worker_index = app_wrk->wrk_index,
+	    .thread_index = thread_index,
+	    .head = clib_fifo_head_index (app_wrk->wrk_evts[thread_index]),
+	    .queued = clib_fifo_elts (app_wrk->wrk_evts[thread_index]),
+	    .protocol = session_get_transport_proto (s),
+	    .rx_ready = !!(s->flags & SESSION_F_RX_READY),
+	    .builtin = is_builtin,
+	    .event_type = evt->event_type,
+	    .stage = APP_ACCEPT_GATE_HEAD,
+	  };
+	  if (app_accept_gate (&gate_event))
+	    break;
+	}
+#endif
       if (!is_builtin)
 	{
 	  ring_index = mq_event_ring_index (evt->event_type);
@@ -157,7 +195,16 @@ app_worker_flush_events_inline (app_worker_t *app_wrk,
 	case SESSION_CTRL_EVT_ACCEPTED:
 	  s = session_get (evt->session_index, thread_index);
 	  old_state = s->session_state;
-	  if (app->cb_fns.session_accept_callback (s))
+	  rv = app->cb_fns.session_accept_callback (s);
+#if CLIB_DEBUG > 0
+	  if (observe_accept)
+	    {
+	      gate_event.stage = APP_ACCEPT_GATE_CALLBACK;
+	      gate_event.callback_result = rv;
+	      app_accept_gate (&gate_event);
+	    }
+#endif
+	  if (rv)
 	    {
 	      session_detach_app (s);
 	      break;
@@ -184,6 +231,14 @@ app_worker_flush_events_inline (app_worker_t *app_wrk,
 		  /* regrab session as application might've grown the pool */
 		  s = session_get (evt->session_index, thread_index);
 		  s->flags |= SESSION_F_RX_READY;
+#if CLIB_DEBUG > 0
+		  if (observe_accept)
+		    {
+		      gate_event.stage = APP_ACCEPT_GATE_RX_READY;
+		      gate_event.rx_ready = 1;
+		      app_accept_gate (&gate_event);
+		    }
+#endif
 		  if (!session_has_transport (s))
 		    {
 		      /* Special handling for cut-through sessions for builtin
@@ -335,6 +390,15 @@ app_worker_flush_events_inline (app_worker_t *app_wrk,
 	  break;
 	}
       clib_fifo_advance_head (app_wrk->wrk_evts[thread_index], 1);
+#if CLIB_DEBUG > 0
+      if (observe_accept)
+	{
+	  gate_event.stage = APP_ACCEPT_GATE_ADVANCED;
+	  gate_event.head = clib_fifo_head_index (app_wrk->wrk_evts[thread_index]);
+	  gate_event.queued = clib_fifo_elts (app_wrk->wrk_evts[thread_index]);
+	  app_accept_gate (&gate_event);
+	}
+#endif
     }
 
   if (!is_builtin)

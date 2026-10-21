@@ -1017,6 +1017,56 @@ typedef struct
 
 static hss_pending_accept_t **hss_pending_accepts;
 
+#if CLIB_DEBUG > 0
+static struct
+{
+  session_handle_t handle;
+  u64 epoch;
+  u64 held;
+  u64 released;
+  u64 callback;
+  u64 ready;
+  u64 advanced;
+  u64 captured;
+  u64 transferred;
+  u64 cleaned;
+  u64 ack;
+  u32 token;
+  u32 enabled;
+  u32 overflow;
+  u32 generation;
+  u32 app;
+  u32 app_worker;
+  u32 listener;
+  u32 thread;
+  u32 protocol;
+  u32 builtin;
+  u32 event_type;
+  u32 head;
+  u32 head_after;
+  u32 enqueued;
+  u32 callbacks;
+  u32 advances;
+  u32 rx_ready;
+  u32 captures;
+  u32 transfers;
+  u32 refs_before;
+  u32 refs_after;
+  u32 cleanups;
+  u32 release_pending;
+  u32 drain_attempts;
+} hss_accept_test;
+
+static int
+hss_accept_test_matches (session_t *ts)
+{
+  return hss_accept_test.enabled && hss_accept_test.held &&
+	 session_handle (ts) == hss_accept_test.handle &&
+	 ts->app_wrk_index == hss_accept_test.app_worker &&
+	 ts->thread_index == hss_accept_test.thread;
+}
+#endif
+
 static hss_pending_accept_t *
 hss_pending_accept_get (session_t *ts)
 {
@@ -1100,6 +1150,14 @@ hss_preserve_pending_accepts (hss_listener_t *l)
 	    pending.app_wrk_index = app_wrk->wrk_index;
 	    clib_atomic_add_fetch (&l->ref_count, 1);
 	    vec_add1 (hss_pending_accepts[i], pending);
+#if CLIB_DEBUG > 0
+	    if (hss_accept_test_matches (ts))
+	      {
+		if (++hss_accept_test.captures != 1 || l->l_index != hss_accept_test.listener)
+		  hss_accept_test.overflow = 1;
+		hss_accept_test.captured = hss_async_sequence ();
+	      }
+#endif
 	  }
     }
   return 0;
@@ -1118,11 +1176,27 @@ hss_ts_accept_callback (session_t *ts)
   if (!hss_listener_get (listener_index))
     return -1;
   pending = hss_pending_accept_get (ts);
+#if CLIB_DEBUG > 0
+  if (hss_accept_test_matches (ts))
+    {
+      hss_accept_test.refs_before = hss_listener_get (listener_index)->ref_count;
+      if (!pending || listener_index != hss_accept_test.listener ||
+	  ++hss_accept_test.transfers != 1)
+	hss_accept_test.overflow = 1;
+    }
+#endif
   if (pending)
     vec_del1 (hss_pending_accepts[ts->thread_index],
 	      pending - hss_pending_accepts[ts->thread_index]);
   else
     clib_atomic_add_fetch (&hss_listener_get (listener_index)->ref_count, 1);
+#if CLIB_DEBUG > 0
+  if (hss_accept_test_matches (ts))
+    {
+      hss_accept_test.refs_after = hss_listener_get (listener_index)->ref_count;
+      hss_accept_test.transferred = hss_async_sequence ();
+    }
+#endif
   hs = hss_session_alloc (ts->thread_index);
 
   hs->vpp_session_index = ts->session_index;
@@ -1188,6 +1262,11 @@ hss_session_cleanup (hss_session_t *hs)
   u32 l_index = hs->listener_index;
 #if CLIB_DEBUG > 0
   u32 record_index = hss_async_cleanup_begin (hs);
+  u8 accept_record = hss_accept_test.enabled && hss_accept_test.held &&
+		     hs->vpp_session_handle == hss_accept_test.handle &&
+		     hs->app_index == hss_accept_test.app && l_index == hss_accept_test.listener;
+  if (accept_record && ++hss_accept_test.cleanups != 1)
+    hss_accept_test.overflow = 1;
 #endif
 
   if (hs->cache_pool_index != ~0)
@@ -1204,6 +1283,8 @@ hss_session_cleanup (hss_session_t *hs)
   hss_listener_release (l_index);
 #if CLIB_DEBUG > 0
   hss_async_cleanup_done (record_index);
+  if (accept_record)
+    hss_accept_test.cleaned = hss_async_sequence ();
 #endif
 }
 
@@ -1632,6 +1713,265 @@ hss_destroy (vlib_main_t *vm)
 }
 
 #if CLIB_DEBUG > 0
+static u32
+hss_accept_capture_count (void)
+{
+  hss_pending_accept_t *pending;
+  u32 count = 0;
+
+  if (hss_accept_test.thread < vec_len (hss_pending_accepts))
+    vec_foreach (pending, hss_pending_accepts[hss_accept_test.thread])
+      if (pending->handle == hss_accept_test.handle &&
+	  pending->app_index == hss_accept_test.app &&
+	  pending->app_wrk_index == hss_accept_test.app_worker)
+	count++;
+  return count;
+}
+
+static u32
+hss_accept_owner_count (void)
+{
+  hss_session_t *session;
+  u32 count = hss_accept_capture_count ();
+
+  if (hss_accept_test.thread < vec_len (hss_main.sessions))
+    pool_foreach (session, hss_main.sessions[hss_accept_test.thread])
+      if (session->vpp_session_handle == hss_accept_test.handle &&
+	  session->app_index == hss_accept_test.app)
+	count++;
+  return count;
+}
+
+static int
+hss_accept_gate (const app_accept_gate_event_t *event)
+{
+  session_t *session;
+
+  if (!hss_accept_test.enabled || event->app_index != hss_accept_test.app ||
+      event->app_worker_index != hss_accept_test.app_worker || event->thread_index != 1)
+    return 0;
+  if (!hss_accept_test.held)
+    {
+      if (hss_accept_test.released || event->stage != APP_ACCEPT_GATE_HEAD)
+	return 0;
+      session = session_get_from_handle_if_valid (event->handle);
+      if (!session || hss_accept_listener_index (session) != hss_accept_test.listener)
+	return 0;
+      if (event->protocol != TRANSPORT_PROTO_HTTP || !event->builtin ||
+	  event->event_type != SESSION_CTRL_EVT_ACCEPTED ||
+	  session->app_wrk_index != hss_accept_test.app_worker ||
+	  session->thread_index != hss_accept_test.thread)
+	{
+	  hss_accept_test.overflow = 1;
+	  return 0;
+	}
+      hss_accept_test.handle = event->handle;
+      hss_accept_test.head = event->head;
+      hss_accept_test.protocol = event->protocol;
+      hss_accept_test.builtin = event->builtin;
+      hss_accept_test.event_type = event->event_type;
+      hss_accept_test.enqueued = event->queued != 0;
+      hss_accept_test.held = hss_async_sequence ();
+    }
+  if (event->handle != hss_accept_test.handle)
+    return 0;
+  if (event->protocol != TRANSPORT_PROTO_HTTP || !event->builtin ||
+      event->event_type != SESSION_CTRL_EVT_ACCEPTED || !hss_accept_test.enqueued)
+    hss_accept_test.overflow = 1;
+  switch (event->stage)
+    {
+    case APP_ACCEPT_GATE_HEAD:
+      if (event->head != hss_accept_test.head || event->rx_ready || !event->queued)
+	hss_accept_test.overflow = 1;
+      return !hss_accept_test.released;
+    case APP_ACCEPT_GATE_CALLBACK:
+      if (!hss_accept_test.released || event->callback_result ||
+	  ++hss_accept_test.callbacks != 1)
+	hss_accept_test.overflow = 1;
+      hss_accept_test.callback = hss_async_sequence ();
+      break;
+    case APP_ACCEPT_GATE_RX_READY:
+      if (!hss_accept_test.callback || !event->rx_ready || ++hss_accept_test.rx_ready != 1)
+	hss_accept_test.overflow = 1;
+      hss_accept_test.ready = hss_async_sequence ();
+      break;
+    case APP_ACCEPT_GATE_ADVANCED:
+      if (!hss_accept_test.ready || ++hss_accept_test.advances != 1)
+	hss_accept_test.overflow = 1;
+      hss_accept_test.head_after = event->head;
+      hss_accept_test.advanced = hss_async_sequence ();
+      break;
+    }
+  return 0;
+}
+
+static uword
+hss_accept_node_fn (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  app_worker_t *worker;
+
+  if (!hss_accept_test.enabled || !hss_accept_test.release_pending || vm->thread_index != 1)
+    return 0;
+  worker = app_worker_get_if_valid (hss_accept_test.app_worker);
+  if (!hss_accept_test.released)
+    hss_accept_test.released = hss_async_sequence ();
+  if (!worker || worker->app_index != hss_accept_test.app)
+    {
+      hss_accept_test.overflow = 1;
+      if (!hss_accept_owner_count ())
+	hss_accept_test.ack = hss_async_sequence ();
+      hss_accept_test.release_pending = 0;
+      return 0;
+    }
+  app_wrk_flush_wrk_events (worker, vm->thread_index);
+  if (clib_fifo_elts (worker->wrk_evts[vm->thread_index]))
+    {
+      if (++hss_accept_test.drain_attempts < 8)
+	vlib_node_set_interrupt_pending (vm, node->node_index);
+      else
+	{
+	  hss_accept_test.overflow = 1;
+	  hss_accept_test.release_pending = 0;
+	}
+      return 0;
+    }
+  if (hss_accept_capture_count () ||
+      (hss_accept_test.held && hss_accept_test.advances != 1))
+    hss_accept_test.overflow = 1;
+  hss_accept_test.ack = hss_async_sequence ();
+  hss_accept_test.release_pending = 0;
+  return 0;
+}
+
+VLIB_REGISTER_NODE (hss_accept_node, static) = {
+  .function = hss_accept_node_fn,
+  .name = "http-static-test-accepted",
+  .type = VLIB_NODE_TYPE_INPUT,
+  .state = VLIB_NODE_STATE_INTERRUPT,
+};
+
+static void
+hss_accept_status (vlib_main_t *vm)
+{
+  hss_async_listener_t *entry = 0;
+  hss_listener_t *listener;
+  app_worker_t *worker = app_worker_get_if_valid (hss_accept_test.app_worker);
+  u32 i, queued = 0, current_head = 0;
+
+  for (i = 0; i < hss_async_test.listener_count; i++)
+    if (hss_async_test.listeners[i].epoch == hss_accept_test.epoch)
+      entry = &hss_async_test.listeners[i];
+  listener = entry && !entry->pool_puts ? hss_listener_get (entry->index) : 0;
+  if (worker && worker->app_index == hss_accept_test.app)
+    {
+      queued = clib_fifo_elts (worker->wrk_evts[hss_accept_test.thread]);
+      current_head = clib_fifo_head_index (worker->wrk_evts[hss_accept_test.thread]);
+    }
+  vlib_cli_output (
+    vm,
+    "token %u enabled %u overflow %u epoch %llu generation %u app %u worker %u "
+    "listener %u thread %u handle %llu protocol %u builtin %u event %u enqueued %u "
+    "head %u current_head %u head_after %u held %llu captured %llu released %llu "
+    "transferred %llu callback %llu ready %llu advanced %llu ack %llu cleaned %llu "
+    "callbacks %u advances %u rx_ready %u captures %u transfers %u refs_before %u "
+    "refs_after %u cleanups %u pending %u queued %u retained %u refs %u retiring %u "
+    "freed %llu poolput %u",
+    hss_accept_test.token, hss_accept_test.enabled,
+    hss_accept_test.overflow | hss_async_test.overflow, hss_accept_test.epoch,
+    hss_accept_test.generation, hss_accept_test.app, hss_accept_test.app_worker,
+    hss_accept_test.listener, hss_accept_test.thread, hss_accept_test.handle,
+    hss_accept_test.protocol, hss_accept_test.builtin, hss_accept_test.event_type,
+    hss_accept_test.enqueued, hss_accept_test.head, current_head, hss_accept_test.head_after,
+    hss_accept_test.held, hss_accept_test.captured, hss_accept_test.released,
+    hss_accept_test.transferred, hss_accept_test.callback, hss_accept_test.ready,
+    hss_accept_test.advanced, hss_accept_test.ack, hss_accept_test.cleaned,
+    hss_accept_test.callbacks, hss_accept_test.advances, hss_accept_test.rx_ready,
+    hss_accept_test.captures, hss_accept_test.transfers, hss_accept_test.refs_before,
+    hss_accept_test.refs_after, hss_accept_test.cleanups, hss_accept_test.release_pending,
+    queued, hss_accept_capture_count (), listener ? listener->ref_count : 0,
+    listener ? listener->retiring : 1, entry ? entry->free_seq : 0, entry ? entry->pool_puts : 0);
+}
+
+static clib_error_t *
+hss_accept_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  hss_async_listener_t *entry;
+  app_worker_t *worker;
+  u32 token, index;
+
+  ASSERT (vlib_thread_is_main_w_barrier ());
+  if (unformat (input, "start %u listener %u", &token, &index))
+    {
+      entry = hss_async_listener (index);
+      if (!token || hss_accept_test.enabled || vlib_num_workers () != 1 || !entry ||
+	  entry->app_index != hss_main.app_index || !hss_listener_get (index) ||
+	  hss_listener_get (index)->retiring)
+	return clib_error_return (0, "accepted start requires an idle record and active listener");
+      worker = application_get_default_worker (application_get (entry->app_index));
+      if (!worker || clib_fifo_elts (worker->wrk_evts[1]))
+	return clib_error_return (0, "accepted start requires an empty worker queue");
+      if (app_worker_set_accept_gate (hss_accept_gate, 1))
+	return clib_error_return (0, "accepted gate already registered");
+      clib_memset (&hss_accept_test, 0, sizeof (hss_accept_test));
+      hss_accept_test.token = token;
+      hss_accept_test.epoch = entry->epoch;
+      hss_accept_test.generation = entry->generation;
+      hss_accept_test.app = entry->app_index;
+      hss_accept_test.app_worker = worker->wrk_index;
+      hss_accept_test.listener = index;
+      hss_accept_test.thread = 1;
+      hss_accept_test.enabled = 1;
+      return 0;
+    }
+  if (!hss_accept_test.enabled)
+    return clib_error_return (0, "accepted gate disabled");
+  if (unformat (input, "identity listener %u", &index))
+    {
+      entry = hss_async_listener (index);
+      if (!entry || entry->app_index != hss_accept_test.app)
+	return clib_error_return (0, "accepted listener identity unavailable");
+      vlib_cli_output (vm, "listener %u epoch %llu generation %u app %u", entry->index,
+		       entry->epoch, entry->generation, entry->app_index);
+      return 0;
+    }
+  if (unformat (input, "status"))
+    {
+      hss_accept_status (vm);
+      return 0;
+    }
+  if (unformat (input, "release"))
+    {
+      if (hss_accept_test.release_pending)
+	return clib_error_return (0, "accepted release pending");
+      if (hss_accept_test.ack)
+	return 0;
+      hss_accept_test.release_pending = 1;
+      vlib_node_set_interrupt_pending (vlib_get_main_by_index (1), hss_accept_node.index);
+      return 0;
+    }
+  if (unformat (input, "clear"))
+    {
+      worker = app_worker_get_if_valid (hss_accept_test.app_worker);
+      if (!hss_accept_test.ack || hss_accept_test.release_pending ||
+	  hss_accept_owner_count () ||
+	  (worker && worker->app_index == hss_accept_test.app &&
+	   clib_fifo_elts (worker->wrk_evts[1])))
+	return clib_error_return (0, "accepted clear requires release and drain acknowledgement");
+      if (app_worker_set_accept_gate (hss_accept_gate, 0))
+	return clib_error_return (0, "accepted gate registration changed");
+      clib_memset (&hss_accept_test, 0, sizeof (hss_accept_test));
+      return 0;
+    }
+  return clib_error_return (0, "unknown accepted command");
+}
+
+VLIB_CLI_COMMAND (hss_accept_command, static) = {
+  .path = "test http static accepted",
+  .short_help = "test http static accepted start <token> listener <index>|"
+		"identity listener <index>|status|release|clear",
+  .function = hss_accept_command_fn,
+};
+
 static hss_url_handler_rc_t
 hss_async_handler (hss_url_handler_args_t *args)
 {
@@ -1890,6 +2230,8 @@ hss_async_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command
     return hss_async_abort_unconsumed ();
   if (unformat (input, "clear"))
     {
+      if (hss_accept_test.enabled)
+	return clib_error_return (0, "async clear requires accepted gate removal");
       if (pool_elts (hss_main.listeners) != hss_async_test.baseline)
 	return clib_error_return (0, "async clear requires baseline listeners");
       for (i = 0; i < HSS_ASYNC_RECORDS; i++)

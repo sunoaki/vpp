@@ -874,6 +874,240 @@ class TestHttpStaticCliWorker(TestHttpStaticCli):
 
     vpp_worker_count = 1
 
+    def _accepted_cli(self, command):
+        reply = self.vapi.cli_return_response(f"test http static accepted {command}")
+        self.assertEqual(reply.retval, 0, reply.reply)
+        return reply.reply
+
+    def _accepted_status(self):
+        output = self._accepted_cli("status")
+        fields = (
+            "token enabled overflow epoch generation app worker listener thread handle "
+            "protocol builtin event enqueued head current_head head_after held captured "
+            "released transferred callback "
+            "ready advanced ack cleaned callbacks advances rx_ready captures transfers "
+            "refs_before refs_after cleanups pending queued retained refs retiring freed poolput"
+        ).split()
+        parts = output.split()
+        self.assertEqual(parts[::2], fields, output)
+        return dict(zip(fields, map(int, parts[1::2])))
+
+    def _accepted_wait(self, field):
+        deadline = time.monotonic() + 10
+        while True:
+            record = self._accepted_status()
+            if record[field] or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        self.assertGreater(record[field], 0, record)
+        return record
+
+    def _accepted_assert_witness(self, record, identity, phase):
+        for field in (
+            "token",
+            "epoch",
+            "generation",
+            "app",
+            "worker",
+            "listener",
+            "handle",
+        ):
+            self.assertEqual(record[field], identity[field], (field, record, identity))
+        self.assertEqual(record["enabled"], 1, record)
+        self.assertEqual(record["overflow"], 0, record)
+        self.assertEqual(record["thread"], 1, record)
+        self.assertEqual(record["handle"] >> 32, 1, record)
+        self.assertEqual(record["protocol"], 7, record)
+        self.assertEqual(record["builtin"], 1, record)
+        self.assertEqual(record["event"], 11, record)
+        self.assertEqual(record["enqueued"], 1, record)
+        self.assertGreater(record["held"], 0, record)
+        self.assertEqual(record["head"], identity["head"], record)
+        if phase == "held":
+            for field in (
+                "released",
+                "transferred",
+                "callback",
+                "ready",
+                "advanced",
+                "ack",
+                "callbacks",
+                "advances",
+                "rx_ready",
+                "transfers",
+                "cleanups",
+            ):
+                self.assertEqual(record[field], 0, (field, record))
+            self.assertEqual(record["head_after"], 0, record)
+            self.assertEqual(record["current_head"], record["head"], record)
+            self.assertGreater(record["queued"], 0, record)
+            return
+        self.assertIn(phase, ("released", "closed"))
+        for field in ("callbacks", "advances", "rx_ready", "captures", "transfers"):
+            self.assertEqual(record[field], 1, (field, record))
+        self.assertEqual(record["refs_before"], 1, record)
+        self.assertEqual(record["refs_after"], 1, record)
+        self.assertNotEqual(record["head_after"], record["head"], record)
+        order = (
+            "held",
+            "captured",
+            "released",
+            "transferred",
+            "callback",
+            "ready",
+            "advanced",
+            "ack",
+        )
+        for before, after in zip(order, order[1:]):
+            self.assertLess(record[before], record[after], (before, after, record))
+        for field in ("pending", "queued", "retained"):
+            self.assertEqual(record[field], 0, (field, record))
+        if phase == "closed":
+            self.assertEqual(record["cleanups"], 1, record)
+            self.assertEqual(record["refs"], 0, record)
+            self.assertEqual(record["poolput"], 1, record)
+            self.assertLess(record["ack"], record["cleaned"], record)
+            self.assertLess(record["cleaned"], record["freed"], record)
+
+    def _accepted_client(self, held=False):
+        script = """
+import http.client, json, sys
+connection = http.client.HTTPConnection("10.10.1.2", 8093, timeout=15)
+connection.request("GET", "/file.txt")
+if sys.argv[1] == "held":
+    print(json.dumps({"requested": True}), flush=True)
+    if sys.stdin.readline().strip() != "response":
+        raise RuntimeError("accepted client response command missing")
+response = connection.getresponse()
+print(json.dumps({"status": response.status, "body": response.read().decode(),
+                  "server": response.getheader("Server"),
+                  "cache": response.getheader("Cache-Control")}), flush=True)
+for command in sys.stdin:
+    if command.strip() == "close":
+        break
+connection.close()
+"""
+        client = subprocess.Popen(
+            [
+                "ip",
+                "netns",
+                "exec",
+                self.ns_name,
+                sys.executable,
+                "-u",
+                "-c",
+                script,
+                "held" if held else "fresh",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self._accepted_clients.append(client)
+        if held:
+            self.assertEqual(self._response(client), {"requested": True})
+        return client
+
+    def _accepted_teardown(self):
+        if self._accepted_armed:
+            with self.subTest(cleanup="release accepted"):
+                self._accepted_cli("release")
+                self._accepted_wait("ack")
+        for client in self._accepted_clients:
+            with self.subTest(cleanup="stop accepted client"):
+                self._stop_client(client)
+        with self.subTest(cleanup="disable accepted server"):
+            reply = self.vapi.cli_return_response("http static server disable")
+            self.assertEqual(reply.retval, 0, reply.reply)
+        with self.subTest(cleanup="wait accepted owners"):
+            self._async_wait_idle()
+        if self._accepted_armed:
+            with self.subTest(cleanup="clear accepted gate"):
+                self._accepted_cli("clear")
+        with self.subTest(cleanup="clear accepted ledger"):
+            self._async_cli("clear")
+
+    def test_http_static_worker_accepted_identity(self):
+        """A real worker HTTP ACCEPTED retains its listener across URI reuse."""
+        if config.vpp_tag != "vpp_debug":
+            self.skipTest("worker ACCEPTED gate requires debug VPP")
+        old_directory = tempfile.TemporaryDirectory()
+        new_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(old_directory.cleanup)
+        self.addCleanup(new_directory.cleanup)
+        self._async_cli("start")
+        self._accepted_armed = False
+        self._accepted_clients = []
+        self.addCleanup(self._accepted_teardown)
+        for directory, body in (
+            (old_directory.name, "old accepted config"),
+            (new_directory.name, "new accepted config"),
+        ):
+            with open(os.path.join(directory, "file.txt"), "w") as output:
+                output.write(body)
+        uri = "tcp://10.10.1.2:8093"
+        self.vapi.cli("http static server")
+        self.vapi.cli(
+            f"http static listener add uri {uri} www-root {old_directory.name} max-age 123"
+        )
+        states, details = self._listener_states()
+        self.assertEqual(list(states.values()), [0], details)
+        old_index = next(iter(states))
+        self._accepted_cli(f"start 201 listener {old_index}")
+        self._accepted_armed = True
+        fields = ("listener", "epoch", "generation", "app")
+        parts = self._accepted_cli(f"identity listener {old_index}").split()
+        self.assertEqual(parts[::2], list(fields), parts)
+        old_identity = dict(zip(fields, map(int, parts[1::2])))
+        old_client = self._accepted_client(held=True)
+        held = self._accepted_wait("held")
+        identity = dict(held, token=201, **old_identity)
+        self._accepted_assert_witness(held, identity, "held")
+        self.vapi.cli(f"http static listener del uri {uri}")
+        captured = self._accepted_status()
+        self._accepted_assert_witness(captured, identity, "held")
+        self.assertEqual(captured["captures"], 1, captured)
+        self.assertEqual(captured["retained"], 1, captured)
+        self.assertEqual(captured["refs"], 1, captured)
+        self.assertEqual(captured["retiring"], 1, captured)
+        self.assertGreater(captured["captured"], captured["held"], captured)
+        self.vapi.cli(
+            f"http static listener add uri {uri} www-root {new_directory.name} max-age 456"
+        )
+        states, details = self._listener_states()
+        self.assertEqual(states.get(old_index), 1, details)
+        active = [index for index, retiring in states.items() if not retiring]
+        self.assertEqual(len(active), 1, details)
+        self.assertNotEqual(active[0], old_index, details)
+        parts = self._accepted_cli(f"identity listener {active[0]}").split()
+        self.assertEqual(parts[::2], list(fields), parts)
+        new_identity = dict(zip(fields, map(int, parts[1::2])))
+        self.assertNotEqual(new_identity["epoch"], old_identity["epoch"])
+        self.assertEqual(new_identity["app"], old_identity["app"])
+        self.assertEqual(new_identity["generation"], old_identity["generation"])
+        self._accepted_assert_witness(self._accepted_status(), identity, "held")
+        self._accepted_cli("release")
+        released = self._accepted_wait("ack")
+        self._accepted_assert_witness(released, identity, "released")
+        old = self._response(old_client, "response")
+        self.assertEqual(old["status"], 200, old)
+        self.assertEqual(old["body"], "old accepted config", old)
+        self.assertEqual(old["cache"], "max-age=123", old)
+        self.assertEqual(old["server"], f"http_static_server_{held['generation']}")
+        new_client = self._accepted_client()
+        new = self._response(new_client)
+        self.assertEqual(new["status"], 200, new)
+        self.assertEqual(new["body"], "new accepted config", new)
+        self.assertEqual(new["cache"], "max-age=456", new)
+        self.assertEqual(new["server"], old["server"], new)
+        self._stop_client(old_client)
+        closed = self._accepted_wait("freed")
+        self._accepted_assert_witness(closed, identity, "closed")
+        self._stop_client(new_client)
+        self.vapi.cli(f"http static listener del uri {uri}")
+        self._wait_released()
+
     def _async_cli(self, command):
         reply = self.vapi.cli_return_response(f"test http static async {command}")
         self.assertEqual(reply.retval, 0, reply.reply)
