@@ -1201,7 +1201,12 @@ hss_session_cleanup (hss_session_t *hs)
   vec_free (hs->target_query);
   vec_free (hs->rx_buff);
   hss_session_free (hs);
-  hss_listener_release (l_index);
+#if CLIB_DEBUG > 0
+  if (record_index != (u32) ~0 && hss_async_test.records[record_index].token == 101)
+    hss_async_test.records[record_index].omitted = 1;
+  else
+#endif
+    hss_listener_release (l_index);
 #if CLIB_DEBUG > 0
   hss_async_cleanup_done (record_index);
 #endif
