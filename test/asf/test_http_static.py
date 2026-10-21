@@ -884,10 +884,12 @@ class TestHttpStaticCliWorker(TestHttpStaticCli):
         lines = output.strip().splitlines()
         self.assertTrue(lines, output)
         self.assertRegex(
-            lines[0], r"^async-ledger enabled 1 overflow 0 live \d+ baseline \d+$"
+            lines[0],
+            r"^async-ledger enabled 1 overflow 0 live \d+ baseline \d+ "
+            r"destroys \d+ detaches \d+ owners \d+$",
         )
         header = lines[0].split()
-        summary = {header[index]: int(header[index + 1]) for index in (5, 7)}
+        summary = {header[index]: int(header[index + 1]) for index in range(5, 15, 2)}
         fields = (
             "token epoch generation app thread hs handle listener enter async send "
             "cancel cleanup sends cancels cleanups duplicate late pending owned tx "
@@ -921,10 +923,44 @@ class TestHttpStaticCliWorker(TestHttpStaticCli):
         self.assertEqual(record["vecfree"], 1, record)
         self.assertEqual(record["releases"], 2, record)
         self.assertEqual(record["recovery"], 0, record)
-        self.assertLess(record["cleanup"], record["freed"], record)
+        event = "cancel" if record["cancels"] else "send"
+        self.assertEqual(record["cancels"], int(event == "cancel"), record)
+        self.assertEqual(record["sends"], int(event == "send"), record)
+        order = ("enter", "async", event, "cleanup", "freed")
+        for field in (*order, "final"):
+            self.assertGreater(record[field], 0, record)
+        for before, after in zip(order, order[1:]):
+            self.assertLess(record[before], record[after], record)
         self.assertLess(record["final"], record["freed"], record)
         self.assertEqual(record["owned"], 0, record)
         self.assertEqual(record["pending"], 0, record)
+
+    def _async_wait_idle(self):
+        deadline = time.monotonic() + 10
+        while True:
+            summary, records = self._async_status()
+            if not any(summary[field] for field in ("destroys", "detaches", "owners")):
+                if not any(record["pending"] for record in records.values()):
+                    self._async_recover_omission(101)
+                    summary, records = self._async_status()
+                    if summary["live"] == summary["baseline"]:
+                        return
+            self.assertLess(time.monotonic(), deadline, (summary, records))
+            time.sleep(0.01)
+
+    def _async_teardown(self):
+        for client in self._async_clients:
+            with self.subTest(cleanup="stop client"):
+                self._stop_client(client)
+        with self.subTest(cleanup="abort unconsumed"):
+            self._async_cli("abort")
+        with self.subTest(cleanup="disable"):
+            reply = self.vapi.cli_return_response("http static server disable")
+            self.assertEqual(reply.retval, 0, reply.reply)
+        with self.subTest(cleanup="wait owners and destroys"):
+            self._async_wait_idle()
+        with self.subTest(cleanup="clear"):
+            self._async_cli("clear")
 
     def _async_recover_omission(self, token):
         _, records = self._async_status()
@@ -975,128 +1011,135 @@ connection.close()
             stderr=subprocess.PIPE,
             text=True,
         )
-        self.addCleanup(self._stop_client, client)
+        self._async_clients.append(client)
         self.assertEqual(self._response(client), {"requested": True})
         return client
+
+    def _async_sent_scenario(self, root, uri):
+        self.vapi.cli("http static server")
+        self.vapi.cli(
+            f"http static listener add uri {uri} url-handlers www-root {root} max-age 123"
+        )
+        states, _ = self._listener_states()
+        old_index = next(iter(states))
+        self._async_cli(f"arm 101 listener {old_index} body old-body")
+        client = self._async_client(8092)
+        waiting = self._async_wait(101, "async")
+        self.assertEqual(waiting["thread"], 1, waiting)
+        self.assertEqual(waiting["sends"], 0, waiting)
+        self.assertEqual(waiting["tx"], 0, waiting)
+        self.assertEqual(waiting["owned"], 1, waiting)
+        self.assertGreater(waiting["enter"], 0, waiting)
+        self.assertLess(waiting["enter"], waiting["async"], waiting)
+        self.vapi.cli(f"http static listener del uri {uri}")
+        self.vapi.cli(f"http static listener add uri {uri} www-root {root} max-age 456")
+        states, details = self._listener_states()
+        self.assertEqual(states[old_index], 1, details)
+        self.assertEqual(sorted(states.values()), [0, 1], details)
+        retained = self._async_status()[1][101]
+        self.assertEqual(retained["epoch"], waiting["epoch"], retained)
+        self.assertEqual(retained["refs"], 1, retained)
+        self._async_cli("release 101")
+        sent = self._async_wait(101, "send")
+        old = self._response(client)
+        self.assertEqual(old["status"], 200)
+        self.assertEqual(old["body"], "old-body")
+        self.assertEqual(old["cache"], "max-age=123")
+        self.assertEqual(old["server"], f"http_static_server_{sent['generation']}")
+        self._async_cli("release 101")
+        duplicate = self._async_wait(101, "duplicate")
+        self.assertEqual(duplicate["sends"], 1, duplicate)
+        fresh = self._client(8092, "/fresh.txt")
+        self._async_clients.append(fresh)
+        new = self._response(fresh)
+        self.assertEqual(new["status"], 200)
+        self.assertEqual(new["body"], "new-config")
+        self.assertEqual(new["cache"], "max-age=456")
+        self.assertEqual(new["server"], old["server"])
+        self._stop_client(client)
+        completed = self._async_wait(101, "cleanup")
+        if not completed["omitted"]:
+            completed = self._async_wait(101, "freed")
+        self._async_assert_freed(completed)
+        self._stop_client(fresh)
+        self.vapi.cli(f"http static listener del uri {uri}")
+        self._wait_released()
+
+    def _async_cancel_scenario(self, root, uri):
+        self.vapi.cli("http static server disable")
+        self._async_wait_idle()
+        self.vapi.cli(
+            f"http static server uri {uri} url-handlers www-root {root} max-age 789"
+        )
+        states, _ = self._listener_states()
+        cancel_index = next(iter(states))
+        self._async_cli(f"arm 102 listener {cancel_index} body canceled-body")
+        canceled_client = self._async_client(8092)
+        armed = self._async_wait(102, "async")
+        self.vapi.cli("http static server disable")
+        canceled = self._async_wait(102, "cleanup")
+        self.assertEqual(canceled["cancels"], 1, canceled)
+        self.assertEqual(canceled["sends"], 0, canceled)
+        self.assertEqual(canceled["owned"], 0, canceled)
+        self.assertGreater(canceled["enter"], 0, canceled)
+        self.assertLess(canceled["enter"], canceled["async"], canceled)
+        self.assertLess(canceled["async"], canceled["cancel"], canceled)
+        self.assertLess(canceled["cancel"], canceled["cleanup"], canceled)
+        self.vapi.cli(
+            f"http static server uri {uri} url-handlers www-root {root} max-age 987"
+        )
+        states, _ = self._listener_states()
+        next_index = next(index for index, retiring in states.items() if not retiring)
+        self._async_cli(f"arm 103 listener {next_index} body next-body")
+        next_client = self._async_client(8092)
+        next_waiting = self._async_wait(103, "async")
+        self.assertNotEqual(next_waiting["epoch"], armed["epoch"])
+        self.assertNotEqual(next_waiting["generation"], armed["generation"])
+        self.assertNotEqual(
+            (next_waiting["app"], next_waiting["epoch"], next_waiting["handle"]),
+            (armed["app"], armed["epoch"], armed["handle"]),
+        )
+        self._async_cli("release 102")
+        late = self._async_wait(102, "late")
+        self.assertEqual(late["sends"], 0, late)
+        untouched = self._async_status()[1][103]
+        self.assertEqual(untouched["sends"], 0, untouched)
+        self.assertEqual(untouched["owned"], 1, untouched)
+        self._async_cli("release 103")
+        self._async_wait(103, "send")
+        next_response = self._response(next_client)
+        self.assertEqual(next_response["status"], 200)
+        self.assertEqual(next_response["body"], "next-body")
+        self.assertEqual(next_response["cache"], "max-age=987")
+        self.assertEqual(
+            next_response["server"], f"http_static_server_{next_waiting['generation']}"
+        )
+        self._stop_client(canceled_client)
+        self._stop_client(next_client)
+        self.vapi.cli(f"http static listener del uri {uri}")
+        self._wait_released()
+        for token in (102, 103):
+            self._async_assert_freed(self._async_wait(token, "freed"))
 
     def test_http_static_async_release_cancel(self):
         """Worker HTTP ASYNC completion retains its listener and cancels safely."""
         if config.vpp_tag != "vpp_debug":
             self.skipTest("ASYNC lifecycle ledger requires debug VPP")
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = directory.name
         self._async_cli("start")
-        self.addCleanup(self._async_cli, "clear")
-        self.addCleanup(self.vapi.cli, "http static server disable")
-        with tempfile.TemporaryDirectory() as root:
-            with open(os.path.join(root, "fresh.txt"), "w") as output:
-                output.write("new-config")
-            uri = "tcp://10.10.1.2:8092"
-            self.vapi.cli("http static server")
-            self.vapi.cli(
-                f"http static listener add uri {uri} url-handlers www-root {root} max-age 123"
-            )
-            states, _ = self._listener_states()
-            old_index = next(iter(states))
-            self._async_cli(f"arm 101 listener {old_index} body old-body")
-            client = self._async_client(8092)
-            waiting = self._async_wait(101, "async")
-            self.assertEqual(waiting["thread"], 1, waiting)
-            self.assertEqual(waiting["sends"], 0, waiting)
-            self.assertEqual(waiting["tx"], 0, waiting)
-            self.assertEqual(waiting["owned"], 1, waiting)
-            self.assertLess(waiting["enter"], waiting["async"], waiting)
-            self.vapi.cli(f"http static listener del uri {uri}")
-            self.vapi.cli(
-                f"http static listener add uri {uri} www-root {root} max-age 456"
-            )
-            states, details = self._listener_states()
-            self.assertEqual(states[old_index], 1, details)
-            self.assertEqual(sorted(states.values()), [0, 1], details)
-            retained = self._async_status()[1][101]
-            self.assertEqual(retained["epoch"], waiting["epoch"], retained)
-            self.assertEqual(retained["refs"], 1, retained)
-            self._async_cli("release 101")
-            sent = self._async_wait(101, "send")
-            old = self._response(client)
-            self.assertEqual(old["status"], 200)
-            self.assertEqual(old["body"], "old-body")
-            self.assertEqual(old["cache"], "max-age=123")
-            self.assertEqual(old["server"], f"http_static_server_{sent['generation']}")
-            self._async_cli("release 101")
-            duplicate = self._async_wait(101, "duplicate")
-            self.assertEqual(duplicate["sends"], 1, duplicate)
-            fresh = self._client(8092, "/fresh.txt")
-            new = self._response(fresh)
-            self.assertEqual(new["status"], 200)
-            self.assertEqual(new["body"], "new-config")
-            self.assertEqual(new["cache"], "max-age=456")
-            self.assertEqual(new["server"], old["server"])
-            self._stop_client(client)
-            completed = self._async_wait(101, "cleanup")
-            try:
-                # Cleanup completion is the control witness, independent of polling for free.
-                if not completed["omitted"]:
-                    completed = self._async_wait(101, "freed")
-                self._async_assert_freed(completed)
-            finally:
-                self._async_recover_omission(101)
-                self._stop_client(fresh)
-                self.vapi.cli(f"http static listener del uri {uri}")
-                self._wait_released()
-            self.vapi.cli("http static server disable")
-            self.vapi.cli(
-                f"http static server uri {uri} url-handlers www-root {root} max-age 789"
-            )
-            states, _ = self._listener_states()
-            cancel_index = next(iter(states))
-            self._async_cli(f"arm 102 listener {cancel_index} body canceled-body")
-            canceled_client = self._async_client(8092)
-            armed = self._async_wait(102, "async")
-            self.vapi.cli("http static server disable")
-            canceled = self._async_wait(102, "cleanup")
-            self.assertEqual(canceled["cancels"], 1, canceled)
-            self.assertEqual(canceled["sends"], 0, canceled)
-            self.assertEqual(canceled["owned"], 0, canceled)
-            self.assertLess(canceled["cancel"], canceled["cleanup"], canceled)
-            self.vapi.cli(
-                f"http static server uri {uri} url-handlers www-root {root} max-age 987"
-            )
-            states, _ = self._listener_states()
-            next_index = next(index for index, retiring in states.items() if not retiring)
-            self._async_cli(f"arm 103 listener {next_index} body next-body")
-            next_client = self._async_client(8092)
-            next_waiting = self._async_wait(103, "async")
-            self.assertNotEqual(next_waiting["epoch"], armed["epoch"])
-            self.assertNotEqual(next_waiting["generation"], armed["generation"])
-            self.assertNotEqual(
-                (next_waiting["app"], next_waiting["epoch"], next_waiting["handle"]),
-                (armed["app"], armed["epoch"], armed["handle"]),
-            )
-            self._async_cli("release 102")
-            late = self._async_wait(102, "late")
-            self.assertEqual(late["sends"], 0, late)
-            untouched = self._async_status()[1][103]
-            self.assertEqual(untouched["sends"], 0, untouched)
-            self.assertEqual(untouched["owned"], 1, untouched)
-            self._async_cli("release 103")
-            self._async_wait(103, "send")
-            next_response = self._response(next_client)
-            self.assertEqual(next_response["status"], 200)
-            self.assertEqual(next_response["body"], "next-body")
-            self.assertEqual(next_response["cache"], "max-age=987")
-            self.assertEqual(
-                next_response["server"], f"http_static_server_{next_waiting['generation']}"
-            )
-            self._stop_client(canceled_client)
-            self._stop_client(next_client)
-            self.vapi.cli(f"http static listener del uri {uri}")
-            self._wait_released()
-            for token in (102, 103):
-                record = self._async_wait(token, "freed")
-                self._async_assert_freed(record)
-            summary, records = self._async_status()
-            self.assertEqual(summary["live"], summary["baseline"], records)
-            self.assertEqual(set(records), {101, 102, 103})
-            self.assertTrue(all(not record["pending"] for record in records.values()))
+        self._async_clients = []
+        self.addCleanup(self._async_teardown)
+        with open(os.path.join(root, "fresh.txt"), "w") as output:
+            output.write("new-config")
+        uri = "tcp://10.10.1.2:8092"
+        self._async_sent_scenario(root, uri)
+        self._async_cancel_scenario(root, uri)
+        summary, records = self._async_status()
+        self.assertEqual(summary["live"], summary["baseline"], records)
+        self.assertEqual(set(records), {101, 102, 103})
+        self.assertTrue(all(not record["pending"] for record in records.values()))
 
 
 if __name__ == "__main__":

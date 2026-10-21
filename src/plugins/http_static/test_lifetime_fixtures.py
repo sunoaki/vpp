@@ -38,7 +38,7 @@ def helper(name):
         "sys": sys,
         "re": re,
         "unittest": unittest,
-        "config": types.SimpleNamespace(excluded_plugins=[]),
+        "config": types.SimpleNamespace(excluded_plugins=[], vpp_tag="vpp_debug"),
     }
     exec(
         compile(ast.Module(body=[node], type_ignores=[]), "hss-helper", "exec"),
@@ -1077,12 +1077,16 @@ class TestAsyncLifecycleWitness(unittest.TestCase):
     def test_status_rejects_overflow_duplicate_and_schema_drift(self):
         record = self.completed()
         line = " ".join(f"{key} {value}" for key, value in record.items())
-        valid = "async-ledger enabled 1 overflow 0 live 0 baseline 0\n" + line
+        valid = (
+            "async-ledger enabled 1 overflow 0 live 0 baseline 0 "
+            "destroys 0 detaches 0 owners 0\n" + line
+        )
         for output, broken in (
             (valid, False),
             (valid.replace("overflow 0", "overflow 1"), True),
             (valid + "\n" + line, True),
             (valid.replace("epoch 1", "allocation 1"), True),
+            (valid.replace(" detaches 0", ""), True),
         ):
             with self.subTest(output=output):
                 case = unittest.TestCase()
@@ -1092,7 +1096,10 @@ class TestAsyncLifecycleWitness(unittest.TestCase):
                         helper("_async_status")(case)
                 else:
                     summary, records = helper("_async_status")(case)
-                    self.assertEqual(summary, {"live": 0, "baseline": 0})
+                    self.assertEqual(
+                        summary,
+                        dict(live=0, baseline=0, destroys=0, detaches=0, owners=0),
+                    )
                     self.assertEqual(records, {101: record})
 
     def test_omitted_final_release_is_ordinary_failure_before_owned_recovery(self):
@@ -1172,39 +1179,179 @@ class TestAsyncLifecycleWitness(unittest.TestCase):
             self.assertLess(recovery.index(guard), recovery.index("hss_listener_release"))
 
     def test_client_and_runtime_method_preserve_real_async_order(self):
-        worker = next(
-            node
-            for node in SUITE.body
-            if isinstance(node, ast.ClassDef) and node.name == "TestHttpStaticCliWorker"
-        )
-        method = next(
-            node
-            for node in worker.body
-            if getattr(node, "name", None) == "test_http_static_async_release_cancel"
-        )
-        text = ast.get_source_segment(
-            (ROOT / "test/asf/test_http_static.py").read_text(), method
-        )
-        self.assertLess(text.index('"async"'), text.index('"release 101"'))
-        self.assertLess(
-            text.index('"cleanup"'), text.index("self._async_assert_freed(completed)")
-        )
-        self.assertIn("finally:", text)
-        self.assertIn("self._async_recover_omission(101)", text)
-        self.assertLess(text.index('"release 102"'), text.index('"release 103"'))
-        client = next(
-            node for node in worker.body if getattr(node, "name", None) == "_async_client"
-        )
+        client = helper("_async_client")
         embedded = next(
-            node.value.value
-            for node in ast.walk(client)
-            if isinstance(node, ast.Assign)
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, str)
+            value
+            for value in client.__code__.co_consts
+            if isinstance(value, str) and "import http.client" in value
         )
         ast.parse(embedded, feature_version=(3, 9))
         self.assertIn('connection.request("GET", "/hss-async-test")', embedded)
         self.assertNotIn("TimeoutError", embedded)
+
+    def run_arm_failure(self, *, deferred=False, abort_failure=False):
+        import os
+        import tempfile
+
+        events = []
+        state = dict(armed=False, owned=False, enabled=False, ticks=0, frees=0)
+        clock = types.SimpleNamespace(now=0)
+        clock.monotonic = lambda: clock.now
+        clock.sleep = lambda seconds: setattr(clock, "now", clock.now + 1)
+
+        def command(text):
+            events.append(text)
+            reply = types.SimpleNamespace(retval=0, reply="")
+            if text.endswith(" async start"):
+                state["enabled"] = True
+            elif " async arm " in text:
+                state.update(armed=True, owned=True)
+            elif text.endswith(" async abort"):
+                if abort_failure:
+                    reply.retval, reply.reply = -1, "injected abort failure"
+                elif state["armed"]:
+                    state.update(armed=False, owned=False, frees=state["frees"] + 1)
+            elif text == "http static server disable":
+                state["ticks"] = 3 if deferred else 0
+            elif text.endswith(" async status"):
+                ticks = state["ticks"]
+                state["ticks"] = max(0, ticks - 1)
+                reply.reply = (
+                    "async-ledger enabled 1 overflow 0 live 0 baseline 0 "
+                    f"destroys {int(ticks == 3)} detaches {int(ticks > 0)} "
+                    f"owners {int(ticks == 3)}"
+                )
+            elif text.endswith(" async clear"):
+                if state["ticks"] or state["armed"] or state["owned"]:
+                    reply.retval, reply.reply = -1, "unsafe clear"
+                else:
+                    state["enabled"] = False
+            return reply
+
+        names = (
+            "_async_cli",
+            "_async_status",
+            "_async_client",
+            "_async_sent_scenario",
+            "_async_teardown",
+            "_async_wait_idle",
+            "_async_recover_omission",
+            "test_http_static_async_release_cancel",
+        )
+        methods = {name: helper(name) for name in names}
+        for method in methods.values():
+            method.__globals__.update(time=clock, tempfile=tempfile, os=os)
+        case_type = type("ArmFailureCase", (unittest.TestCase,), methods)
+        case = case_type("test_http_static_async_release_cancel")
+        case.vapi = types.SimpleNamespace(cli=command, cli_return_response=command)
+        case.ns_name = "fixture-only"
+        case._listener_states = lambda: ({0: 0}, "fixture listener")
+        client = object()
+        case._response = unittest.mock.Mock(
+            side_effect=AssertionError("original client failure")
+        )
+        case._stop_client = lambda process: events.append("stop client")
+        with patch.object(subprocess, "Popen", return_value=client):
+            result = unittest.TestResult()
+            case.run(result)
+        return result, state, events
+
+    def test_failure_immediately_after_arm_drains_unconsumed_response(self):
+        result, state, events = self.run_arm_failure()
+        self.assertEqual(len(result.failures), 1, result.failures)
+        self.assertIn("original client failure", result.failures[0][1])
+        self.assertEqual(result.errors, [])
+        self.assertFalse(state["armed"] or state["owned"] or state["enabled"])
+        self.assertEqual(state["frees"], 1)
+        self.assertLess(
+            events.index("stop client"), events.index("test http static async abort")
+        )
+        self.assertLess(
+            events.index("test http static async abort"),
+            events.index("http static server disable"),
+        )
+        self.assertEqual(events[-1], "test http static async clear")
+
+    def test_deferred_destroy_and_detach_finish_before_clear(self):
+        result, state, events = self.run_arm_failure(deferred=True)
+        self.assertEqual(len(result.failures), 1, result.failures)
+        self.assertEqual(result.errors, [])
+        disabled = events.index("http static server disable")
+        cleared = events.index("test http static async clear")
+        polls = events[disabled:cleared].count("test http static async status")
+        self.assertGreaterEqual(polls, 4)
+        self.assertFalse(state["enabled"])
+
+    def test_cleanup_failure_preserves_original_and_reports_secondary_failure(self):
+        result, state, events = self.run_arm_failure(abort_failure=True)
+        failures = "\n".join(text for case, text in result.failures)
+        self.assertIn("original client failure", failures)
+        self.assertIn("injected abort failure", failures)
+        self.assertIn("unsafe clear", failures)
+        self.assertGreaterEqual(len(result.failures), 3)
+        self.assertEqual(result.errors, [])
+        self.assertTrue(state["enabled"] and state["armed"] and state["owned"])
+        self.assertEqual(state["frees"], 0)
+        self.assertIn("http static server disable", events)
+
+    def test_event_checks_reject_zero_and_misordered_sent_and_cancel_sequences(self):
+        sent = self.completed()
+        canceled = dict(sent, send=0, sends=0, cancel=3, cancels=1)
+        for record, event in ((sent, "send"), (canceled, "cancel")):
+            helper("_async_assert_freed")(self, record)
+            order = ("enter", "async", event, "cleanup", "freed")
+            for field in (*order, "final"):
+                with self.subTest(event=event, zero=field):
+                    with self.assertRaises(AssertionError):
+                        helper("_async_assert_freed")(self, dict(record, **{field: 0}))
+            for before, after in zip(order, order[1:]):
+                for value in (record[before], record[before] - 1):
+                    with self.subTest(event=event, after=after, value=value):
+                        with self.assertRaises(AssertionError):
+                            helper("_async_assert_freed")(
+                                self, dict(record, **{after: value})
+                            )
+            with self.assertRaises(AssertionError):
+                helper("_async_assert_freed")(self, dict(record, final=record["freed"]))
+
+    def test_abort_and_completion_observers_preserve_ownership_guards(self):
+        source = (ROOT / "src/plugins/http_static/static_server.c").read_text()
+        abort = source.split("\nhss_async_abort_unconsumed (", 1)[1].split(
+            "\nstatic void", 1
+        )[0]
+        for guard in (
+            "vlib_thread_is_main_w_barrier",
+            "record->enter_seq",
+            "record->async_seq",
+            "record->handle",
+            "record->active",
+            "record->pending",
+            "!record->armed",
+        ):
+            self.assertLess(abort.index(guard), abort.index("vec_free (record->response)"))
+        self.assertEqual(abort.count("vec_free (record->response)"), 1)
+        self.assertNotIn("hss_listener_release", abort)
+        self.assertNotIn("hss_session_free", abort)
+        detach = source.split("\nhss_detach_rpc (", 1)[1].split("\nstatic int", 1)[0]
+        self.assertLess(
+            detach.index("vnet_application_detach (&da)"),
+            detach.index("hss_async_pending_detaches--"),
+        )
+        self.assertIn("if (!rv)", detach)
+        clear = source.split('if (unformat (input, "clear"))', 1)[1].split(
+            'if (unformat (input, "arm', 1
+        )[0]
+        for guard in (
+            ".armed",
+            ".active",
+            ".pending",
+            ".response",
+            ".pool_puts",
+            "hss_async_destroy_count",
+            "hss_async_pending_detaches",
+            "hss_async_owner_count",
+        ):
+            self.assertIn(guard, clear)
 
 
 if __name__ == "__main__":
