@@ -1126,7 +1126,12 @@ class TestAsyncLifecycleWitness(unittest.TestCase):
         helper("_async_recover_omission")(case, 101)
         case._async_cli.assert_called_once_with("recover 101")
         case._async_wait.assert_called_once_with(101, "freed")
-        for changed in (dict(refs=2), dict(cleanups=0), dict(retiring=0), dict(final=8)):
+        for changed in (
+            dict(refs=2),
+            dict(cleanups=0),
+            dict(retiring=0),
+            dict(final=8),
+        ):
             case._async_status.return_value = ({}, {101: dict(omitted, **changed)})
             case._async_cli.reset_mock()
             with self.assertRaises(AssertionError):
@@ -1165,9 +1170,12 @@ class TestAsyncLifecycleWitness(unittest.TestCase):
             cleanup.index("hss_async_cleanup_begin"), cleanup.index("hss_session_free")
         )
         self.assertLess(
-            cleanup.index("hss_listener_release"), cleanup.index("hss_async_cleanup_done")
+            cleanup.index("hss_listener_release"),
+            cleanup.index("hss_async_cleanup_done"),
         )
-        recovery = source.split("\nhss_async_recover (", 1)[1].split("\nstatic void", 1)[0]
+        recovery = source.split("\nhss_async_recover (", 1)[1].split(
+            "\nstatic void", 1
+        )[0]
         for guard in (
             "listener->ref_count != 1",
             "!record->omitted",
@@ -1176,7 +1184,9 @@ class TestAsyncLifecycleWitness(unittest.TestCase):
             "hs->listener_index",
             "record->token != 101",
         ):
-            self.assertLess(recovery.index(guard), recovery.index("hss_listener_release"))
+            self.assertLess(
+                recovery.index(guard), recovery.index("hss_listener_release")
+            )
 
     def test_client_and_runtime_method_preserve_real_async_order(self):
         client = helper("_async_client")
@@ -1328,7 +1338,9 @@ class TestAsyncLifecycleWitness(unittest.TestCase):
             "record->pending",
             "!record->armed",
         ):
-            self.assertLess(abort.index(guard), abort.index("vec_free (record->response)"))
+            self.assertLess(
+                abort.index(guard), abort.index("vec_free (record->response)")
+            )
         self.assertEqual(abort.count("vec_free (record->response)"), 1)
         self.assertNotIn("hss_listener_release", abort)
         self.assertNotIn("hss_session_free", abort)
