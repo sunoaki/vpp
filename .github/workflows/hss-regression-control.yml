@@ -2550,9 +2550,16 @@ jobs:
                           last_records[101]["vecfree"] == 1 and last_records[101]["refs"] == 0 and
                           last_records[101]["freed"] > last_records[101]["cleanup"] > 0,
                           "Omitted release was not independently recovered")
-                  require(any(failure["seq"] < seq < recoveries[0]["seq"] and
-                              all(summary[key] == 0 for key in ("destroys", "detaches", "owners"))
-                              for seq, summary, _ in sent), "Recovery preceded real owner/destroy completion")
+                  before_recovery = [snapshot for snapshot in snapshots if snapshot[0] < recoveries[0]["seq"]]
+                  require(before_recovery, "Missing latest pre-recovery snapshot")
+                  seq, summary, records = before_recovery[-1]
+                  record = records.get(101, {})
+                  require(failure["seq"] < seq and
+                          all(summary[key] == 0 for key in ("destroys", "detaches", "owners")) and
+                          all(item["pending"] == 0 for item in records.values()) and
+                          all(record.get(key) == 1 for key in ("omitted", "refs", "cleanups")) and
+                          all(record.get(key) == 0 for key in ("poolput", "final", "freed", "recovery")),
+                          "Latest ASYNC snapshot does not permit guarded recovery")
                   return
               require(set(last_records) == {101, 102, 103} and not any(command.startswith("recover ") for command in commands),
                       "Fixed ASYNC unexpectedly recovered omission")
@@ -2584,12 +2591,22 @@ jobs:
                           callbacks == [("addFailure", "TestHttpStaticCliWorker", "test_http_static_async_release_cancel")] and
                           sum(event["failures"] for event in complete) == 1 and
                           not any(event.get("error") for event in subs), "Omission did not complete with one ordinary failure")
-                  trace = outcomes[0].get("traceback", "")
-                  for witness in ('in test_http_static_async_release_cancel', 'in _async_sent_scenario',
-                                  'in _async_assert_freed', 'self.assertEqual(record["refs"], 0, record)',
-                                  'AssertionError: 1 != 0'):
-                      require(witness in trace and witness in console and witness in logs,
-                              "Missing exact raw omitted-release assertion: " + witness)
+                  frames = ((1137, "test_http_static_async_release_cancel", "self._async_sent_scenario(root, uri)"),
+                            (1063, "_async_sent_scenario", "self._async_assert_freed(completed)"),
+                            (920, "_async_assert_freed", 'self.assertEqual(record["refs"], 0, record)'))
+                  unittest_frame = (r'  File "/[^"\n]*/unittest/(?:case|result)\.py", line [1-9][0-9]*, in \w+\n'
+                                    r"    [^\n]+\n(?:    [ ~^]*[~^][ ~^]*\n)?")
+                  pattern = r"(?m)^Traceback \(most recent call last\):\n(?:" + unittest_frame + ")*"
+                  for index, (line, method, statement) in enumerate(frames):
+                      filename = r'(?P<file>/[^"\n]*/test/asf/test_http_static\.py)' if index == 0 else r'(?P=file)'
+                      pattern += (r'  File "' + filename + r'", line ' + str(line) + ", in " + method +
+                                  r"\n    " + re.escape(statement) + r"\n(?:    [ ~^]*[~^][ ~^]*\n)?")
+                  pattern += "(?:" + unittest_frame + r")*(?P<error>AssertionError: 1 != 0(?: : [^\n]*)?)\n"
+                  raw_trace = re.compile(pattern)
+                  match = raw_trace.fullmatch(outcomes[0].get("traceback", ""))
+                  require(match is not None, "Missing complete frozen ASYNC assertion traceback")
+                  require(all(match.groups() in [item.groups() for item in raw_trace.finditer(raw)]
+                              for raw in (console, logs)), "Raw ASYNC traceback differs from failure event")
                   async_evidence(events, negative=True)
               elif variant == "read-error-unlock":
                   require(rc > 0 and rc != 124 and not outcomes and not callbacks,
@@ -3930,7 +3947,79 @@ jobs:
               rejects_async(negative, True, raw=trace.replace(before, after))
           for rc in (0, 1, 124, -11):
               rejects_async(negative, True, rc=rc)
-          print(f"ASYNC fixtures passed: fixed and ordinary omission with separate recovery; {rejected} invalid inputs rejected")
+          def with_trace(raw):
+              changed = copy.deepcopy(negative)
+              next(event for event in changed if event["kind"] == "addFailure")["traceback"] = raw
+              return changed
+          callback = "--- addFailure() TestHttpStaticCliWorker.test_http_static_async_release_cancel("
+          fragments = ('in test_http_static_async_release_cancel\nin _async_sent_scenario\n'
+                       'in _async_assert_freed\nself.assertEqual(record["refs"], 0, record)\nAssertionError: 1 != 0\n')
+          invalid_traces = [fragments, trace.split("\n", 1)[1]]
+          lines = trace.splitlines(keepends=True)
+          for index in (1, 3, 5):
+              invalid_traces.append("".join(lines[:index] + lines[index + 1:]))
+          invalid_traces.append("".join([lines[0], *lines[3:5], *lines[1:3], *lines[5:]]))
+          for before, after in (("test/asf/test_http_static.py", "test/asf/test_other.py"),
+                                ("line 1137", "line 1138"), ("line 1063", "line 1064"), ("line 920", "line 921"),
+                                ("in _async_sent_scenario", "in _other_scenario"),
+                                ("self._async_sent_scenario(root, uri)", "self._async_sent_scenario(uri, root)"),
+                                ("self._async_assert_freed(completed)", "self._async_assert_freed(other)"),
+                                ('self.assertEqual(record["refs"], 0, record)', 'self.assertEqual(record["refs"], 1, record)'),
+                                ("AssertionError: 1 != 0", "AssertionError: 2 != 0")):
+              invalid_traces.append(trace.replace(before, after))
+          invalid_traces.append(trace.replace('/fixture/test/asf/test_http_static.py',
+                                              '/foreign/test/asf/test_http_static.py', 1))
+          invalid_traces.append(trace.replace("    self._async_assert_freed(completed)\n",
+                                              "    unrelated()\n    self._async_assert_freed(completed)\n"))
+          for raw in invalid_traces:
+              rejects_async(with_trace(raw), True, raw=raw, raw_logs=raw + callback)
+          for raw in (trace.replace("/fixture/", "/foreign/"), trace.replace("refs retained", "different detail")):
+              rejects_async(negative, True, raw=raw)
+              rejects_async(negative, True, raw_logs=raw + callback)
+          caret = trace
+          for statement in ("self._async_sent_scenario(root, uri)", "self._async_assert_freed(completed)",
+                            'self.assertEqual(record["refs"], 0, record)'):
+              caret = caret.replace("    " + statement + "\n", "    " + statement + "\n    ~~~~~~~~~~  ^^^^^\n")
+          unittest_trace = trace.replace("Traceback (most recent call last):\n",
+              'Traceback (most recent call last):\n  File "/usr/lib/python3.13/unittest/case.py", line 58, in testPartExecutor\n'
+              '    yield\n  File "/usr/lib/python3.13/unittest/case.py", line 651, in run\n    self._callTestMethod(testMethod)\n'
+              '  File "/usr/lib/python3.13/unittest/case.py", line 606, in _callTestMethod\n    method()\n')
+          unittest_trace = unittest_trace.replace("AssertionError: 1 != 0",
+              '  File "/usr/lib/python3.13/unittest/case.py", line 899, in assertEqual\n    assertion_func(first, second, msg=msg)\n'
+              '  File "/usr/lib/python3.13/unittest/case.py", line 892, in _baseAssertEqual\n    raise self.failureException(msg)\n'
+              'AssertionError: 1 != 0')
+          for event_trace, raw, raw_logs in ((caret, caret, caret + callback),
+                                             (trace, caret, logs), (caret, trace, logs),
+                                             (unittest_trace, trace, logs), (trace, unittest_trace, unittest_trace + callback)):
+              control["validate"](with_trace(event_trace), raw, 2, [control["ASYNC_TEST"]],
+                                  "async-omit-release", raw_logs)
+          recovery_index = next(index for index, event in enumerate(negative)
+                                if event.get("command") == "test http static async recover 101")
+          status_index = recovery_index - 1
+          def pre_recovery(reply, append=False):
+              changed = copy.deepcopy(negative)
+              if append:
+                  changed.insert(recovery_index, dict(changed[status_index], reply=reply))
+              else:
+                  changed[status_index]["reply"] = reply
+              for index, event in enumerate(changed, 1):
+                  event["seq"] = index
+              return changed
+          idle = negative[status_index]["reply"]
+          for before, after in (("pending 0", "pending 1"), ("owners 0", "owners 1"),
+                                ("destroys 0", "destroys 1"), ("detaches 0", "detaches 1"),
+                                ("omitted 1", "omitted 0"), ("refs 1", "refs 0"),
+                                ("cleanups 1", "cleanups 0"), ("poolput 0", "poolput 1"),
+                                ("final 0", "final 5"), ("freed 0", "freed 6"), ("recovery 0", "recovery 1")):
+              for append in (False, True):
+                  rejects_async(pre_recovery(idle.replace(before, after), append), True)
+          nonidle = idle.replace("owners 0", "owners 1").replace("detaches 0", "detaches 1").replace("pending 0", "pending 1")
+          rejects_async(pre_recovery(nonidle, True), True)
+          extra_pending = idle + idle.splitlines(keepends=True)[1].replace("token 101", "token 102").replace("pending 0", "pending 1")
+          rejects_async(pre_recovery(extra_pending), True)
+          rejects_async(pre_recovery(idle.splitlines(keepends=True)[0]), True)
+          control["validate"](pre_recovery(idle, True), trace, 2, [control["ASYNC_TEST"]], "async-omit-release", logs)
+          print(f"Pure-memory ASYNC fixtures passed: fixed, ordinary omission, legal caret traces and latest idle recovery; {rejected} invalid inputs rejected")
           PY
 
       - &hss_mutate
