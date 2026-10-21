@@ -1712,8 +1712,12 @@ class TestDestroyOwnerWitnesses(unittest.TestCase):
         self.assertNotIn("hss_destroy_record (ctx)", tail)
         self.assertIn("owner->remaining = remaining", tail)
         self.assertLess(owner.index("owner->gate"), owner.index("session_reset (s)"))
-        self.assertLess(owner.index("hss_session_cleanup (hs)"), owner.index("owner->done ="))
-        self.assertLess(owner.index("owner->done ="), owner.index("clib_atomic_sub_fetch"))
+        self.assertLess(
+            owner.index("hss_session_cleanup (hs)"), owner.index("owner->done =")
+        )
+        self.assertLess(
+            owner.index("owner->done ="), owner.index("clib_atomic_sub_fetch")
+        )
 
     def test_destroy_clear_checks_all_inflight_and_teardown_releases_first(self):
         source = (ROOT / "src/plugins/http_static/static_server.c").read_text()
@@ -1734,7 +1738,9 @@ class TestDestroyOwnerWitnesses(unittest.TestCase):
             and owner.name == "TestHttpStaticCliWorker"
         )
         teardown = next(
-            node for node in worker.body if getattr(node, "name", None) == "_destroy_teardown"
+            node
+            for node in worker.body
+            if getattr(node, "name", None) == "_destroy_teardown"
         )
         text = ast.unparse(teardown)
         self.assertLess(text.index("release all"), text.index("_stop_client"))
@@ -1742,7 +1748,8 @@ class TestDestroyOwnerWitnesses(unittest.TestCase):
         test = next(
             node
             for node in worker.body
-            if getattr(node, "name", None) == "test_http_static_destroy_owner_generations"
+            if getattr(node, "name", None)
+            == "test_http_static_destroy_owner_generations"
         )
         text = ast.unparse(test)
         self.assertIn("(301, 302)", text)

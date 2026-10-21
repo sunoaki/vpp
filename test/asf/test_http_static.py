@@ -1048,7 +1048,9 @@ class TestHttpStaticCliWorker(TestHttpStaticCli):
             self._destroy_wait(token, 1, "freed")
             for owner in (0, 1):
                 self._destroy_assert_witness(
-                    self._destroy_status(token, owner), identities[token][owner], "freed"
+                    self._destroy_status(token, owner),
+                    identities[token][owner],
+                    "freed",
                 )
             self._assert_closed(self._response(pending[token], "drain"))
             if token == 302:

@@ -294,7 +294,7 @@ session_t *app_listener_get_local_session (app_listener_t * al);
 session_t *app_listener_get_wrk_cl_session (app_listener_t *al, u32 wrk_index);
 
 __clib_export application_t *application_get (u32 index);
-application_t *application_get_if_valid (u32 index);
+__clib_export application_t *application_get_if_valid (u32 index);
 application_t *application_lookup (u32 api_client_index);
 __clib_export application_t *application_lookup_name (const u8 *name);
 __clib_export app_worker_t *application_get_worker (application_t *app, u32 wrk_index);
