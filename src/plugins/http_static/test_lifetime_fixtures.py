@@ -26,7 +26,13 @@ CLI = next(
 
 
 def helper(name):
-    node = next(node for node in CLI.body if getattr(node, "name", None) == name)
+    node = next(
+        node
+        for owner in SUITE.body
+        if isinstance(owner, ast.ClassDef)
+        for node in owner.body
+        if getattr(node, "name", None) == name
+    )
     namespace = {
         "subprocess": subprocess,
         "sys": sys,
@@ -1030,6 +1036,175 @@ class TestCacheWitnesses(unittest.TestCase):
         self.assertEqual(failures["fixed"], 0)
         self.assertGreater(failures["old"], 0)
         self.assertGreater(failures["only_remove_next"], 0)
+
+
+class TestAsyncLifecycleWitness(unittest.TestCase):
+    def completed(self):
+        return {
+            "token": 101,
+            "epoch": 1,
+            "generation": 7,
+            "app": 3,
+            "thread": 1,
+            "hs": 2,
+            "handle": 4294967301,
+            "listener": 0,
+            "enter": 1,
+            "async": 2,
+            "send": 3,
+            "cancel": 0,
+            "cleanup": 5,
+            "sends": 1,
+            "cancels": 0,
+            "cleanups": 1,
+            "duplicate": 1,
+            "late": 0,
+            "pending": 0,
+            "owned": 0,
+            "tx": 0,
+            "refs": 0,
+            "retiring": 1,
+            "final": 4,
+            "freed": 6,
+            "releases": 2,
+            "cachefree": 1,
+            "vecfree": 1,
+            "poolput": 1,
+            "recovery": 0,
+            "omitted": 0,
+        }
+
+    def test_status_rejects_overflow_duplicate_and_schema_drift(self):
+        record = self.completed()
+        line = " ".join(f"{key} {value}" for key, value in record.items())
+        valid = "async-ledger enabled 1 overflow 0 live 0 baseline 0\n" + line
+        for output, broken in (
+            (valid, False),
+            (valid.replace("overflow 0", "overflow 1"), True),
+            (valid + "\n" + line, True),
+            (valid.replace("epoch 1", "allocation 1"), True),
+        ):
+            with self.subTest(output=output):
+                case = unittest.TestCase()
+                case._async_cli = unittest.mock.Mock(return_value=output)
+                if broken:
+                    with self.assertRaises(AssertionError):
+                        helper("_async_status")(case)
+                else:
+                    summary, records = helper("_async_status")(case)
+                    self.assertEqual(summary, {"live": 0, "baseline": 0})
+                    self.assertEqual(records, {101: record})
+
+    def test_omitted_final_release_is_ordinary_failure_before_owned_recovery(self):
+        completed = self.completed()
+        helper("_async_assert_freed")(self, completed)
+        omitted = dict(
+            completed,
+            refs=1,
+            final=0,
+            freed=0,
+            releases=1,
+            cachefree=0,
+            vecfree=0,
+            poolput=0,
+            omitted=1,
+        )
+        with self.assertRaises(AssertionError):
+            helper("_async_assert_freed")(self, omitted)
+        recovered = dict(completed, recovery=1, omitted=1)
+        case = unittest.TestCase()
+        case._async_status = unittest.mock.Mock(return_value=({}, {101: omitted}))
+        case._async_cli = unittest.mock.Mock()
+        case._async_wait = unittest.mock.Mock(return_value=recovered)
+        helper("_async_recover_omission")(case, 101)
+        case._async_cli.assert_called_once_with("recover 101")
+        case._async_wait.assert_called_once_with(101, "freed")
+        for changed in (dict(refs=2), dict(cleanups=0), dict(retiring=0), dict(final=8)):
+            case._async_status.return_value = ({}, {101: dict(omitted, **changed)})
+            case._async_cli.reset_mock()
+            with self.assertRaises(AssertionError):
+                helper("_async_recover_omission")(case, 101)
+            case._async_cli.assert_not_called()
+
+    def test_real_source_guards_transfer_and_cleanup_precede_reuse(self):
+        source = (ROOT / "src/plugins/http_static/static_server.c").read_text()
+        handler = source.split("\nhss_async_handler (hss_url_handler_args_t *args)", 1)[
+            1
+        ].split("\nstatic uword", 1)[0]
+        self.assertIn("HSS_URL_HANDLER_ASYNC", handler)
+        self.assertNotIn("args->query", handler)
+        self.assertNotIn("args->req_data", handler)
+        owner = source.split("\nhss_async_node_fn (", 1)[1].split(
+            "\nVLIB_REGISTER_NODE", 1
+        )[0]
+        for guard in (
+            "!record->active",
+            "hs->vpp_session_handle != record->handle",
+            "hs->app_index != record->app_index",
+            "worker->app_index != record->app_index",
+            "hss_async_listener (entry->index) != entry",
+            "session->opaque != record->hs_index",
+        ):
+            self.assertLess(
+                owner.index(guard), owner.index("hss_session_send_data (&args)")
+            )
+        self.assertLess(
+            owner.index("record->response = 0"), owner.index("hss_session_send_data")
+        )
+        cleanup = source.split("\nhss_session_cleanup (hss_session_t *hs)", 1)[1].split(
+            "\nstatic void", 1
+        )[0]
+        self.assertLess(
+            cleanup.index("hss_async_cleanup_begin"), cleanup.index("hss_session_free")
+        )
+        self.assertLess(
+            cleanup.index("hss_listener_release"), cleanup.index("hss_async_cleanup_done")
+        )
+        recovery = source.split("\nhss_async_recover (", 1)[1].split("\nstatic void", 1)[0]
+        for guard in (
+            "listener->ref_count != 1",
+            "!record->omitted",
+            "cached->inuse",
+            "pending->listener_index",
+            "hs->listener_index",
+            "record->token != 101",
+        ):
+            self.assertLess(recovery.index(guard), recovery.index("hss_listener_release"))
+
+    def test_client_and_runtime_method_preserve_real_async_order(self):
+        worker = next(
+            node
+            for node in SUITE.body
+            if isinstance(node, ast.ClassDef) and node.name == "TestHttpStaticCliWorker"
+        )
+        method = next(
+            node
+            for node in worker.body
+            if getattr(node, "name", None) == "test_http_static_async_release_cancel"
+        )
+        text = ast.get_source_segment(
+            (ROOT / "test/asf/test_http_static.py").read_text(), method
+        )
+        self.assertLess(text.index('"async"'), text.index('"release 101"'))
+        self.assertLess(
+            text.index('"cleanup"'), text.index("self._async_assert_freed(completed)")
+        )
+        self.assertIn("finally:", text)
+        self.assertIn("self._async_recover_omission(101)", text)
+        self.assertLess(text.index('"release 102"'), text.index('"release 103"'))
+        client = next(
+            node for node in worker.body if getattr(node, "name", None) == "_async_client"
+        )
+        embedded = next(
+            node.value.value
+            for node in ast.walk(client)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        )
+        ast.parse(embedded, feature_version=(3, 9))
+        self.assertIn('connection.request("GET", "/hss-async-test")', embedded)
+        self.assertNotIn("TimeoutError", embedded)
 
 
 if __name__ == "__main__":

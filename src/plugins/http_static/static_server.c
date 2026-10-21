@@ -28,6 +28,153 @@ hss_main_t hss_main;
 static int file_handler_discard_body (hss_session_t *hs, session_t *ts);
 static int url_handler_read_body (hss_session_t *hs, session_t *ts);
 
+#if CLIB_DEBUG > 0
+#define HSS_ASYNC_RECORDS   8
+#define HSS_ASYNC_LISTENERS 32
+
+typedef struct
+{
+  u64 epoch;
+  u64 final_seq;
+  u64 free_seq;
+  u32 index;
+  u32 generation;
+  u32 app_index;
+  u32 releases;
+  u32 cache_frees;
+  u32 vec_frees;
+  u32 pool_puts;
+  u32 recoveries;
+} hss_async_listener_t;
+
+typedef struct
+{
+  u64 handle;
+  u64 enter_seq;
+  u64 async_seq;
+  u64 send_seq;
+  u64 cancel_seq;
+  u64 cleanup_seq;
+  u32 token;
+  u32 listener;
+  u32 thread;
+  u32 hs_index;
+  u32 app_index;
+  u32 app_worker;
+  u32 armed;
+  u32 active;
+  u32 pending;
+  u32 sends;
+  u32 cancels;
+  u32 cleanups;
+  u32 duplicates;
+  u32 late;
+  u32 tx_before;
+  u32 omitted;
+  u8 *response;
+} hss_async_record_t;
+
+static struct
+{
+  hss_async_record_t records[HSS_ASYNC_RECORDS];
+  hss_async_listener_t listeners[HSS_ASYNC_LISTENERS];
+  u64 sequence;
+  u64 epoch;
+  u32 enabled;
+  u32 overflow;
+  u32 listener_count;
+  u32 baseline;
+} hss_async_test;
+
+static u64
+hss_async_sequence (void)
+{
+  return clib_atomic_add_fetch (&hss_async_test.sequence, 1);
+}
+
+static hss_async_listener_t *
+hss_async_listener (u32 index)
+{
+  u32 i;
+
+  if (!hss_async_test.enabled)
+    return 0;
+  for (i = hss_async_test.listener_count; i > 0; i--)
+    if (hss_async_test.listeners[i - 1].index == index &&
+	!hss_async_test.listeners[i - 1].pool_puts)
+      return &hss_async_test.listeners[i - 1];
+  return 0;
+}
+
+static void
+hss_async_listener_added (u32 index)
+{
+  hss_async_listener_t *entry;
+
+  if (!hss_async_test.enabled)
+    return;
+  if (hss_async_test.listener_count == HSS_ASYNC_LISTENERS)
+    {
+      hss_async_test.overflow = 1;
+      return;
+    }
+  entry = &hss_async_test.listeners[hss_async_test.listener_count++];
+  entry->index = index;
+  entry->epoch = ++hss_async_test.epoch;
+  entry->generation = hss_main.app_generation - 1;
+  entry->app_index = hss_main.app_index;
+}
+
+static hss_async_record_t *
+hss_async_owned_record (hss_session_t *hs)
+{
+  hss_async_record_t *record;
+  hss_async_listener_t *entry = hss_async_listener (hs->listener_index);
+  u32 i;
+
+  if (!entry)
+    return 0;
+  for (i = 0; i < HSS_ASYNC_RECORDS; i++)
+    {
+      record = &hss_async_test.records[i];
+      if (record->enter_seq && !record->cleanups &&
+	  record->listener == entry - hss_async_test.listeners &&
+	  record->thread == hs->thread_index && record->hs_index == hs->session_index &&
+	  record->handle == hs->vpp_session_handle && record->app_index == hs->app_index)
+	return record;
+    }
+  return 0;
+}
+
+static u32
+hss_async_cleanup_begin (hss_session_t *hs)
+{
+  hss_async_record_t *record = hss_async_owned_record (hs);
+
+  if (!record)
+    return ~0;
+  if (record->active)
+    {
+      record->active = 0;
+      record->cancels++;
+      record->cancel_seq = hss_async_sequence ();
+      vec_free (record->response);
+    }
+  return record - hss_async_test.records;
+}
+
+static void
+hss_async_cleanup_done (u32 index)
+{
+  if (index == (u32) ~0)
+    return;
+  hss_async_test.records[index].cleanups++;
+  hss_async_test.records[index].cleanup_seq = hss_async_sequence ();
+}
+
+static hss_url_handler_rc_t hss_async_handler (hss_url_handler_args_t *args);
+#endif
+
 static void
 hss_listener_free_rpc (void *arg)
 {
@@ -36,14 +183,32 @@ hss_listener_free_rpc (void *arg)
 
   ASSERT (vlib_thread_is_main_w_barrier ());
   ASSERT (l && l->retiring && l->ref_count == 0);
+#if CLIB_DEBUG > 0
+  hss_async_listener_t *entry = hss_async_listener (l_index);
+#endif
   if (l->cache)
     {
       hss_cache_free (l->cache);
       clib_mem_free (l->cache);
+#if CLIB_DEBUG > 0
+      if (entry)
+	entry->cache_frees++;
+#endif
     }
   vec_free (l->www_root);
   vec_free (l->max_age_formatted);
+#if CLIB_DEBUG > 0
+  if (entry)
+    entry->vec_frees++;
+#endif
   pool_put (hss_main.listeners, l);
+#if CLIB_DEBUG > 0
+  if (entry)
+    {
+      entry->pool_puts++;
+      entry->free_seq = hss_async_sequence ();
+    }
+#endif
 }
 
 static void
@@ -51,7 +216,17 @@ hss_listener_release (u32 l_index)
 {
   hss_listener_t *l = hss_listener_get (l_index);
 
-  if (clib_atomic_sub_fetch (&l->ref_count, 1) == 0)
+  u32 remaining = clib_atomic_sub_fetch (&l->ref_count, 1);
+#if CLIB_DEBUG > 0
+  hss_async_listener_t *entry = hss_async_listener (l_index);
+  if (entry)
+    {
+      clib_atomic_add_fetch (&entry->releases, 1);
+      if (!remaining)
+	entry->final_seq = hss_async_sequence ();
+    }
+#endif
+  if (remaining == 0)
     vlib_rpc_call_main_thread (hss_listener_free_rpc, (u8 *) &l_index, sizeof (l_index));
 }
 
@@ -254,6 +429,14 @@ hss_session_send_data (hss_url_handler_args_t *args)
       args->sc = HTTP_STATUS_INTERNAL_ERROR;
 
   start_send_data (hs, args->sc);
+#if CLIB_DEBUG > 0
+  hss_async_record_t *record = hss_async_owned_record (hs);
+  if (record)
+    {
+      record->sends++;
+      record->send_seq = hss_async_sequence ();
+    }
+#endif
 }
 
 /*
@@ -411,7 +594,14 @@ try_url_handler (hss_session_t *hs)
 
   /* Wait for data from handler */
   if (rv == HSS_URL_HANDLER_ASYNC)
-    return 0;
+    {
+#if CLIB_DEBUG > 0
+      hss_async_record_t *record = hss_async_owned_record (hs);
+      if (record)
+	record->async_seq = hss_async_sequence ();
+#endif
+      return 0;
+    }
 
   if (rv == HSS_URL_HANDLER_ERROR)
     {
@@ -996,6 +1186,9 @@ static void
 hss_session_cleanup (hss_session_t *hs)
 {
   u32 l_index = hs->listener_index;
+#if CLIB_DEBUG > 0
+  u32 record_index = hss_async_cleanup_begin (hs);
+#endif
 
   if (hs->cache_pool_index != ~0)
     hss_cache_detach_entry (hss_listener_get (l_index)->cache, hs->cache_pool_index);
@@ -1009,6 +1202,9 @@ hss_session_cleanup (hss_session_t *hs)
   vec_free (hs->rx_buff);
   hss_session_free (hs);
   hss_listener_release (l_index);
+#if CLIB_DEBUG > 0
+  hss_async_cleanup_done (record_index);
+#endif
 }
 
 static void
@@ -1164,6 +1360,9 @@ hss_url_handlers_init (hss_main_t *hsm)
   hsm->get_url_handlers = hash_create_string (0, sizeof (uword));
   hsm->post_url_handlers = hash_create_string (0, sizeof (uword));
   hss_builtinurl_json_handlers_init ();
+#if CLIB_DEBUG > 0
+  hss_register_url_handler (hss_async_handler, "hss-async-test", HTTP_REQ_GET);
+#endif
 }
 
 int
@@ -1206,6 +1405,9 @@ hss_listener_add (hss_listener_t *l_cfg)
     hss_url_handlers_init (hsm);
 
   l->max_age_formatted = format (0, "max-age=%d", l->max_age);
+#if CLIB_DEBUG > 0
+  hss_async_listener_added (l->l_index);
+#endif
   return 0;
 }
 
@@ -1418,6 +1620,294 @@ hss_destroy (vlib_main_t *vm)
 }
 
 #if CLIB_DEBUG > 0
+static hss_url_handler_rc_t
+hss_async_handler (hss_url_handler_args_t *args)
+{
+  hss_session_t *hs = hss_session_get (args->sh.thread_index, args->sh.session_index);
+  hss_async_listener_t *entry;
+  hss_async_record_t *record;
+  session_t *session;
+  u32 i;
+
+  args->data = 0;
+  args->data_len = 0;
+  args->free_vec_data = 0;
+  if (!hss_async_test.enabled || !hs || hs->thread_index != 1)
+    return HSS_URL_HANDLER_ERROR;
+  entry = hss_async_listener (hs->listener_index);
+  session = session_get_from_handle_if_valid (hs->vpp_session_handle);
+  if (!entry || !session || session_get_transport_proto (session) != TRANSPORT_PROTO_HTTP)
+    return HSS_URL_HANDLER_ERROR;
+  for (i = 0; i < HSS_ASYNC_RECORDS; i++)
+    {
+      record = &hss_async_test.records[i];
+      if (!record->armed || record->listener != entry - hss_async_test.listeners)
+	continue;
+      record->armed = 0;
+      record->active = 1;
+      record->thread = hs->thread_index;
+      record->hs_index = hs->session_index;
+      record->handle = hs->vpp_session_handle;
+      record->app_index = hs->app_index;
+      record->app_worker = session->app_wrk_index;
+      record->tx_before = svm_fifo_max_dequeue (session->tx_fifo);
+      record->enter_seq = hss_async_sequence ();
+      return HSS_URL_HANDLER_ASYNC;
+    }
+  hss_async_test.overflow = 1;
+  return HSS_URL_HANDLER_ERROR;
+}
+
+static uword
+hss_async_node_fn (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  hss_async_record_t *record;
+  hss_async_listener_t *entry;
+  hss_url_handler_args_t args = {};
+  hss_session_t *hs;
+  app_worker_t *worker;
+  session_t *session;
+  u32 i;
+
+  for (i = 0; i < HSS_ASYNC_RECORDS; i++)
+    {
+      record = &hss_async_test.records[i];
+      if (!record->pending || record->thread != vm->thread_index)
+	continue;
+      record->pending = 0;
+      if (!record->active)
+	{
+	  if (record->cancels)
+	    record->late++;
+	  else
+	    record->duplicates++;
+	  continue;
+	}
+      entry = &hss_async_test.listeners[record->listener];
+      hs = hss_session_get (record->thread, record->hs_index);
+      session = session_get_from_handle_if_valid (record->handle);
+      worker = app_worker_get_if_valid (record->app_worker);
+      if (!hs || !session || !worker || !record->async_seq ||
+	  hs->vpp_session_handle != record->handle || hs->app_index != record->app_index ||
+	  hs->listener_index != entry->index || hss_async_listener (entry->index) != entry ||
+	  session->opaque != record->hs_index || session->app_wrk_index != record->app_worker ||
+	  worker->app_index != record->app_index)
+	{
+	  hss_async_test.overflow = 1;
+	  record->active = 0;
+	  record->cancels++;
+	  record->cancel_seq = hss_async_sequence ();
+	  vec_free (record->response);
+	  continue;
+	}
+      args.sh.thread_index = record->thread;
+      args.sh.session_index = record->hs_index;
+      args.data = record->response;
+      args.data_len = vec_len (record->response);
+      args.free_vec_data = 1;
+      args.sc = HTTP_STATUS_OK;
+      args.ct = HTTP_CONTENT_TEXT_PLAIN;
+      if (hss_add_header (hs, HTTP_HEADER_CACHE_CONTROL,
+			  (const char *) hss_listener_get (entry->index)->max_age_formatted,
+			  vec_len (hss_listener_get (entry->index)->max_age_formatted)))
+	args.sc = HTTP_STATUS_INTERNAL_ERROR;
+      record->response = 0;
+      record->active = 0;
+      hss_session_send_data (&args);
+    }
+  return 0;
+}
+
+VLIB_REGISTER_NODE (hss_async_node, static) = {
+  .function = hss_async_node_fn,
+  .name = "http-static-test-async",
+  .type = VLIB_NODE_TYPE_INPUT,
+  .state = VLIB_NODE_STATE_INTERRUPT,
+};
+
+static clib_error_t *
+hss_async_recover (hss_async_record_t *record)
+{
+  hss_async_listener_t *entry = &hss_async_test.listeners[record->listener];
+  hss_listener_t *listener = hss_listener_get (entry->index);
+  hss_session_t *hs;
+  hss_pending_accept_t *pending;
+  u32 i;
+
+  if (!record->cleanup_seq || record->pending || entry->recoveries || entry->pool_puts ||
+      !listener || hss_async_listener (entry->index) != entry || !listener->retiring ||
+      listener->ref_count != 1 || entry->cache_frees || entry->final_seq || !record->omitted)
+    return clib_error_return (0, "async recovery requires one observed omitted final reference");
+  for (i = 0; i < vec_len (hss_main.sessions); i++)
+    {
+      pool_foreach (hs, hss_main.sessions[i])
+	if (hs->listener_index == entry->index)
+	  return clib_error_return (0, "async recovery has a live session owner");
+      if (i < vec_len (hss_pending_accepts))
+	vec_foreach (pending, hss_pending_accepts[i])
+	  if (pending->listener_index == entry->index)
+	    return clib_error_return (0, "async recovery has a captured owner");
+    }
+  if (listener->cache)
+    {
+      hss_cache_entry_t *cached;
+      pool_foreach (cached, listener->cache->cache_pool)
+	if (cached->inuse)
+	  return clib_error_return (0, "async recovery has a live cache owner");
+    }
+  if (record->token != 101 || record->sends != 1 || record->cleanups != 1)
+    return clib_error_return (0, "async recovery is restricted to completed token 101");
+  entry->recoveries++;
+  hss_listener_release (entry->index);
+  return 0;
+}
+
+static void
+hss_async_status (vlib_main_t *vm)
+{
+  hss_async_record_t *record;
+  hss_async_listener_t *entry;
+  hss_listener_t *listener;
+  u32 i;
+
+  vlib_cli_output (vm, "async-ledger enabled %u overflow %u live %u baseline %u",
+		   hss_async_test.enabled, hss_async_test.overflow, pool_elts (hss_main.listeners),
+		   hss_async_test.baseline);
+  for (i = 0; i < HSS_ASYNC_RECORDS; i++)
+    {
+      record = &hss_async_test.records[i];
+      if (!record->token)
+	continue;
+      entry = &hss_async_test.listeners[record->listener];
+      listener = entry->pool_puts ? 0 : hss_listener_get (entry->index);
+      vlib_cli_output (
+	vm,
+	"token %u epoch %llu generation %u app %u thread %u hs %u handle %llu "
+	"listener %u enter %llu async %llu send %llu cancel %llu cleanup %llu "
+	"sends %u cancels %u cleanups %u duplicate %u late %u pending %u "
+	"owned %u tx %u refs %u retiring %u final %llu freed %llu "
+	"releases %u cachefree %u vecfree %u poolput %u recovery %u omitted %u",
+	record->token, entry->epoch, entry->generation, record->app_index, record->thread,
+	record->hs_index, record->handle, entry->index, record->enter_seq, record->async_seq,
+	record->send_seq, record->cancel_seq, record->cleanup_seq, record->sends, record->cancels,
+	record->cleanups, record->duplicates, record->late, record->pending, record->response != 0,
+	record->tx_before, listener ? listener->ref_count : 0, listener ? listener->retiring : 1,
+	entry->final_seq, entry->free_seq, entry->releases, entry->cache_frees, entry->vec_frees,
+	entry->pool_puts, entry->recoveries, record->omitted);
+    }
+}
+
+static clib_error_t *
+hss_async_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  hss_async_record_t *record = 0;
+  hss_async_listener_t *entry;
+  u32 token, index, i;
+  u8 *body = 0;
+
+  ASSERT (vlib_thread_is_main_w_barrier ());
+  if (unformat (input, "start"))
+    {
+      if (hss_async_test.enabled || pool_elts (hss_main.listeners) || vlib_num_workers () != 1)
+	return clib_error_return (0, "async start requires idle listeners and one worker");
+      for (i = 0; i < vec_len (hss_pending_destroys); i++)
+	if (vec_len (hss_pending_destroys[i]))
+	  return clib_error_return (0, "async start requires completed destroys");
+      for (i = 0; i < vec_len (hss_main.sessions); i++)
+	if (pool_elts (hss_main.sessions[i]))
+	  return clib_error_return (0, "async start requires no sessions");
+      clib_memset (&hss_async_test, 0, sizeof (hss_async_test));
+      hss_async_test.enabled = 1;
+      hss_async_test.baseline = pool_elts (hss_main.listeners);
+      return 0;
+    }
+  if (!hss_async_test.enabled)
+    return clib_error_return (0, "async ledger is disabled");
+  if (unformat (input, "status"))
+    {
+      hss_async_status (vm);
+      return 0;
+    }
+  if (unformat (input, "clear"))
+    {
+      if (pool_elts (hss_main.listeners) != hss_async_test.baseline)
+	return clib_error_return (0, "async clear requires baseline listeners");
+      for (i = 0; i < HSS_ASYNC_RECORDS; i++)
+	if (hss_async_test.records[i].armed || hss_async_test.records[i].active ||
+	    hss_async_test.records[i].pending || hss_async_test.records[i].response)
+	  return clib_error_return (0, "async clear requires drained records");
+      for (i = 0; i < hss_async_test.listener_count; i++)
+	if (!hss_async_test.listeners[i].pool_puts)
+	  return clib_error_return (0, "async clear requires completed listener frees");
+      for (i = 0; i < vec_len (hss_pending_destroys); i++)
+	if (vec_len (hss_pending_destroys[i]))
+	  return clib_error_return (0, "async clear requires completed destroys");
+      hss_async_test.enabled = 0;
+      return 0;
+    }
+  if (unformat (input, "arm %u listener %u body %s", &token, &index, &body))
+    {
+      entry = hss_async_listener (index);
+      if (!token || !entry || !hss_listener_get (index) || hss_listener_get (index)->retiring)
+	{
+	  vec_free (body);
+	  return clib_error_return (0, "async arm listener invalid");
+	}
+      for (i = 0; i < HSS_ASYNC_RECORDS; i++)
+	{
+	  if (hss_async_test.records[i].token == token ||
+	      (hss_async_test.records[i].armed &&
+	       hss_async_test.records[i].listener == entry - hss_async_test.listeners))
+	    {
+	      vec_free (body);
+	      return clib_error_return (0, "async token or listener already armed");
+	    }
+	  if (!record && !hss_async_test.records[i].token)
+	    record = &hss_async_test.records[i];
+	}
+      if (!record)
+	{
+	  vec_free (body);
+	  return clib_error_return (0, "async records full");
+	}
+      record->token = token;
+      record->listener = entry - hss_async_test.listeners;
+      record->response = body;
+      vec_set_len (body, strlen ((char *) body));
+      record->armed = 1;
+      return 0;
+    }
+  if (unformat (input, "release %u", &token))
+    {
+      for (i = 0; i < HSS_ASYNC_RECORDS; i++)
+	if (hss_async_test.records[i].token == token)
+	  record = &hss_async_test.records[i];
+      if (!record || !record->async_seq || record->pending)
+	return clib_error_return (0, "async release token not ready");
+      record->pending = 1;
+      vlib_node_set_interrupt_pending (vlib_get_main_by_index (record->thread),
+				       hss_async_node.index);
+      return 0;
+    }
+  if (unformat (input, "recover %u", &token))
+    {
+      for (i = 0; i < HSS_ASYNC_RECORDS; i++)
+	if (hss_async_test.records[i].token == token)
+	  record = &hss_async_test.records[i];
+      if (!record)
+	return clib_error_return (0, "async recovery token missing");
+      return hss_async_recover (record);
+    }
+  return clib_error_return (0, "unknown async command");
+}
+
+VLIB_CLI_COMMAND (hss_async_command, static) = {
+  .path = "test http static async",
+  .short_help = "test http static async start|status|arm <token> listener <index> body <body>|"
+		"release <token>|recover <token>|clear",
+  .function = hss_async_command_fn,
+};
+
 static session_handle_t
 hss_test_accept_alloc (session_handle_t listener, session_handle_t parent)
 {
