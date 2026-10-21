@@ -1350,7 +1350,8 @@ class TestAsyncLifecycleWitness(unittest.TestCase):
             detach.index("hss_async_pending_detaches--"),
         )
         self.assertIn("if (!rv)", detach)
-        clear = source.split('if (unformat (input, "clear"))', 1)[1].split(
+        command = source.split("\nhss_async_command_fn (", 1)[1]
+        clear = command.split('if (unformat (input, "clear"))', 1)[1].split(
             'if (unformat (input, "arm', 1
         )[0]
         for guard in (
@@ -1364,6 +1365,165 @@ class TestAsyncLifecycleWitness(unittest.TestCase):
             "hss_async_owner_count",
         ):
             self.assertIn(guard, clear)
+
+
+class TestAcceptedWitness(unittest.TestCase):
+    @staticmethod
+    def completed():
+        return dict(
+            token=201,
+            enabled=1,
+            overflow=0,
+            epoch=1,
+            generation=2,
+            app=3,
+            worker=4,
+            listener=5,
+            thread=1,
+            handle=(1 << 32) | 6,
+            protocol=7,
+            builtin=1,
+            event=11,
+            enqueued=1,
+            head=8,
+            current_head=8,
+            head_after=9,
+            held=1,
+            captured=2,
+            released=3,
+            transferred=4,
+            callback=5,
+            ready=6,
+            advanced=7,
+            ack=8,
+            cleaned=9,
+            callbacks=1,
+            advances=1,
+            rx_ready=1,
+            captures=1,
+            transfers=1,
+            refs_before=1,
+            refs_after=1,
+            cleanups=1,
+            pending=0,
+            queued=0,
+            retained=0,
+            refs=0,
+            retiring=1,
+            freed=10,
+            poolput=1,
+        )
+
+    def test_completed_witness_accepts_exact_identity_and_order(self):
+        record = self.completed()
+        helper("_accepted_assert_witness")(self, record, record, "closed")
+
+    def test_witness_rejects_main_queue_non_http_wrong_app_and_handle(self):
+        record = self.completed()
+        for change in (
+            dict(thread=0), dict(handle=6), dict(protocol=2), dict(app=4),
+            dict(worker=5), dict(handle=(1 << 32) | 7), dict(epoch=2),
+            dict(generation=3), dict(token=202), dict(listener=6),
+            dict(builtin=0), dict(event=0),
+        ):
+            with self.subTest(change=change):
+                with self.assertRaises(AssertionError):
+                    helper("_accepted_assert_witness")(
+                        self, dict(record, **change), record, "closed"
+                    )
+
+    def test_witness_rejects_missing_enqueue_duplicates_and_reference_changes(self):
+        record = self.completed()
+        for change in (
+            dict(enqueued=0), dict(callbacks=2), dict(transfers=2),
+            dict(advances=2), dict(rx_ready=2), dict(captures=2),
+            dict(refs_before=2), dict(refs_after=2), dict(overflow=1),
+            dict(queued=1), dict(retained=1), dict(poolput=0), dict(refs=1),
+        ):
+            with self.subTest(change=change):
+                with self.assertRaises(AssertionError):
+                    helper("_accepted_assert_witness")(
+                        self, dict(record, **change), record, "closed"
+                    )
+
+    def test_witness_rejects_early_callback_head_advance_and_rx_ready(self):
+        identity = self.completed()
+        held = dict(identity, head_after=0, queued=1)
+        for field in (
+            "released", "transferred", "callback", "ready", "advanced", "ack",
+            "callbacks", "advances", "rx_ready", "transfers", "cleanups",
+        ):
+            held[field] = 0
+        helper("_accepted_assert_witness")(self, held, identity, "held")
+        for field in (
+            "callback", "callbacks", "advanced", "advances", "rx_ready", "ready", "current_head"
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(AssertionError):
+                    helper("_accepted_assert_witness")(
+                        self, dict(held, **{field: 1}), identity, "held"
+                    )
+        for field in ("callback", "ready", "advanced", "ack", "captured", "transferred"):
+            with self.subTest(zero=field):
+                with self.assertRaises(AssertionError):
+                    helper("_accepted_assert_witness")(
+                        self, dict(identity, **{field: 0}), identity, "closed"
+                    )
+        with self.assertRaises(AssertionError):
+            helper("_accepted_assert_witness")(
+                self, dict(identity, advanced=identity["ready"]), identity, "closed"
+            )
+
+    def test_core_hold_precedes_callback_and_head_advance(self):
+        source = (ROOT / "src/vnet/session/session_input.c").read_text()
+        flush = source.split("app_worker_flush_events_inline (", 1)[1]
+        self.assertLess(
+            flush.index("if (app_accept_gate (&gate_event))"),
+            flush.index("switch (evt->event_type)"),
+        )
+        self.assertIn(
+            "break;",
+            flush.split("if (app_accept_gate (&gate_event))", 1)[1].split("#endif", 1)[0],
+        )
+        self.assertLess(
+            flush.index("session_accept_callback (s)"),
+            flush.index("APP_ACCEPT_GATE_CALLBACK"),
+        )
+        self.assertLess(
+            flush.index("s->flags |= SESSION_F_RX_READY"),
+            flush.index("APP_ACCEPT_GATE_RX_READY"),
+        )
+        self.assertLess(
+            flush.index("clib_fifo_advance_head"),
+            flush.index("APP_ACCEPT_GATE_ADVANCED"),
+        )
+        registration = source.split("app_worker_set_accept_gate (", 1)[1].split(
+            "#endif", 1
+        )[0]
+        self.assertIn("vlib_thread_is_main_w_barrier", registration)
+        self.assertIn("app_accept_gate != 0", registration)
+        self.assertIn("app_accept_gate != gate", registration)
+        self.assertNotIn("http_static", source)
+
+    def test_release_uses_owner_node_and_clear_unhooks_after_drain(self):
+        source = (ROOT / "src/plugins/http_static/static_server.c").read_text()
+        owner = source.split("\nhss_accept_node_fn (", 1)[1].split("\nVLIB_REGISTER_NODE", 1)[0]
+        self.assertIn("vm->thread_index != 1", owner)
+        self.assertIn("worker->app_index != hss_accept_test.app", owner)
+        self.assertLess(
+            owner.index("app_wrk_flush_wrk_events"),
+            owner.rindex("hss_accept_test.ack ="),
+        )
+        self.assertIn("if (!hss_accept_owner_count ())", owner)
+        self.assertNotIn("app_worker_add_event", owner)
+        command = source.split("\nhss_accept_command_fn (", 1)[1].split("\nVLIB_CLI_COMMAND", 1)[0]
+        clear = command.split('if (unformat (input, "clear"))', 1)[1]
+        self.assertLess(clear.index("!hss_accept_test.ack"), clear.index("app_worker_set_accept_gate"))
+        self.assertLess(clear.index("app_worker_set_accept_gate"), clear.index("clib_memset"))
+        teardown = helper("_accepted_teardown")
+        calls = teardown.__code__.co_consts
+        self.assertIn("release", calls)
+        self.assertIn("ack", calls)
 
 
 if __name__ == "__main__":
