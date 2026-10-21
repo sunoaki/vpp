@@ -2420,3 +2420,401 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
 
         self._check_recovery(attempts_before, completed_before, "invalid-fd")
         self._check_linux_update_reaches_vpp()
+
+    def _router(self, arguments):
+        return self.vapi.cli(f"test lcp router {arguments}")
+
+    def _router_refs(self, proto, table, expected):
+        output = self._router(f"{proto} table {table} state")
+        lines = output.splitlines()
+        self.assertTrue(lines, output)
+        self.assertRegex(lines[0], rf"^refs:{expected} fib:[0-9]+ mfib:[0-9]+$", output)
+        self.assertEqual(sum(line.startswith("refs:") for line in lines), 1, output)
+        self.assertIn("invalid-source-refs:0", output)
+        if proto == "ip4":
+            self.assertIn("broadcast refs:1 local:1", output)
+
+    def _router_absent(self, proto, table):
+        self.assertEqual(
+            self._router(f"{proto} table {table} state").strip(),
+            f"absent fib:{CLIB_U32_MAX} mfib:{CLIB_U32_MAX}",
+        )
+
+    def _router_sources(self, proto, table, prefix, expected, forwarding=None):
+        output = self._router(f"{proto} table {table} entry {prefix}")
+        lines = output.splitlines()
+        for source, refs in zip(("static", "dynamic", "permanent"), expected):
+            self.assertIn(f"{source}:{int(refs != 0)} refs:{refs}", lines, output)
+        if forwarding is not None:
+            self.assertIn(f"forwarding:{forwarding}", lines, output)
+
+    def _router_broadcast_priority(self, table, dynamic):
+        base = f"ip4 table {table}"
+        prefix = "255.255.255.255/32"
+        self._router_sources("ip4", table, prefix, (0, 0, 1), "receive")
+        self._router(f"{base} add {prefix} proto 186 drop")
+        self._router_refs("ip4", table, 2)
+        self._router_sources("ip4", table, prefix, (0, 1, 1), "receive")
+        self._router(f"{base} add {prefix} proto 4 drop")
+        self._router_refs("ip4", table, 3)
+        self._router_sources("ip4", table, prefix, (1, 1, 1), "drop")
+        self._router(f"{base} del {prefix} proto 4 drop")
+        self._router_refs("ip4", table, 2)
+        self._router_sources("ip4", table, prefix, (0, 1, 1), "receive")
+        self._router(f"{base} del {prefix} proto 186 drop")
+        self._router_refs("ip4", table, 1)
+        self._router_sources("ip4", table, prefix, (0, 0, 1), "receive")
+        for protocol in (4, 186):
+            self._router(f"{base} add {prefix} proto {protocol} drop")
+            self._router("begin")
+            self._router(f"{base} add {dynamic}")
+            self._router("end")
+            self._router_refs("ip4", table, 1)
+            self._router_sources("ip4", table, prefix, (0, 0, 1), "receive")
+
+    def test_router_source_ownership(self):
+        """Repeated updates and stale sweeps release each IP source owner"""
+        for proto, prefix, table in (
+            ("ip4", "198.18.88.0/24", 1088),
+            ("ip6", "2001:db8:88::/64", 1089),
+        ):
+            base = f"{proto} table {table}"
+            route = f"{prefix} proto 4 drop"
+            dynamic = f"{prefix} proto 186 drop"
+            self._router_absent(proto, table)
+            try:
+                self._router(f"{base} add {route}")
+                self._router_refs(proto, table, 1)
+                self._router_sources(proto, table, prefix, (1, 0, 0))
+                self._router(f"{base} del {prefix} proto 186 drop")
+                self._router_refs(proto, table, 1)
+                self._router_sources(proto, table, prefix, (1, 0, 0))
+                for _ in range(3):
+                    self._router(f"{base} replace {route}")
+                    self._router(f"{base} add {route}")
+                    self._router_refs(proto, table, 1)
+                    self._router_sources(proto, table, prefix, (1, 0, 0))
+                self._router(f"{base} add {dynamic}")
+                self._router_refs(proto, table, 2)
+                self._router_sources(proto, table, prefix, (1, 1, 0))
+                for _ in range(2):
+                    self._router("begin")
+                    self._router(f"{base} add {route}")
+                    self._router(f"{base} add {dynamic}")
+                    self._router("end")
+                    self._router_refs(proto, table, 2)
+                    self._router_sources(proto, table, prefix, (1, 1, 0))
+                self._router("begin")
+                self._router(f"{base} add {dynamic}")
+                self._router("end")
+                self._router_refs(proto, table, 1)
+                self._router_sources(proto, table, prefix, (0, 1, 0))
+                if proto == "ip4":
+                    self._router_broadcast_priority(table, dynamic)
+                self._router("begin")
+                self._router("end")
+                self._router_absent(proto, table)
+                self._router(f"{base} add {route}")
+                self._router_refs(proto, table, 1)
+                self._router_sources(proto, table, prefix, (1, 0, 0))
+                self._router(f"{base} del {route}")
+                self._router_absent(proto, table)
+            finally:
+                if proto == "ip4":
+                    for protocol in (4, 186):
+                        self._router(
+                            f"{base} del 255.255.255.255/32 proto {protocol} drop"
+                        )
+                self._router(f"{base} del {route}")
+                self._router(f"{base} del {dynamic}")
+
+    def test_router_partial_delete_ownership(self):
+        """Partial IPv4 deletes preserve source and independent API ownership"""
+        pair = next(
+            entry
+            for entry in self.vapi.vpp.details_iter(self.vapi.lcp_itf_pair_get)
+            if entry.phy_sw_if_index == self.lo_interfaces[0].sw_if_index
+        )
+        table = 1090
+        prefix = "198.18.90.0/24"
+        base = f"ip4 table {table}"
+        route = f"{prefix} proto 4 vif {pair.vif_index} via 192.0.2.1"
+        other = f"{prefix} proto 4 vif {pair.vif_index} via 192.0.2.2"
+        multipath = f"{route} vif {pair.vif_index} via 192.0.2.2"
+        api_route = VppIpRoute(
+            self,
+            "198.18.90.0",
+            24,
+            [
+                VppRoutePath(
+                    "0.0.0.0", CLIB_U32_MAX, type=FibPathType.FIB_PATH_TYPE_DROP
+                )
+            ],
+            table_id=table,
+        )
+        self.vapi.ip_table_add_del(is_add=True, table={"table_id": table})
+        api_route.add_vpp_config()
+        try:
+            self._router(f"{base} add {multipath}")
+            self._router_refs("ip4", table, 1)
+            self._router(f"{base} del {route}")
+            self._router_refs("ip4", table, 1)
+            paths = next(
+                entry.route.paths
+                for entry in self.vapi.ip_route_dump(table, False)
+                if str(entry.route.prefix) == prefix
+            )
+            self.assertEqual(len(paths), 1)
+            self.assertEqual(str(paths[0].nh.address.ip4), "192.0.2.2")
+            self._router(f"{base} del {route}")
+            self._router_refs("ip4", table, 1)
+            self._router(f"{base} del {other}")
+            self.assertTrue(find_route(self, "198.18.90.0", 24, table_id=table))
+            self.assertIn("absent", self._router(f"{base} state"))
+            self._router(f"{base} add {route}")
+            self._router(f"{base} del {prefix} proto 186 vif {pair.vif_index}")
+            self._router_refs("ip4", table, 1)
+            self._router(f"{base} del {route}")
+            self.assertIn("absent", self._router(f"{base} state"))
+            self.assertTrue(find_route(self, "198.18.90.0", 24, table_id=table))
+        finally:
+            self._router(f"{base} del {route}")
+            api_route.remove_vpp_config()
+            self.vapi.ip_table_add_del(is_add=False, table={"table_id": table})
+        self._router_absent("ip4", table)
+
+    def test_router_mpls_ownership(self):
+        """MPLS EOS and non-EOS retain and release separate source owners"""
+        pair = next(iter(self.vapi.vpp.details_iter(self.vapi.lcp_itf_pair_get)))
+        base = "mpls table 1091"
+        route = f"18801 proto 4 vif {pair.vif_index} via 192.0.2.1"
+        dynamic = f"18801 proto 186 vif {pair.vif_index} via 192.0.2.1"
+        self._router_absent("mpls", 1091)
+        try:
+            self._router(f"{base} add {route}")
+            self._router_refs("mpls", 1091, 2)
+            for eos in (0, 1):
+                self._router_sources("mpls", 1091, f"18801 eos {eos}", (1, 0, 0))
+            entries = [
+                entry.mr_route
+                for entry in self.vapi.mpls_route_dump(1091)
+                if entry.mr_route.mr_label == 18801
+            ]
+            self.assertEqual(sorted(entry.mr_eos for entry in entries), [0, 1])
+            for entry in entries:
+                self.assertEqual(entry.mr_n_paths, 1)
+                self.assertEqual(str(entry.mr_paths[0].nh.address.ip4), "192.0.2.1")
+                if entry.mr_eos:
+                    self.assertEqual(entry.mr_eos_proto, 0)
+            for _ in range(3):
+                self._router(f"{base} replace {route}")
+                self._router(f"{base} add {route}")
+                self._router_refs("mpls", 1091, 2)
+                for eos in (0, 1):
+                    self._router_sources("mpls", 1091, f"18801 eos {eos}", (1, 0, 0))
+            self._router(f"{base} add {dynamic}")
+            self._router_refs("mpls", 1091, 4)
+            for eos in (0, 1):
+                self._router_sources("mpls", 1091, f"18801 eos {eos}", (1, 1, 0))
+            self._router("begin")
+            self._router(f"{base} add {dynamic}")
+            self._router("end")
+            self._router_refs("mpls", 1091, 2)
+            for eos in (0, 1):
+                self._router_sources("mpls", 1091, f"18801 eos {eos}", (0, 1, 0))
+            self._router(f"{base} del {dynamic}")
+            self._router_absent("mpls", 1091)
+            self._router(f"{base} add {route}")
+            self._router("begin")
+            self._router("end")
+            self._router_absent("mpls", 1091)
+        finally:
+            self._router(f"{base} del {route}")
+            self._router(f"{base} del {dynamic}")
+
+    def _router_linux_path(self, proto, table, prefix, gateway, protocol):
+        def paths():
+            return [
+                (
+                    path.sw_if_index,
+                    path.type,
+                    path.preference,
+                    str(path.nh.address.ip6 if proto == "ip6" else path.nh.address.ip4),
+                )
+                for entry in self.vapi.ip_route_dump(table, proto == "ip6")
+                if str(entry.route.prefix) == prefix
+                for path in entry.route.paths
+            ]
+
+        self.poll_for(
+            f"{prefix} via {gateway} preference 100 in VPP",
+            paths,
+            [
+                (
+                    self.lo_interfaces[0].sw_if_index,
+                    FibPathType.FIB_PATH_TYPE_NORMAL,
+                    100,
+                    gateway,
+                )
+            ],
+        )
+        self._router_refs(proto, table, 1)
+        self._router_sources(
+            proto, table, prefix, (1, 0, 0) if protocol == 4 else (0, 1, 0)
+        )
+
+    def test_router_linux_replace_replay(self):
+        """Changing Linux gateways and recovery replay retain one source owner"""
+        set_interface_up(self.ns_name, "hloop0")
+        for family, proto, prefix, table, address, gateways in (
+            (
+                "-4",
+                "ip4",
+                "198.18.92.0/24",
+                1092,
+                "192.0.2.254/24",
+                ("192.0.2.1", "192.0.2.2", "192.0.2.3"),
+            ),
+            (
+                "-6",
+                "ip6",
+                "2001:db8:93::/64",
+                1093,
+                "2001:db8:ffff::fe/64",
+                ("2001:db8:ffff::1", "2001:db8:ffff::2", "2001:db8:ffff::3"),
+            ),
+        ):
+            add_namespace_address(self.ns_name, "hloop0", address)
+            try:
+                for protocol in (4, 186):
+                    command = ["ip", "-n", self.ns_name, family, "route"]
+                    try:
+                        for gateway in gateways:
+                            subprocess.run(
+                                command
+                                + [
+                                    "replace",
+                                    prefix,
+                                    "via",
+                                    gateway,
+                                    "dev",
+                                    "hloop0",
+                                    "onlink",
+                                    "table",
+                                    str(table),
+                                    "proto",
+                                    str(protocol),
+                                    "metric",
+                                    "100",
+                                ],
+                                check=True,
+                                capture_output=True,
+                            )
+                            self._router_linux_path(
+                                proto, table, prefix, gateway, protocol
+                            )
+                        for _ in range(2):
+                            stats = self._netlink_stats()
+                            self._invoke_netlink_error_callback()
+                            self._check_recovery(
+                                self._netlink_count(stats, "synchronization attempts"),
+                                self._netlink_count(stats, "synchronization completed"),
+                                "route replay ownership",
+                            )
+                            self._router_linux_path(
+                                proto, table, prefix, gateways[-1], protocol
+                            )
+                    finally:
+                        subprocess.run(
+                            command + ["flush", "table", str(table)],
+                            check=True,
+                            capture_output=True,
+                        )
+                        self.poll_for(
+                            "Linux route table released",
+                            lambda: self._router(
+                                f"{proto} table {table} state"
+                            ).split()[0],
+                            "absent",
+                        )
+                    self._router_absent(proto, table)
+            finally:
+                del_namespace_address(self.ns_name, "hloop0", address)
+
+    def test_router_bound_table_sweep(self):
+        """Sweep releases routes while pair binding preserves table lifetime"""
+        interface = self.lo_interfaces[0]
+        for is_ipv6, proto, prefix, table in (
+            (False, "ip4", "198.18.94.0/24", 1094),
+            (True, "ip6", "2001:db8:95::/64", 1095),
+        ):
+            self.vapi.ip_table_add_del(
+                is_add=True, table={"table_id": table, "is_ip6": is_ipv6}
+            )
+            try:
+                self.vapi.sw_interface_set_table(
+                    sw_if_index=interface.sw_if_index, is_ipv6=is_ipv6, vrf_id=table
+                )
+                self._router_refs(proto, table, 1)
+                base = f"{proto} table {table}"
+                self._router(f"{base} add {prefix} proto 4 drop")
+                self._router_refs(proto, table, 2)
+                self._router("begin")
+                self._router("end")
+                self._router_refs(proto, table, 1)
+                self._router(f"{base} del {prefix} proto 4 drop")
+                self._router_refs(proto, table, 1)
+            finally:
+                self.vapi.sw_interface_set_table(
+                    sw_if_index=interface.sw_if_index, is_ipv6=is_ipv6, vrf_id=0
+                )
+                self.vapi.ip_table_add_del(
+                    is_add=False, table={"table_id": table, "is_ip6": is_ipv6}
+                )
+            self._router_absent(proto, table)
+
+    def test_router_broadcast_recovery(self):
+        """Permanent limited broadcast receive survives repeated real recovery"""
+        self.create_pg_interfaces(range(1))
+        phy = self.pg0
+        phy.admin_up()
+        phy.config_ip4()
+        self.vapi.cli(f"lcp create {phy.name} host-if hbcast netns {self.ns_name}")
+        host = HostInterface(self, self.ns_name, "hbcast")
+        packet = (
+            Ether(src=phy.remote_mac, dst="ff:ff:ff:ff:ff:ff")
+            / IP(src=phy.remote_ip4, dst="255.255.255.255")
+            / UDP(sport=18888, dport=18888)
+            / Raw(b"lcp broadcast ownership")
+        )
+        try:
+            for cycle in range(4):
+                self.assertIn(
+                    "broadcast refs:1 local:1", self._router("ip4 table 0 state")
+                )
+                host.enable_capture()
+                phy.add_stream([packet])
+                self.pg_start(trace=False)
+                captured = host.get_capture(
+                    expected_count=1,
+                    timeout=5,
+                    filter_out_fn=lambda pkt: not (
+                        pkt.haslayer(UDP) and pkt[UDP].dport == 18888
+                    ),
+                )
+                self.assertEqual(captured[0][IP].dst, "255.255.255.255")
+                host.disable_capture()
+                if cycle == 3:
+                    break
+                stats = self._netlink_stats()
+                self._invoke_netlink_error_callback()
+                self._check_recovery(
+                    self._netlink_count(stats, "synchronization attempts"),
+                    self._netlink_count(stats, "synchronization completed"),
+                    "broadcast receive ownership",
+                )
+        finally:
+            host.disable_capture()
+            self.vapi.cli(f"lcp delete {phy.name}")
+            phy.unconfig_ip4()
+            phy.admin_down()

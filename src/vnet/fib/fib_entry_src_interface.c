@@ -221,6 +221,7 @@ fib_entry_src_interface_deactivate (fib_entry_src_t *src,
     {
 	cover = fib_entry_get(src->u.interface.fesi_cover);
 	fib_entry_cover_untrack(cover, src->u.interface.fesi_sibling);
+	fib_attached_export_covered_removed (cover, fib_entry_get_index (fib_entry));
 
 	src->u.interface.fesi_cover = FIB_NODE_INDEX_INVALID;
 	src->u.interface.fesi_sibling = ~0;
@@ -269,15 +270,15 @@ fib_entry_src_interface_cover_change (fib_entry_src_t *src,
 }
 
 static void
-fib_entry_src_interface_installed (fib_entry_src_t *src,
-				   const fib_entry_t *fib_entry)
+fib_entry_src_interface_fwd_update (fib_entry_src_t *src,
+                                    const fib_entry_t *fib_entry,
+                                    fib_source_t best_source)
 {
-    /*
-     * The interface source now rules! poke our cover to get exported
-     */
     fib_entry_t *cover;
 
-    if (FIB_NODE_INDEX_INVALID != src->u.interface.fesi_cover)
+    if ((src->fes_flags & FIB_ENTRY_SRC_FLAG_CONTRIBUTING) &&
+        dpo_id_is_valid(&fib_entry->fe_lb) &&
+        FIB_NODE_INDEX_INVALID != src->u.interface.fesi_cover)
     {
 	cover = fib_entry_get(src->u.interface.fesi_cover);
 
@@ -301,7 +302,7 @@ const static fib_entry_src_vft_t interface_src_vft = {
     .fesv_activate = fib_entry_src_interface_activate,
     .fesv_deactivate = fib_entry_src_interface_deactivate,
     .fesv_format = fib_entry_src_interface_format,
-    .fesv_installed = fib_entry_src_interface_installed,
+    .fesv_fwd_update = fib_entry_src_interface_fwd_update,
     .fesv_cover_change = fib_entry_src_interface_cover_change,
     /*
      * not concerned about updates to the cover. the cover will

@@ -400,7 +400,7 @@ extern void fib_entry_inherit(fib_node_index_t cover,
 extern fib_entry_src_flag_t fib_entry_delete(fib_node_index_t fib_entry_index,
 					     fib_source_t source);
 
-extern void fib_entry_recalculate_forwarding(
+__clib_export extern void fib_entry_recalculate_forwarding(
     fib_node_index_t fib_entry_index);
 extern void fib_entry_contribute_urpf(fib_node_index_t path_index,
 				      index_t urpf);
@@ -457,7 +457,7 @@ __clib_export extern fib_entry_flag_t fib_entry_get_flags(fib_node_index_t fib_e
 extern fib_entry_flag_t fib_entry_get_flags_for_source(
     fib_node_index_t fib_entry_index,
     fib_source_t source);
-extern fib_source_t fib_entry_get_best_source(fib_node_index_t fib_entry_index);
+__clib_export extern fib_source_t fib_entry_get_best_source(fib_node_index_t fib_entry_index);
 __clib_export extern int fib_entry_is_sourced(fib_node_index_t fib_entry_index,
                                 fib_source_t source);
 
