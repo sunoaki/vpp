@@ -141,5 +141,5 @@ extern int lcp_nl_drain_messages (void);
 extern void lcp_nl_set_buffer_size (u32 buf_size);
 extern void lcp_nl_set_batch_size (u32 batch_size);
 extern void lcp_nl_set_batch_delay (u32 batch_delay_ms);
-extern void lcp_nl_test_set_sync_pause (u8 enable);
-extern int lcp_nl_test_inject_dump (u32 sock_type, u32 scenario);
+__clib_export void lcp_nl_test_set_sync_pause (u8 enable);
+__clib_export int lcp_nl_test_inject_dump (u32 sock_type, u32 scenario);
