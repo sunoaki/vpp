@@ -48,11 +48,11 @@ jobs:
     env:
       VARIANT_NAME: ${{ matrix.variant }}
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: 21c5ddbed9ca410cd29a8887c90b3664c264ea73
+      CANDIDATE_SHA: e0ab2740e90afe86a32275625bfcd02e18f17c2d
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: d15c775352be6899e2e81d5562b647581a4102d8
-      CONTROL_SHA: 08fd58509dcc225eaf5bc2fccf7bdcceb5493944
-      CONTROL_TREE: 59987ec77377091d7ac1b5ddf257e6845378d4e8
+      CANDIDATE_TREE: e0939a52c77f850c8516cd722103627eaf618de4
+      CONTROL_SHA: 9d1252098e455f9f9ed2035696761cc26f14c2db
+      CONTROL_TREE: 63717b0881cd5a37cd60480d25c57cf8e992f094
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
@@ -86,7 +86,7 @@ jobs:
           printf '%s\n' bootstrap checkout prepare dependencies feature-list pinned-python black-version \
             fixture-python-style fixtures mutate fallback-version build binaries namespace environment runtime tests http-name http-name-runtime collect \
             > "$EVIDENCE/planned-phases.txt"
-          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 bc3f722462af7eeac5f8c3d51052941b690c4cb5 314747c69ebdc5d7b6fb4a34786071a3dec218e1 21c5ddbed9ca410cd29a8887c90b3664c264ea73; do
+          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 bc3f722462af7eeac5f8c3d51052941b690c4cb5 314747c69ebdc5d7b6fb4a34786071a3dec218e1 21c5ddbed9ca410cd29a8887c90b3664c264ea73 e0ab2740e90afe86a32275625bfcd02e18f17c2d; do
             printf 'style-%s\napi-%s\nmessage-%s\n' "$commit" "$commit" "$commit" >> "$EVIDENCE/planned-phases.txt"
           done
           {
@@ -1829,11 +1829,11 @@ jobs:
           TEST = "test/asf/test_http_static.py"
           FIXTURE = "src/plugins/http_static/test_lifetime_fixtures.py"
           HTTP_TEST = "test/asf/test_http.py"
-          TEST_BLOBS = {TEST: "ea039fd67a7a8d10aef07be51d65d71600a49a5b",
-                        FIXTURE: "d974b1fb1aaf96427f30218b02b2b059d9c742fe",
+          TEST_BLOBS = {TEST: "d379117d5b266f7964a709b6b710e9f7d8f37805",
+                        FIXTURE: "9c0d2839291bf7ea794c258d318d1380d7a0cc9f",
                         HTTP_TEST: "0a7353040c8323e3ec2f4500d2ce72c1f2a94934"}
           CORE_BLOBS = {"src/vnet/session/session_input.c": "4c3b9df8973ed3fcff455b83b826b0dfb04e0f8e",
-                        "src/vnet/session/application.h": "728c6e9b1d9d406445d6e6d9ce335d8dc11d185f"}
+                        "src/vnet/session/application.h": "949d9dcb1dc4c7396185754b9198413aea1eb603"}
           ACCEPTED_FIELDS = ("token enabled overflow epoch generation app worker listener thread handle protocol builtin "
               "event enqueued head current_head head_after held captured released transferred callback ready advanced "
               "ack cleaned callbacks advances rx_ready captures transfers refs_before refs_after cleanups pending queued "
@@ -1861,12 +1861,12 @@ jobs:
           ACCEPTED_TEST = "test_http_static.TestHttpStaticCliWorker.test_http_static_worker_accepted_identity"
           DESTROY_TEST = "test_http_static.TestHttpStaticCliWorker.test_http_static_destroy_owner_generations"
           BUILD_IDENTITIES = {
-              "fixed": ("4c998afbbe0fb6fb00f546c795551223dc825266", "d15c775352be6899e2e81d5562b647581a4102d8"),
-              "cache-limit": ("3f4027039d2128e9c04dd5ee8c1c503918dc89e7", "fc09f15b03c9b4c9c5370bfbb864687d6cfe8b10"),
-              "api-protocol": ("9be90d745ea02afaa6471ca1cc163d95d9f397af", "1cdf750907bd8d388160e9b3b185aff51766642b"),
-              "original-endpoint": ("ba2ea7f899ea5b004352415f0876d1c9ca6fa55b", "fa870bf71b1d9a29b279477f25b63ffe10e04f17"),
-              "read-error-unlock": ("404e94c25c913ffa91fd96004a15f58fb16c11f2", "417e3f4c1e3693eedfb13bc359ab06ef93fc0b18"),
-              "async-omit-release": ("3dec235bd3ba97b134ee0132863d54fc4ddd81f5", "59987ec77377091d7ac1b5ddf257e6845378d4e8")}
+              "fixed": ("4c998afbbe0fb6fb00f546c795551223dc825266", "e0939a52c77f850c8516cd722103627eaf618de4"),
+              "cache-limit": ("3f4027039d2128e9c04dd5ee8c1c503918dc89e7", "0f9aa7dbdc828a854e4b54f8f710847627521e27"),
+              "api-protocol": ("9be90d745ea02afaa6471ca1cc163d95d9f397af", "639b9e6cd461db48ab565df0f3d41019d6271e78"),
+              "original-endpoint": ("ba2ea7f899ea5b004352415f0876d1c9ca6fa55b", "bca81680f05bb25b1ffd4c2c980987e7a93ff7a1"),
+              "read-error-unlock": ("404e94c25c913ffa91fd96004a15f58fb16c11f2", "994fec06563c3c3e78f331ca99f5efa620a205a6"),
+              "async-omit-release": ("3dec235bd3ba97b134ee0132863d54fc4ddd81f5", "63717b0881cd5a37cd60480d25c57cf8e992f094")}
           RECIPES = {
               "cache-limit": ("rmp->cache_size_limit = htonl (l->cache ? l->cache->cache_limit : 0);",
                               "rmp->cache_size_limit = htonl (hsm->default_listener.cache ? hsm->default_listener.cache->cache_limit : 0);"),
@@ -2198,7 +2198,8 @@ jobs:
           def source_identity():
               pure = "bc3f722462af7eeac5f8c3d51052941b690c4cb5"
               observer = "314747c69ebdc5d7b6fb4a34786071a3dec218e1"
-              for child, parent in ((CANDIDATE, observer), (observer, pure),
+              for child, parent in ((CANDIDATE, "21c5ddbed9ca410cd29a8887c90b3664c264ea73"),
+                                    ("21c5ddbed9ca410cd29a8887c90b3664c264ea73", observer), (observer, pure),
                                     (pure, "40b52275db082d350158684cdb117e9f43450418")):
                   require(git("rev-list", "--parents", "-n", "1", child).split() == [child, parent],
                           "Frozen destroy source ancestry differs")
@@ -5044,11 +5045,11 @@ jobs:
     env:
       VARIANT_NAME: fixed
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: 21c5ddbed9ca410cd29a8887c90b3664c264ea73
+      CANDIDATE_SHA: e0ab2740e90afe86a32275625bfcd02e18f17c2d
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: d15c775352be6899e2e81d5562b647581a4102d8
-      CONTROL_SHA: 08fd58509dcc225eaf5bc2fccf7bdcceb5493944
-      CONTROL_TREE: 59987ec77377091d7ac1b5ddf257e6845378d4e8
+      CANDIDATE_TREE: e0939a52c77f850c8516cd722103627eaf618de4
+      CONTROL_SHA: 9d1252098e455f9f9ed2035696761cc26f14c2db
+      CONTROL_TREE: 63717b0881cd5a37cd60480d25c57cf8e992f094
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
