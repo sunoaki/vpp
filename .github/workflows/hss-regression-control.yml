@@ -48,11 +48,11 @@ jobs:
     env:
       VARIANT_NAME: ${{ matrix.variant }}
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: 9ca6598ca4b0b43d8ceeb65c50c8c16a50e36d6f
+      CANDIDATE_SHA: 21c5ddbed9ca410cd29a8887c90b3664c264ea73
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: 7992427757c37544fc1b40ac11779df86ad6c432
-      CONTROL_SHA: 3723557df24d5b57f84afd16062f5fc8c7ff311e
-      CONTROL_TREE: 3ed81ae2fb2a499aaddc847a1a59e91582504293
+      CANDIDATE_TREE: d15c775352be6899e2e81d5562b647581a4102d8
+      CONTROL_SHA: 08fd58509dcc225eaf5bc2fccf7bdcceb5493944
+      CONTROL_TREE: 59987ec77377091d7ac1b5ddf257e6845378d4e8
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
@@ -86,7 +86,7 @@ jobs:
           printf '%s\n' bootstrap checkout prepare dependencies feature-list pinned-python black-version \
             fixture-python-style fixtures mutate fallback-version build binaries namespace environment runtime tests http-name http-name-runtime collect \
             > "$EVIDENCE/planned-phases.txt"
-          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 2ff4cf5eb2a84522213e1182ff1b3934153645d7 ca0843b651f6f9c1fca0635c61e6916112759fda 6459dbc8f8c82f18e00e72bc9e4676bbada62484 dee4c6f4b61e1b55d257f6c814bb3b49723a2d57 4ad5878cb0a4b1047e199fe828f7ab790409c18e b230ba5d6bd0ef362fd8c9d80e8a1a95a367c111 9ca6598ca4b0b43d8ceeb65c50c8c16a50e36d6f; do
+          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 bc3f722462af7eeac5f8c3d51052941b690c4cb5 314747c69ebdc5d7b6fb4a34786071a3dec218e1 21c5ddbed9ca410cd29a8887c90b3664c264ea73; do
             printf 'style-%s\napi-%s\nmessage-%s\n' "$commit" "$commit" "$commit" >> "$EVIDENCE/planned-phases.txt"
           done
           {
@@ -1487,8 +1487,8 @@ jobs:
                               task.get("control") != os.environ["CONTROL_SHA"] or
                               variant not in ("fixed", "cache-limit", "api-protocol", "original-endpoint", "read-error-unlock", "async-omit-release") or
                               any(task.get(key) != acceptance.get(key) for key in ("candidate", "control", "variant")) or
-                              task.get("fixtures") != 39 or not isinstance(acceptance.get("expected"), list) or
-                              len(acceptance["expected"]) != (29 if variant == "fixed" else 1 if variant == "async-omit-release" else 2) or
+                              task.get("fixtures") != 46 or not isinstance(acceptance.get("expected"), list) or
+                              len(acceptance["expected"]) != (30 if variant == "fixed" else 1 if variant == "async-omit-release" else 2) or
                               len(set(acceptance["expected"])) != len(acceptance["expected"]) or
                               task.get("runtime_tests") != acceptance.get("expected")):
                           raise ValueError("Product acceptance identity differs")
@@ -1829,8 +1829,8 @@ jobs:
           TEST = "test/asf/test_http_static.py"
           FIXTURE = "src/plugins/http_static/test_lifetime_fixtures.py"
           HTTP_TEST = "test/asf/test_http.py"
-          TEST_BLOBS = {TEST: "2a873caf2e85c8c22b1c153a41bcfb7712ebcba7",
-                        FIXTURE: "134c3c51751d008029671586186af400f4acd6e8",
+          TEST_BLOBS = {TEST: "ea039fd67a7a8d10aef07be51d65d71600a49a5b",
+                        FIXTURE: "d974b1fb1aaf96427f30218b02b2b059d9c742fe",
                         HTTP_TEST: "0a7353040c8323e3ec2f4500d2ce72c1f2a94934"}
           CORE_BLOBS = {"src/vnet/session/session_input.c": "4c3b9df8973ed3fcff455b83b826b0dfb04e0f8e",
                         "src/vnet/session/application.h": "728c6e9b1d9d406445d6e6d9ce335d8dc11d185f"}
@@ -1845,16 +1845,28 @@ jobs:
               "test_witness_rejects_early_callback_head_advance_and_rx_ready",
               "test_core_hold_precedes_callback_and_head_advance",
               "test_release_uses_owner_node_and_clear_unhooks_after_drain")
+          DESTROY_FIELDS = ("token enabled overflow epoch generation app cert bound published detach cert_delete freed "
+              "app_before app_after cert_before cert_after detach_rv cert_rv app_live cert_live inflight thread handle "
+              "hs_index listener captured gate held reset transport cleanup done ack remaining resets transports cleanups").split()
+          DESTROY_FIXTURES = (
+              "test_destroy_main_and_worker_positive_order",
+              "test_destroy_identity_and_pool_state_are_required",
+              "test_destroy_cleanup_ack_and_last_detach_order_are_required",
+              "test_destroy_held_owner_cannot_claim_cleanup_or_detach",
+              "test_destroy_static_slots_and_post_atomic_lifetime",
+              "test_destroy_clear_checks_all_inflight_and_teardown_releases_first",
+              "test_destroy_cleanup_stack_releases_before_each_client_stop")
           CLASSES = ("TestHttpStaticCli", "TestHttpStaticCliWorker")
           ASYNC_TEST = "test_http_static.TestHttpStaticCliWorker.test_http_static_async_release_cancel"
           ACCEPTED_TEST = "test_http_static.TestHttpStaticCliWorker.test_http_static_worker_accepted_identity"
+          DESTROY_TEST = "test_http_static.TestHttpStaticCliWorker.test_http_static_destroy_owner_generations"
           BUILD_IDENTITIES = {
-              "fixed": ("4c998afbbe0fb6fb00f546c795551223dc825266", "7992427757c37544fc1b40ac11779df86ad6c432"),
-              "cache-limit": ("3f4027039d2128e9c04dd5ee8c1c503918dc89e7", "cf31d1183f5e1bf201a219345256f1656c4b6c1e"),
-              "api-protocol": ("9be90d745ea02afaa6471ca1cc163d95d9f397af", "f315bc9a79e444dd96eaaff635dd081e89fdd053"),
-              "original-endpoint": ("384fd81dcae885ca1688e832fcfe965432515741", "e4c649d8ba4e390e3d824ae98771a75d5fe904e8"),
-              "read-error-unlock": ("404e94c25c913ffa91fd96004a15f58fb16c11f2", "381745d61cb0233fc1e8d0eda212e4f6697f77ce"),
-              "async-omit-release": ("e58f12f48c8107930fdf5bf7411ba67e8d552542", "3ed81ae2fb2a499aaddc847a1a59e91582504293")}
+              "fixed": ("4c998afbbe0fb6fb00f546c795551223dc825266", "d15c775352be6899e2e81d5562b647581a4102d8"),
+              "cache-limit": ("3f4027039d2128e9c04dd5ee8c1c503918dc89e7", "fc09f15b03c9b4c9c5370bfbb864687d6cfe8b10"),
+              "api-protocol": ("9be90d745ea02afaa6471ca1cc163d95d9f397af", "1cdf750907bd8d388160e9b3b185aff51766642b"),
+              "original-endpoint": ("ba2ea7f899ea5b004352415f0876d1c9ca6fa55b", "fa870bf71b1d9a29b279477f25b63ffe10e04f17"),
+              "read-error-unlock": ("404e94c25c913ffa91fd96004a15f58fb16c11f2", "417e3f4c1e3693eedfb13bc359ab06ef93fc0b18"),
+              "async-omit-release": ("3dec235bd3ba97b134ee0132863d54fc4ddd81f5", "59987ec77377091d7ac1b5ddf257e6845378d4e8")}
           RECIPES = {
               "cache-limit": ("rmp->cache_size_limit = htonl (l->cache ? l->cache->cache_limit : 0);",
                               "rmp->cache_size_limit = htonl (hsm->default_listener.cache ? hsm->default_listener.cache->cache_limit : 0);"),
@@ -2184,11 +2196,18 @@ jobs:
                   save(f"dependency-{label}.json", report)
 
           def source_identity():
-              require(git("rev-list", "--parents", "-n", "1", CANDIDATE).split() ==
-                      [CANDIDATE, "b230ba5d6bd0ef362fd8c9d80e8a1a95a367c111"],
-                      "Candidate must have exactly the frozen worker ACCEPTED parent")
+              pure = "bc3f722462af7eeac5f8c3d51052941b690c4cb5"
+              observer = "314747c69ebdc5d7b6fb4a34786071a3dec218e1"
+              for child, parent in ((CANDIDATE, observer), (observer, pure),
+                                    (pure, "40b52275db082d350158684cdb117e9f43450418")):
+                  require(git("rev-list", "--parents", "-n", "1", child).split() == [child, parent],
+                          "Frozen destroy source ancestry differs")
+              require(git("rev-parse", f"{pure}^{{tree}}") ==
+                      git("rev-parse", "9ca6598ca4b0b43d8ceeb65c50c8c16a50e36d6f^{tree}") ==
+                      "7992427757c37544fc1b40ac11779df86ad6c432",
+                      "Pure product baseline differs from previously tested source tree")
               require(git("rev-parse", f"{CANDIDATE}^{{tree}}") == os.environ["CANDIDATE_TREE"],
-                      "Candidate tree differs from frozen worker ACCEPTED source")
+                      "Candidate tree differs from frozen destroy source")
               require(git("rev-list", "--parents", "-n", "1", CONTROL).split() == [CONTROL, CANDIDATE] and
                       git("rev-parse", f"{CONTROL}^{{tree}}") == os.environ["CONTROL_TREE"] and
                       git("diff", "--name-only", CANDIDATE, CONTROL).splitlines() ==
@@ -2203,10 +2222,10 @@ jobs:
                   return [(cls.name, node.name) for cls in ast.parse(content(ref, FIXTURE)).body
                           if isinstance(cls, ast.ClassDef) for node in cls.body
                           if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")]
-              baseline = inventory("b230ba5d6bd0ef362fd8c9d80e8a1a95a367c111")
-              require(len(baseline) == 33 and inventory(CANDIDATE) == baseline +
-                      [("TestAcceptedWitness", name) for name in ACCEPTED_FIXTURES],
-                      "Frozen thirty-nine fixture names differ from original thirty-three plus ACCEPTED six")
+              baseline = inventory(pure)
+              require(len(baseline) == 39 and inventory(CANDIDATE) == baseline +
+                      [("TestDestroyOwnerWitnesses", name) for name in DESTROY_FIXTURES],
+                      "Frozen forty-six fixture names differ from baseline thirty-nine plus destroy seven")
               require(content(CANDIDATE, HTTP_TEST) == content(CHECK_BASE, HTTP_TEST),
                       "HTTP name regression differs from integrated master")
               sources = {name: ast.parse(content(CANDIDATE, path)) for name, path in
@@ -2245,7 +2264,7 @@ jobs:
                               workflow_blob=git("rev-parse", f"{workflow}:.github/workflows/hss-regression-control.yml"),
                               candidate_tree=git("rev-parse", f"{CANDIDATE}^{{tree}}"), variant=VARIANT,
                               control_sha=CONTROL, control_tree=os.environ["CONTROL_TREE"], superseded=initial["superseded"],
-                              async_scope="worker1 real HTTP ASYNC release/cancel; multi-event ACCEPTED/destroy and ACK/reset/heap remain open",
+                              async_scope="worker1 real HTTP ASYNC release/cancel; lifecycle omission controls remain bounded",
                               run_id=os.environ["GITHUB_RUN_ID"], attempt=os.environ["GITHUB_RUN_ATTEMPT"],
                               artifact=f"hss-{VARIANT}-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
                               run_url=f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
@@ -2263,6 +2282,13 @@ jobs:
                       sha256=hashlib.sha256(content(CANDIDATE, path)).hexdigest()) for path, blob in CORE_BLOBS.items()}
               manifest["accepted_scope"] = "one real worker1 HTTP ACCEPTED at consumer head; token201 old/new URI reuse"
               manifest["accepted_fields"] = ACCEPTED_FIELDS
+              manifest["destroy_scope"] = "tokens301/302: two real worker1 HTTP responses; held owners, reverse release, ACK/detach/cert/free order"
+              manifest["destroy_fields"] = DESTROY_FIELDS
+              manifest["destroy_test"] = DESTROY_TEST
+              manifest["historical_product_run"] = dict(run_id="39569176010",
+                  candidate="9ca6598ca4b0b43d8ceeb65c50c8c16a50e36d6f",
+                  workflow="d7296842e029b3ca59f9304b5750bbe21570cb82",
+                  scope="previous tree: 39 fixtures/full29 and five controls; not execution of current candidate")
               manifest["python_dependencies"] = {path: dict(blob=git("rev-parse", f"{CANDIDATE}:{path}"),
                       sha256=hashlib.sha256(content(CANDIDATE, path)).hexdigest()) for path in
                       ("test/requirements.txt", "test/requirements-3.txt")}
@@ -2295,8 +2321,8 @@ jobs:
               require(not git("diff", "--name-only"), "Tracked source changed before mutation")
               original = Path(SOURCE).read_bytes()
               if VARIANT == "async-omit-release":
-                  require(git("rev-parse", f"{CANDIDATE}:{SOURCE}") == "6ab2dc027a25168e6d8135850c1000cd23765bfe" and
-                          git("rev-parse", f"{CONTROL}:{SOURCE}") == "e58f12f48c8107930fdf5bf7411ba67e8d552542",
+                  require(git("rev-parse", f"{CANDIDATE}:{SOURCE}") == "5e0165561a5c74b04f5406a6ed3867b9bd0d61b9" and
+                          git("rev-parse", f"{CONTROL}:{SOURCE}") == "3dec235bd3ba97b134ee0132863d54fc4ddd81f5",
                           "Omitted-release source blobs differ")
                   Path(SOURCE).write_bytes(content(CONTROL, SOURCE))
               elif VARIANT != "fixed":
@@ -2441,11 +2467,11 @@ jobs:
                        "test_http_static_cache_owners", "test_http_static_cache_read_error",
                        "test_http_static_cache_pressure", "test_http_static_cache_relocation")),
                       "Reviewed thirteen methods or separate synthetic test changed")
-              require(methods["TestHttpStaticCliWorker"] == ["test_http_static_worker_accepted_identity",
-                      "test_http_static_async_release_cancel"] and
+              require(methods["TestHttpStaticCliWorker"] == ["test_http_static_destroy_owner_generations",
+                      "test_http_static_worker_accepted_identity", "test_http_static_async_release_cancel"] and
                       methods["TestHttpStaticVapi"] == ["test_http_static_vapi"], "Frozen suite classes changed")
               return [f"test_http_static.{cls}.{method}" for cls in (*CLASSES, "TestHttpStaticVapi")
-                      for method in methods["TestHttpStaticCli" if cls in CLASSES else cls]] + [ASYNC_TEST, ACCEPTED_TEST]
+                      for method in methods["TestHttpStaticCli" if cls in CLASSES else cls]] + [ASYNC_TEST, ACCEPTED_TEST, DESTROY_TEST]
 
           def infrastructure_text(text, events, variant):
               require(not re.search(r"ERROR: (?:AddressSanitizer|ASAN):|AddressSanitizer:DEADLYSIGNAL|"
@@ -2840,6 +2866,187 @@ jobs:
                       disables[0]["seq"] < idle_seq < clears[0]["seq"] and len(successes) == 1 and
                       ledger[-1]["seq"] < successes[0]["seq"], "ACCEPTED success preceded final owner drain")
 
+          class EvidenceIncomplete(AssertionError):
+              pass
+
+          def destroy_record(event):
+              parts = event.get("reply", "").split()
+              if (len(parts) != 2 * len(DESTROY_FIELDS) or parts[::2] != DESTROY_FIELDS or
+                      not all(re.fullmatch(r"-?[0-9]+", value) for value in parts[1::2])):
+                  raise EvidenceIncomplete("DESTROY missing or malformed thirty-seven-field raw reply")
+              record = dict(zip(DESTROY_FIELDS, map(int, parts[1::2])))
+              require(all(value >= 0 for key, value in record.items() if key not in ("detach_rv", "cert_rv")),
+                      "DESTROY negative lifecycle value")
+              return record
+
+          def destroy_witness(record, identity, phase):
+              binding = ("token", "epoch", "generation", "app", "cert", "thread", "handle",
+                         "hs_index", "listener", "captured")
+              require(all(record[key] == identity[key] for key in binding), "DESTROY owner identity changed")
+              require(record["enabled"] == record["bound"] == 1 and record["overflow"] == 0 and
+                      record["published"] > 0, "DESTROY disabled, unbound or overflowed")
+              worker = record["thread"] == 1
+              require(record["thread"] in (0, 1), "DESTROY unexpected owner thread")
+              if worker:
+                  require(record["captured"] == 1 and record["handle"] >> 32 == 1 and
+                          record["published"] < record["held"], "DESTROY missing real held worker1 owner")
+              if phase == "held":
+                  require(all(record[key] == 0 for key in ("detach", "cert_delete", "freed")) and
+                          record["app_live"] == record["cert_live"] == record["inflight"] == 1,
+                          "DESTROY held owner detached, freed or lost live pools")
+                  if worker:
+                      require(record["gate"] == 1 and all(record[key] == 0 for key in
+                              ("reset", "transport", "cleanup", "done", "ack", "resets", "transports", "cleanups")),
+                              "DESTROY worker cleanup or ACK occurred while held")
+                      return
+                  require(record["remaining"] == 1, "DESTROY main ACK did not retain worker owner")
+              else:
+                  require(phase == "freed" and record["app_before"] == record["cert_before"] == 1 and
+                          all(record[key] == 0 for key in ("app_after", "cert_after", "app_live", "cert_live",
+                              "detach_rv", "cert_rv", "gate")) and
+                          record["ack"] < record["detach"] < record["cert_delete"] < record["freed"] and
+                          record["remaining"] == int(not worker), "DESTROY ACK/detach/cert/free evidence differs")
+              require(record["published"] < record["done"] < record["ack"] and
+                      record["resets"] == record["cleanups"] == record["captured"],
+                      "DESTROY cleanup/ACK order or counts differ")
+              if record["captured"]:
+                  require(record["transports"] == 1 and record["published"] < record["reset"] <
+                          record["transport"] < record["cleanup"] < record["done"] and
+                          (not worker or record["held"] < record["reset"]), "DESTROY reset/transport/cleanup order differs")
+              else:
+                  require(record["transports"] == 0, "DESTROY uncaptured owner reported transport cleanup")
+
+          def destroy_evidence(events):
+              boundaries = [event for event in events if event.get("test") == DESTROY_TEST and
+                            event["kind"] in ("startTest", "stopTest", "addSuccess")]
+              if collections.Counter(event["kind"] for event in boundaries) != collections.Counter(
+                      ("startTest", "stopTest", "addSuccess")):
+                  raise EvidenceIncomplete("DESTROY missing unique successful method interval")
+              start = next(event for event in boundaries if event["kind"] == "startTest")
+              require(start.get("workers") == 1, "DESTROY method did not use worker1")
+              if not any(event["kind"] == "loaded" and event["pid"] == start["pid"] and
+                         event["seq"] < start["seq"] for event in events):
+                  raise EvidenceIncomplete("DESTROY observer load provenance missing")
+              active = test_interval(events, DESTROY_TEST)
+              require(next(event for event in boundaries if event["kind"] == "addSuccess") in active and
+                      all(type(event["seq"]) is int for event in active) and
+                      all(left["seq"] < right["seq"] for left, right in zip(active, active[1:])),
+                      "DESTROY observer events duplicated, out of order or success outside method")
+              require(not any(event["kind"] in ("addFailure", "addError") or
+                      (event["kind"] == "addSubTest" and event.get("error")) for event in active),
+                      "DESTROY original failure remains after recovery")
+              replies = [event for event in active if event["kind"] == "cli_reply"]
+              prefix = "test http static destroy "
+              commands = [event for event in replies if event.get("command", "").startswith(prefix)]
+              for event in replies:
+                  retry = (event["command"] == prefix + "clear" and event["retval"] != 0 and
+                           "all owners and detach RPCs drained" in event.get("reply", ""))
+                  require(type(event.get("retval")) is int and (event["retval"] == 0 or retry),
+                          "DESTROY real CLI command failed")
+              def unique(command):
+                  found = [event for event in replies if event["command"] == command]
+                  if len(found) != 1:
+                      raise EvidenceIncomplete("DESTROY missing or duplicate command: " + command)
+                  return found[0]
+              begin = unique(prefix + "start")
+              arms = {token: unique(prefix + f"arm {token}") for token in (301, 302)}
+              releases = {token: unique(prefix + f"release {token}") for token in (301, 302)}
+              clears = [event for event in commands if event["command"] == prefix + "clear"]
+              all_releases = [event for event in commands if event["command"] == prefix + "release all"]
+              disables = [event for event in replies if event["command"] == "http static server disable"]
+              if not clears or not all_releases or len(disables) != 3:
+                  raise EvidenceIncomplete("DESTROY missing disable/release-all/drain evidence")
+              success = next(event for event in boundaries if event["kind"] == "addSuccess")
+              require(begin == commands[0] and commands[-1] == clears[-1] and clears[-1]["retval"] == 0 and
+                      begin["seq"] < arms[301]["seq"] < disables[0]["seq"] < arms[302]["seq"] <
+                      disables[1]["seq"] < releases[302]["seq"] < releases[301]["seq"] <
+                      all_releases[0]["seq"] < disables[-1]["seq"] < clears[0]["seq"] <=
+                      clears[-1]["seq"] < success["seq"] and
+                      all(all_releases[0]["seq"] <= event["seq"] < disables[-1]["seq"] for event in all_releases),
+                      "DESTROY operation/reverse-release/drain order differs")
+              histories = {(token, owner): [] for token in (301, 302) for owner in (0, 1)}
+              for event in commands:
+                  match = re.fullmatch(re.escape(prefix) + r"status (301|302) owner ([01])", event["command"])
+                  if match:
+                      token, owner = map(int, match.groups())
+                      record = destroy_record(event)
+                      require(record["token"] == token and record["thread"] == owner,
+                              "DESTROY status command and owner identity differ")
+                      histories[token, owner].append((event, record))
+                  else:
+                      require(event in [begin, *arms.values(), *releases.values(), *clears, *all_releases],
+                              "DESTROY unexpected ledger command")
+              identities, held_events, freed_events = {}, {}, {}
+              for (token, owner), history in histories.items():
+                  if not history:
+                      raise EvidenceIncomplete("DESTROY owner snapshots missing")
+                  first, identity = history[0]
+                  require(arms[token]["seq"] < first["seq"] < disables[token - 301]["seq"],
+                          "DESTROY initial identity not captured before disable")
+                  identities[token, owner] = identity
+                  held = [(event, record) for event, record in history if
+                          disables[token - 301]["seq"] < event["seq"] < releases[token]["seq"] and
+                          record["held" if owner else "ack"] > 0]
+                  freed = [(event, record) for event, record in history if
+                           releases[token]["seq"] < event["seq"] < all_releases[0]["seq"] and record["freed"] > 0]
+                  if not held or not freed:
+                      raise EvidenceIncomplete("DESTROY held or freed owner stage missing")
+                  held_events[token, owner], freed_events[token, owner] = held[0][0], freed[0][0]
+                  for event, record in history:
+                      require(all(record[key] == identity[key] for key in
+                              ("token", "epoch", "generation", "app", "cert", "thread", "handle", "hs_index", "listener", "captured")),
+                              "DESTROY snapshot identity changed")
+                      require(record["enabled"] == record["bound"] == 1 and record["overflow"] == 0 and
+                              record["detach_rv"] == record["cert_rv"] == 0, "DESTROY snapshot reported real owner failure")
+                      if held[0][0]["seq"] <= event["seq"] < releases[token]["seq"]:
+                          destroy_witness(record, identity, "held")
+                      elif record["freed"]:
+                          destroy_witness(record, identity, "freed")
+              require(all(identities[301, 1][key] != identities[302, 1][key] for key in
+                      ("epoch", "generation", "app", "cert", "handle")), "DESTROY generations alias")
+              for token in (301, 302):
+                  require(all(identities[token, owner][key] == identities[token, 1][key] for owner in (0, 1)
+                          for key in ("epoch", "generation", "app", "cert")), "DESTROY owners belong to different applications")
+              for owner in (0, 1):
+                  require(any(disables[1]["seq"] < event["seq"] < releases[302]["seq"] and
+                          record["freed"] == 0 for event, record in histories[301, owner]) and
+                          any(releases[302]["seq"] < event["seq"] < releases[301]["seq"] and
+                          record["freed"] == 0 for event, record in histories[301, owner]),
+                          "DESTROY first generation not observed held across second destroy and release")
+              helpers = [event for event in active if event["kind"] == "helper"]
+              require(all(event.get("test") == DESTROY_TEST for event in helpers), "DESTROY foreign helper event")
+              clients = [event for event in helpers if event.get("helper") == "_client"]
+              responses = [event for event in helpers if event.get("helper") == "_response"]
+              if len(clients) != 4 or len(responses) != 6:
+                  raise EvidenceIncomplete("DESTROY missing real HTTP client or response")
+              require(len({event["client"] for event in clients}) == 4 and all(
+                      event["port"] == 8094 and event["secure"] is False for event in clients),
+                      "DESTROY client identity or endpoint differs")
+              for index, token in enumerate((301, 302)):
+                  response = responses[index]
+                  require(clients[index]["seq"] < response["seq"] < arms[token]["seq"] and
+                          response["client"] == clients[index]["client"] and response["response"].get("status") == 200 and
+                          response["response"].get("server") == f"http_static_server_{identities[token, 1]['generation']}",
+                          "DESTROY pending HTTP response lost generation identity")
+              require(max(held_events[302, owner]["seq"] for owner in (0, 1)) < clients[2]["seq"] <
+                      responses[2]["seq"] < releases[302]["seq"] and responses[2]["client"] == clients[2]["client"] and
+                      responses[2]["response"].get("status") == 200, "DESTROY replacement did not serve while both generations held")
+              for index, token in ((3, 302), (4, 301)):
+                  response = responses[index]
+                  require(max(freed_events[token, owner]["seq"] for owner in (0, 1)) < response["seq"] and
+                          response["client"] == clients[token - 301]["client"] and response["response"].get("closed") in
+                          ("ConnectionResetError", "BrokenPipeError", "IncompleteRead", "RemoteDisconnected") and
+                          (token == 301 or response["seq"] < releases[301]["seq"]),
+                          "DESTROY old response was not closed after owner free")
+              require(responses[4]["seq"] < clients[3]["seq"] < responses[5]["seq"] < all_releases[0]["seq"] and
+                      responses[5]["client"] == clients[3]["client"] and responses[5]["response"].get("status") == 200 and
+                      any(responses[5]["seq"] < event["seq"] < all_releases[0]["seq"] and record["inflight"] == 0
+                          for event, record in histories[301, 0]), "DESTROY final fresh response or owner drain missing")
+              return dict(test=DESTROY_TEST, pid=start["pid"], start_seq=start["seq"], success_seq=success["seq"],
+                  fields=DESTROY_FIELDS, records=[dict(pid=event["pid"], seq=event["seq"], command=event["command"],
+                      reply_sha256=hashlib.sha256(event["reply"].encode()).hexdigest()) for event in commands],
+                  helper_seqs=[event["seq"] for event in helpers])
+
           def validate(events, console, rc, expected, variant, logs):
               starts, stops, complete, wanted = execution_evidence(events, console, expected, variant, logs)
               subs = [event for event in events if event["kind"] == "addSubTest"]
@@ -2852,9 +3059,9 @@ jobs:
                           callbacks == [("addFailure", "TestHttpStaticCliWorker", "test_http_static_async_release_cancel")] and
                           sum(event["failures"] for event in complete) == 1 and
                           not any(event.get("error") for event in subs), "Omission did not complete with one ordinary failure")
-                  frames = ((1371, "test_http_static_async_release_cancel", "self._async_sent_scenario(root, uri)"),
-                            (1297, "_async_sent_scenario", "self._async_assert_freed(completed)"),
-                            (1154, "_async_assert_freed", 'self.assertEqual(record["refs"], 0, record)'))
+                  frames = ((1558, "test_http_static_async_release_cancel", "self._async_sent_scenario(root, uri)"),
+                            (1484, "_async_sent_scenario", "self._async_assert_freed(completed)"),
+                            (1341, "_async_assert_freed", 'self.assertEqual(record["refs"], 0, record)'))
                   unittest_frame = (r'  File "/[^"\n]*/unittest/(?:case|result)\.py", line [1-9][0-9]*, in \w+\n'
                                     r"    [^\n]+\n(?:    [ ~^]*[~^][ ~^]*\n)?")
                   pattern = r"(?m)^Traceback \(most recent call last\):\n(?:" + unittest_frame + ")*"
@@ -2928,6 +3135,7 @@ jobs:
                   quic_evidence(events)
                   async_evidence(events)
                   accepted_evidence(events)
+                  return destroy_evidence(events)
               else:
                   require(rc > 0 and rc != 124, "Restored command unexpectedly passed or timed out")
                   require(collections.Counter(event["test"] for event in outcomes) == wanted and
@@ -3016,19 +3224,25 @@ jobs:
                   require(runtime["rc"] == rc, "Runtime snapshot return code changed")
                   require(not snapshot["fatal"], "Fatal diagnostic found before log tail")
                   work_remaining()
-                  validate(events, payloads["console.log"].decode(errors="replace"), rc, expected,
-                           VARIANT, payloads["validation.log"].decode("utf-8"))
+                  destroy = validate(events, payloads["console.log"].decode(errors="replace"), rc, expected,
+                                     VARIANT, payloads["validation.log"].decode("utf-8"))
+                  if destroy is not None:
+                      destroy["source"] = dict(collection_identity=collection["identity"],
+                          snapshot=str(Path(collection["control"]) / "snapshot.json"),
+                          events=str(Path(collection["control"]) / "events.jsonl"),
+                          receipt=snapshot["files"]["events.jsonl"])
               except Exception as error:
-                  publish(acceptance, dict(status="FAIL", error=str(error), expected=expected))
+                  publish(acceptance, dict(status="INCOMPLETE" if isinstance(error, EvidenceIncomplete) else "FAIL",
+                      error=str(error), expected=expected))
                   raise
               publish(acceptance, dict(status="PASS", expected=expected, candidate=CANDIDATE, control=CONTROL,
-                  variant=VARIANT, workflow=os.environ["WORKFLOW_SHA"],
-                  claims="full29: original28 plus one worker1 real HTTP ACCEPTED URI reuse" if VARIANT == "fixed" else
+                  variant=VARIANT, workflow=os.environ["WORKFLOW_SHA"], destroy=destroy,
+                  claims="full30: previous29 plus worker1 two-generation destroy owners" if VARIANT == "fixed" else
                          "one ordinary refs1 failure followed by separate guarded recovery" if VARIANT == "async-omit-release" else
                          "narrow restored field/unlock only; lifecycle negative gaps remain"))
               publish(Path(os.environ["HSS_CONTROL"]) / "task-map.json", dict(product_controls="EXECUTED",
                   candidate=CANDIDATE, control=CONTROL, workflow=os.environ["WORKFLOW_SHA"], variant=VARIANT,
-                  runtime_tests=expected, fixtures=39, original_tasks="OPEN", acceptance="bounded-only"))
+                  runtime_tests=expected, fixtures=46, original_tasks="OPEN", acceptance="bounded-only"))
 
           def validate_http_name(events, console, rc, logs):
               test = "test_http.TestHttpNameOwnership.test_app_name_ownership"
@@ -3873,7 +4087,7 @@ jobs:
           python3 "$TOOLS/control.py" fixture-python-style build-root/test/venv/bin/black --check -t py39 \
             src/plugins/http_static/test_lifetime_fixtures.py test/asf/test_http_static.py
 
-      - name: Execute exactly thirty-nine standalone fixtures
+      - name: Execute exactly forty-six standalone fixtures
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -3885,7 +4099,7 @@ jobs:
           from pathlib import Path
           import re
           text = (Path(os.environ["EVIDENCE"]) / "fixtures/console.log").read_text()
-          assert "Ran 39 tests in " in text and "\nOK\n" in text, text
+          assert "Ran 46 tests in " in text and "\nOK\n" in text, text
           tree = ast.parse((Path(os.environ["TOOLS"]) / "control.py").read_text())
           functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and
                        node.name in ("require", "infrastructure_text")]
@@ -4170,11 +4384,11 @@ jobs:
               finished = record(enter=1, send=3, cleanup=4, sends=1, cleanups=1, duplicate=1, final=5, freed=6,
                                 releases=2, cachefree=1, vecfree=1, poolput=1, **{"async": 2})
               trace = ('Traceback (most recent call last):\n'
-                       '  File "/fixture/test/asf/test_http_static.py", line 1371, in test_http_static_async_release_cancel\n'
+                       '  File "/fixture/test/asf/test_http_static.py", line 1558, in test_http_static_async_release_cancel\n'
                        '    self._async_sent_scenario(root, uri)\n'
-                       '  File "/fixture/test/asf/test_http_static.py", line 1297, in _async_sent_scenario\n'
+                       '  File "/fixture/test/asf/test_http_static.py", line 1484, in _async_sent_scenario\n'
                        '    self._async_assert_freed(completed)\n'
-                       '  File "/fixture/test/asf/test_http_static.py", line 1154, in _async_assert_freed\n'
+                       '  File "/fixture/test/asf/test_http_static.py", line 1341, in _async_assert_freed\n'
                        '    self.assertEqual(record["refs"], 0, record)\nAssertionError: 1 != 0 : refs retained\n')
               if negative:
                   leaked = dict(finished, refs=1, omitted=1, poolput=0, cachefree=0, vecfree=0, final=0, freed=0, releases=1)
@@ -4263,7 +4477,7 @@ jobs:
               invalid_traces.append("".join(lines[:index] + lines[index + 1:]))
           invalid_traces.append("".join([lines[0], *lines[3:5], *lines[1:3], *lines[5:]]))
           for before, after in (("test/asf/test_http_static.py", "test/asf/test_other.py"),
-                                ("line 1371", "line 1372"), ("line 1297", "line 1298"), ("line 1154", "line 1155"),
+                                ("line 1558", "line 1559"), ("line 1484", "line 1485"), ("line 1341", "line 1342"),
                                 ("in _async_sent_scenario", "in _other_scenario"),
                                 ("self._async_sent_scenario(root, uri)", "self._async_sent_scenario(uri, root)"),
                                 ("self._async_assert_freed(completed)", "self._async_assert_freed(other)"),
@@ -4398,6 +4612,193 @@ jobs:
                       event["reply"] = event["reply"].replace(before, after)
               rejects_accepted(changed)
           print(f"Pure-memory ACCEPTED verifier checks passed; {rejected} invalid inputs rejected; no runtime claim")
+          destroy_fields = control["DESTROY_FIELDS"]
+          destroy_test = control["DESTROY_TEST"]
+          def destroy_fixture():
+              result = []
+              def emit(kind, **values):
+                  result.append(dict(kind=kind, pid=1, seq=len(result) + 1, **values))
+              def cli(command, reply="", retval=0):
+                  emit("cli_reply", command=command, retval=retval, reply=reply)
+              def ledger(command):
+                  cli("test http static destroy " + command)
+              def status(token, owner, phase="initial", idle=False):
+                  record = dict.fromkeys(destroy_fields, 0)
+                  record.update(token=token, enabled=1, epoch=token, generation=token + 10, app=token + 20,
+                      cert=token + 30, bound=1, published=1, app_live=1, cert_live=1, inflight=int(not idle),
+                      thread=owner, handle=(owner << 32) + token, hs_index=token, listener=token, captured=owner)
+                  if owner:
+                      record.update(held=2, gate=1)
+                  if phase == "held" and not owner:
+                      record.update(done=3, ack=4, remaining=1)
+                  if phase == "freed":
+                      record.update(app_before=1, cert_before=1, app_live=0, cert_live=0, gate=0,
+                          reset=3 if owner else 0, transport=4 if owner else 0, cleanup=5 if owner else 0,
+                          done=6, ack=7, detach=8, cert_delete=9, freed=10, remaining=int(not owner),
+                          resets=owner, transports=owner, cleanups=owner)
+                  cli(f"test http static destroy status {token} owner {owner}",
+                      " ".join(f"{key} {record[key]}" for key in destroy_fields))
+              def client(client_id):
+                  emit("helper", test=destroy_test, helper="_client", client=client_id, port=8094, secure=False)
+              def response(client_id, **values):
+                  emit("helper", test=destroy_test, helper="_response", client=client_id, response=values)
+              emit("loaded")
+              emit("startTest", test=destroy_test, workers=1, netns_disabled=False, excluded=[], vpp_cmdline=["vpp"])
+              ledger("start")
+              for token in (301, 302):
+                  cli("http static server uri http://10.10.1.2:8094 www-root /fixture")
+                  client(token)
+                  response(token, status=200, server=f"http_static_server_{token + 10}")
+                  ledger(f"arm {token}")
+                  for owner in (0, 1):
+                      status(token, owner)
+                  cli("http static server disable")
+                  for retained in range(301, token + 1):
+                      for owner in (0, 1):
+                          status(retained, owner, "held")
+              cli("http static server uri http://10.10.1.2:8094 url-handlers")
+              client(400)
+              response(400, status=200, server="http_static_server_500")
+              for token in (302, 301):
+                  ledger(f"release {token}")
+                  for owner in (0, 1):
+                      status(token, owner, "freed")
+                  response(token, closed="ConnectionResetError")
+                  if token == 302:
+                      for owner in (0, 1):
+                          status(301, owner, "held")
+              client(401)
+              response(401, status=200, server="http_static_server_500")
+              status(301, 0, "freed", idle=True)
+              for repeat in range(5):
+                  ledger("release all")
+              cli("http static server disable")
+              ledger("clear")
+              emit("addSuccess", test=destroy_test)
+              emit("stopTest", test=destroy_test)
+              return result
+          destroy_events = destroy_fixture()
+          destroy = control["destroy_evidence"]
+          witness = destroy(destroy_events)
+          assert witness["test"] == destroy_test and witness["pid"] == 1 and witness["records"]
+          rejected = 0
+          def rejects_destroy(changed, incomplete=False):
+              global rejected
+              try:
+                  destroy(changed)
+              except control["EvidenceIncomplete"]:
+                  assert incomplete, "Real failure was misclassified as missing evidence"
+                  rejected += 1
+              except AssertionError:
+                  assert not incomplete, "Missing evidence was misclassified as real failure"
+                  rejected += 1
+              else:
+                  raise AssertionError("Invalid DESTROY evidence was accepted")
+          for kind in ("loaded", "startTest", "stopTest", "addSuccess", "helper"):
+              rejects_destroy([event for event in destroy_events if event["kind"] != kind], incomplete=True)
+          for command in ("start", "arm 301", "arm 302", "release 302", "release 301", "clear", "release all"):
+              rejects_destroy([event for event in destroy_events if event.get("command") !=
+                  "test http static destroy " + command], incomplete=True)
+          status_command = "test http static destroy status 301 owner 1"
+          for malformed in ("token 301", " ".join("token 301" for repeat in range(37)),
+                            next(event["reply"] for event in destroy_events if event.get("command") == status_command)
+                            .replace("captured 1", "captured invalid")):
+              changed = copy.deepcopy(destroy_events)
+              next(event for event in changed if event.get("command") == status_command)["reply"] = malformed
+              rejects_destroy(changed, incomplete=True)
+          for before, after in (("thread 1", "thread 0"), ("handle 4294967597", "handle 301"),
+                                ("overflow 0", "overflow 1"), ("enabled 1", "enabled 0"),
+                                ("bound 1", "bound 0"), ("detach 0", "detach 1"),
+                                ("app_live 1", "app_live 0"), ("cert_live 1", "cert_live 0"),
+                                ("done 6", "done 4"), ("ack 7", "ack 9"),
+                                ("cleanup 5", "cleanup 0"), ("cleanups 1", "cleanups 0"),
+                                ("transports 1", "transports 0"), ("detach_rv 0", "detach_rv -1"),
+                                ("cert_rv 0", "cert_rv -1"), ("app_after 0", "app_after 1")):
+              changed = copy.deepcopy(destroy_events)
+              for event in changed:
+                  if event.get("command") == status_command:
+                      event["reply"] = event["reply"].replace(before, after)
+              rejects_destroy(changed)
+          for kind, key, value in (("startTest", "workers", 0), ("cli_reply", "retval", -1),
+                                   ("helper", "port", 8080), ("helper", "client", 302)):
+              changed = copy.deepcopy(destroy_events)
+              next(event for event in changed if event["kind"] == kind)[key] = value
+              rejects_destroy(changed)
+          changed = copy.deepcopy(destroy_events)
+          for event in changed:
+              if event.get("command", "").startswith("test http static destroy status 302 "):
+                  for key in ("epoch", "generation", "app", "cert", "handle"):
+                      parts = event["reply"].split()
+                      index = parts.index(key) + 1
+                      parts[index] = str(int(parts[index]) - 1)
+                      event["reply"] = " ".join(parts)
+          rejects_destroy(changed)
+          changed = [event for event in copy.deepcopy(destroy_events) if not (
+              event.get("command", "").startswith("test http static destroy status ") and
+              "freed 0" in event.get("reply", "") and "ack 0" not in event.get("reply", ""))]
+          rejects_destroy(changed, incomplete=True)
+          changed = copy.deepcopy(destroy_events)
+          failure = dict(kind="addFailure", pid=1, seq=1, test=destroy_test, error="AssertionError",
+                         traceback="original destroy failure before release-all recovery")
+          index = next(index for index, event in enumerate(changed) if event.get("command") ==
+                       "test http static destroy release all")
+          changed.insert(index, failure)
+          for index, event in enumerate(changed, 1):
+              event["seq"] = index
+          rejects_destroy(changed)
+          changed = copy.deepcopy(destroy_events)
+          next(event for event in changed if event.get("command") == status_command)["pid"] = 2
+          rejects_destroy(changed)
+          changed = copy.deepcopy(destroy_events)
+          next(event for event in changed if event.get("command") == status_command)["seq"] = 1
+          rejects_destroy(changed)
+          changed = copy.deepcopy(destroy_events)
+          first = next(event for event in changed if event.get("command") == status_command)
+          changed.insert(changed.index(first), copy.deepcopy(first))
+          rejects_destroy(changed)
+          changed = copy.deepcopy(destroy_events)
+          clear_index = next(index for index, event in enumerate(changed) if event.get("command") ==
+                             "test http static destroy clear")
+          changed.insert(clear_index, dict(changed[clear_index], retval=-1,
+              reply="test http static destroy: clear requires all owners and detach RPCs drained"))
+          for index, event in enumerate(changed, 1):
+              event["seq"] = index
+          destroy(changed)
+          original_reply = next(event["reply"] for event in destroy_events if event.get("command") == status_command)
+          for malformed in (" ".join(original_reply.split()[:-1]),
+                            " ".join(original_reply.split() + ["extra", "1"])):
+              changed = copy.deepcopy(destroy_events)
+              next(event for event in changed if event.get("command") == status_command)["reply"] = malformed
+              rejects_destroy(changed, incomplete=True)
+          for before, after in (("captured 1", "captured 0"), ("gate 1", "gate 0"),
+                                ("remaining 0", "remaining 1"), ("freed 10", "freed 8"),
+                                ("cert_delete 9", "cert_delete 8"), ("reset 3", "reset 1")):
+              changed = copy.deepcopy(destroy_events)
+              for event in changed:
+                  if event.get("command") == status_command:
+                      event["reply"] = event["reply"].replace(before, after)
+              rejects_destroy(changed)
+          for select, replacement in (("status", {"status": 500}),
+                                      ("closed", {"drained": True}),
+                                      ("status", {"status": 200, "server": "http_static_server_999"})):
+              changed = copy.deepcopy(destroy_events)
+              event = next(event for event in changed if event.get("helper") == "_response" and
+                           select in event["response"])
+              event["response"] = replacement
+              rejects_destroy(changed)
+          changed = [event for event in copy.deepcopy(destroy_events) if not (
+              event.get("command", "").startswith("test http static destroy status ") and
+              "freed 0" in event.get("reply", ""))]
+          rejects_destroy(changed)
+          changed = copy.deepcopy(destroy_events)
+          release = next(event for event in changed if event.get("command") == "test http static destroy release 302")
+          release["command"] = "test http static destroy release 301"
+          rejects_destroy(changed, incomplete=True)
+          changed = copy.deepcopy(destroy_events)
+          event = next(event for event in changed if event.get("command") == "test http static destroy clear")
+          event.update(retval=-1, reply="unexpected clear failure")
+          rejects_destroy(changed)
+          print(f"Pure-memory DESTROY verifier checks passed; {rejected} invalid inputs rejected; no runtime claim")
           PY
 
       - &hss_mutate
@@ -4582,11 +4983,11 @@ jobs:
     env:
       VARIANT_NAME: fixed
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: 9ca6598ca4b0b43d8ceeb65c50c8c16a50e36d6f
+      CANDIDATE_SHA: 21c5ddbed9ca410cd29a8887c90b3664c264ea73
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: 7992427757c37544fc1b40ac11779df86ad6c432
-      CONTROL_SHA: 3723557df24d5b57f84afd16062f5fc8c7ff311e
-      CONTROL_TREE: 3ed81ae2fb2a499aaddc847a1a59e91582504293
+      CANDIDATE_TREE: d15c775352be6899e2e81d5562b647581a4102d8
+      CONTROL_SHA: 08fd58509dcc225eaf5bc2fccf7bdcceb5493944
+      CONTROL_TREE: 59987ec77377091d7ac1b5ddf257e6845378d4e8
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
