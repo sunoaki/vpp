@@ -48,11 +48,11 @@ jobs:
     env:
       VARIANT_NAME: ${{ matrix.variant }}
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: f89072eefd4dae7c7392b2a828ffb297b47bd9a9
+      CANDIDATE_SHA: c49f0816bc5244f256c03d478771ba56c506d53d
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: 7d86133605624990b0342f9074d78e1c9dd265b2
-      CONTROL_SHA: 8e85e05616a1b86b9b3e95354415e28047967217
-      CONTROL_TREE: 5cde6288d912293c9bac96da4fcfd126a6604b48
+      CANDIDATE_TREE: 50d94521e1e8821870a554ec7336025d2aa89ade
+      CONTROL_SHA: b0fbd244ca9b93a21fa877403a5dae730ea29d02
+      CONTROL_TREE: f605cc14330f3d5b9303b5f155df5312cf4264e7
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
@@ -74,6 +74,7 @@ jobs:
           cat > "$EVIDENCE/manifest.json" <<JSON
           {"workflow_sha":"$WORKFLOW_SHA","candidate_sha":"$CANDIDATE_SHA","check_base_sha":"$CHECK_BASE_SHA","frozen_sha":"$FROZEN_SHA",
            "control_sha":"$CONTROL_SHA","control_tree":"$CONTROL_TREE",
+           "superseded":{"candidate_sha":"f89072eefd4dae7c7392b2a828ffb297b47bd9a9","control_sha":"8e85e05616a1b86b9b3e95354415e28047967217","workflow_sha":"9252a75296fa150414c239b5f9c0b45302ae6ba7","run_id":"39557655958","failure":"candidate C style failed; later product phases NOT_RUN"},
            "variant":"$VARIANT_NAME","run_id":"$GITHUB_RUN_ID","attempt":"$GITHUB_RUN_ATTEMPT",
            "work_deadline":$WORK_DEADLINE,"status":"before_bootstrap",
            "workflow_blob":null,"candidate_tree":null,"tools":null,
@@ -84,7 +85,7 @@ jobs:
           printf '%s\n' bootstrap checkout prepare dependencies feature-list pinned-python black-version \
             fixture-python-style fixtures mutate fallback-version build binaries namespace environment runtime tests http-name http-name-runtime collect \
             > "$EVIDENCE/planned-phases.txt"
-          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 2ff4cf5eb2a84522213e1182ff1b3934153645d7 ca0843b651f6f9c1fca0635c61e6916112759fda 6459dbc8f8c82f18e00e72bc9e4676bbada62484 dee4c6f4b61e1b55d257f6c814bb3b49723a2d57 4ad5878cb0a4b1047e199fe828f7ab790409c18e b230ba5d6bd0ef362fd8c9d80e8a1a95a367c111 f89072eefd4dae7c7392b2a828ffb297b47bd9a9; do
+          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 2ff4cf5eb2a84522213e1182ff1b3934153645d7 ca0843b651f6f9c1fca0635c61e6916112759fda 6459dbc8f8c82f18e00e72bc9e4676bbada62484 dee4c6f4b61e1b55d257f6c814bb3b49723a2d57 4ad5878cb0a4b1047e199fe828f7ab790409c18e b230ba5d6bd0ef362fd8c9d80e8a1a95a367c111 c49f0816bc5244f256c03d478771ba56c506d53d; do
             printf 'style-%s\napi-%s\nmessage-%s\n' "$commit" "$commit" "$commit" >> "$EVIDENCE/planned-phases.txt"
           done
           {
@@ -1830,7 +1831,7 @@ jobs:
           TEST_BLOBS = {TEST: "2a873caf2e85c8c22b1c153a41bcfb7712ebcba7",
                         FIXTURE: "1e856bf2d7716a8e71c506300b146a5c050cba51",
                         HTTP_TEST: "0a7353040c8323e3ec2f4500d2ce72c1f2a94934"}
-          CORE_BLOBS = {"src/vnet/session/session_input.c": "82824a67180bf448d3f3f7a0a8ffc59bad44f806",
+          CORE_BLOBS = {"src/vnet/session/session_input.c": "4c3b9df8973ed3fcff455b83b826b0dfb04e0f8e",
                         "src/vnet/session/application.h": "728c6e9b1d9d406445d6e6d9ce335d8dc11d185f"}
           ACCEPTED_FIELDS = ("token enabled overflow epoch generation app worker listener thread handle protocol builtin "
               "event enqueued head current_head head_after held captured released transferred callback ready advanced "
@@ -1847,12 +1848,12 @@ jobs:
           ASYNC_TEST = "test_http_static.TestHttpStaticCliWorker.test_http_static_async_release_cancel"
           ACCEPTED_TEST = "test_http_static.TestHttpStaticCliWorker.test_http_static_worker_accepted_identity"
           BUILD_IDENTITIES = {
-              "fixed": ("4c998afbbe0fb6fb00f546c795551223dc825266", "7d86133605624990b0342f9074d78e1c9dd265b2"),
-              "cache-limit": ("3f4027039d2128e9c04dd5ee8c1c503918dc89e7", "8c07b2e10182b6a462f2f01e556fd1c583466794"),
-              "api-protocol": ("9be90d745ea02afaa6471ca1cc163d95d9f397af", "3f7a0335762a5cab119b2974bde83f6e89e508bf"),
-              "original-endpoint": ("4a354387776cd40dfc1f2644b087cbc6561086cb", "2b2085a17dc1aedc51e5d692df0b3e1398855951"),
-              "read-error-unlock": ("404e94c25c913ffa91fd96004a15f58fb16c11f2", "ef22645de35b41eeea5c6648b6cafea779dea241"),
-              "async-omit-release": ("735a35989c74fd8ae241d8133ca6c6b8389aea32", "5cde6288d912293c9bac96da4fcfd126a6604b48")}
+              "fixed": ("4c998afbbe0fb6fb00f546c795551223dc825266", "50d94521e1e8821870a554ec7336025d2aa89ade"),
+              "cache-limit": ("3f4027039d2128e9c04dd5ee8c1c503918dc89e7", "48f649f51514618fe2ace591383f53530d2c9625"),
+              "api-protocol": ("9be90d745ea02afaa6471ca1cc163d95d9f397af", "56488baa5dcce2e0e1d561ffa3bf0d061acc99dd"),
+              "original-endpoint": ("384fd81dcae885ca1688e832fcfe965432515741", "c56ece2f0dabb9613050a5d8678a4002644c412d"),
+              "read-error-unlock": ("404e94c25c913ffa91fd96004a15f58fb16c11f2", "a04bb3bb4984340366d4d13f34ae0f28af593356"),
+              "async-omit-release": ("e58f12f48c8107930fdf5bf7411ba67e8d552542", "f605cc14330f3d5b9303b5f155df5312cf4264e7")}
           RECIPES = {
               "cache-limit": ("rmp->cache_size_limit = htonl (l->cache ? l->cache->cache_limit : 0);",
                               "rmp->cache_size_limit = htonl (hsm->default_listener.cache ? hsm->default_listener.cache->cache_limit : 0);"),
@@ -2242,7 +2243,7 @@ jobs:
               manifest = dict(workflow_sha=workflow, candidate_sha=CANDIDATE, check_base_sha=CHECK_BASE, frozen_sha=FROZEN,
                               workflow_blob=git("rev-parse", f"{workflow}:.github/workflows/hss-regression-control.yml"),
                               candidate_tree=git("rev-parse", f"{CANDIDATE}^{{tree}}"), variant=VARIANT,
-                              control_sha=CONTROL, control_tree=os.environ["CONTROL_TREE"],
+                              control_sha=CONTROL, control_tree=os.environ["CONTROL_TREE"], superseded=initial["superseded"],
                               async_scope="worker1 real HTTP ASYNC release/cancel; multi-event ACCEPTED/destroy and ACK/reset/heap remain open",
                               run_id=os.environ["GITHUB_RUN_ID"], attempt=os.environ["GITHUB_RUN_ATTEMPT"],
                               artifact=f"hss-{VARIANT}-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
@@ -2293,8 +2294,8 @@ jobs:
               require(not git("diff", "--name-only"), "Tracked source changed before mutation")
               original = Path(SOURCE).read_bytes()
               if VARIANT == "async-omit-release":
-                  require(git("rev-parse", f"{CANDIDATE}:{SOURCE}") == "886d83b7fbb2e7f34dee0e3771eaeaed07dea264" and
-                          git("rev-parse", f"{CONTROL}:{SOURCE}") == "735a35989c74fd8ae241d8133ca6c6b8389aea32",
+                  require(git("rev-parse", f"{CANDIDATE}:{SOURCE}") == "6ab2dc027a25168e6d8135850c1000cd23765bfe" and
+                          git("rev-parse", f"{CONTROL}:{SOURCE}") == "e58f12f48c8107930fdf5bf7411ba67e8d552542",
                           "Omitted-release source blobs differ")
                   Path(SOURCE).write_bytes(content(CONTROL, SOURCE))
               elif VARIANT != "fixed":
@@ -4580,11 +4581,11 @@ jobs:
     env:
       VARIANT_NAME: fixed
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: f89072eefd4dae7c7392b2a828ffb297b47bd9a9
+      CANDIDATE_SHA: c49f0816bc5244f256c03d478771ba56c506d53d
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: 7d86133605624990b0342f9074d78e1c9dd265b2
-      CONTROL_SHA: 8e85e05616a1b86b9b3e95354415e28047967217
-      CONTROL_TREE: 5cde6288d912293c9bac96da4fcfd126a6604b48
+      CANDIDATE_TREE: 50d94521e1e8821870a554ec7336025d2aa89ade
+      CONTROL_SHA: b0fbd244ca9b93a21fa877403a5dae730ea29d02
+      CONTROL_TREE: f605cc14330f3d5b9303b5f155df5312cf4264e7
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
