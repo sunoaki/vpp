@@ -27,10 +27,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [fixed, cache-limit, api-protocol, original-endpoint, read-error-unlock]
+        variant: [fixed, cache-limit, api-protocol, original-endpoint, read-error-unlock, async-omit-release]
     # Independent Debian 13 builds, OpenSSL TLS/QUIC, two CPUs and namespace access.
     # IPv6 and HTTP/3 checks establish control-plane identity only.
-    # These narrow API negatives do not cover lifecycle/reset/cleanup/ack mutations.
+    # The omission control covers one final release; ACK/reset/heap controls remain open.
     # Default AF_PACKET V3 RX 10 MiB + TX 66 MiB; 256 MiB bounds each process with headroom.
     container: &hss_container
       image: debian:trixie
@@ -48,9 +48,11 @@ jobs:
     env:
       VARIANT_NAME: ${{ matrix.variant }}
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: 6459dbc8f8c82f18e00e72bc9e4676bbada62484
+      CANDIDATE_SHA: d03ce59a82d80f84661120acade463828e88a518
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: 82cefc33393c2484423b4668dcaf542d3d1bdcd4
+      CANDIDATE_TREE: d7294ec676db157f0c47c618bbe39c5d38763563
+      CONTROL_SHA: 2faf558df6edb4be2083df5bde1a456a9597ed5e
+      CONTROL_TREE: 2ee54cbd40274ef591132742a8873512c0401531
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
@@ -71,17 +73,18 @@ jobs:
             "$TOOLS" "$EVIDENCE" "$WORK_DEADLINE" "$HSS_CONTROL" >> "$GITHUB_ENV"
           cat > "$EVIDENCE/manifest.json" <<JSON
           {"workflow_sha":"$WORKFLOW_SHA","candidate_sha":"$CANDIDATE_SHA","check_base_sha":"$CHECK_BASE_SHA","frozen_sha":"$FROZEN_SHA",
+           "control_sha":"$CONTROL_SHA","control_tree":"$CONTROL_TREE",
            "variant":"$VARIANT_NAME","run_id":"$GITHUB_RUN_ID","attempt":"$GITHUB_RUN_ATTEMPT",
            "work_deadline":$WORK_DEADLINE,"status":"before_bootstrap",
            "workflow_blob":null,"candidate_tree":null,"tools":null,
            "unavailable_reason":"Bootstrap/checkout has not completed; hashes unavailable",
-           "source":{"path":"src/plugins/http_static/$(if [ "$VARIANT_NAME" = original-endpoint ]; then printf static_server.c; elif [ "$VARIANT_NAME" = read-error-unlock ]; then printf http_cache.c; else printf http_static.c; fi)","candidate_blob":null,"frozen_blob":null},
+           "source":{"path":"src/plugins/http_static/$(if [ "$VARIANT_NAME" = original-endpoint ] || [ "$VARIANT_NAME" = async-omit-release ]; then printf static_server.c; elif [ "$VARIANT_NAME" = read-error-unlock ]; then printf http_cache.c; else printf http_static.c; fi)","candidate_blob":null,"frozen_blob":null},
            "tests":{"test/asf/test_http_static.py":{"blob":null,"sha256":null},"src/plugins/http_static/test_lifetime_fixtures.py":{"blob":null,"sha256":null},"test/asf/test_http.py":{"blob":null,"sha256":null}}}
           JSON
           printf '%s\n' bootstrap checkout prepare dependencies feature-list pinned-python black-version \
             fixture-python-style fixtures mutate fallback-version build binaries namespace environment runtime tests http-name http-name-runtime collect \
             > "$EVIDENCE/planned-phases.txt"
-          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 2ff4cf5eb2a84522213e1182ff1b3934153645d7 ca0843b651f6f9c1fca0635c61e6916112759fda 6459dbc8f8c82f18e00e72bc9e4676bbada62484; do
+          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 2ff4cf5eb2a84522213e1182ff1b3934153645d7 ca0843b651f6f9c1fca0635c61e6916112759fda 6459dbc8f8c82f18e00e72bc9e4676bbada62484 66a74121133e2716031d33385e16f32bc6ffe993 d03ce59a82d80f84661120acade463828e88a518; do
             printf 'style-%s\napi-%s\nmessage-%s\n' "$commit" "$commit" "$commit" >> "$EVIDENCE/planned-phases.txt"
           done
           {
@@ -1385,8 +1388,35 @@ jobs:
                   summary["phases"]["collect"] = dict(status="unknown/incomplete", complete=False,
                       raw_result=summary["phases"].get("collect"))
               if not diagnostic:
+                  try:
+                      task = record("task-map.json")
+                      acceptance = record("acceptance.json")
+                      variant = task.get("variant")
+                      if (task.get("workflow") != workflow or task.get("product_controls") != "EXECUTED" or
+                              task.get("original_tasks") != "OPEN" or acceptance.get("status") != "PASS" or
+                              acceptance.get("workflow") != workflow or
+                              task.get("candidate") != os.environ["CANDIDATE_SHA"] or
+                              task.get("control") != os.environ["CONTROL_SHA"] or
+                              variant not in ("fixed", "cache-limit", "api-protocol", "original-endpoint", "read-error-unlock", "async-omit-release") or
+                              any(task.get(key) != acceptance.get(key) for key in ("candidate", "control", "variant")) or
+                              task.get("fixtures") != 33 or not isinstance(acceptance.get("expected"), list) or
+                              len(acceptance["expected"]) != (28 if variant == "fixed" else 1 if variant == "async-omit-release" else 2) or
+                              len(set(acceptance["expected"])) != len(acceptance["expected"]) or
+                              task.get("runtime_tests") != acceptance.get("expected")):
+                          raise ValueError("Product acceptance identity differs")
+                      summary["bounded_product_result"] = acceptance
+                      summary["original_tasks"] = "OPEN"
+                  except (OSError, ValueError, KeyError, TypeError) as error:
+                      summary["errors"].append(f"product: {type(error).__name__}: {error}"[:512])
+                      variant = None
                   for name, phase in summary["phases"].items():
-                      if not isinstance(phase, dict) or phase.get("status") not in ("completed", "success") or phase.get("rc", 0) != 0:
+                      if (variant not in (None, "fixed") and name in ("http-name", "http-name-runtime") and
+                              isinstance(phase, dict) and phase.get("status") == "not_run"):
+                          continue
+                      expected_rc = 2 if name == "runtime" and variant not in (None, "fixed") else 0
+                      if (not isinstance(phase, dict) or phase.get("status") not in ("completed", "success") or
+                              phase.get("rc", 0) != expected_rc or
+                              (name == "runtime" and phase.get("cleanup_complete") is not True)):
                           summary["errors"].append("Phase incomplete or failed: " + name)
                   summary["complete"] = not summary["errors"]
                   return summary
@@ -1663,6 +1693,9 @@ jobs:
                   return collection.read_regular(healthy / relative(name), cap, time.monotonic() + 5)
               summary = terminal(load, os.environ["WORKFLOW_SHA"], collection_rc,
                   diagnostic=os.environ.get("GITHUB_JOB") == "diagnostic")
+              summary.update(candidate=control.CANDIDATE, control=control.CONTROL,
+                  candidate_tree=os.environ["CANDIDATE_TREE"], control_tree=os.environ["CONTROL_TREE"],
+                  variant=control.VARIANT)
               control.publish(healthy / "phase-status.json", summary)
               result = collection.supervise(control, dict(mode="upload", root=os.environ["EVIDENCE"],
                   destination=str(Path(os.environ["RUNNER_TEMP"]) / "hss-upload")))
@@ -1702,17 +1735,26 @@ jobs:
           CANDIDATE = os.environ["CANDIDATE_SHA"]
           CHECK_BASE = os.environ["CHECK_BASE_SHA"]
           FROZEN = os.environ["FROZEN_SHA"]
+          CONTROL = os.environ["CONTROL_SHA"]
           VARIANT = os.environ["VARIANT_NAME"]
           SOURCE = "src/plugins/http_static/" + (
-              "static_server.c" if VARIANT == "original-endpoint" else
+              "static_server.c" if VARIANT in ("original-endpoint", "async-omit-release") else
               "http_cache.c" if VARIANT == "read-error-unlock" else "http_static.c")
           TEST = "test/asf/test_http_static.py"
           FIXTURE = "src/plugins/http_static/test_lifetime_fixtures.py"
           HTTP_TEST = "test/asf/test_http.py"
-          TEST_BLOBS = {TEST: "7ec2c2dde7b8ea060d7fcbef760319b82b978c35",
-                        FIXTURE: "894e32ad12ae1a0c4e923f0f59a74542ac4e22a7",
+          TEST_BLOBS = {TEST: "208e249476fd5a5710bf19444bfa1af28bb7020a",
+                        FIXTURE: "dd4f6e4db6699cd315a6e13a4fb3206c80d3c40e",
                         HTTP_TEST: "0a7353040c8323e3ec2f4500d2ce72c1f2a94934"}
           CLASSES = ("TestHttpStaticCli", "TestHttpStaticCliWorker")
+          ASYNC_TEST = "test_http_static.TestHttpStaticCliWorker.test_http_static_async_release_cancel"
+          BUILD_IDENTITIES = {
+              "fixed": ("4c998afbbe0fb6fb00f546c795551223dc825266", "d7294ec676db157f0c47c618bbe39c5d38763563"),
+              "cache-limit": ("3f4027039d2128e9c04dd5ee8c1c503918dc89e7", "e459a96f95b63210ff7afedc5aa9e8b592cb3dc6"),
+              "api-protocol": ("9be90d745ea02afaa6471ca1cc163d95d9f397af", "079baa60ee78727aaed6f9ae816e44982ab58df2"),
+              "original-endpoint": ("3f220c1d3b4469bec620d5c14f75e36b4737314f", "43cbc1a6a9b47d3873f6b88726ac5c07efd156b8"),
+              "read-error-unlock": ("404e94c25c913ffa91fd96004a15f58fb16c11f2", "1b6b785ed70081fda1fea048fc860ad6e9688434"),
+              "async-omit-release": ("80b9be05f58700ff0ac258c83ff65913c02a5979", "2ee54cbd40274ef591132742a8873512c0401531")}
           RECIPES = {
               "cache-limit": ("rmp->cache_size_limit = htonl (l->cache ? l->cache->cache_limit : 0);",
                               "rmp->cache_size_limit = htonl (hsm->default_listener.cache ? hsm->default_listener.cache->cache_limit : 0);"),
@@ -2017,18 +2059,43 @@ jobs:
 
           def source_identity():
               require(git("rev-list", "--parents", "-n", "1", CANDIDATE).split() ==
-                      [CANDIDATE, "ca0843b651f6f9c1fca0635c61e6916112759fda"],
-                      "Candidate must have exactly the reviewed composition parent")
+                      [CANDIDATE, "66a74121133e2716031d33385e16f32bc6ffe993"],
+                      "Candidate must have exactly the frozen ASYNC parent")
               require(git("rev-parse", f"{CANDIDATE}^{{tree}}") == os.environ["CANDIDATE_TREE"],
-                      "Candidate tree differs from reviewed integration")
+                      "Candidate tree differs from frozen ASYNC source")
+              require(git("rev-list", "--parents", "-n", "1", CONTROL).split() == [CONTROL, CANDIDATE] and
+                      git("rev-parse", f"{CONTROL}^{{tree}}") == os.environ["CONTROL_TREE"] and
+                      git("diff", "--name-only", CANDIDATE, CONTROL).splitlines() ==
+                      ["src/plugins/http_static/static_server.c"], "Omitted-release control identity differs")
               for path, blob in TEST_BLOBS.items():
-                  require(git("rev-parse", f"{CANDIDATE}:{path}") == blob, "Reviewed test blob differs: " + path)
+                  require(git("rev-parse", f"{CANDIDATE}:{path}") == blob and
+                          git("rev-parse", f"{CONTROL}:{path}") == blob, "Frozen identical test blob differs: " + path)
               fixtures = ast.parse(content(CANDIDATE, FIXTURE))
               require(sum(isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
-                          for cls in fixtures.body if isinstance(cls, ast.ClassDef) for node in cls.body) == 24,
-                      "Reviewed standalone fixture inventory differs")
+                          for cls in fixtures.body if isinstance(cls, ast.ClassDef) for node in cls.body) == 33,
+                      "Frozen standalone fixture inventory differs")
               require(content(CANDIDATE, HTTP_TEST) == content(CHECK_BASE, HTTP_TEST),
                       "HTTP name regression differs from integrated master")
+              sources = {name: ast.parse(content(CANDIDATE, path)) for name, path in
+                         (("test_http_static", TEST), ("vpp_papi_provider", "test/vpp_papi_provider.py"))}
+              setup_lines = {}
+              for cls in sources["test_http_static"].body:
+                  if isinstance(cls, ast.ClassDef) and cls.name in ("TestHttpStaticVapi", "TestHttpStaticCli"):
+                      method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "setUpClass")
+                      calls = [node.lineno for node in ast.walk(method) if isinstance(node, ast.Call) and
+                               isinstance(node.func, ast.Attribute) and node.func.attr == "cli" and node.args and
+                               isinstance(node.args[0], ast.JoinedStr) and any(isinstance(part, ast.Constant) and
+                               part.value == "create host-interface name " for part in node.args[0].values)]
+                      require(len(calls) == 1, "Ambiguous diagnostic setup call")
+                      setup_lines[cls.name] = calls[0]
+              require(setup_lines == {"TestHttpStaticVapi": 58, "TestHttpStaticCli": 199},
+                      "Diagnostic observer setup source identity differs")
+              provider = next(node for node in sources["vpp_papi_provider"].body if
+                              isinstance(node, ast.ClassDef) and node.name == "VppPapiProvider")
+              method = next(node for node in provider.body if isinstance(node, ast.FunctionDef) and node.name == "cli")
+              calls = [node.lineno for node in ast.walk(method) if isinstance(node, ast.Call) and
+                       isinstance(node.func, ast.Attribute) and node.func.attr == "cli_return_response"]
+              require(calls == [480], "Diagnostic observer provider call identity differs")
 
           def prepare():
               workflow = os.environ["WORKFLOW_SHA"]
@@ -2044,6 +2111,8 @@ jobs:
               manifest = dict(workflow_sha=workflow, candidate_sha=CANDIDATE, check_base_sha=CHECK_BASE, frozen_sha=FROZEN,
                               workflow_blob=git("rev-parse", f"{workflow}:.github/workflows/hss-regression-control.yml"),
                               candidate_tree=git("rev-parse", f"{CANDIDATE}^{{tree}}"), variant=VARIANT,
+                              control_sha=CONTROL, control_tree=os.environ["CONTROL_TREE"],
+                              async_scope="worker1 real HTTP ASYNC release/cancel; pre-ACCEPTED queue and ACK/reset/heap remain open",
                               run_id=os.environ["GITHUB_RUN_ID"], attempt=os.environ["GITHUB_RUN_ATTEMPT"],
                               artifact=f"hss-{VARIANT}-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
                               run_url=f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
@@ -2088,7 +2157,12 @@ jobs:
               require(git("rev-parse", "HEAD") == CANDIDATE, "Candidate HEAD moved")
               require(not git("diff", "--name-only"), "Tracked source changed before mutation")
               original = Path(SOURCE).read_bytes()
-              if VARIANT != "fixed":
+              if VARIANT == "async-omit-release":
+                  require(git("rev-parse", f"{CANDIDATE}:{SOURCE}") == "85b8b09100d57a7acbb570b31509fdae6e78e7eb" and
+                          git("rev-parse", f"{CONTROL}:{SOURCE}") == "80b9be05f58700ff0ac258c83ff65913c02a5979",
+                          "Omitted-release source blobs differ")
+                  Path(SOURCE).write_bytes(content(CONTROL, SOURCE))
+              elif VARIANT != "fixed":
                   old, new = RECIPES.get(VARIANT, (None, None))
                   # Whitespace comes from immutable source; preserve surrounding bytes exactly.
                   if VARIANT == "api-protocol":
@@ -2125,6 +2199,11 @@ jobs:
               subprocess.run(["git", "read-tree", CANDIDATE], env=index_env, check=True, timeout=60)
               subprocess.run(["git", "add", SOURCE], env=index_env, check=True, timeout=60)
               manifest["built_tree"] = subprocess.check_output(["git", "write-tree"], env=index_env, text=True, timeout=60).strip()
+              require((manifest["source"]["built_blob"], manifest["built_tree"]) == BUILD_IDENTITIES[VARIANT],
+                      "Restored source blob or built tree differs from frozen recipe")
+              if VARIANT == "async-omit-release":
+                  require(manifest["built_tree"] == os.environ["CONTROL_TREE"], "Control built tree differs from frozen control")
+                  manifest["source"]["control_blob"] = git("rev-parse", f"{CONTROL}:{SOURCE}")
               manifest["tools"] = {path.name: digest(path) for path in TOOLS.glob("*.py")}
               save("manifest.json", manifest)
               (OUT / "restoration.diff").write_text(git("diff", "--", SOURCE) + "\n")
@@ -2222,10 +2301,10 @@ jobs:
                        "test_http_static_cache_owners", "test_http_static_cache_read_error",
                        "test_http_static_cache_pressure", "test_http_static_cache_relocation")),
                       "Reviewed thirteen methods or separate synthetic test changed")
-              require(methods["TestHttpStaticCliWorker"] == [] and
-                      methods["TestHttpStaticVapi"] == ["test_http_static_vapi"], "Reviewed suite classes changed")
+              require(methods["TestHttpStaticCliWorker"] == ["test_http_static_async_release_cancel"] and
+                      methods["TestHttpStaticVapi"] == ["test_http_static_vapi"], "Frozen suite classes changed")
               return [f"test_http_static.{cls}.{method}" for cls in (*CLASSES, "TestHttpStaticVapi")
-                      for method in methods["TestHttpStaticCli" if cls in CLASSES else cls]]
+                      for method in methods["TestHttpStaticCli" if cls in CLASSES else cls]] + [ASYNC_TEST]
 
           def infrastructure_text(text, events, variant):
               require(not re.search(r"ERROR: (?:AddressSanitizer|ASAN):|AddressSanitizer:DEADLYSIGNAL|"
@@ -2375,12 +2454,144 @@ jobs:
                   require(len(successes) == 1 and operations[-1]["seq"] < successes[0]["seq"],
                           "QUIC identity queries did not precede test success")
 
+          def async_snapshots(active):
+              header = "enabled overflow live baseline destroys detaches owners".split()
+              fields = ("token epoch generation app thread hs handle listener enter async send cancel cleanup "
+                        "sends cancels cleanups duplicate late pending owned tx refs retiring final freed "
+                        "releases cachefree vecfree poolput recovery omitted").split()
+              snapshots = []
+              for event in active:
+                  if event["kind"] != "cli_reply" or event.get("command") != "test http static async status":
+                      continue
+                  require(event["retval"] == 0, "ASYNC status command failed")
+                  lines = event["reply"].strip().splitlines()
+                  parts = lines[0].split() if lines else []
+                  require(parts[:1] == ["async-ledger"] and parts[1::2] == header and
+                          len(parts) == 15, "Invalid ASYNC status header")
+                  summary = dict(zip(header, map(int, parts[2::2])))
+                  require(summary["enabled"] == 1 and summary["overflow"] == 0, "ASYNC ledger disabled or overflowed")
+                  records = {}
+                  for line in lines[1:]:
+                      parts = line.split()
+                      require(parts[::2] == fields and len(parts) == 62, "Invalid ASYNC scalar record")
+                      record = dict(zip(fields, map(int, parts[1::2])))
+                      require(record["token"] not in records and all(value >= 0 for value in record.values()),
+                              "Duplicate or negative ASYNC record")
+                      records[record["token"]] = record
+                  snapshots.append((event["seq"], summary, records))
+              require(snapshots, "Missing actual ASYNC status replies")
+              return snapshots
+
+          def async_freed(record, canceled=False):
+              for key in ("refs", "owned", "pending", "recovery", "omitted"):
+                  require(record[key] == 0, "ASYNC completion retained " + key)
+              for key in ("cleanups", "poolput", "cachefree", "vecfree"):
+                  require(record[key] == 1, "ASYNC completion count differs: " + key)
+              require(record["releases"] == 2 and record["sends"] == int(not canceled) and
+                      record["cancels"] == int(canceled), "ASYNC send/cancel/release count differs")
+              order = ("enter", "async", "cancel" if canceled else "send", "cleanup", "freed")
+              require(all(record[key] > 0 for key in (*order, "final")) and
+                      all(record[left] < record[right] for left, right in zip(order, order[1:])) and
+                      record["final"] < record["freed"], "ASYNC lifecycle sequence differs")
+
+          def async_evidence(events, negative=False):
+              active = test_interval(events, ASYNC_TEST)
+              require(all(left["seq"] < right["seq"] for left, right in zip(active, active[1:])),
+                      "ASYNC observer events out of order")
+              replies = [event for event in active if event["kind"] == "cli_reply" and
+                         event.get("command", "").startswith("test http static async ")]
+              require(replies and all(event["retval"] == 0 for event in replies), "ASYNC CLI failed")
+              commands = [event["command"].removeprefix("test http static async ") for event in replies]
+              require(commands[0] == "start" and commands[-1] == "clear" and commands.count("start") ==
+                      commands.count("abort") == commands.count("clear") == 1 and
+                      commands.count("release 101") == 2, "ASYNC command lifecycle differs")
+              snapshots = async_snapshots(active)
+              history = {token: [(seq, summary, records[token]) for seq, summary, records in snapshots if token in records]
+                         for token in (101, 102, 103)}
+              sent = history[101]
+              require(sent and all(record["thread"] == 1 for _, _, record in sent if record["enter"]),
+                      "ASYNC request did not run on worker1")
+              require(any(record["enter"] > 0 and record["async"] > record["enter"] and
+                          record["sends"] == record["tx"] == 0 and record["owned"] == 1
+                          for _, _, record in sent), "Missing genuine unsent ASYNC state")
+              require(any(record["retiring"] == record["refs"] == 1 and record["sends"] == 0
+                          for _, _, record in sent), "Old listener not retained before release")
+              require(any(record["duplicate"] == 1 and record["sends"] == 1 for _, _, record in sent),
+                      "Duplicate ASYNC release was not observed")
+              responses = [event for event in active if event["kind"] == "helper" and
+                           event.get("helper") == "_response" and event.get("response", {}).get("status") == 200]
+              bodies = [event["response"].get("body") for event in responses]
+              require(bodies == (["old-body", "new-config"] if negative else ["old-body", "new-config", "next-body"]),
+                      "Missing actual ASYNC HTTP200 bodies")
+              old, fresh = [event["response"] for event in responses[:2]]
+              generation = next(record["generation"] for _, _, record in sent if record["send"])
+              require(old.get("cache") == "max-age=123" and fresh.get("cache") == "max-age=456" and
+                      old.get("server") == fresh.get("server") == f"http_static_server_{generation}",
+                      "ASYNC old/new listener configuration differs")
+              last_seq, last_summary, last_records = snapshots[-1]
+              require(last_summary["live"] == last_summary["baseline"] and
+                      all(last_summary[key] == 0 for key in ("destroys", "detaches", "owners")) and
+                      all(record["pending"] == record["owned"] == 0 for record in last_records.values()),
+                      "ASYNC final owners or destroys incomplete")
+              clear = next(event for event in reversed(replies) if event["command"] == "test http static async clear")
+              require(last_seq < clear["seq"], "ASYNC clear lacks prior idle snapshot")
+              if negative:
+                  failures = [event for event in active if event["kind"] == "addFailure"]
+                  require(len(failures) == 1, "Missing unique ASYNC omission failure")
+                  failure = failures[0]
+                  require(any(seq < failure["seq"] and record["omitted"] == record["refs"] == record["cleanups"] == 1 and
+                              record["poolput"] == record["final"] == record["freed"] == record["recovery"] == 0
+                              for seq, _, record in sent), "Missing pre-recovery refs1 witness")
+                  recoveries = [event for event in replies if event["command"] == "test http static async recover 101"]
+                  require(len(recoveries) == 1 and failure["seq"] < recoveries[0]["seq"] < last_seq < clear["seq"],
+                          "Guarded recovery did not follow original failure")
+                  require(set(last_records) == {101} and last_records[101]["recovery"] ==
+                          last_records[101]["poolput"] == last_records[101]["cachefree"] ==
+                          last_records[101]["vecfree"] == 1 and last_records[101]["refs"] == 0 and
+                          last_records[101]["freed"] > last_records[101]["cleanup"] > 0,
+                          "Omitted release was not independently recovered")
+                  require(any(failure["seq"] < seq < recoveries[0]["seq"] and
+                              all(summary[key] == 0 for key in ("destroys", "detaches", "owners"))
+                              for seq, summary, _ in sent), "Recovery preceded real owner/destroy completion")
+                  return
+              require(set(last_records) == {101, 102, 103} and not any(command.startswith("recover ") for command in commands),
+                      "Fixed ASYNC unexpectedly recovered omission")
+              for token in (101, 102, 103):
+                  async_freed(last_records[token], canceled=token == 102)
+              require(commands.count("release 102") == commands.count("release 103") == 1 and
+                      last_records[102]["late"] == 1 and last_records[101]["duplicate"] == 1,
+                      "Missing canceled late release or duplicate rejection")
+              canceled, replacement = last_records[102], last_records[103]
+              require(canceled["epoch"] != replacement["epoch"] and canceled["generation"] != replacement["generation"] and
+                      (canceled["app"], canceled["epoch"], canceled["handle"]) !=
+                      (replacement["app"], replacement["epoch"], replacement["handle"]), "ASYNC replacement identity reused")
+              require(any(records.get(102, {}).get("late") == 1 and records.get(103, {}).get("sends") == 0 and
+                          records[103]["owned"] == 1 for _, _, records in snapshots), "Late release touched new request")
+              response = responses[-1]["response"]
+              require(response.get("cache") == "max-age=987" and
+                      response.get("server") == f"http_static_server_{replacement['generation']}",
+                      "Replacement ASYNC HTTP configuration differs")
+
           def validate(events, console, rc, expected, variant, logs):
               starts, stops, complete, wanted = execution_evidence(events, console, expected, variant, logs)
               subs = [event for event in events if event["kind"] == "addSubTest"]
               outcomes = [event for event in events if event["kind"] in ("addSuccess", "addFailure")]
               callbacks = re.findall(r"--- (add\w+)\(\) (\w+)\.(\w+)\(", logs)
-              if variant == "read-error-unlock":
+              if variant == "async-omit-release":
+                  require(rc == 2 and expected == [ASYNC_TEST] and len(outcomes) == 1 and
+                          outcomes[0]["kind"] == "addFailure" and outcomes[0]["test"] == ASYNC_TEST and
+                          outcomes[0].get("error") == "AssertionError" and
+                          callbacks == [("addFailure", "TestHttpStaticCliWorker", "test_http_static_async_release_cancel")] and
+                          sum(event["failures"] for event in complete) == 1 and
+                          not any(event.get("error") for event in subs), "Omission did not complete with one ordinary failure")
+                  trace = outcomes[0].get("traceback", "")
+                  for witness in ('in test_http_static_async_release_cancel', 'in _async_sent_scenario',
+                                  'in _async_assert_freed', 'self.assertEqual(record["refs"], 0, record)',
+                                  'AssertionError: 1 != 0'):
+                      require(witness in trace and witness in console and witness in logs,
+                              "Missing exact raw omitted-release assertion: " + witness)
+                  async_evidence(events, negative=True)
+              elif variant == "read-error-unlock":
                   require(rc > 0 and rc != 124 and not outcomes and not callbacks,
                           "Read-error control did not complete with only subtest failures")
                   require(len(subs) == 4 and sum(event["failures"] for event in complete) == 4,
@@ -2437,6 +2648,7 @@ jobs:
                       require(sequence == ["_client", "_response", "_refused"] * 8,
                               "HTTP200/delete/refusal sequence differs")
                   quic_evidence(events)
+                  async_evidence(events)
               else:
                   require(rc > 0 and rc != 124, "Restored command unexpectedly passed or timed out")
                   require(collections.Counter(event["test"] for event in outcomes) == wanted and
@@ -2482,6 +2694,8 @@ jobs:
                   f"http_static.{cls}.{method}" for cls in CLASSES)
               expected = expected_ids() if VARIANT == "fixed" else [
                   f"test_http_static.{cls}.{method}" for cls in CLASSES]
+              if VARIANT == "async-omit-release":
+                  selector, expected = ASYNC_TEST.removeprefix("test_"), [ASYNC_TEST]
               event_base = OUT / "events"
               diagnostic_config = None
               try:
@@ -2518,7 +2732,8 @@ jobs:
                   publish(Path(os.environ["HSS_CONTROL"]) / "runtime-collection.json", collection)
                   events = [json.loads(line) for line in payloads["events.jsonl"].splitlines() if line]
                   runtime = json.loads(payloads["runtime.json"])
-                  require(runtime["status"] == "completed", "Runtime command timed out or exceeded work budget")
+                  require(runtime["status"] == "completed" and runtime.get("cleanup_complete") is True,
+                          "Runtime command or process cleanup incomplete")
                   require(runtime["rc"] == rc, "Runtime snapshot return code changed")
                   require(not snapshot["fatal"], "Fatal diagnostic found before log tail")
                   work_remaining()
@@ -2527,9 +2742,14 @@ jobs:
               except Exception as error:
                   publish(acceptance, dict(status="FAIL", error=str(error), expected=expected))
                   raise
-              publish(acceptance, dict(status="PASS", expected=expected,
-                  claims="full27 fixed successes:14 original regressions,2 main-queue synthetic,8 cache,3 existing" if VARIANT == "fixed" else
+              publish(acceptance, dict(status="PASS", expected=expected, candidate=CANDIDATE, control=CONTROL,
+                  variant=VARIANT, workflow=os.environ["WORKFLOW_SHA"],
+                  claims="full28: original27 plus worker1 real ASYNC release/cancel" if VARIANT == "fixed" else
+                         "one ordinary refs1 failure followed by separate guarded recovery" if VARIANT == "async-omit-release" else
                          "narrow restored field/unlock only; lifecycle negative gaps remain"))
+              publish(Path(os.environ["HSS_CONTROL"]) / "task-map.json", dict(product_controls="EXECUTED",
+                  candidate=CANDIDATE, control=CONTROL, workflow=os.environ["WORKFLOW_SHA"], variant=VARIANT,
+                  runtime_tests=expected, fixtures=33, original_tasks="OPEN", acceptance="bounded-only"))
 
           def validate_http_name(events, console, rc, logs):
               test = "test_http.TestHttpNameOwnership.test_app_name_ownership"
@@ -2725,7 +2945,8 @@ jobs:
 
           def provenance():
               return dict(workflow=os.environ["WORKFLOW_SHA"], candidate=control.CANDIDATE,
-                  fixture_sha256=control.digest(__file__),
+                  control=control.CONTROL, candidate_tree=os.environ["CANDIDATE_TREE"],
+                  control_tree=os.environ["CONTROL_TREE"], fixture_sha256=control.digest(__file__),
                   modules={path.name: control.digest(path) for path in control.TOOLS.glob("*.py")},
                   tests=control.TEST_BLOBS, binaries="CI hash records only; binary bytes not uploaded")
 
@@ -3332,7 +3553,7 @@ jobs:
           python3 "$TOOLS/control.py" fixture-python-style build-root/test/venv/bin/black --check -t py39 \
             src/plugins/http_static/test_lifetime_fixtures.py test/asf/test_http_static.py
 
-      - name: Execute exactly twenty-four standalone fixtures
+      - name: Execute exactly thirty-three standalone fixtures
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -3344,7 +3565,7 @@ jobs:
           from pathlib import Path
           import re
           text = (Path(os.environ["EVIDENCE"]) / "fixtures/console.log").read_text()
-          assert "Ran 24 tests in " in text and "\nOK\n" in text, text
+          assert "Ran 33 tests in " in text and "\nOK\n" in text, text
           tree = ast.parse((Path(os.environ["TOOLS"]) / "control.py").read_text())
           functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and
                        node.name in ("require", "infrastructure_text")]
@@ -3594,6 +3815,122 @@ jobs:
           changed[-4]["reply"] = changed[-3]["reply"] = "[0:2][Q] baseline\n[1:5][Q] retained\n"
           rejects_quic(changed)
           print(f"QUIC fixtures passed: both worker classes and two exact listener iterations; {rejected} invalid inputs rejected")
+          fields = ("token epoch generation app thread hs handle listener enter async send cancel cleanup sends cancels "
+                    "cleanups duplicate late pending owned tx refs retiring final freed releases cachefree vecfree "
+                    "poolput recovery omitted").split()
+          def async_fixture(negative=False):
+              events = [dict(kind="loaded", pid=1, seq=1)]
+              def emit(kind, **values):
+                  events.append(dict(kind=kind, pid=1, seq=len(events) + 1, **values))
+              def cli(command):
+                  emit("cli_reply", command="test http static async " + command, retval=0, reply="")
+              def record(token=101, **values):
+                  result = dict.fromkeys(fields, 0)
+                  result.update(token=token, epoch=token, generation=token, app=token, thread=1,
+                                hs=token, handle=token, listener=token, **values)
+                  return result
+              def status(records, idle=False):
+                  header = "async-ledger enabled 1 overflow 0 live 0 baseline 0 destroys 0 detaches 0 owners 0\n"
+                  if not idle:
+                      header = header.replace("live 0", "live 1").replace("owners 0", "owners 1")
+                  emit("cli_reply", command="test http static async status", retval=0,
+                       reply=header + "".join(" ".join(f"{key} {item[key]}" for key in fields) + "\n" for item in records))
+              test = control["ASYNC_TEST"]
+              emit("startTest", test=test, workers=1, netns_disabled=False, excluded=[], vpp_cmdline=["vpp"])
+              cli("start")
+              status([record(enter=1, owned=1, **{"async": 2})])
+              status([record(enter=1, refs=1, retiring=1, **{"async": 2})])
+              cli("release 101")
+              emit("helper", test=test, helper="_response", response=dict(status=200, body="old-body", cache="max-age=123",
+                   server="http_static_server_101"))
+              cli("release 101")
+              status([record(enter=1, send=3, sends=1, duplicate=1, **{"async": 2})])
+              emit("helper", test=test, helper="_response", response=dict(status=200, body="new-config", cache="max-age=456",
+                   server="http_static_server_101"))
+              finished = record(enter=1, send=3, cleanup=4, sends=1, cleanups=1, duplicate=1, final=5, freed=6,
+                                releases=2, cachefree=1, vecfree=1, poolput=1, **{"async": 2})
+              trace = ('Traceback (most recent call last):\n'
+                       '  File "/fixture/test/asf/test_http_static.py", line 1137, in test_http_static_async_release_cancel\n'
+                       '    self._async_sent_scenario(root, uri)\n'
+                       '  File "/fixture/test/asf/test_http_static.py", line 1063, in _async_sent_scenario\n'
+                       '    self._async_assert_freed(completed)\n'
+                       '  File "/fixture/test/asf/test_http_static.py", line 920, in _async_assert_freed\n'
+                       '    self.assertEqual(record["refs"], 0, record)\nAssertionError: 1 != 0 : refs retained\n')
+              if negative:
+                  leaked = dict(finished, refs=1, omitted=1, poolput=0, cachefree=0, vecfree=0, final=0, freed=0, releases=1)
+                  status([leaked])
+                  emit("addFailure", test=test, error="AssertionError", traceback=trace)
+                  cli("abort")
+                  status([leaked], idle=True)
+                  cli("recover 101")
+                  status([dict(finished, omitted=1, recovery=1)], idle=True)
+              else:
+                  cli("release 102")
+                  cli("release 103")
+                  canceled = record(102, enter=7, cancel=9, cleanup=10, cancels=1, cleanups=1, late=1,
+                                    final=11, freed=12, releases=2, cachefree=1, vecfree=1, poolput=1, **{"async": 8})
+                  replacement = record(103, enter=13, owned=1, **{"async": 14})
+                  status([finished, canceled, replacement])
+                  emit("helper", test=test, helper="_response", response=dict(status=200, body="next-body", cache="max-age=987",
+                       server="http_static_server_103"))
+                  replacement.update(send=15, cleanup=16, sends=1, cleanups=1, owned=0, final=17, freed=18,
+                                     releases=2, cachefree=1, vecfree=1, poolput=1)
+                  cli("abort")
+                  status([finished, canceled, replacement], idle=True)
+              cli("clear")
+              if not negative:
+                  emit("addSuccess", test=test)
+              emit("stopTest", test=test)
+              emit("completed", tests=1, failures=int(negative), errors=0, skips=0, expected=0, unexpected=0)
+              logs = trace + "--- addFailure() TestHttpStaticCliWorker.test_http_static_async_release_cancel(" if negative else ""
+              return events, trace, logs
+          validate_async = control["async_evidence"]
+          fixed, _, _ = async_fixture()
+          validate_async(fixed)
+          negative, trace, logs = async_fixture(True)
+          control["validate"](negative, trace, 2, [control["ASYNC_TEST"]], "async-omit-release", logs)
+          rejected = 0
+          def rejects_async(changed, negative=False, raw=None, raw_logs=None, rc=2):
+              global rejected
+              try:
+                  if negative:
+                      control["validate"](changed, trace if raw is None else raw, rc, [control["ASYNC_TEST"]],
+                                          "async-omit-release", logs if raw_logs is None else raw_logs)
+                  else:
+                      validate_async(changed)
+              except (AssertionError, ValueError, KeyError, IndexError, StopIteration):
+                  rejected += 1
+              else:
+                  raise AssertionError("Invalid ASYNC evidence was accepted")
+          for original, is_negative in ((fixed, False), (negative, True)):
+              for index, event in enumerate(original):
+                  if event["kind"] in ("cli_reply", "helper"):
+                      if event.get("command") == "test http static async status" and "duplicate 1" in event["reply"] and \
+                              "cleanup 0" in event["reply"]:
+                          continue
+                      rejects_async(original[:index] + original[index + 1:], is_negative)
+              for before, after in (("overflow 0", "overflow 1"), ("thread 1", "thread 0"),
+                                    ("owned 1", "owned 0"), ("refs 1 retiring 1", "refs 0 retiring 1"),
+                                    ("duplicate 1", "duplicate 0"), ("vecfree 1", "vecfree 0")):
+                  changed = copy.deepcopy(original)
+                  for event in changed:
+                      if event.get("command") == "test http static async status":
+                          event["reply"] = event["reply"].replace(before, after)
+                  rejects_async(changed, is_negative)
+          for before, after in (("late 1", "late 0"), ("cancel 9", "cancel 0"), ("freed 18", "freed 16"),
+                                ("epoch 103", "epoch 102"), ("generation 103", "generation 102")):
+              changed = copy.deepcopy(fixed)
+              for event in changed:
+                  if event.get("command") == "test http static async status":
+                      event["reply"] = event["reply"].replace(before, after)
+              rejects_async(changed)
+          for marker in ("SIGSEGV", "TimeoutError", "operation timed out"):
+              rejects_async(negative, True, raw=trace + marker)
+          for before, after in (("record[\"refs\"], 0", "record[\"refs\"], 1"), ("1 != 0", "2 != 0")):
+              rejects_async(negative, True, raw=trace.replace(before, after))
+          for rc in (0, 1, 124, -11):
+              rejects_async(negative, True, rc=rc)
+          print(f"ASYNC fixtures passed: fixed and ordinary omission with separate recovery; {rejected} invalid inputs rejected")
           PY
 
       - &hss_mutate
@@ -3771,9 +4108,11 @@ jobs:
     env:
       VARIANT_NAME: fixed
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: 6459dbc8f8c82f18e00e72bc9e4676bbada62484
+      CANDIDATE_SHA: d03ce59a82d80f84661120acade463828e88a518
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: 82cefc33393c2484423b4668dcaf542d3d1bdcd4
+      CANDIDATE_TREE: d7294ec676db157f0c47c618bbe39c5d38763563
+      CONTROL_SHA: 2faf558df6edb4be2083df5bde1a456a9597ed5e
+      CONTROL_TREE: 2ee54cbd40274ef591132742a8873512c0401531
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
@@ -3789,7 +4128,8 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s\n' bootstrap checkout prepare dependencies diagnostic-dependencies mutate fallback-version build binaries namespace environment diagnostic-contract collect > "$EVIDENCE/planned-phases.txt"
-          printf '{"product_controls":"NOT_RUN","historical_run":"39494180264","diagnostic_acceptance":"independent"}\n' > "$HSS_CONTROL/task-map.json"
+          printf '{"product_controls":"NOT_RUN","historical_run":"39494180264","diagnostic_acceptance":"independent","candidate":"%s","control":"%s","workflow":"%s"}\n' \
+            "$CANDIDATE_SHA" "$CONTROL_SHA" "$WORKFLOW_SHA" > "$HSS_CONTROL/task-map.json"
       - *hss_dependencies
       - name: Prepare pinned diagnostic Python environment
         timeout-minutes: 15
