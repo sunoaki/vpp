@@ -48,11 +48,11 @@ jobs:
     env:
       VARIANT_NAME: ${{ matrix.variant }}
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: adfc1f1ece072db95dbf5e85badf6d5f9ff56546
+      CANDIDATE_SHA: 4ad5878cb0a4b1047e199fe828f7ab790409c18e
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: b61038e27b53c2855bad9ab15cb51dc0d6128238
-      CONTROL_SHA: 88cf2970ee9ddd39d3265b3cfb53c00c23e46e60
-      CONTROL_TREE: 1c26c674f437f58f10e45833f669706d783fea6b
+      CANDIDATE_TREE: 9cf02d6ee329de01082788f894be40b2a4b0e191
+      CONTROL_SHA: cb99b671df7e3aaf6a1db5a3829a209b967d923e
+      CONTROL_TREE: 858e25788b2ab6b5a74a32834ca6d000ae1e6848
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
@@ -84,7 +84,7 @@ jobs:
           printf '%s\n' bootstrap checkout prepare dependencies feature-list pinned-python black-version \
             fixture-python-style fixtures mutate fallback-version build binaries namespace environment runtime tests http-name http-name-runtime collect \
             > "$EVIDENCE/planned-phases.txt"
-          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 2ff4cf5eb2a84522213e1182ff1b3934153645d7 ca0843b651f6f9c1fca0635c61e6916112759fda 6459dbc8f8c82f18e00e72bc9e4676bbada62484 dee4c6f4b61e1b55d257f6c814bb3b49723a2d57 adfc1f1ece072db95dbf5e85badf6d5f9ff56546; do
+          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 2ff4cf5eb2a84522213e1182ff1b3934153645d7 ca0843b651f6f9c1fca0635c61e6916112759fda 6459dbc8f8c82f18e00e72bc9e4676bbada62484 dee4c6f4b61e1b55d257f6c814bb3b49723a2d57 4ad5878cb0a4b1047e199fe828f7ab790409c18e; do
             printf 'style-%s\napi-%s\nmessage-%s\n' "$commit" "$commit" "$commit" >> "$EVIDENCE/planned-phases.txt"
           done
           {
@@ -1833,12 +1833,12 @@ jobs:
           CLASSES = ("TestHttpStaticCli", "TestHttpStaticCliWorker")
           ASYNC_TEST = "test_http_static.TestHttpStaticCliWorker.test_http_static_async_release_cancel"
           BUILD_IDENTITIES = {
-              "fixed": ("4c998afbbe0fb6fb00f546c795551223dc825266", "b61038e27b53c2855bad9ab15cb51dc0d6128238"),
-              "cache-limit": ("3f4027039d2128e9c04dd5ee8c1c503918dc89e7", "34b75b4004d85de3f2f1c0cd5fd13335f6930245"),
-              "api-protocol": ("9be90d745ea02afaa6471ca1cc163d95d9f397af", "9a0dd806f53a56ad098fac1b1a35d729e3be76ce"),
-              "original-endpoint": ("5f7fadd9551879e6aca0d782e9471728216583d4", "5d6d21ad7d8a1743f4f656718ca8ad0239554fc4"),
-              "read-error-unlock": ("404e94c25c913ffa91fd96004a15f58fb16c11f2", "95179618b7cfc384be437792255d35f323761356"),
-              "async-omit-release": ("dc37ac9d514466df0ac805d90c6652b2d6e74bd5", "1c26c674f437f58f10e45833f669706d783fea6b")}
+              "fixed": ("4c998afbbe0fb6fb00f546c795551223dc825266", "9cf02d6ee329de01082788f894be40b2a4b0e191"),
+              "cache-limit": ("3f4027039d2128e9c04dd5ee8c1c503918dc89e7", "3d7a6d5a793b11b634c153efe83ca1011746b0a0"),
+              "api-protocol": ("9be90d745ea02afaa6471ca1cc163d95d9f397af", "03d6743d8d0d6e7f480725ec480715faf438db58"),
+              "original-endpoint": ("1fe38a4ff66b7c7bc806c71c57b148edd84781f6", "179ff5560743716c614aba8265fc6b8137bea1a0"),
+              "read-error-unlock": ("404e94c25c913ffa91fd96004a15f58fb16c11f2", "a157dac356cb19dd215673e6868eec63f302b9ac"),
+              "async-omit-release": ("202798e749319c02b76fde7ca15679d6a0d7f73a", "858e25788b2ab6b5a74a32834ca6d000ae1e6848")}
           RECIPES = {
               "cache-limit": ("rmp->cache_size_limit = htonl (l->cache ? l->cache->cache_limit : 0);",
                               "rmp->cache_size_limit = htonl (hsm->default_listener.cache ? hsm->default_listener.cache->cache_limit : 0);"),
@@ -2268,8 +2268,8 @@ jobs:
               require(not git("diff", "--name-only"), "Tracked source changed before mutation")
               original = Path(SOURCE).read_bytes()
               if VARIANT == "async-omit-release":
-                  require(git("rev-parse", f"{CANDIDATE}:{SOURCE}") == "185f0ec8b3da984104b3fa70307ec44f6a60c919" and
-                          git("rev-parse", f"{CONTROL}:{SOURCE}") == "dc37ac9d514466df0ac805d90c6652b2d6e74bd5",
+                  require(git("rev-parse", f"{CANDIDATE}:{SOURCE}") == "cbfe3506d63b04ec4cf477a87215641309578471" and
+                          git("rev-parse", f"{CONTROL}:{SOURCE}") == "202798e749319c02b76fde7ca15679d6a0d7f73a",
                           "Omitted-release source blobs differ")
                   Path(SOURCE).write_bytes(content(CONTROL, SOURCE))
               elif VARIANT != "fixed":
@@ -4355,11 +4355,11 @@ jobs:
     env:
       VARIANT_NAME: fixed
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: adfc1f1ece072db95dbf5e85badf6d5f9ff56546
+      CANDIDATE_SHA: 4ad5878cb0a4b1047e199fe828f7ab790409c18e
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: b61038e27b53c2855bad9ab15cb51dc0d6128238
-      CONTROL_SHA: 88cf2970ee9ddd39d3265b3cfb53c00c23e46e60
-      CONTROL_TREE: 1c26c674f437f58f10e45833f669706d783fea6b
+      CANDIDATE_TREE: 9cf02d6ee329de01082788f894be40b2a4b0e191
+      CONTROL_SHA: cb99b671df7e3aaf6a1db5a3829a209b967d923e
+      CONTROL_TREE: 858e25788b2ab6b5a74a32834ca6d000ae1e6848
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
