@@ -1,0 +1,771 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Full positive acceptance
+
+on:
+  push:
+    branches: [validation/full-positive-20261022]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: full-positive-cce149c4d1ccd2d4ab88d07acc92478a82a2b100
+  cancel-in-progress: false
+
+jobs:
+  full-positive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    container:
+      image: debian:trixie
+      options: >-
+        --shm-size=2g
+        --cap-add=SYS_ADMIN
+        --cap-add=NET_ADMIN
+        --security-opt=apparmor=unconfined
+        --device-cgroup-rule="c 10:200 rwm"
+        --device-cgroup-rule="c 10:238 rwm"
+    defaults:
+      run:
+        shell: bash
+    env:
+      CANDIDATE_SHA: cce149c4d1ccd2d4ab88d07acc92478a82a2b100
+      CANDIDATE_TREE: dc04885a19d9b3acfe1ab1184f83239031ef6e6b
+      CANDIDATE_PARENT: 626c341265faa473681e373013645701fc12aedd
+      CANDIDATE_BASE: 415599eade17cc745989b5c92e7f3c12e5d0ce60
+      CLANG_FORMAT_VER: "19"
+      CCACHE_COMPRESS: "true"
+      CCACHE_MAXSIZE: 2G
+      VPP_EXTRA_CMAKE_ARGS: >-
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+    steps:
+      - name: Install base tools
+        timeout-minutes: 5
+        run: |
+          set -Eeuo pipefail
+          rm -f /etc/apt/apt.conf.d/docker-clean
+          apt-get update -qq
+          apt-get install -y -qq sudo make git bash python3 iproute2 binutils procps curl ca-certificates
+
+      - name: Check out the control carrier
+        uses: actions/checkout@v4
+        with:
+          path: control
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out the exact candidate
+        uses: actions/checkout@v4
+        with:
+          ref: cce149c4d1ccd2d4ab88d07acc92478a82a2b100
+          path: candidate
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Check out an independent style workspace
+        uses: actions/checkout@v4
+        with:
+          ref: cce149c4d1ccd2d4ab88d07acc92478a82a2b100
+          path: style-source
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Prepare evidence control and verify identities
+        id: identity
+        run: |
+          set -Eeuo pipefail
+          export ACCEPTANCE_ROOT="${RUNNER_TEMP}/full-positive-evidence"
+          echo "ACCEPTANCE_ROOT=${ACCEPTANCE_ROOT}" >> "$GITHUB_ENV"
+          mkdir "$ACCEPTANCE_ROOT"
+          cat > "${RUNNER_TEMP}/full-positive.py" <<'PY'
+          import ast
+          import hashlib
+          import json
+          import os
+          import re
+          import shutil
+          import stat
+          import subprocess
+          import sys
+          import threading
+          import time
+          from pathlib import Path
+
+          root = Path(os.environ["ACCEPTANCE_ROOT"])
+          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          candidate = workspace / "candidate"
+          source_sha = os.environ["CANDIDATE_SHA"]
+          source_tree = os.environ["CANDIDATE_TREE"]
+          parent = os.environ["CANDIDATE_PARENT"]
+          base = os.environ["CANDIDATE_BASE"]
+          suites = ["linux_cp", "linux_cp_lifecycle", "linux_cp_netlink", "gre",
+                    "gre_teib", "ip_mcast", "ip4", "ipsec_esp", "fib"]
+          limit_bytes = 256 * 1024 * 1024
+          limit_file = 32 * 1024 * 1024
+          limit_count = 2000
+          callbacks = re.compile(r" --- (add\w+)\(\) (\w+)\.(\w+)\(")
+
+          def save(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(value, indent=2) + "\n")
+
+          def load(path):
+              return json.loads(path.read_text())
+
+          def git(*args, cwd=candidate):
+              return subprocess.check_output(["git", *args], cwd=cwd)
+
+          def text(*args, cwd=candidate):
+              return git(*args, cwd=cwd).decode().strip()
+
+          def digest(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def blob(data):
+              return hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+
+          def usage():
+              files = [p for p in root.rglob("*") if p.is_file() and not p.is_symlink()]
+              return len(files), sum(p.stat().st_size for p in files)
+
+          def reserve(size):
+              count, total = usage()
+              if size > limit_file or count >= limit_count or total + size > limit_bytes:
+                  raise RuntimeError("Evidence limits exceeded; acceptance incomplete")
+
+          def copy_file(source, destination, required=False):
+              if source.is_symlink() or not source.is_file():
+                  if required:
+                      raise RuntimeError(f"Missing or unsafe required file: {source}")
+                  return {"path": str(source), "status": "unsafe-or-missing"}
+              size = source.stat().st_size
+              count, total = usage()
+              if size > limit_file or count >= limit_count or total + size > limit_bytes:
+                  if required:
+                      raise RuntimeError(f"Required evidence exceeds limits: {source}")
+                  sha = hashlib.sha256()
+                  with source.open("rb") as stream:
+                      for part in iter(lambda: stream.read(1024 * 1024), b""):
+                          sha.update(part)
+                  return {"path": str(source), "size": size, "sha256": sha.hexdigest(),
+                          "status": "omitted-limit"}
+              reserve(size)
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(source, destination, follow_symlinks=False)
+              return {"path": str(source), "stored": str(destination.relative_to(root)),
+                      "size": size, "sha256": digest(destination.read_bytes()), "status": "copied"}
+
+          def command(label, args, cwd=candidate, seconds=1200):
+              directory = root / "commands" / label
+              directory.mkdir(parents=True, exist_ok=False)
+              reserve(limit_file)
+              save(directory / "command.json", {"argv": args, "cwd": str(cwd),
+                                               "start": time.time(), "timeout": seconds})
+              script = '''set -uo pipefail
+          set +e
+          timeout --signal=TERM --kill-after=30s "$1" "${@:4}" 2>&1 |
+            (ulimit -f 32768; tee "$2")
+          codes=("${PIPESTATUS[@]}")
+          printf '%s\\n' "${codes[0]}" > "$3/raw-returncode.txt"
+          printf '%s\\n' "${codes[1]}" > "$3/capture-returncode.txt"
+          test "${codes[0]}" = 0 && test "${codes[1]}" = 0
+          '''
+              result = subprocess.run(["bash", "-c", script, "acceptance", str(seconds),
+                                       str(directory / "command.log"), str(directory), *args], cwd=cwd)
+              save(directory / "result.json", {"returncode": result.returncode, "end": time.time()})
+              if result.returncode:
+                  raise RuntimeError(f"Command failed: {label}")
+
+          def clean(cwd=candidate):
+              if git("status", "--porcelain", "--untracked-files=no", cwd=cwd):
+                  raise RuntimeError(f"Tracked source drift: {cwd}")
+
+          def manifest():
+              return git("ls-tree", "-r", "-z", source_tree)
+
+          def verify_source():
+              if text("rev-parse", "HEAD") != source_sha:
+                  raise RuntimeError("Candidate HEAD changed")
+              if text("rev-parse", "HEAD^{tree}") != source_tree:
+                  raise RuntimeError("Candidate tree changed")
+              clean()
+              version = candidate / "src/scripts/.version"
+              provenance_path = root / "provenance.json"
+              if provenance_path.exists():
+                  provenance = load(provenance_path)
+                  if version.is_symlink():
+                      raise RuntimeError("Version became a symlink")
+                  if provenance["version"]["source"] == "src/scripts/.version":
+                      if not version.is_file() or digest(version.read_bytes()) != provenance["version"]["sha256"]:
+                          raise RuntimeError("Build version drift")
+                  elif version.exists():
+                      raise RuntimeError("Unexpected build version file")
+                  else:
+                      current = git("describe", "--long", "--match", "v*")
+                      if digest(current) != provenance["version"]["sha256"]:
+                          raise RuntimeError("Tag-derived build version drift")
+                  if digest((root / "built-source-manifest.nul").read_bytes()) != provenance["built_manifest_sha256"]:
+                      raise RuntimeError("Built manifest evidence drift")
+                  binaries_path = root / "binaries.json"
+                  if binaries_path.exists():
+                      for binary in load(binaries_path).values():
+                          if file_identity(Path(binary["path"])) != {key: value for key, value in binary.items() if key != "build_id"}:
+                              raise RuntimeError("Installed binary drift: " + binary["path"])
+
+          def identity():
+              for path in [candidate, workspace / "style-source", workspace / "control"]:
+                  subprocess.run(["git", "config", "--global", "--add", "safe.directory", str(path)], check=True)
+              verify_source()
+              if text("show", "-s", "--format=%P", source_sha) != parent:
+                  raise RuntimeError("Candidate sole parent mismatch")
+              if text("show", "-s", "--format=%P", parent) != base:
+                  raise RuntimeError("Candidate base mismatch")
+              expected = "a0498570cd61e9135fe26dff6def7eb72dc6d26c"
+              if text("rev-parse", f"HEAD:.github/workflows/pr-verify.yml") != expected:
+                  raise RuntimeError("Candidate original workflow changed")
+              carrier = workspace / "control"
+              if text("rev-parse", "HEAD", cwd=carrier) != os.environ["GITHUB_SHA"]:
+                  raise RuntimeError("Carrier SHA mismatch")
+              data = manifest()
+              (root / "candidate-manifest.nul").write_bytes(data)
+              save(root / "identity.json", {
+                  "candidate_sha": source_sha, "candidate_tree": source_tree,
+                  "sole_parent": parent, "base": base, "manifest_sha256": digest(data),
+                  "carrier_sha": text("rev-parse", "HEAD", cwd=carrier),
+                  "carrier_tree": text("rev-parse", "HEAD^{tree}", cwd=carrier),
+                  "workflow_blob": text("rev-parse", "HEAD:.github/workflows/full-positive-acceptance.yml", cwd=carrier),
+                  "candidate_workflow_blob": expected,
+                  "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"],
+                  "run_id": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                  "job": os.environ["GITHUB_JOB"], "event": os.environ["GITHUB_EVENT_NAME"],
+                  "ref": os.environ["GITHUB_REF"], "run_url": os.environ["GITHUB_SERVER_URL"] + "/" +
+                  os.environ["GITHUB_REPOSITORY"] + "/actions/runs/" + os.environ["GITHUB_RUN_ID"],
+                  "ci01": "OPEN: no natural recovered-retry artifact observed here",
+                  "negative": "UNFULFILLED/HOLD", "merge": "HOLD"})
+              save(root / "suite-status.json", {suite: "NOT_RUN" for suite in suites})
+              command("resources", ["bash", "-c", "id; uname -a; nproc; free -b; df -B1; cat /proc/self/status; cat /etc/os-release; dpkg-query -W"], seconds=60)
+
+          def style():
+              directory = workspace / "style-source"
+              commits = text("rev-list", "--reverse", f"{base}..{source_sha}", cwd=directory).splitlines()
+              if commits != [parent, source_sha]:
+                  raise RuntimeError("Unexpected style commit range")
+              for commit in commits:
+                  subprocess.run(["git", "checkout", "--detach", commit], cwd=directory, check=True)
+                  clean(directory)
+                  command("feature-" + commit[:8], ["make", "checkfeaturelist"], cwd=directory, seconds=300)
+                  command("c-style-" + commit[:8], ["env", "CHECKSTYLE_COMMIT=" + commit, "make", "checkstyle"], cwd=directory, seconds=600)
+                  command("api-" + commit[:8], ["make", "checkstyle-api"], cwd=directory, seconds=300)
+                  clean(directory)
+                  command("message-" + commit[:8], ["bash", "extras/scripts/check_commit_msg.sh"], cwd=directory, seconds=60)
+              command("python-style", ["make", "checkstyle-python"], cwd=directory, seconds=1200)
+              verify_source()
+
+          def provenance():
+              verify_source()
+              version = candidate / "src/scripts/.version"
+              if version.is_symlink():
+                  raise RuntimeError("Unsafe version input")
+              described = subprocess.run(["git", "describe", "--tags", "--long", "--match", "v[0-9]*"], cwd=candidate,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              if described.returncode and not version.exists():
+                  stamp = text("log", "-1", "--format=%ct")
+                  count = text("rev-list", "--count", "HEAD")
+                  short = text("rev-parse", "--short=7", "HEAD")
+                  version.write_text(f"0.0.0-release+{stamp}.{count}-g{short}\n")
+              if version.exists():
+                  if not version.is_file() or not 0 < version.stat().st_size <= 4096:
+                      raise RuntimeError("Invalid version input")
+                  raw = version.read_bytes()
+                  origin = "src/scripts/.version"
+              else:
+                  raw = git("describe", "--long", "--match", "v*")
+                  if not raw.strip() or len(raw) > 4096:
+                      raise RuntimeError("Invalid tag version")
+                  origin = "git describe --long --match v*"
+              (root / "build-version.raw").write_bytes(raw)
+              index = root / "source.index"
+              env = dict(os.environ, GIT_INDEX_FILE=str(index))
+              try:
+                  subprocess.run(["git", "read-tree", source_sha], cwd=candidate, env=env, check=True)
+                  if origin == "src/scripts/.version":
+                      subprocess.run(["git", "add", "-f", "--", origin], cwd=candidate, env=env, check=True)
+                  built_tree = subprocess.check_output(["git", "write-tree"], cwd=candidate, env=env).decode().strip()
+              finally:
+                  index.unlink(missing_ok=True)
+              built_manifest = git("ls-tree", "-r", "-z", built_tree)
+              (root / "built-source-manifest.nul").write_bytes(built_manifest)
+              save(root / "provenance.json", {"candidate_sha": source_sha, "candidate_tree": source_tree,
+                   "built_source_tree": built_tree, "built_manifest_sha256": digest(built_manifest),
+                   "replacement_count": 0, "version": {"source": origin, "blob": blob(raw), "sha256": digest(raw)},
+                   "header": text("rev-parse", "HEAD:src/vnet/tunnel/tunnel_dp.h"),
+                   "esp_test": text("rev-parse", "HEAD:test/test_ipsec_esp.py"),
+                   "cmake_args": os.environ["VPP_EXTRA_CMAKE_ARGS"]})
+              if text("rev-parse", "HEAD:src/vnet/tunnel/tunnel_dp.h") != "468c628236393f184ab64736441fe1b7bbd40e36":
+                  raise RuntimeError("ESP header mismatch")
+              if text("rev-parse", "HEAD:test/test_ipsec_esp.py") != "093794c2074bbdf66f9350308439e833a03dccc6":
+                  raise RuntimeError("ESP test mismatch")
+              verify_source()
+
+          def file_identity(path):
+              info = path.stat()
+              return {"path": str(path), "sha256": digest(path.read_bytes()), "size": info.st_size,
+                      "inode": info.st_ino, "major": os.major(info.st_dev), "minor": os.minor(info.st_dev)}
+
+          def elf():
+              install = candidate / "build-root/install-vpp_debug-native/vpp"
+              files = {}
+              for name in ["linux_nl_plugin.so", "linux_cp_unittest_plugin.so"]:
+                  paths = [install / lib / "vpp_plugins" / name for lib in ["lib", "lib64"]]
+                  paths = list({p.resolve() for p in paths if p.is_file()})
+                  if len(paths) != 1 or not paths[0].is_relative_to(install.resolve()):
+                      raise RuntimeError(f"Ambiguous or external installed plugin: {name}")
+                  files[name] = file_identity(paths[0])
+                  notes = subprocess.check_output(["readelf", "-n", str(paths[0])])
+                  (root / (name + ".notes.txt")).write_bytes(notes)
+                  match = re.search(rb"Build ID: (\w+)", notes)
+                  files[name]["build_id"] = match.group(1).decode() if match else None
+              provider = files["linux_nl_plugin.so"]
+              dynamic = subprocess.check_output(["readelf", "--dyn-syms", "--wide", provider["path"]])
+              (root / "linux_nl_plugin.so.dynsym.txt").write_bytes(dynamic)
+              for symbol in ["lcp_nl_test_set_sync_pause", "lcp_nl_test_inject_dump"]:
+                  rows = [line.split() for line in dynamic.decode().splitlines() if line.split() and line.split()[-1] == symbol]
+                  if len(rows) != 1 or rows[0][3:6] != ["FUNC", "GLOBAL", "DEFAULT"] or not rows[0][6].isdigit():
+                      raise RuntimeError(f"Invalid dynamic export: {symbol}: {rows}")
+              files["vpp"] = file_identity((install / "bin/vpp").resolve())
+              save(root / "binaries.json", files)
+              command("toolchain", ["bash", "-c", "cc --version; c++ --version; ccache -s; dpkg-query -W"], seconds=60)
+
+          def snapshot(destination):
+              records = []
+              roots = sorted(Path("/tmp").glob("vpp-unittest-*"))
+              roots += [Path("/tmp/vpp-failed-unittests"), candidate / "build-root/test-logs"]
+              files = []
+              for directory in roots:
+                  if directory.is_symlink():
+                      records.append({"path": str(directory), "link": os.readlink(directory)})
+                      continue
+                  if not directory.is_dir():
+                      continue
+                  for current, directories, names in os.walk(directory, followlinks=False):
+                      directories[:] = sorted(d for d in directories if not (Path(current) / d).is_symlink())
+                      for name in sorted(names):
+                          path = Path(current) / name
+                          if path.is_symlink():
+                              records.append({"path": str(path), "link": os.readlink(path)})
+                          elif stat.S_ISREG(path.stat().st_mode):
+                              files.append((path.name != "log.txt", path, directory))
+              for _, path, directory in sorted(files, key=lambda item: (item[0], str(item[1]))):
+                  target = destination / "files" / directory.name / path.relative_to(directory)
+                  records.append(copy_file(path, target, required=path.name == "log.txt"))
+              save(destination / "snapshot.json", {"at": time.time(), "files": records})
+
+          def groups():
+              return {
+                  "linux_cp": {"TestLinuxCPNetlinkRecovery": ["test_netlink_poll_error_recovery", "test_netlink_poll_error_invalid_fd", "test_router_source_ownership", "test_router_partial_delete_ownership", "test_router_mpls_ownership", "test_router_linux_replace_replay", "test_router_bound_table_sweep", "test_router_broadcast_recovery"],
+                      "TestLinuxCPPairManagement": ["test_pair_delete_static_routes_ipv4", "test_pair_delete_dynamic_routes_ipv4", "test_pair_delete_static_routes_ipv6", "test_pair_delete_dynamic_routes_ipv6", "test_pair_create_delete_tun", "test_gre_lcp_ipv4_survives_pair_churn", "test_pair_create_delete_tap", "test_pair_vlan_subinterface", "test_pair_auto_subinterface"],
+                      "TestLinuxCPOSPFMcast": ["test_ospf_mcast_host_to_phy", "test_ospf_mcast_phy_to_host"]},
+                  "linux_cp_lifecycle": {"TestLinuxCPLifecycle": ["test_default_namespace_resources", "test_default_namespace_failure", "test_pair_replace_resend", "test_pair_flags_pool_reuse", "test_vlan_resources"], "TestLinuxCPNamespaceOwnership": ["test_equal_ifindex_namespace_delete"]},
+                  "linux_cp_netlink": {"TestLinuxCPNetlinkSocketOwnership": ["test_pair_add_during_netlink_recovery"], "TestLinuxCPNetlinkDumpCompletion": ["test_dump_completion_errors", "test_dump_completion_success"]},
+                  "gre_teib": {"TestGreTeib": ["test_gre_teib_ipv4", "test_gre_teib_ipv6", "test_gre_teib_cross_mp"]},
+                  "ip_mcast": {"TestIPMcast": ["test_mfib_zero_flags_ip4", "test_mfib_zero_flags_ip6"], "TestMFIB": ["test_mfib"]},
+                  "ip4": {"TestIPv4IfAddrRoute": ["test_ipv4_local_export_withdraw_glean", "test_ipv4_local_export_withdraw_non_glean"]},
+                  "ipsec_esp": {"TestIpsecEspTun": ["test_tun_df44"]},
+                  "fib": {"TestFIB": ["test_fib"]}}
+
+          def inventory(suite, directory):
+              selected = (root / "commands" / (suite + "-list") / "command.log").read_text(errors="replace")
+              match = re.search(r"total: (\d+) test\(s\) selected", selected)
+              if not match or int(match.group(1)) == 0:
+                  raise RuntimeError("Empty or missing discovered inventory")
+              expected_count = int(match.group(1))
+              selected_classes = {}
+              for name, content in re.findall(r"^    (\w+): (.+)$", selected, flags=re.M):
+                  count = re.fullmatch(r"(\d+) test\(s\)", content)
+                  selected_classes[name] = int(count.group(1)) if count else len(content.split(", "))
+              results, skips, raw_logs, startups = {}, [], [], []
+              for log in sorted((directory / "files").glob("vpp-unittest-*/log.txt")):
+                  contents = log.read_text(errors="replace")
+                  raw_logs.append({"path": str(log.relative_to(root)), "sha256": digest(log.read_bytes())})
+                  for raw in re.findall(r"vpp_cmdline args: (.+)", contents):
+                      argv = ast.literal_eval(raw)
+                      workers = argv[argv.index("corelist-workers") + 1].split(",") if "corelist-workers" in argv else []
+                      startups.append({"class": log.parent.name.removeprefix("vpp-unittest-"),
+                                       "argv": argv, "configured_worker_cores": workers,
+                                       "configured_worker_count": len(workers)})
+                  for callback, cls, method in callbacks.findall(contents):
+                      results.setdefault(cls + "." + method, []).append(callback)
+                  skips.extend(line for line in contents.splitlines() if "addSkip" in line)
+              actual_classes = {}
+              for name in results:
+                  cls = name.split(".")[0]
+                  actual_classes[cls] = actual_classes.get(cls, 0) + 1
+              issues = []
+              if sum(selected_classes.values()) != expected_count or actual_classes != selected_classes:
+                  issues.append("Discovered class counts and actual method inventory differ")
+              for name, values in results.items():
+                  if values != ["addSuccess"]:
+                      issues.append(f"{name}: {values}")
+              if skips:
+                  issues.append("Skipped tests or classes remain OPEN")
+              required = []
+              for cls, methods in groups().get(suite, {}).items():
+                  for method in methods:
+                      name = cls + "." + method
+                      required.append(name)
+                      if results.get(name) != ["addSuccess"]:
+                          issues.append("Required non-skip unique success missing: " + name)
+              command_log = (root / "commands" / suite / "command.log").read_text(errors="replace")
+              if not re.search(r"vpp_worker_count=0(?:[,\)])", command_log) or not re.search(r"retries=0(?:[,\)])", command_log):
+                  issues.append("Harness global worker/retry config missing")
+              started_classes = {entry["class"] for entry in startups}
+              if not set(selected_classes) <= started_classes:
+                  issues.append("Per-class actual startup configuration missing")
+              if suite == "fib" and (not startups or any(entry["configured_worker_count"] != 0 for entry in startups)):
+                  issues.append("Full FIB did not start with zero workers")
+              counts = {callback: sum(values.count(callback) for values in results.values())
+                        for callback in ["addSuccess", "addSkip", "addFailure", "addError", "addExpectedFailure", "addUnexpectedSuccess"]}
+              save(directory / "inventory.json", {"module": "test_" + suite, "discovered": expected_count,
+                   "ran": len(results), "callback_counts": counts,
+                   "discovered_classes": selected_classes, "actual_classes": actual_classes,
+                   "methods": results, "skip_details": skips, "required": required,
+                   "command_config": {"vpp_worker_count": 0, "retries": 0,
+                                      "class_worker_overrides": "Existing class declarations remain authoritative; see vpp_cmdline logs"},
+                   "actual_startups": startups,
+                   "all_classes_zero_workers": bool(startups) and all(entry["configured_worker_count"] == 0 for entry in startups),
+                   "raw_logs": raw_logs, "issues": issues})
+              if issues:
+                  raise RuntimeError("; ".join(issues))
+
+          def watch_processes(stop, output):
+              binaries = load(root / "binaries.json")
+              expected_exe = binaries["vpp"]
+              observed = {}
+              errors = []
+              while not stop.is_set():
+                  for proc in Path("/proc").iterdir():
+                      if not proc.name.isdigit():
+                          continue
+                      try:
+                          info = (proc / "exe").stat()
+                          if info.st_ino != expected_exe["inode"] or os.major(info.st_dev) != expected_exe["major"] or os.minor(info.st_dev) != expected_exe["minor"]:
+                              continue
+                          start = (proc / "stat").read_text().rsplit(")", 1)[1].split()[19]
+                          key = proc.name + "-" + start
+                          if key in observed:
+                              continue
+                          cmdline = (proc / "cmdline").read_bytes()
+                          maps = (proc / "maps").read_bytes()
+                          found = {}
+                          for row in maps.decode().splitlines():
+                              parts = row.split(None, 5)
+                              if len(parts) != 6:
+                                  continue
+                              for name in ["linux_nl_plugin.so", "linux_cp_unittest_plugin.so"]:
+                                  expected = binaries[name]
+                                  if Path(parts[5]).name != name:
+                                      continue
+                                  device = [int(v, 16) for v in parts[3].split(":")]
+                                  if parts[5] != expected["path"] or int(parts[4]) != expected["inode"] or device != [expected["major"], expected["minor"]]:
+                                      raise RuntimeError("Loaded plugin identity differs: " + row)
+                                  if digest(Path(parts[5]).read_bytes()) != expected["sha256"]:
+                                      raise RuntimeError("Loaded plugin bytes changed")
+                                  found[name] = expected
+                          if len(found) != 2:
+                              continue
+                          directory = output / key
+                          directory.mkdir(parents=True)
+                          (directory / "cmdline.raw").write_bytes(cmdline)
+                          (directory / "maps.txt").write_bytes(maps)
+                          classes = re.findall(r"vpp-unittest-(\w+)", cmdline.decode(errors="replace"))
+                          observed[key] = {"pid": int(proc.name), "start_ticks": start,
+                              "classes": sorted(set(classes)), "plugins": found,
+                              "exe": expected_exe, "at": time.time()}
+                      except (FileNotFoundError, ProcessLookupError):
+                          continue
+                      except Exception as error:
+                          errors.append(str(error))
+                  stop.wait(0.05)
+              save(output / "identity.json", {"processes": observed, "errors": errors})
+
+          def run_suites():
+              verify_source()
+              states = load(root / "suite-status.json")
+              for suite in suites:
+                  directory = root / "suites" / suite
+                  directory.mkdir(parents=True)
+                  states[suite] = "RUNNING"
+                  save(root / "suite-status.json", states)
+                  stop = threading.Event()
+                  watcher = None
+                  try:
+                      command(suite + "-list", ["make", "UNATTENDED=yes", "TEST_JOBS=1", "VPP_WORKER_COUNT=0", "RETRIES=0", "TEST=" + suite, "test-list"], seconds=300)
+                      if suite == "linux_cp_netlink":
+                          watcher = threading.Thread(target=watch_processes, args=(stop, directory / "loaded"))
+                          watcher.start()
+                      run_error = None
+                      try:
+                          command(suite, ["make", "UNATTENDED=yes", "TEST_JOBS=1", "VPP_WORKER_COUNT=0", "RETRIES=0", "TEST=" + suite, "test-debug"], seconds=1200)
+                      except Exception as error:
+                          run_error = error
+                      finally:
+                          if watcher:
+                              stop.set()
+                              watcher.join(timeout=10)
+                              if watcher.is_alive():
+                                  run_error = RuntimeError("Process identity collection did not stop")
+                          snapshot(directory)
+                      inventory_error = None
+                      try:
+                          inventory(suite, directory)
+                      except Exception as error:
+                          inventory_error = error
+                      if run_error or inventory_error:
+                          raise RuntimeError(f"Command: {run_error}; inventory: {inventory_error}")
+                      if suite == "linux_cp_netlink":
+                          loaded = load(directory / "loaded/identity.json")
+                          classes = {cls for entry in loaded["processes"].values() for cls in entry["classes"]}
+                          if loaded["errors"] or not {"TestLinuxCPNetlinkSocketOwnership", "TestLinuxCPNetlinkDumpCompletion"} <= classes:
+                              raise RuntimeError("Required real netlink process mappings missing or invalid")
+                      verify_source()
+                      states[suite] = "PASS"
+                  except Exception as error:
+                      states[suite] = "FAIL: " + str(error)
+                      save(root / "suite-status.json", states)
+                      raise
+                  save(root / "suite-status.json", states)
+
+          def collect():
+              snapshot(root / "final-diagnostics")
+              records = []
+              for path in sorted(root.rglob("*")):
+                  if path.is_symlink():
+                      raise RuntimeError("Symlink in evidence output")
+                  if path.is_file() and path.name != "artifact-manifest.json":
+                      records.append({"path": str(path.relative_to(root)), "size": path.stat().st_size,
+                                      "sha256": digest(path.read_bytes())})
+              if len(records) >= limit_count or sum(item["size"] for item in records) > limit_bytes:
+                  raise RuntimeError("Final artifact limit exceeded")
+              if any(item["size"] > limit_file for item in records):
+                  raise RuntimeError("Artifact file limit exceeded")
+              payload = json.dumps(records, indent=2) + "\n"
+              if len(records) + 2 > limit_count or sum(item["size"] for item in records) + len(payload.encode()) + 4096 > limit_bytes:
+                  raise RuntimeError("No capacity for final artifact manifest")
+              if len(payload.encode()) > limit_file:
+                  raise RuntimeError("Artifact manifest exceeds per-file limit")
+              (root / "artifact-manifest.json").write_text(payload)
+
+          stage = sys.argv[1]
+          try:
+              if stage == "identity":
+                  identity()
+              elif stage == "dependencies":
+                  command("dependencies", ["make", "UNATTENDED=yes", "install-dep"], seconds=1500)
+                  verify_source()
+              elif stage == "style":
+                  style()
+              elif stage == "provenance":
+                  provenance()
+              elif stage == "build":
+                  for path in ["build-root/build-vpp_debug-native", "build-root/install-vpp_debug-native"]:
+                      if (candidate / path).exists():
+                          raise RuntimeError("Fresh build output already exists")
+                  command("build", ["make", "UNATTENDED=yes", "build"], seconds=5400)
+                  verify_source()
+              elif stage == "elf":
+                  elf()
+              elif stage == "suites":
+                  run_suites()
+              elif stage == "drift":
+                  verify_source()
+              elif stage == "collect":
+                  collect()
+              else:
+                  raise RuntimeError("Unknown stage")
+              save(root / "stages" / (stage + ".json"), {"status": "PASS", "at": time.time()})
+          except Exception as error:
+              save(root / "stages" / (stage + ".json"), {"status": "FAIL", "error": str(error), "at": time.time()})
+              raise
+          PY
+          python3 "${RUNNER_TEMP}/full-positive.py" identity
+
+      - name: Install standard dependencies
+        id: dependencies
+        timeout-minutes: 25
+        working-directory: candidate
+        run: python3 "${RUNNER_TEMP}/full-positive.py" dependencies
+
+      - name: Check the complete candidate patch style
+        id: style
+        timeout-minutes: 30
+        run: python3 "${RUNNER_TEMP}/full-positive.py" style
+
+      - name: Record exact build source and version
+        id: provenance
+        run: python3 "${RUNNER_TEMP}/full-positive.py" provenance
+
+      - name: Build fresh VPP debug
+        id: build
+        timeout-minutes: 90
+        run: python3 "${RUNNER_TEMP}/full-positive.py" build
+
+      - name: Verify actual installed dynamic exports
+        id: elf
+        run: python3 "${RUNNER_TEMP}/full-positive.py" elf
+
+      - name: Remount test shared memory
+        id: runtime
+        uses: ./candidate/.github/actions/vpp-docker-runtime-setup
+        with:
+          WORKSPACE: ${{ github.workspace }}/candidate
+          SHM_SIZE: 2G
+          LOG_DIR: ${{ github.workspace }}/candidate/build-root/test-logs
+
+      - name: Verify namespace, devices and shared memory
+        id: preflight
+        timeout-minutes: 5
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee "${ACCEPTANCE_ROOT}/preflight.log") 2>&1
+          namespace="vpp-full-positive-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            result=$?
+            trap - EXIT
+            if [ -e "/run/netns/${namespace}" ]; then
+              ip netns del "$namespace" || result=1
+            fi
+            exit "$result"
+          }
+          trap cleanup EXIT
+          id
+          cat /proc/self/status
+          df -B1 /dev/shm
+          test "$(df -B1 --output=size /dev/shm | tail -1)" -ge 2147483648
+          ip netns add "$namespace"
+          ip netns exec "$namespace" ip link set lo up
+          ip netns exec "$namespace" ip link show lo
+          ip netns exec "$namespace" cat /proc/net/netlink
+          ip netns exec "$namespace" sh -c 'test -r /proc/self/fdinfo/0 && test -d /proc/self/fd'
+          mkdir -p /dev/net
+          if [ ! -e /dev/net/tun ]; then mknod /dev/net/tun c 10 200; fi
+          if [ ! -e /dev/vhost-net ]; then mknod /dev/vhost-net c 10 238; fi
+          for device in /dev/net/tun /dev/vhost-net; do
+            test -c "$device"
+            (: <> "$device")
+          done
+          ip netns exec "$namespace" ip tuntap add dev vpp-ci-tap mode tap
+          ip netns exec "$namespace" ip link del vpp-ci-tap
+
+      - name: Run all nine complete modules and seal each result
+        id: suites
+        timeout-minutes: 190
+        run: python3 "${RUNNER_TEMP}/full-positive.py" suites
+
+      - name: Verify source and version after testing
+        id: drift
+        run: python3 "${RUNNER_TEMP}/full-positive.py" drift
+
+      - name: Collect bounded evidence even after failure
+        id: collect
+        if: always()
+        timeout-minutes: 5
+        run: |
+          set -Eeuo pipefail
+          test -f "${RUNNER_TEMP}/full-positive.py"
+          python3 "${RUNNER_TEMP}/full-positive.py" collect
+
+      - name: Upload positive evidence
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-positive-cce149c4d1ccd2d4ab88d07acc92478a82a2b100-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/full-positive-evidence/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 6
+
+      - name: Verify the uploaded archive digest
+        id: archive
+        if: always() && steps.upload.outcome == 'success'
+        timeout-minutes: 6
+        env:
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          archive="${RUNNER_TEMP}/full-positive-artifact.zip"
+          curl --fail --silent --show-error --location --max-time 300 --max-filesize 314572800 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            --output "$archive"
+          expected="${ARTIFACT_DIGEST#sha256:}"
+          test "${#expected}" = 64
+          printf '%s  %s\n' "$expected" "$archive" | sha256sum --check --strict
+
+      - name: Download the actual uploaded archive
+        id: download
+        if: always() && steps.upload.outcome == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ steps.upload.outputs.artifact-id }}
+          path: ${{ runner.temp }}/full-positive-downloaded
+          merge-multiple: true
+
+      - name: Verify downloaded bytes and final positive verdict
+        id: verdict
+        if: always()
+        env:
+          STEP_RESULTS: ${{ toJSON(steps) }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          steps = json.loads(os.environ["STEP_RESULTS"])
+          required = ["identity", "dependencies", "style", "provenance", "build", "elf",
+                      "runtime", "preflight", "suites", "drift", "collect", "upload", "archive", "download"]
+          failed = [name for name in required if steps.get(name, {}).get("outcome") != "success"]
+          downloaded = Path(os.environ["RUNNER_TEMP"]) / "full-positive-downloaded"
+          manifest = downloaded / "artifact-manifest.json"
+          if not manifest.is_file() or manifest.is_symlink():
+              failed.append("downloaded manifest missing")
+          else:
+              for entry in json.loads(manifest.read_text()):
+                  relative = Path(entry["path"])
+                  if relative.is_absolute() or ".." in relative.parts:
+                      raise SystemExit("Unsafe artifact manifest path")
+                  path = downloaded / relative
+                  if path.is_symlink() or not path.is_file() or path.stat().st_size != entry["size"] or hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]:
+                      failed.append("downloaded bytes: " + str(relative))
+          status = downloaded / "suite-status.json"
+          expected = ["linux_cp", "linux_cp_lifecycle", "linux_cp_netlink", "gre", "gre_teib",
+                      "ip_mcast", "ip4", "ipsec_esp", "fib"]
+          states = json.loads(status.read_text()) if status.is_file() else {}
+          if set(states) != set(expected) or any(states.get(suite) != "PASS" for suite in expected):
+              failed.append("complete suite success missing")
+          report = {"positive": "FAIL" if failed else "PASS", "issues": failed,
+                    "artifact_id": os.environ["ARTIFACT_ID"], "artifact_url": os.environ["ARTIFACT_URL"],
+                    "artifact_digest": os.environ["ARTIFACT_DIGEST"], "steps": steps,
+                    "ci01": "OPEN: requires a real natural recovered retry, later suite reset, and downloaded ordinary-run diagnostic artifact on this exact candidate",
+                    "negative": "UNFULFILLED/HOLD", "merge": "HOLD", "final_r5": "SEALED"}
+          print(json.dumps(report, indent=2))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("Full positive: " + report["positive"] + "\n\n")
+              summary.write("Candidate: cce149c4d1ccd2d4ab88d07acc92478a82a2b100 / dc04885a19d9b3acfe1ab1184f83239031ef6e6b\n\n")
+              summary.write("Artifact: " + os.environ["ARTIFACT_URL"] + "\n\n")
+              summary.write("CI01 OPEN; negative UNFULFILLED/HOLD; merge HOLD; final r5 SEALED.\n")
+          if failed:
+              raise SystemExit(1)
+          PY
