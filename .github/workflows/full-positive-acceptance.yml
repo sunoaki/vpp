@@ -425,8 +425,13 @@ jobs:
               started_classes = {entry["class"] for entry in startups}
               if not set(selected_classes) <= started_classes:
                   issues.append("Per-class actual startup configuration missing")
-              if suite == "fib" and (not startups or any(entry["configured_worker_count"] != 0 for entry in startups)):
-                  issues.append("Full FIB did not start with zero workers")
+              required_startups = {}
+              for cls in groups().get(suite, {}):
+                  records = [entry for entry in startups if entry["class"] == cls]
+                  required_startups[cls] = records
+                  if not records or any(entry["configured_worker_count"] != 0 for entry in records):
+                      issues.append("Required class did not prove an actual zero-worker startup: " + cls)
+              save(directory / "required-zero-worker-startups.json", required_startups)
               counts = {callback: sum(values.count(callback) for values in results.values())
                         for callback in ["addSuccess", "addSkip", "addFailure", "addError", "addExpectedFailure", "addUnexpectedSuccess"]}
               save(directory / "inventory.json", {"module": "test_" + suite, "discovered": expected_count,
