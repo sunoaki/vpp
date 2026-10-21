@@ -971,6 +971,12 @@ class TestHttpStaticCliWorker(TestHttpStaticCli):
         else:
             self.assertEqual(record["transports"], 0, record)
 
+    def _destroy_client(self, port, path="/version.json", pending=False):
+        try:
+            return self._client(port, path, pending=pending)
+        finally:
+            self.addCleanup(self._destroy_cli, "release all")
+
     def _destroy_teardown(self):
         with self.subTest(cleanup="release destroy owners"):
             self._destroy_cli("release all")
@@ -1006,7 +1012,7 @@ class TestHttpStaticCliWorker(TestHttpStaticCli):
             self.vapi.cli(
                 f"http static server uri http://10.10.1.2:8094 www-root {root.name}"
             )
-            client = self._client(8094, "/large.txt", pending=True)
+            client = self._destroy_client(8094, "/large.txt", pending=True)
             self._destroy_clients.append(client)
             response = self._response(client)
             self.assertEqual(response["status"], 200)
@@ -1034,7 +1040,7 @@ class TestHttpStaticCliWorker(TestHttpStaticCli):
                 identities[301][1][field], identities[302][1][field], field
             )
         self.vapi.cli("http static server uri http://10.10.1.2:8094 url-handlers")
-        active = self._client(8094)
+        active = self._destroy_client(8094)
         self._destroy_clients.append(active)
         self.assertEqual(self._response(active)["status"], 200)
         for token in (302, 301):
@@ -1050,7 +1056,7 @@ class TestHttpStaticCliWorker(TestHttpStaticCli):
                     self._destroy_assert_witness(
                         self._destroy_status(301, owner), identities[301][owner], "held"
                     )
-        fresh = self._client(8094)
+        fresh = self._destroy_client(8094)
         self._destroy_clients.append(fresh)
         self.assertEqual(self._response(fresh)["status"], 200)
         self.assertEqual(self._destroy_status(301, 0)["inflight"], 0)

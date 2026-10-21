@@ -1750,6 +1750,89 @@ class TestDestroyOwnerWitnesses(unittest.TestCase):
         self.assertIn("pending=True", text)
         self.assertIn("_assert_closed", text)
 
+    def test_destroy_cleanup_stack_releases_before_each_client_stop(self):
+        worker = next(
+            node
+            for node in SUITE.body
+            if isinstance(node, ast.ClassDef) and node.name == "TestHttpStaticCliWorker"
+        )
+        methods = {
+            node.name: node for node in worker.body if isinstance(node, ast.FunctionDef)
+        }
+        wrapper = methods["_destroy_client"]
+        self.assertEqual(len(wrapper.body), 1)
+        guarded = wrapper.body[0]
+        self.assertIsInstance(guarded, ast.Try)
+        self.assertFalse(guarded.handlers)
+        self.assertFalse(guarded.orelse)
+        self.assertEqual(len(guarded.body), 1)
+        self.assertIsInstance(guarded.body[0], ast.Return)
+        self.assertEqual(
+            ast.unparse(guarded.body[0].value),
+            "self._client(port, path, pending=pending)",
+        )
+        self.assertEqual(len(guarded.finalbody), 1)
+        self.assertEqual(
+            ast.unparse(guarded.finalbody[0]),
+            "self.addCleanup(self._destroy_cli, 'release all')",
+        )
+        client = next(
+            node for node in CLI.body if getattr(node, "name", None) == "_client"
+        )
+        self.assertEqual(
+            ast.unparse(client.body[-2]), "self.addCleanup(self._stop_client, client)"
+        )
+        self.assertEqual(ast.unparse(client.body[-1]), "return client")
+        test = methods["test_http_static_destroy_owner_generations"]
+        calls = [node for node in ast.walk(test) if isinstance(node, ast.Call)]
+        self.assertFalse(
+            any(
+                isinstance(node.func, ast.Attribute) and node.func.attr == "_client"
+                for node in calls
+            )
+        )
+        creations = sorted(
+            (
+                node
+                for node in calls
+                if isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_destroy_client"
+            ),
+            key=lambda node: node.lineno,
+        )
+        self.assertEqual(len(creations), 3)
+        registration = next(
+            node
+            for node in calls
+            if ast.unparse(node) == "self.addCleanup(self._destroy_teardown)"
+        )
+        self.assertLess(registration.lineno, creations[0].lineno)
+        generations = next(
+            node
+            for node in test.body
+            if isinstance(node, ast.For) and ast.unparse(node.target) == "token"
+        )
+        self.assertEqual(ast.literal_eval(generations.iter), (301, 302))
+        self.assertIn(creations[0], list(ast.walk(generations)))
+        for attempt in range(4):
+            for outcome in ("assertion", "create failed", "registered then failed"):
+                with self.subTest(attempt=attempt, outcome=outcome):
+                    stack = ["root cleanup", "destroy teardown"]
+                    for _ in range(attempt):
+                        stack.extend(("stop client", "release all"))
+                    if outcome != "create failed":
+                        stack.append("stop client")
+                    stack.append("release all")
+                    callbacks = list(reversed(stack))
+                    self.assertEqual(callbacks[0], "release all")
+                    for index, callback in enumerate(callbacks):
+                        if callback == "stop client":
+                            self.assertEqual(callbacks[index - 1], "release all")
+                    self.assertLess(
+                        callbacks.index("release all"),
+                        callbacks.index("destroy teardown"),
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
