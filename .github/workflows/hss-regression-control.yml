@@ -48,11 +48,11 @@ jobs:
     env:
       VARIANT_NAME: ${{ matrix.variant }}
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: c49f0816bc5244f256c03d478771ba56c506d53d
+      CANDIDATE_SHA: 9ca6598ca4b0b43d8ceeb65c50c8c16a50e36d6f
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: 50d94521e1e8821870a554ec7336025d2aa89ade
-      CONTROL_SHA: b0fbd244ca9b93a21fa877403a5dae730ea29d02
-      CONTROL_TREE: f605cc14330f3d5b9303b5f155df5312cf4264e7
+      CANDIDATE_TREE: 7992427757c37544fc1b40ac11779df86ad6c432
+      CONTROL_SHA: 3723557df24d5b57f84afd16062f5fc8c7ff311e
+      CONTROL_TREE: 3ed81ae2fb2a499aaddc847a1a59e91582504293
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
@@ -74,7 +74,8 @@ jobs:
           cat > "$EVIDENCE/manifest.json" <<JSON
           {"workflow_sha":"$WORKFLOW_SHA","candidate_sha":"$CANDIDATE_SHA","check_base_sha":"$CHECK_BASE_SHA","frozen_sha":"$FROZEN_SHA",
            "control_sha":"$CONTROL_SHA","control_tree":"$CONTROL_TREE",
-           "superseded":{"candidate_sha":"f89072eefd4dae7c7392b2a828ffb297b47bd9a9","control_sha":"8e85e05616a1b86b9b3e95354415e28047967217","workflow_sha":"9252a75296fa150414c239b5f9c0b45302ae6ba7","run_id":"39557655958","failure":"candidate C style failed; later product phases NOT_RUN"},
+           "superseded":{"candidate_sha":"f89072eefd4dae7c7392b2a828ffb297b47bd9a9","control_sha":"8e85e05616a1b86b9b3e95354415e28047967217","workflow_sha":"9252a75296fa150414c239b5f9c0b45302ae6ba7","run_id":"39557655958","failure":"candidate C style failed; later product phases NOT_RUN",
+                         "successor":{"candidate_sha":"c49f0816bc5244f256c03d478771ba56c506d53d","control_sha":"b0fbd244ca9b93a21fa877403a5dae730ea29d02","workflow_sha":"c22e62969f312c299e46a37118bdd4e29e08d983","run_id":"39563564954","failure":"candidate Python style failed; later product phases NOT_RUN"}},
            "variant":"$VARIANT_NAME","run_id":"$GITHUB_RUN_ID","attempt":"$GITHUB_RUN_ATTEMPT",
            "work_deadline":$WORK_DEADLINE,"status":"before_bootstrap",
            "workflow_blob":null,"candidate_tree":null,"tools":null,
@@ -85,7 +86,7 @@ jobs:
           printf '%s\n' bootstrap checkout prepare dependencies feature-list pinned-python black-version \
             fixture-python-style fixtures mutate fallback-version build binaries namespace environment runtime tests http-name http-name-runtime collect \
             > "$EVIDENCE/planned-phases.txt"
-          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 2ff4cf5eb2a84522213e1182ff1b3934153645d7 ca0843b651f6f9c1fca0635c61e6916112759fda 6459dbc8f8c82f18e00e72bc9e4676bbada62484 dee4c6f4b61e1b55d257f6c814bb3b49723a2d57 4ad5878cb0a4b1047e199fe828f7ab790409c18e b230ba5d6bd0ef362fd8c9d80e8a1a95a367c111 c49f0816bc5244f256c03d478771ba56c506d53d; do
+          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 2ff4cf5eb2a84522213e1182ff1b3934153645d7 ca0843b651f6f9c1fca0635c61e6916112759fda 6459dbc8f8c82f18e00e72bc9e4676bbada62484 dee4c6f4b61e1b55d257f6c814bb3b49723a2d57 4ad5878cb0a4b1047e199fe828f7ab790409c18e b230ba5d6bd0ef362fd8c9d80e8a1a95a367c111 9ca6598ca4b0b43d8ceeb65c50c8c16a50e36d6f; do
             printf 'style-%s\napi-%s\nmessage-%s\n' "$commit" "$commit" "$commit" >> "$EVIDENCE/planned-phases.txt"
           done
           {
@@ -1829,7 +1830,7 @@ jobs:
           FIXTURE = "src/plugins/http_static/test_lifetime_fixtures.py"
           HTTP_TEST = "test/asf/test_http.py"
           TEST_BLOBS = {TEST: "2a873caf2e85c8c22b1c153a41bcfb7712ebcba7",
-                        FIXTURE: "1e856bf2d7716a8e71c506300b146a5c050cba51",
+                        FIXTURE: "134c3c51751d008029671586186af400f4acd6e8",
                         HTTP_TEST: "0a7353040c8323e3ec2f4500d2ce72c1f2a94934"}
           CORE_BLOBS = {"src/vnet/session/session_input.c": "4c3b9df8973ed3fcff455b83b826b0dfb04e0f8e",
                         "src/vnet/session/application.h": "728c6e9b1d9d406445d6e6d9ce335d8dc11d185f"}
@@ -1848,12 +1849,12 @@ jobs:
           ASYNC_TEST = "test_http_static.TestHttpStaticCliWorker.test_http_static_async_release_cancel"
           ACCEPTED_TEST = "test_http_static.TestHttpStaticCliWorker.test_http_static_worker_accepted_identity"
           BUILD_IDENTITIES = {
-              "fixed": ("4c998afbbe0fb6fb00f546c795551223dc825266", "50d94521e1e8821870a554ec7336025d2aa89ade"),
-              "cache-limit": ("3f4027039d2128e9c04dd5ee8c1c503918dc89e7", "48f649f51514618fe2ace591383f53530d2c9625"),
-              "api-protocol": ("9be90d745ea02afaa6471ca1cc163d95d9f397af", "56488baa5dcce2e0e1d561ffa3bf0d061acc99dd"),
-              "original-endpoint": ("384fd81dcae885ca1688e832fcfe965432515741", "c56ece2f0dabb9613050a5d8678a4002644c412d"),
-              "read-error-unlock": ("404e94c25c913ffa91fd96004a15f58fb16c11f2", "a04bb3bb4984340366d4d13f34ae0f28af593356"),
-              "async-omit-release": ("e58f12f48c8107930fdf5bf7411ba67e8d552542", "f605cc14330f3d5b9303b5f155df5312cf4264e7")}
+              "fixed": ("4c998afbbe0fb6fb00f546c795551223dc825266", "7992427757c37544fc1b40ac11779df86ad6c432"),
+              "cache-limit": ("3f4027039d2128e9c04dd5ee8c1c503918dc89e7", "cf31d1183f5e1bf201a219345256f1656c4b6c1e"),
+              "api-protocol": ("9be90d745ea02afaa6471ca1cc163d95d9f397af", "f315bc9a79e444dd96eaaff635dd081e89fdd053"),
+              "original-endpoint": ("384fd81dcae885ca1688e832fcfe965432515741", "e4c649d8ba4e390e3d824ae98771a75d5fe904e8"),
+              "read-error-unlock": ("404e94c25c913ffa91fd96004a15f58fb16c11f2", "381745d61cb0233fc1e8d0eda212e4f6697f77ce"),
+              "async-omit-release": ("e58f12f48c8107930fdf5bf7411ba67e8d552542", "3ed81ae2fb2a499aaddc847a1a59e91582504293")}
           RECIPES = {
               "cache-limit": ("rmp->cache_size_limit = htonl (l->cache ? l->cache->cache_limit : 0);",
                               "rmp->cache_size_limit = htonl (hsm->default_listener.cache ? hsm->default_listener.cache->cache_limit : 0);"),
@@ -4581,11 +4582,11 @@ jobs:
     env:
       VARIANT_NAME: fixed
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: c49f0816bc5244f256c03d478771ba56c506d53d
+      CANDIDATE_SHA: 9ca6598ca4b0b43d8ceeb65c50c8c16a50e36d6f
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: 50d94521e1e8821870a554ec7336025d2aa89ade
-      CONTROL_SHA: b0fbd244ca9b93a21fa877403a5dae730ea29d02
-      CONTROL_TREE: f605cc14330f3d5b9303b5f155df5312cf4264e7
+      CANDIDATE_TREE: 7992427757c37544fc1b40ac11779df86ad6c432
+      CONTROL_SHA: 3723557df24d5b57f84afd16062f5fc8c7ff311e
+      CONTROL_TREE: 3ed81ae2fb2a499aaddc847a1a59e91582504293
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
