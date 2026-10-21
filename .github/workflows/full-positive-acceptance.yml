@@ -15,7 +15,12 @@ concurrency:
 
 jobs:
   full-positive:
+    name: Full positive execution
     runs-on: ubuntu-24.04
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-url: ${{ steps.upload.outputs.artifact-url }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
     timeout-minutes: 360
     container:
       image: debian:trixie
@@ -128,14 +133,23 @@ jobs:
           def blob(data):
               return hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
 
-          def usage():
-              files = [p for p in root.rglob("*") if p.is_file() and not p.is_symlink()]
+          def attribution():
+              provenance_path = root / "provenance.json"
+              return {"carrier_sha": os.environ["GITHUB_SHA"], "candidate_sha": source_sha,
+                      "candidate_tree": source_tree,
+                      "built_source_tree": load(provenance_path)["built_source_tree"]
+                      if provenance_path.exists() else "UNAVAILABLE: build provenance not yet recorded"}
+
+          def pool_usage(optional):
+              files = [p for p in root.rglob("*") if p.is_file() and not p.is_symlink()
+                       and ("optional" in p.relative_to(root).parts) == optional]
               return len(files), sum(p.stat().st_size for p in files)
 
-          def reserve(size):
-              count, total = usage()
-              if size > limit_file or count >= limit_count or total + size > limit_bytes:
-                  raise RuntimeError("Evidence limits exceeded; acceptance incomplete")
+          def reserve(size, optional=False):
+              count, total = pool_usage(optional)
+              byte_budget, file_budget = (16 * 1024 * 1024, 256) if optional else (168 * 1024 * 1024, 1488)
+              if size > limit_file or count >= file_budget or total + size > byte_budget:
+                  raise RuntimeError("Evidence pool exceeded; mandatory evidence INCOMPLETE")
 
           def copy_file(source, destination, required=False):
               if source.is_symlink() or not source.is_file():
@@ -143,28 +157,33 @@ jobs:
                       raise RuntimeError(f"Missing or unsafe required file: {source}")
                   return {"path": str(source), "status": "unsafe-or-missing"}
               size = source.stat().st_size
-              count, total = usage()
-              if size > limit_file or count >= limit_count or total + size > limit_bytes:
-                  if required:
-                      raise RuntimeError(f"Required evidence exceeds limits: {source}")
-                  sha = hashlib.sha256()
-                  with source.open("rb") as stream:
-                      for part in iter(lambda: stream.read(1024 * 1024), b""):
-                          sha.update(part)
-                  return {"path": str(source), "size": size, "sha256": sha.hexdigest(),
-                          "status": "omitted-limit"}
-              reserve(size)
+              sha = hashlib.sha256()
+              with source.open("rb") as stream:
+                  for part in iter(lambda: stream.read(1024 * 1024), b""):
+                      sha.update(part)
+              record = {"path": str(source), "size": size, "sha256": sha.hexdigest()}
+              try:
+                  reserve(size, optional=not required)
+              except RuntimeError:
+                  record["status"] = "required-limit-INCOMPLETE" if required else "omitted-optional-limit"
+                  return record
               destination.parent.mkdir(parents=True, exist_ok=True)
               shutil.copyfile(source, destination, follow_symlinks=False)
-              return {"path": str(source), "stored": str(destination.relative_to(root)),
-                      "size": size, "sha256": digest(destination.read_bytes()), "status": "copied"}
+              record.update(stored=str(destination.relative_to(root)), status="copied")
+              return record
 
           def command(label, args, cwd=candidate, seconds=1200):
               directory = root / "commands" / label
               directory.mkdir(parents=True, exist_ok=False)
-              reserve(limit_file)
               save(directory / "command.json", {"argv": args, "cwd": str(cwd),
-                                               "start": time.time(), "timeout": seconds})
+                                               "start": time.time(), "timeout": seconds,
+                                               "identity": attribution()})
+              try:
+                  reserve(limit_file)
+              except RuntimeError as error:
+                  save(directory / "result.json", {"status": "NOT_RUN/INCOMPLETE", "end": time.time(),
+                       "error": str(error), "identity": attribution()})
+                  raise
               script = '''set -uo pipefail
           set +e
           timeout --signal=TERM --kill-after=30s "$1" "${@:4}" 2>&1 |
@@ -340,29 +359,76 @@ jobs:
               save(root / "binaries.json", files)
               command("toolchain", ["bash", "-c", "cc --version; c++ --version; ccache -s; dpkg-query -W"], seconds=60)
 
+          def link_record(path, allowed):
+              raw = os.readlink(path)
+              target = Path(os.path.abspath(os.path.join(path.parent, raw)))
+              record = {"path": str(path), "link": raw, "lexical_target": str(target),
+                        "resolution": "UNSAFE", "copied": False, "traversed": False}
+              owner = next((directory for directory in allowed if target.is_relative_to(directory)), None)
+              if ".." in Path(raw).parts or owner is None:
+                  record["reason"] = "Parent traversal or target outside accepted diagnostic roots"
+                  return record
+              current = Path(owner.anchor)
+              try:
+                  for component in target.parts[1:]:
+                      current /= component
+                      mode = current.lstat().st_mode
+                      if stat.S_ISLNK(mode):
+                          record["reason"] = "Nested symlink rejected without traversal"
+                          return record
+                  record.update(resolution="SAFE", resolved=str(target),
+                                target_kind="directory" if stat.S_ISDIR(mode) else "file")
+              except OSError as error:
+                  record.update(resolution="UNRESOLVED", reason=str(error))
+              return record
+
           def snapshot(destination):
-              records = []
+              records, issues = [], []
               roots = sorted(Path("/tmp").glob("vpp-unittest-*"))
               roots += [Path("/tmp/vpp-failed-unittests"), candidate / "build-root/test-logs"]
+              allowed = [directory for directory in roots if not directory.is_symlink()]
               files = []
               for directory in roots:
                   if directory.is_symlink():
-                      records.append({"path": str(directory), "link": os.readlink(directory)})
+                      records.append(link_record(directory, allowed))
                       continue
                   if not directory.is_dir():
+                      records.append({"path": str(directory), "status": "missing"})
                       continue
                   for current, directories, names in os.walk(directory, followlinks=False):
-                      directories[:] = sorted(d for d in directories if not (Path(current) / d).is_symlink())
+                      retained = []
+                      for name in sorted(directories):
+                          path = Path(current) / name
+                          if path.is_symlink():
+                              records.append(link_record(path, allowed))
+                          else:
+                              retained.append(name)
+                      directories[:] = retained
                       for name in sorted(names):
                           path = Path(current) / name
                           if path.is_symlink():
-                              records.append({"path": str(path), "link": os.readlink(path)})
-                          elif stat.S_ISREG(path.stat().st_mode):
+                              records.append(link_record(path, allowed))
+                          elif stat.S_ISREG(path.lstat().st_mode):
                               files.append((path.name != "log.txt", path, directory))
-              for _, path, directory in sorted(files, key=lambda item: (item[0], str(item[1]))):
-                  target = destination / "files" / directory.name / path.relative_to(directory)
-                  records.append(copy_file(path, target, required=path.name == "log.txt"))
-              save(destination / "snapshot.json", {"at": time.time(), "files": records})
+              for optional, path, directory in sorted(files, key=lambda item: (item[0], str(item[1]))):
+                  area = "optional" if optional else "files"
+                  target = destination / area / directory.name / path.relative_to(directory)
+                  try:
+                      record = copy_file(path, target, required=not optional)
+                  except OSError as error:
+                      record = {"path": str(path), "status": "copy-INCOMPLETE", "error": str(error)}
+                  records.append(record)
+                  if record["status"] == "copy-INCOMPLETE" or (not optional and record["status"] != "copied"):
+                      issues.append(str(path))
+              save(destination / "snapshot.json", {"at": time.time(), "identity": attribution(),
+                   "files": records, "issues": issues,
+                   "capacity_policy": {"mandatory_bytes": 168 * 1024 * 1024, "mandatory_files": 1488,
+                       "optional_bytes": 16 * 1024 * 1024, "optional_files": 256,
+                       "seal_reserve_bytes": 8 * 1024 * 1024, "seal_reserve_files": 128,
+                       "post_job_reserved_bytes": 64 * 1024 * 1024, "post_job_reserved_files": 128,
+                       "overflow": "Mandatory FAIL/INCOMPLETE; optional omitted with size/hash; records retained"}})
+              if issues:
+                  raise RuntimeError("Mandatory snapshot evidence INCOMPLETE: " + repr(issues))
 
           def groups():
               return {
@@ -544,27 +610,60 @@ jobs:
                       raise
                   save(root / "suite-status.json", states)
 
+          def acceptance_groups():
+              buckets = {"original26": [], "fullfib1": [], "pair_ospf11": []}
+              for suite, classes in groups().items():
+                  inventory_path = root / "suites" / suite / "inventory.json"
+                  actual = load(inventory_path).get("methods", {}) if inventory_path.exists() else {}
+                  for cls, methods in classes.items():
+                      group = "fullfib1" if suite == "fib" else "pair_ospf11" if cls in {
+                          "TestLinuxCPPairManagement", "TestLinuxCPOSPFMcast"} else "original26"
+                      for method in methods:
+                          name = cls + "." + method
+                          buckets[group].append({"module": suite, "method": name,
+                                                "callbacks": actual.get(name, []),
+                                                "status": "PASS" if actual.get(name) == ["addSuccess"] else "INCOMPLETE"})
+              save(root / "acceptance-groups.json", {name: {
+                  "required": len(entries), "success": sum(item["status"] == "PASS" for item in entries),
+                  "status": "PASS" if all(item["status"] == "PASS" for item in entries) else "INCOMPLETE",
+                  "methods": entries} for name, entries in buckets.items()})
+
           def collect():
-              snapshot(root / "final-diagnostics")
+              errors = []
+              try:
+                  snapshot(root / "final-diagnostics")
+              except Exception as error:
+                  errors.append(str(error))
+              acceptance_groups()
+              save(root / "log-identities.json", {"identity": attribution(), "logs": [
+                  {"path": str(path.relative_to(root)), "identity": attribution(),
+                   "built_identity_scope": "Actual build input when available; pre-build commands precede this build"}
+                  for path in sorted(root.rglob("*")) if path.is_file() and not path.is_symlink()
+                  and (path.suffix in {".log", ".txt", ".raw"})]})
+              save(root / "worker-contract.json", {"all_classes_zero_workers": "UNFULFILLED",
+                   "reason": "Complete ip4 retains TestIPPuntHandoff worker2; complete ipsec_esp retains async/handoff worker2 classes",
+                   "required_classes_zero_workers": "Separate actual-startup gate for all 13 required classes; no substitute for all classes"})
+              if errors:
+                  raise RuntimeError("; ".join(errors))
+
+          def seal():
               records = []
               for path in sorted(root.rglob("*")):
                   if path.is_symlink():
                       raise RuntimeError("Symlink in evidence output")
-                  if path.is_file() and path.name != "artifact-manifest.json":
+                  if path.is_file() and path != root / "artifact-manifest.json":
                       records.append({"path": str(path.relative_to(root)), "size": path.stat().st_size,
                                       "sha256": digest(path.read_bytes())})
-              if len(records) >= limit_count or sum(item["size"] for item in records) > limit_bytes:
-                  raise RuntimeError("Final artifact limit exceeded")
-              if any(item["size"] > limit_file for item in records):
-                  raise RuntimeError("Artifact file limit exceeded")
               payload = json.dumps(records, indent=2) + "\n"
-              if len(records) + 2 > limit_count or sum(item["size"] for item in records) + len(payload.encode()) + 4096 > limit_bytes:
-                  raise RuntimeError("No capacity for final artifact manifest")
-              if len(payload.encode()) > limit_file:
-                  raise RuntimeError("Artifact manifest exceeds per-file limit")
+              if (len(records) + 1 > limit_count - 128 or
+                  sum(item["size"] for item in records) + len(payload.encode()) > limit_bytes - 64 * 1024 * 1024 or
+                  len(payload.encode()) > limit_file or any(item["size"] > limit_file for item in records)):
+                  raise RuntimeError("Artifact limits exceeded; evidence INCOMPLETE, records retained without truncation")
               (root / "artifact-manifest.json").write_text(payload)
 
           stage = sys.argv[1]
+          started = time.time()
+          stage_error = None
           try:
               if stage == "identity":
                   identity()
@@ -591,10 +690,20 @@ jobs:
                   collect()
               else:
                   raise RuntimeError("Unknown stage")
-              save(root / "stages" / (stage + ".json"), {"status": "PASS", "at": time.time()})
           except Exception as error:
-              save(root / "stages" / (stage + ".json"), {"status": "FAIL", "error": str(error), "at": time.time()})
-              raise
+              stage_error = str(error)
+          save(root / "stages" / (stage + ".json"), {"status": "FAIL" if stage_error else "PASS",
+               "error": stage_error, "start": started, "end": time.time(), "identity": attribution()})
+          if stage == "collect":
+              try:
+                  seal()
+              except Exception as error:
+                  stage_error = str(error)
+                  save(root / "stages/collect.json", {"status": "FAIL", "error": stage_error,
+                       "start": started, "end": time.time(), "identity": attribution()})
+                  raise
+          if stage_error:
+              raise SystemExit(stage_error)
           PY
           python3 "${RUNNER_TEMP}/full-positive.py" identity
 
@@ -747,9 +856,17 @@ jobs:
           if not manifest.is_file() or manifest.is_symlink():
               failed.append("downloaded manifest missing")
           else:
-              for entry in json.loads(manifest.read_text()):
+              entries = json.loads(manifest.read_text())
+              listed = [entry["path"] for entry in entries]
+              actual = {str(path.relative_to(downloaded)) for path in downloaded.rglob("*")
+                        if path.is_file() and path != manifest}
+              if len(listed) != len(set(listed)) or set(listed) != actual:
+                  failed.append("Manifest and actual downloaded file sets differ (only root manifest excluded)")
+              if any(path.is_symlink() for path in downloaded.rglob("*")):
+                  failed.append("Symlink in downloaded evidence")
+              for entry in entries:
                   relative = Path(entry["path"])
-                  if relative.is_absolute() or ".." in relative.parts:
+                  if relative.is_absolute() or ".." in relative.parts or str(relative) != entry["path"]:
                       raise SystemExit("Unsafe artifact manifest path")
                   path = downloaded / relative
                   if path.is_symlink() or not path.is_file() or path.stat().st_size != entry["size"] or hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]:
@@ -760,17 +877,254 @@ jobs:
           states = json.loads(status.read_text()) if status.is_file() else {}
           if set(states) != set(expected) or any(states.get(suite) != "PASS" for suite in expected):
               failed.append("complete suite success missing")
-          report = {"positive": "FAIL" if failed else "PASS", "issues": failed,
+          grouped_path = downloaded / "acceptance-groups.json"
+          grouped = json.loads(grouped_path.read_text()) if grouped_path.is_file() else {}
+          for name, count in {"original26": 26, "fullfib1": 1, "pair_ospf11": 11}.items():
+              if grouped.get(name, {}).get("required") != count or grouped[name].get("success") != count:
+                  failed.append("Incomplete acceptance group: " + name)
+          report = {"positive_execution": "FAIL" if failed else "PASS", "issues": failed,
+                    "complete_evidence_contract": "PENDING: post-job read-only archive must verify actual image and execution timestamps",
+                    "acceptance_groups": grouped,
+                    "all_classes_zero_workers": "UNFULFILLED: complete ip4/ipsec_esp retain existing worker2 classes",
                     "artifact_id": os.environ["ARTIFACT_ID"], "artifact_url": os.environ["ARTIFACT_URL"],
                     "artifact_digest": os.environ["ARTIFACT_DIGEST"], "steps": steps,
                     "ci01": "OPEN: requires a real natural recovered retry, later suite reset, and downloaded ordinary-run diagnostic artifact on this exact candidate",
                     "negative": "UNFULFILLED/HOLD", "merge": "HOLD", "final_r5": "SEALED"}
           print(json.dumps(report, indent=2))
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-              summary.write("Full positive: " + report["positive"] + "\n\n")
+              summary.write("Positive execution: " + report["positive_execution"] + "; complete evidence pending post-job archive.\n\n")
+              summary.write("all_classes_zero_workers=UNFULFILLED: existing full-module worker2 classes retained.\n\n")
               summary.write("Candidate: cce149c4d1ccd2d4ab88d07acc92478a82a2b100 / dc04885a19d9b3acfe1ab1184f83239031ef6e6b\n\n")
               summary.write("Artifact: " + os.environ["ARTIFACT_URL"] + "\n\n")
               summary.write("CI01 OPEN; negative UNFULFILLED/HOLD; merge HOLD; final r5 SEALED.\n")
           if failed:
+              raise SystemExit(1)
+          PY
+
+  execution-archive:
+    name: Archive completed execution identity
+    needs: full-positive
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Download execution evidence by immutable artifact id
+        id: download
+        if: needs.full-positive.outputs.artifact-id != ''
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.full-positive.outputs.artifact-id }}
+          path: ${{ runner.temp }}/completed-execution
+          merge-multiple: true
+
+      - name: Record completed job timestamps and actual runner container identity
+        id: records
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXECUTION_RESULT: ${{ needs.full-positive.result }}
+          EXECUTION_ARTIFACT_ID: ${{ needs.full-positive.outputs.artifact-id }}
+          EXECUTION_ARTIFACT_DIGEST: ${{ needs.full-positive.outputs.artifact-digest }}
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          from pathlib import Path
+
+          output = Path(os.environ["RUNNER_TEMP"]) / "execution-archive"
+          output.mkdir()
+          evidence = Path(os.environ["RUNNER_TEMP"]) / "completed-execution"
+          issues = []
+          report = {"status": "INCOMPLETE", "started_at": time.time(),
+                    "execution_result": os.environ["EXECUTION_RESULT"],
+                    "carrier_sha": os.environ["GITHUB_SHA"],
+                    "candidate_sha": "cce149c4d1ccd2d4ab88d07acc92478a82a2b100",
+                    "candidate_tree": "dc04885a19d9b3acfe1ab1184f83239031ef6e6b",
+                    "run_id": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                    "execution_artifact_id": os.environ["EXECUTION_ARTIFACT_ID"],
+                    "execution_artifact_digest": os.environ["EXECUTION_ARTIFACT_DIGEST"],
+                    "container_identity": "UNVERIFIED", "job_step_timestamps": "INCOMPLETE",
+                    "all_classes_zero_workers": "UNFULFILLED: full ip4/ipsec_esp retain worker2 classes",
+                    "ci01": "OPEN/NOT_OBSERVED", "negative": "UNFULFILLED/HOLD",
+                    "merge": "HOLD", "final_r5": "SEALED"}
+
+          def sha(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def save(path, value):
+              path.write_text(json.dumps(value, indent=2) + "\n")
+
+          def fetch(suffix, destination, maximum=33554432):
+              url = os.environ["GITHUB_API_URL"] + "/repos/" + os.environ["GITHUB_REPOSITORY"] + suffix
+              result = subprocess.run(["curl", "--fail", "--silent", "--show-error", "--location",
+                  "--max-time", "120", "--max-filesize", str(maximum),
+                  "-H", "Authorization: Bearer " + os.environ["GH_TOKEN"],
+                  "-H", "Accept: application/vnd.github+json", url, "--output", str(destination)])
+              if result.returncode:
+                  raise RuntimeError("Read-only GitHub evidence fetch failed: " + suffix)
+              return destination.read_bytes()
+
+          try:
+              manifest_path = evidence / "artifact-manifest.json"
+              entries = json.loads(manifest_path.read_text())
+              listed = [entry["path"] for entry in entries]
+              actual = {str(path.relative_to(evidence)) for path in evidence.rglob("*")
+                        if path.is_file() and path != manifest_path}
+              if len(listed) != len(set(listed)) or set(listed) != actual:
+                  raise RuntimeError("Downloaded execution file set differs from manifest")
+              if any(path.is_symlink() for path in evidence.rglob("*")):
+                  raise RuntimeError("Downloaded execution contains symlinks")
+              for entry in entries:
+                  relative = Path(entry["path"])
+                  if relative.is_absolute() or ".." in relative.parts or str(relative) != entry["path"]:
+                      raise RuntimeError("Unsafe execution manifest path")
+                  data = (evidence / relative).read_bytes()
+                  if len(data) != entry["size"] or sha(data) != entry["sha256"]:
+                      raise RuntimeError("Downloaded execution byte mismatch: " + str(relative))
+              save(output / "execution-artifact-files.json", {"manifest_size": manifest_path.stat().st_size,
+                   "manifest_sha256": sha(manifest_path.read_bytes()), "files": entries})
+              for name in ["identity.json", "provenance.json", "acceptance-groups.json", "worker-contract.json"]:
+                  data = (evidence / name).read_bytes()
+                  (output / name).write_bytes(data)
+              provenance = json.loads((output / "provenance.json").read_text())
+              report["built_source_tree"] = provenance["built_source_tree"]
+              report["acceptance_groups"] = json.loads((output / "acceptance-groups.json").read_text())
+              identity = json.loads((output / "identity.json").read_text())
+              if any(identity[key] != report[key] for key in ["carrier_sha", "candidate_sha", "candidate_tree"]):
+                  raise RuntimeError("Execution identity differs from carrier/candidate contract")
+              report["log_attribution"] = {"carrier_sha": report["carrier_sha"],
+                  "candidate_sha": report["candidate_sha"], "candidate_tree": report["candidate_tree"],
+                  "built_source_tree": report["built_source_tree"],
+                  "execution_logs": "All GitHub execution job/step logs in job.log",
+                  "artifact_logs": "Per-log identities in execution artifact log-identities.json"}
+          except Exception as error:
+              issues.append("Execution artifact INCOMPLETE: " + str(error))
+          try:
+              prefix = "/actions/runs/" + os.environ["GITHUB_RUN_ID"] + "/attempts/" + os.environ["GITHUB_RUN_ATTEMPT"]
+              jobs = json.loads(fetch(prefix + "/jobs?per_page=100", output / "jobs.json"))
+              if jobs["total_count"] > 100:
+                  raise RuntimeError("Job listing exceeds bounded single-page contract")
+              selected = [job for job in jobs["jobs"] if job["name"] == "Full positive execution"]
+              if len(selected) != 1:
+                  raise RuntimeError("Completed execution job is not unique")
+              job = selected[0]
+              save(output / "execution-job.json", job)
+              if job["status"] != "completed" or not job.get("started_at") or not job.get("completed_at"):
+                  issues.append("Execution job completion timestamps INCOMPLETE")
+              for step in job.get("steps", []):
+                  if step.get("status") != "completed" or not step.get("started_at") or not step.get("completed_at"):
+                      issues.append("Step timestamps INCOMPLETE: " + step["name"])
+                  if step.get("conclusion") != "success":
+                      issues.append("Execution step did not succeed: " + step["name"])
+              if not job.get("steps"):
+                  issues.append("Execution steps missing")
+              if not any("timestamps" in issue for issue in issues) and job.get("steps"):
+                  report["job_step_timestamps"] = "VERIFIED: GitHub API actual completed execution job and every step"
+              raw = fetch("/actions/jobs/" + str(job["id"]) + "/logs", output / "job.log")
+              logs = raw.decode(errors="replace")
+              block = re.search(r"##\[group\]Initialize containers(.*?)(?:##\[endgroup\])", logs, re.S)
+              if block is None:
+                  raise RuntimeError("Actual container initialization log unavailable; identity UNVERIFIED")
+              initialization = block.group(1)
+              (output / "container-initialization.log").write_text(initialization)
+              pull = re.search(r"docker pull debian:trixie\s*\n(.*?)(?=\[command\]|$)", initialization, re.S)
+              create = re.search(r"docker create [^\n]* debian:trixie[^\n]*\n[^\n]*?\b([0-9a-f]{64})\s*\n", initialization)
+              image_digest = re.findall(r"Digest: (sha256:[0-9a-f]{64})", pull.group(1)) if pull else []
+              if len(image_digest) != 1 or create is None:
+                  raise RuntimeError("Actual pull digest/create container binding UNVERIFIED")
+              container_id = create.group(1)
+              if not re.search(r"docker start " + container_id + r"\b", initialization):
+                  raise RuntimeError("Actual container start identity UNVERIFIED")
+              report["container_identity"] = {"status": "VERIFIED", "actual_digest": image_digest[0],
+                  "container_id": container_id, "requested_tag": "debian:trixie",
+                  "source": "Same execution job Initialize containers pull/digest/create/start records",
+                  "raw_log_sha256": sha(raw), "initialization_sha256": sha(initialization.encode())}
+              if os.environ["EXECUTION_RESULT"] != "success" or job.get("conclusion") != "success":
+                  issues.append("Positive execution job did not succeed")
+          except Exception as error:
+              issues.append(str(error))
+          report.update(status="FAIL/INCOMPLETE" if issues else "PASS", issues=issues, ended_at=time.time())
+          save(output / "completed-execution-report.json", report)
+          files = [{"path": str(path.relative_to(output)), "size": path.stat().st_size,
+                    "sha256": sha(path.read_bytes())} for path in sorted(output.iterdir()) if path.is_file()]
+          payload = (json.dumps(files, indent=2) + "\n").encode()
+          if len(files) + 1 > 128 or any(item["size"] > 33554432 for item in files) or sum(item["size"] for item in files) + len(payload) > 67108864:
+              raise SystemExit("Completed-job archive limits exceeded; INCOMPLETE (raw records retained)")
+          (output / "artifact-manifest.json").write_bytes(payload)
+          print(json.dumps(report, indent=2))
+          if issues:
+              raise SystemExit(1)
+          PY
+
+      - name: Upload completed execution records
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-positive-execution-records-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/execution-archive/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Download completed execution records
+        id: redownload
+        if: always() && steps.upload.outcome == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ steps.upload.outputs.artifact-id }}
+          path: ${{ runner.temp }}/execution-archive-downloaded
+          merge-multiple: true
+
+      - name: Verify completed execution archive bytes and contract
+        if: always()
+        env:
+          RECORD_OUTCOME: ${{ steps.records.outcome }}
+          DOWNLOAD_OUTCOME: ${{ steps.redownload.outcome }}
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -Eeuo pipefail
+          archive="${RUNNER_TEMP}/execution-records.zip"
+          curl --fail --silent --show-error --location --max-time 120 --max-filesize 157286400 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            --output "$archive"
+          expected="${ARTIFACT_DIGEST#sha256:}"
+          test "${#expected}" = 64
+          printf '%s  %s\n' "$expected" "$archive" | sha256sum --check --strict
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "execution-archive-downloaded"
+          manifest = root / "artifact-manifest.json"
+          entries = json.loads(manifest.read_text())
+          paths = [entry["path"] for entry in entries]
+          actual = {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file() and path != manifest}
+          if len(paths) != len(set(paths)) or set(paths) != actual or any(path.is_symlink() for path in root.rglob("*")):
+              raise SystemExit("Completed-job artifact file set mismatch")
+          for entry in entries:
+              relative = Path(entry["path"])
+              if relative.is_absolute() or ".." in relative.parts or str(relative) != entry["path"]:
+                  raise SystemExit("Unsafe completed-job artifact path")
+              data = (root / relative).read_bytes()
+              if len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
+                  raise SystemExit("Completed-job evidence byte mismatch")
+          report = json.loads((root / "completed-execution-report.json").read_text())
+          print(json.dumps(report, indent=2))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("Completed execution evidence: " + report["status"] + "\n\n")
+              summary.write("Archive: " + os.environ["ARTIFACT_URL"] + "\n\n")
+              summary.write("all_classes_zero_workers=UNFULFILLED; CI01 OPEN; negative UNFULFILLED; merge HOLD; r5 SEALED.\n")
+          if report["status"] != "PASS" or os.environ["RECORD_OUTCOME"] != "success" or os.environ["DOWNLOAD_OUTCOME"] != "success":
               raise SystemExit(1)
           PY
