@@ -1579,11 +1579,82 @@ jobs:
               if collection.read_regular(target, len(raw), request["deadline"]) != raw:
                   raise ValueError("Upload inventory publication mismatch")
               control.publish(directory / "upload-inventory.json", manifest)
-              control.publish(directory / "upload-ready.json", dict(identity=request["identity"],
-                  inventory=fingerprint(raw), path=str(target)))
+              if manifest["complete"]:
+                  control.publish(directory / "upload-ready.json", dict(identity=request["identity"],
+                      inventory=fingerprint(raw), path=str(target)))
               return dict(complete=manifest["complete"], entries=len(manifest["entries"]), bytes=manifest["bytes"],
                   index=dict(path=str(target), **fingerprint(raw)),
                   **({"error": str(manifest["errors"])[:512]} if manifest["errors"] else {}))
+
+          def upload_complete(load, result, healthy, destination):
+              identity = result["identity"]
+              if (not isinstance(identity, str) or len(identity) != 32 or
+                      any(char not in "0123456789abcdef" for char in identity)):
+                  raise ValueError("Invalid upload collector identity")
+              request = json.loads(load(f"{identity}/request.json", collection.LIMIT))
+              recorded = json.loads(load(f"{identity}/result.json", collection.LIMIT))
+              worker = json.loads(load(f"{identity}/worker.json", collection.LIMIT))
+              if (not isinstance(request, dict) or not isinstance(recorded, dict) or
+                      not isinstance(worker, dict) or request.get("schema") != collection.SCHEMA or
+                      result.get("schema") != collection.SCHEMA or request.get("identity") != identity or
+                      request.get("mode") != "upload" or request.get("control") != str(healthy / identity) or
+                      result.get("control") != request["control"] or request.get("destination") != str(destination) or
+                      type(request.get("deadline")) not in (int, float) or not 0 < request["deadline"] < float("inf") or
+                      not isinstance(request.get("module_sha256"), str) or len(request["module_sha256"]) != 64 or
+                      any(char not in "0123456789abcdef" for char in request["module_sha256"]) or
+                      type(result.get("entries")) is not int or type(result.get("bytes")) is not int or
+                      type(result.get("pid")) is not int or result["pid"] <= 0 or recorded != result or
+                      result.get("worker") != worker or result.get("complete") is not True or
+                      "error" in result or "cleanup_error" in result or
+                      not collection.receipt_complete(request, worker, result["pid"], result["status"],
+                          result["rc"], result["cleanup_complete"]) or
+                      result.get("index") != worker["index"] or result.get("entries") != worker["entries"] or
+                      result.get("bytes") != worker["bytes"]):
+                  raise ValueError("Incomplete or foreign upload collector receipt")
+              raw = load(f"{identity}/upload-inventory.json", 2 * 1024 * 1024)
+              manifest = json.loads(raw)
+              ready = json.loads(load(f"{identity}/upload-ready.json", collection.LIMIT))
+              receipt = dict(path=str(destination / "evidence-index.json"), **fingerprint(raw))
+              if (not isinstance(manifest, dict) or not isinstance(ready, dict) or
+                      manifest.get("schema") != "hss-upload-inventory-v1" or manifest.get("identity") != identity or
+                      manifest.get("deadline") != request["deadline"] or manifest.get("complete") is not True or
+                      manifest.get("errors") != [] or not isinstance(manifest.get("entries"), list) or
+                      manifest.get("source_roots") != dict(evidence=request["root"], control=str(healthy)) or
+                      type(manifest.get("bytes")) is not int or not 0 <= manifest["bytes"] <= CAP or
+                      type(manifest.get("actual_read_bytes")) is not int or not 0 <= manifest["actual_read_bytes"] <= CAP or
+                      len(manifest["entries"]) != result["entries"] or manifest["bytes"] != result["bytes"] or
+                      result["index"] != receipt or ready != dict(identity=identity,
+                          inventory=fingerprint(raw), path=receipt["path"])):
+                  raise ValueError("Incomplete or contradictory upload manifest/ready receipt")
+              seen, included, copied, path_bytes = set(), set(), 0, 0
+              for row in manifest["entries"]:
+                  if not isinstance(row, dict):
+                      raise ValueError("Malformed upload inventory entry")
+                  name = relative(row["path"])
+                  path_bytes += len(name.encode())
+                  if name in seen or path_bytes > 256 * 1024 or type(row.get("included")) is not bool:
+                      raise ValueError("Duplicate or oversized upload inventory")
+                  seen.add(name)
+                  if row["included"]:
+                      if (row.get("type") != "regular" or row.get("reason") != "included-verified-regular" or
+                              type(row.get("bytes")) is not int or row["bytes"] < 0 or
+                              not isinstance(row.get("sha256"), str) or len(row["sha256"]) != 64 or
+                              any(char not in "0123456789abcdef" for char in row["sha256"])):
+                          raise ValueError("Invalid included upload evidence")
+                      included.add(name)
+                      copied += row["bytes"]
+                  elif (row.get("type"), row.get("reason")) not in {
+                          ("directory", "excluded-directory-metadata-only"),
+                          ("directory", "excluded-inflight-upload-control-subtree"),
+                          *((kind, "excluded-special-object") for kind in
+                              ("socket", "symlink", "fifo", "character", "block", "unsupported"))}:
+                      raise ValueError("Incomplete or invalid excluded upload entry")
+              required = {"evidence/evidence-index.json", "control/phase-status.json", "control/final-collection.json"}
+              if os.environ.get("GITHUB_JOB") == "diagnostic":
+                  required.update(("control/task-map.json", "control/diagnostic-contract/watchdog.json",
+                      "control/diagnostic-contract/diagnostic-contract.json"))
+              if not required <= included or copied != manifest["bytes"] or manifest["actual_read_bytes"] < copied:
+                  raise ValueError("Upload inventory required entries or byte totals disagree")
 
           def finalize(collection_rc):
               import control
@@ -1597,11 +1668,7 @@ jobs:
                   destination=str(Path(os.environ["RUNNER_TEMP"]) / "hss-upload")))
               control.publish(healthy / "upload-collection.json", result)
               try:
-                  ready = json.loads(load(result["identity"] + "/upload-ready.json", collection.LIMIT))
-                  raw = load(result["identity"] + "/upload-inventory.json", 2 * 1024 * 1024)
-                  if (ready.get("identity") != result["identity"] or ready.get("inventory") != fingerprint(raw) or
-                          ready.get("path") != str(Path(os.environ["RUNNER_TEMP"]) / "hss-upload/evidence-index.json")):
-                      raise ValueError("Upload publication identity mismatch")
+                  upload_complete(load, result, healthy, Path(os.environ["RUNNER_TEMP"]) / "hss-upload")
                   with open(os.environ["GITHUB_ENV"], "a") as stream:
                       stream.write("HSS_UPLOAD_READY=true\n")
               except (OSError, ValueError, KeyError, TypeError) as error:
@@ -3612,21 +3679,47 @@ jobs:
           export EVIDENCE="${EVIDENCE:-$RUNNER_TEMP/hss-evidence}"
           export TOOLS="${TOOLS:-$RUNNER_TEMP/hss-tools}"
           export HSS_CONTROL="${HSS_CONTROL:-$RUNNER_TEMP/hss-collection-control}"
-          mkdir -m 700 -p "$HSS_CONTROL"
-          timeout --signal=TERM --kill-after=5s 65s python3 "$TOOLS/control.py" collect \
-            > "$HSS_CONTROL/final-console.log" 2>&1
-          collection_status=$?
-          printf 'rc=%s\n' "$collection_status" > "$HSS_CONTROL/final-status.txt"
-          timeout --signal=TERM --kill-after=5s 65s python3 "$TOOLS/hss_delivery.py" "$collection_status" \
-            > "$HSS_CONTROL/delivery-console.log" 2>&1
-          delivery_status=$?
-          printf 'rc=%s\n' "$delivery_status" > "$HSS_CONTROL/delivery-status.txt"
+          record_status=0
+          if mkdir -m 700 -p "$HSS_CONTROL"; then :; else
+            record_status=$?
+            printf 'Healthy control directory unavailable: rc=%s\n' "$record_status" >&2 || :
+          fi
+          if timeout --signal=TERM --kill-after=5s 65s python3 "$TOOLS/control.py" collect \
+              > "$HSS_CONTROL/final-console.log" 2>&1; then
+            collection_status=0
+          else
+            collection_status=$?
+          fi
+          if printf 'rc=%s\n' "$collection_status" > "$HSS_CONTROL/final-status.txt"; then :; else
+            record_status=$?
+            printf 'Cannot preserve collection rc=%s: write rc=%s\n' "$collection_status" "$record_status" >&2 || :
+          fi
+          if timeout --signal=TERM --kill-after=5s 65s python3 "$TOOLS/hss_delivery.py" "$collection_status" \
+              > "$HSS_CONTROL/delivery-console.log" 2>&1; then
+            delivery_status=0
+          else
+            delivery_status=$?
+          fi
+          if printf 'rc=%s\n' "$delivery_status" > "$HSS_CONTROL/delivery-status.txt"; then :; else
+            record_status=$?
+            printf 'Cannot preserve delivery rc=%s: write rc=%s\n' "$delivery_status" "$record_status" >&2 || :
+          fi
           if [ ! -f "$HSS_CONTROL/phase-status.json" ]; then
-            printf '{"schema":"hss-terminal-v1","authority":"terminal","complete":false,"product_acceptance":false,"collection_rc":%s,"delivery_rc":%s,"phases":{"collect":{"status":"unknown/incomplete","complete":false}},"errors":["Terminal publisher unavailable; inspect healthy final and delivery records"]}\n' \
-              "$collection_status" "$delivery_status" > "$HSS_CONTROL/phase-status.json"
+            if printf '{"schema":"hss-terminal-v1","authority":"terminal","complete":false,"product_acceptance":false,"collection_rc":%s,"delivery_rc":%s,"phases":{"collect":{"status":"unknown/incomplete","complete":false}},"errors":["Terminal publisher unavailable; inspect healthy final and delivery records"]}\n' \
+                "$collection_status" "$delivery_status" > "$HSS_CONTROL/phase-status.json"; then :; else
+              record_status=$?
+              printf 'Cannot publish fallback: collection rc=%s delivery rc=%s write rc=%s\n' \
+                "$collection_status" "$delivery_status" "$record_status" >&2 || :
+            fi
+          fi
+          if printf 'Collection rc=%s delivery rc=%s healthy-record rc=%s\n' \
+              "$collection_status" "$delivery_status" "$record_status" >&2; then :; else
+            console_status=$?
+            if [ "$record_status" -eq 0 ]; then record_status=$console_status; fi
           fi
           if [ "$collection_status" -ne 0 ]; then exit "$collection_status"; fi
-          exit "$delivery_status"
+          if [ "$delivery_status" -ne 0 ]; then exit "$delivery_status"; fi
+          exit "$record_status"
 
       - &hss_upload
         name: Upload bounded HSS evidence on every outcome
