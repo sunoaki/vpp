@@ -48,11 +48,11 @@ jobs:
     env:
       VARIANT_NAME: ${{ matrix.variant }}
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: b230ba5d6bd0ef362fd8c9d80e8a1a95a367c111
+      CANDIDATE_SHA: f89072eefd4dae7c7392b2a828ffb297b47bd9a9
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: 29d53a203ac7e84c2c6328699fd3a6607ede25f3
-      CONTROL_SHA: e132784bb0d70718857144840244913220e18779
-      CONTROL_TREE: 5e28f65ab2030e35bafd0af4390fc5ff0c2a8776
+      CANDIDATE_TREE: 7d86133605624990b0342f9074d78e1c9dd265b2
+      CONTROL_SHA: 8e85e05616a1b86b9b3e95354415e28047967217
+      CONTROL_TREE: 5cde6288d912293c9bac96da4fcfd126a6604b48
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
@@ -84,7 +84,7 @@ jobs:
           printf '%s\n' bootstrap checkout prepare dependencies feature-list pinned-python black-version \
             fixture-python-style fixtures mutate fallback-version build binaries namespace environment runtime tests http-name http-name-runtime collect \
             > "$EVIDENCE/planned-phases.txt"
-          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 2ff4cf5eb2a84522213e1182ff1b3934153645d7 ca0843b651f6f9c1fca0635c61e6916112759fda 6459dbc8f8c82f18e00e72bc9e4676bbada62484 dee4c6f4b61e1b55d257f6c814bb3b49723a2d57 4ad5878cb0a4b1047e199fe828f7ab790409c18e b230ba5d6bd0ef362fd8c9d80e8a1a95a367c111; do
+          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 2ff4cf5eb2a84522213e1182ff1b3934153645d7 ca0843b651f6f9c1fca0635c61e6916112759fda 6459dbc8f8c82f18e00e72bc9e4676bbada62484 dee4c6f4b61e1b55d257f6c814bb3b49723a2d57 4ad5878cb0a4b1047e199fe828f7ab790409c18e b230ba5d6bd0ef362fd8c9d80e8a1a95a367c111 f89072eefd4dae7c7392b2a828ffb297b47bd9a9; do
             printf 'style-%s\napi-%s\nmessage-%s\n' "$commit" "$commit" "$commit" >> "$EVIDENCE/planned-phases.txt"
           done
           {
@@ -1485,8 +1485,8 @@ jobs:
                               task.get("control") != os.environ["CONTROL_SHA"] or
                               variant not in ("fixed", "cache-limit", "api-protocol", "original-endpoint", "read-error-unlock", "async-omit-release") or
                               any(task.get(key) != acceptance.get(key) for key in ("candidate", "control", "variant")) or
-                              task.get("fixtures") != 33 or not isinstance(acceptance.get("expected"), list) or
-                              len(acceptance["expected"]) != (28 if variant == "fixed" else 1 if variant == "async-omit-release" else 2) or
+                              task.get("fixtures") != 39 or not isinstance(acceptance.get("expected"), list) or
+                              len(acceptance["expected"]) != (29 if variant == "fixed" else 1 if variant == "async-omit-release" else 2) or
                               len(set(acceptance["expected"])) != len(acceptance["expected"]) or
                               task.get("runtime_tests") != acceptance.get("expected")):
                           raise ValueError("Product acceptance identity differs")
@@ -1827,18 +1827,32 @@ jobs:
           TEST = "test/asf/test_http_static.py"
           FIXTURE = "src/plugins/http_static/test_lifetime_fixtures.py"
           HTTP_TEST = "test/asf/test_http.py"
-          TEST_BLOBS = {TEST: "208e249476fd5a5710bf19444bfa1af28bb7020a",
-                        FIXTURE: "4f4f15015001e1ad6d53a191d400222f52dd3ed4",
+          TEST_BLOBS = {TEST: "2a873caf2e85c8c22b1c153a41bcfb7712ebcba7",
+                        FIXTURE: "1e856bf2d7716a8e71c506300b146a5c050cba51",
                         HTTP_TEST: "0a7353040c8323e3ec2f4500d2ce72c1f2a94934"}
+          CORE_BLOBS = {"src/vnet/session/session_input.c": "82824a67180bf448d3f3f7a0a8ffc59bad44f806",
+                        "src/vnet/session/application.h": "728c6e9b1d9d406445d6e6d9ce335d8dc11d185f"}
+          ACCEPTED_FIELDS = ("token enabled overflow epoch generation app worker listener thread handle protocol builtin "
+              "event enqueued head current_head head_after held captured released transferred callback ready advanced "
+              "ack cleaned callbacks advances rx_ready captures transfers refs_before refs_after cleanups pending queued "
+              "retained refs retiring freed poolput").split()
+          ACCEPTED_FIXTURES = (
+              "test_completed_witness_accepts_exact_identity_and_order",
+              "test_witness_rejects_main_queue_non_http_wrong_app_and_handle",
+              "test_witness_rejects_missing_enqueue_duplicates_and_reference_changes",
+              "test_witness_rejects_early_callback_head_advance_and_rx_ready",
+              "test_core_hold_precedes_callback_and_head_advance",
+              "test_release_uses_owner_node_and_clear_unhooks_after_drain")
           CLASSES = ("TestHttpStaticCli", "TestHttpStaticCliWorker")
           ASYNC_TEST = "test_http_static.TestHttpStaticCliWorker.test_http_static_async_release_cancel"
+          ACCEPTED_TEST = "test_http_static.TestHttpStaticCliWorker.test_http_static_worker_accepted_identity"
           BUILD_IDENTITIES = {
-              "fixed": ("4c998afbbe0fb6fb00f546c795551223dc825266", "29d53a203ac7e84c2c6328699fd3a6607ede25f3"),
-              "cache-limit": ("3f4027039d2128e9c04dd5ee8c1c503918dc89e7", "f933237d8ee6d7f2715d6c3cd01a2add59bd3c8d"),
-              "api-protocol": ("9be90d745ea02afaa6471ca1cc163d95d9f397af", "6af7418ed17338e1ebacf957e04d24074c54775a"),
-              "original-endpoint": ("1fe38a4ff66b7c7bc806c71c57b148edd84781f6", "6b67216f76ab96bad7e31948ed08bd6200a7736e"),
-              "read-error-unlock": ("404e94c25c913ffa91fd96004a15f58fb16c11f2", "7cabc5d201db3e0f222778939be8d1fedabb3e29"),
-              "async-omit-release": ("202798e749319c02b76fde7ca15679d6a0d7f73a", "5e28f65ab2030e35bafd0af4390fc5ff0c2a8776")}
+              "fixed": ("4c998afbbe0fb6fb00f546c795551223dc825266", "7d86133605624990b0342f9074d78e1c9dd265b2"),
+              "cache-limit": ("3f4027039d2128e9c04dd5ee8c1c503918dc89e7", "8c07b2e10182b6a462f2f01e556fd1c583466794"),
+              "api-protocol": ("9be90d745ea02afaa6471ca1cc163d95d9f397af", "3f7a0335762a5cab119b2974bde83f6e89e508bf"),
+              "original-endpoint": ("4a354387776cd40dfc1f2644b087cbc6561086cb", "2b2085a17dc1aedc51e5d692df0b3e1398855951"),
+              "read-error-unlock": ("404e94c25c913ffa91fd96004a15f58fb16c11f2", "ef22645de35b41eeea5c6648b6cafea779dea241"),
+              "async-omit-release": ("735a35989c74fd8ae241d8133ca6c6b8389aea32", "5cde6288d912293c9bac96da4fcfd126a6604b48")}
           RECIPES = {
               "cache-limit": ("rmp->cache_size_limit = htonl (l->cache ? l->cache->cache_limit : 0);",
                               "rmp->cache_size_limit = htonl (hsm->default_listener.cache ? hsm->default_listener.cache->cache_limit : 0);"),
@@ -2169,10 +2183,10 @@ jobs:
 
           def source_identity():
               require(git("rev-list", "--parents", "-n", "1", CANDIDATE).split() ==
-                      [CANDIDATE, "4ad5878cb0a4b1047e199fe828f7ab790409c18e"],
-                      "Candidate must have exactly the frozen ASYNC parent")
+                      [CANDIDATE, "b230ba5d6bd0ef362fd8c9d80e8a1a95a367c111"],
+                      "Candidate must have exactly the frozen worker ACCEPTED parent")
               require(git("rev-parse", f"{CANDIDATE}^{{tree}}") == os.environ["CANDIDATE_TREE"],
-                      "Candidate tree differs from frozen ASYNC source")
+                      "Candidate tree differs from frozen worker ACCEPTED source")
               require(git("rev-list", "--parents", "-n", "1", CONTROL).split() == [CONTROL, CANDIDATE] and
                       git("rev-parse", f"{CONTROL}^{{tree}}") == os.environ["CONTROL_TREE"] and
                       git("diff", "--name-only", CANDIDATE, CONTROL).splitlines() ==
@@ -2180,10 +2194,17 @@ jobs:
               for path, blob in TEST_BLOBS.items():
                   require(git("rev-parse", f"{CANDIDATE}:{path}") == blob and
                           git("rev-parse", f"{CONTROL}:{path}") == blob, "Frozen identical test blob differs: " + path)
-              fixtures = ast.parse(content(CANDIDATE, FIXTURE))
-              require(sum(isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
-                          for cls in fixtures.body if isinstance(cls, ast.ClassDef) for node in cls.body) == 33,
-                      "Frozen standalone fixture inventory differs")
+              for path, blob in CORE_BLOBS.items():
+                  require(git("rev-parse", f"{CANDIDATE}:{path}") == blob and
+                          git("rev-parse", f"{CONTROL}:{path}") == blob, "Frozen ACCEPTED core blob differs: " + path)
+              def inventory(ref):
+                  return [(cls.name, node.name) for cls in ast.parse(content(ref, FIXTURE)).body
+                          if isinstance(cls, ast.ClassDef) for node in cls.body
+                          if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")]
+              baseline = inventory("b230ba5d6bd0ef362fd8c9d80e8a1a95a367c111")
+              require(len(baseline) == 33 and inventory(CANDIDATE) == baseline +
+                      [("TestAcceptedWitness", name) for name in ACCEPTED_FIXTURES],
+                      "Frozen thirty-nine fixture names differ from original thirty-three plus ACCEPTED six")
               require(content(CANDIDATE, HTTP_TEST) == content(CHECK_BASE, HTTP_TEST),
                       "HTTP name regression differs from integrated master")
               sources = {name: ast.parse(content(CANDIDATE, path)) for name, path in
@@ -2222,7 +2243,7 @@ jobs:
                               workflow_blob=git("rev-parse", f"{workflow}:.github/workflows/hss-regression-control.yml"),
                               candidate_tree=git("rev-parse", f"{CANDIDATE}^{{tree}}"), variant=VARIANT,
                               control_sha=CONTROL, control_tree=os.environ["CONTROL_TREE"],
-                              async_scope="worker1 real HTTP ASYNC release/cancel; pre-ACCEPTED queue and ACK/reset/heap remain open",
+                              async_scope="worker1 real HTTP ASYNC release/cancel; multi-event ACCEPTED/destroy and ACK/reset/heap remain open",
                               run_id=os.environ["GITHUB_RUN_ID"], attempt=os.environ["GITHUB_RUN_ATTEMPT"],
                               artifact=f"hss-{VARIANT}-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
                               run_url=f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
@@ -2236,6 +2257,10 @@ jobs:
               manifest["tests"] = {path: dict(blob=git("rev-parse", f"{CANDIDATE}:{path}"),
                                              sha256=hashlib.sha256(content(CANDIDATE, path)).hexdigest())
                                    for path in TEST_BLOBS}
+              manifest["accepted_sources"] = {path: dict(blob=blob,
+                      sha256=hashlib.sha256(content(CANDIDATE, path)).hexdigest()) for path, blob in CORE_BLOBS.items()}
+              manifest["accepted_scope"] = "one real worker1 HTTP ACCEPTED at consumer head; token201 old/new URI reuse"
+              manifest["accepted_fields"] = ACCEPTED_FIELDS
               manifest["python_dependencies"] = {path: dict(blob=git("rev-parse", f"{CANDIDATE}:{path}"),
                       sha256=hashlib.sha256(content(CANDIDATE, path)).hexdigest()) for path in
                       ("test/requirements.txt", "test/requirements-3.txt")}
@@ -2268,8 +2293,8 @@ jobs:
               require(not git("diff", "--name-only"), "Tracked source changed before mutation")
               original = Path(SOURCE).read_bytes()
               if VARIANT == "async-omit-release":
-                  require(git("rev-parse", f"{CANDIDATE}:{SOURCE}") == "cbfe3506d63b04ec4cf477a87215641309578471" and
-                          git("rev-parse", f"{CONTROL}:{SOURCE}") == "202798e749319c02b76fde7ca15679d6a0d7f73a",
+                  require(git("rev-parse", f"{CANDIDATE}:{SOURCE}") == "886d83b7fbb2e7f34dee0e3771eaeaed07dea264" and
+                          git("rev-parse", f"{CONTROL}:{SOURCE}") == "735a35989c74fd8ae241d8133ca6c6b8389aea32",
                           "Omitted-release source blobs differ")
                   Path(SOURCE).write_bytes(content(CONTROL, SOURCE))
               elif VARIANT != "fixed":
@@ -2303,6 +2328,9 @@ jobs:
               manifest = json.loads((OUT / "manifest.json").read_text())
               for path, provenance in manifest["tests"].items():
                   require(digest(path) == provenance["sha256"], f"Candidate test changed: {path}")
+              for path, provenance in manifest["accepted_sources"].items():
+                  require(git("hash-object", path) == provenance["blob"] and digest(path) == provenance["sha256"],
+                          "ACCEPTED core source changed: " + path)
               manifest["source"] = dict(path=SOURCE, candidate_blob=git("rev-parse", f"{CANDIDATE}:{SOURCE}"),
                                         frozen_blob=git("rev-parse", f"{FROZEN}:{SOURCE}"), built_blob=git("hash-object", SOURCE))
               index_env = dict(os.environ, GIT_INDEX_FILE=str(TOOLS / "build-index"))
@@ -2411,10 +2439,11 @@ jobs:
                        "test_http_static_cache_owners", "test_http_static_cache_read_error",
                        "test_http_static_cache_pressure", "test_http_static_cache_relocation")),
                       "Reviewed thirteen methods or separate synthetic test changed")
-              require(methods["TestHttpStaticCliWorker"] == ["test_http_static_async_release_cancel"] and
+              require(methods["TestHttpStaticCliWorker"] == ["test_http_static_worker_accepted_identity",
+                      "test_http_static_async_release_cancel"] and
                       methods["TestHttpStaticVapi"] == ["test_http_static_vapi"], "Frozen suite classes changed")
               return [f"test_http_static.{cls}.{method}" for cls in (*CLASSES, "TestHttpStaticVapi")
-                      for method in methods["TestHttpStaticCli" if cls in CLASSES else cls]] + [ASYNC_TEST]
+                      for method in methods["TestHttpStaticCli" if cls in CLASSES else cls]] + [ASYNC_TEST, ACCEPTED_TEST]
 
           def infrastructure_text(text, events, variant):
               require(not re.search(r"ERROR: (?:AddressSanitizer|ASAN):|AddressSanitizer:DEADLYSIGNAL|"
@@ -2689,6 +2718,126 @@ jobs:
                       response.get("server") == f"http_static_server_{replacement['generation']}",
                       "Replacement ASYNC HTTP configuration differs")
 
+          def accepted_evidence(events):
+              active = test_interval(events, ACCEPTED_TEST)
+              require(all(left["seq"] < right["seq"] for left, right in zip(active, active[1:])),
+                      "ACCEPTED observer events out of order")
+              replies = [event for event in active if event["kind"] == "cli_reply"]
+              require(replies and all(event["retval"] == 0 for event in replies), "ACCEPTED CLI failed")
+              prefix = "test http static accepted "
+              commands = [event for event in replies if event.get("command", "").startswith(prefix)]
+              starts = [event for event in commands if re.fullmatch(prefix + r"start 201 listener [0-9]+", event["command"])]
+              releases = [event for event in commands if event["command"] == prefix + "release"]
+              clears = [event for event in commands if event["command"] == prefix + "clear"]
+              require(len(starts) == len(clears) == 1 and len(releases) == 2 and
+                      commands[0] == starts[0] and commands[-1] == clears[0], "ACCEPTED command lifecycle differs")
+              identities, snapshots = [], []
+              for event in commands:
+                  command, parts = event["command"], event["reply"].split()
+                  if command == prefix + "status":
+                      require(len(parts) == 2 * len(ACCEPTED_FIELDS) and parts[::2] == ACCEPTED_FIELDS and
+                              all(re.fullmatch(r"[0-9]+", value) for value in parts[1::2]),
+                              "ACCEPTED forty-one-field schema differs")
+                      record = dict(zip(ACCEPTED_FIELDS, map(int, parts[1::2])))
+                      require(record["token"] == 201 and record["enabled"] == 1 and record["overflow"] == 0,
+                              "ACCEPTED record disabled, overflowed or wrong token")
+                      snapshots.append((event["seq"], record))
+                  elif re.fullmatch(prefix + r"identity listener [0-9]+", command):
+                      fields = ("listener", "epoch", "generation", "app")
+                      require(len(parts) == 8 and parts[::2] == list(fields) and
+                              all(re.fullmatch(r"[0-9]+", value) for value in parts[1::2]),
+                              "ACCEPTED listener identity schema differs")
+                      identity = dict(zip(fields, map(int, parts[1::2])))
+                      require(identity["listener"] == int(command.split()[-1]), "ACCEPTED identity reply differs")
+                      identities.append((event["seq"], identity))
+                  else:
+                      require(event in starts + releases + clears, "Unexpected ACCEPTED command")
+              require(len(identities) == 2 and snapshots, "Missing ACCEPTED old/new identities or snapshots")
+              (old_seq, old), (new_seq, new) = identities
+              require(old["listener"] == int(starts[0]["command"].split()[-1]) and
+                      old["listener"] != new["listener"] and old["epoch"] != new["epoch"] and
+                      old["app"] == new["app"] and old["generation"] == new["generation"] and
+                      starts[0]["seq"] < old_seq < new_seq < releases[0]["seq"],
+                      "ACCEPTED old/new allocation identity differs")
+              held = [(seq, record) for seq, record in snapshots if record["held"]]
+              require(held and old_seq < held[0][0] < new_seq, "Missing real held ACCEPTED before replacement")
+              original = held[0][1]
+              binding = ("token", "epoch", "generation", "app", "worker", "listener", "thread", "handle", "head", "held")
+              order = ("held", "captured", "released", "transferred", "callback", "ready", "advanced", "ack")
+              for seq, record in held:
+                  require(all(record[key] == original[key] for key in binding) and
+                          all(record[key] == value for key, value in old.items()) and
+                          record["thread"] == record["handle"] >> 32 == 1 and
+                          record["protocol"] == 7 and record["builtin"] == record["enqueued"] == 1 and
+                          record["event"] == 11, "ACCEPTED queue/session/app identity changed")
+                  require(all(record[key] <= 1 for key in
+                          ("callbacks", "advances", "rx_ready", "captures", "transfers", "cleanups", "poolput")),
+                          "Duplicate ACCEPTED ownership or callback")
+                  if seq < releases[0]["seq"]:
+                      require(all(record[key] == 0 for key in
+                              ("released", "transferred", "callback", "ready", "advanced", "ack", "cleaned",
+                               "callbacks", "advances", "rx_ready", "transfers", "cleanups", "head_after", "freed", "poolput")) and
+                              record["current_head"] == record["head"] and record["queued"] > 0,
+                              "ACCEPTED advanced, invoked callback or freed while held")
+                  if record["ack"]:
+                      require(all(record[left] < record[right] for left, right in zip(order, order[1:])) and
+                              all(record[key] == 1 for key in
+                                  ("callbacks", "advances", "rx_ready", "captures", "transfers", "refs_before", "refs_after")) and
+                              record["head_after"] != record["head"] and
+                              all(record[key] == 0 for key in ("pending", "queued", "retained")),
+                              "ACCEPTED release/transfer/callback/RX_READY/head/ACK order differs")
+                  if record["freed"]:
+                      require(record["ack"] < record["cleaned"] < record["freed"] and
+                              record["cleanups"] == record["poolput"] == 1 and record["refs"] == 0,
+                              "ACCEPTED cleanup/free evidence differs")
+              uri = "tcp://10.10.1.2:8093"
+              deletes = [event for event in replies if event["command"] == "http static listener del uri " + uri]
+              additions = [event for event in replies if re.fullmatch(
+                  r"http static listener add uri " + re.escape(uri) + r" www-root \S+ max-age (?:123|456)", event["command"])]
+              require(len(deletes) == len(additions) == 2 and
+                      additions[0]["command"].endswith("max-age 123") and
+                      additions[1]["command"].endswith("max-age 456") and
+                      additions[0]["seq"] < starts[0]["seq"] < held[0][0] < deletes[0]["seq"] <
+                      additions[1]["seq"] < new_seq, "ACCEPTED same-URI delete/recreate order differs")
+              captures = [(seq, record) for seq, record in held if deletes[0]["seq"] < seq < additions[1]["seq"]]
+              require(captures and all(record["captures"] == record["retained"] == record["refs"] ==
+                      record["retiring"] == 1 and record["captured"] > record["held"] for _, record in captures) and
+                      any(new_seq < seq < releases[0]["seq"] for seq, _ in held),
+                      "ACCEPTED listener was not captured and retained across replacement")
+              helpers = [event for event in active if event["kind"] == "helper" and event.get("helper") == "_response"]
+              require(len(helpers) == 3 and all(event.get("test") == ACCEPTED_TEST for event in helpers) and
+                      helpers[0].get("response") == {"requested": True} and
+                      old_seq < helpers[0]["seq"] < held[0][0] and
+                      helpers[0]["client"] == helpers[1]["client"] != helpers[2]["client"],
+                      "Missing ACCEPTED held request and distinct old/new HTTP clients")
+              responses = helpers[1:]
+              for event, body, cache in zip(responses, ("old accepted config", "new accepted config"),
+                                            ("max-age=123", "max-age=456")):
+                  response = event["response"]
+                  require(response.get("status") == 200 and response.get("body") == body and
+                          response.get("cache") == cache and
+                          response.get("server") == f"http_static_server_{old['generation']}",
+                          "ACCEPTED HTTP response lost old/new listener configuration")
+              acknowledged = [(seq, record) for seq, record in held if record["ack"]]
+              closed = [(seq, record) for seq, record in held if record["freed"]]
+              require(acknowledged and closed and releases[0]["seq"] < acknowledged[0][0] < responses[0]["seq"] <
+                      responses[1]["seq"] < closed[0][0] < deletes[1]["seq"] < releases[1]["seq"] < clears[0]["seq"] and
+                      snapshots[-1][1]["freed"] > 0 and
+                      all(snapshots[-1][1][key] == 0 for key in ("pending", "queued", "retained", "refs")),
+                      "ACCEPTED response/close/release/drain/clear order differs")
+              disables = [event for event in replies if event["command"] == "http static server disable"]
+              ledger = [event for event in replies if event["command"].startswith("test http static async ")]
+              require(len(disables) == 1 and releases[1]["seq"] < snapshots[-1][0] < disables[0]["seq"] < clears[0]["seq"] and
+                      ledger[0]["command"] == "test http static async start" and
+                      ledger[-1]["command"] == "test http static async clear" and
+                      clears[0]["seq"] < ledger[-1]["seq"], "ACCEPTED teardown failed to disable and clear ownership ledger")
+              idle_seq, summary, records = async_snapshots(active)[-1]
+              successes = [event for event in active if event["kind"] == "addSuccess" and event.get("test") == ACCEPTED_TEST]
+              require(not records and summary["live"] == summary["baseline"] and
+                      all(summary[key] == 0 for key in ("destroys", "detaches", "owners")) and
+                      disables[0]["seq"] < idle_seq < clears[0]["seq"] and len(successes) == 1 and
+                      ledger[-1]["seq"] < successes[0]["seq"], "ACCEPTED success preceded final owner drain")
+
           def validate(events, console, rc, expected, variant, logs):
               starts, stops, complete, wanted = execution_evidence(events, console, expected, variant, logs)
               subs = [event for event in events if event["kind"] == "addSubTest"]
@@ -2701,9 +2850,9 @@ jobs:
                           callbacks == [("addFailure", "TestHttpStaticCliWorker", "test_http_static_async_release_cancel")] and
                           sum(event["failures"] for event in complete) == 1 and
                           not any(event.get("error") for event in subs), "Omission did not complete with one ordinary failure")
-                  frames = ((1137, "test_http_static_async_release_cancel", "self._async_sent_scenario(root, uri)"),
-                            (1063, "_async_sent_scenario", "self._async_assert_freed(completed)"),
-                            (920, "_async_assert_freed", 'self.assertEqual(record["refs"], 0, record)'))
+                  frames = ((1371, "test_http_static_async_release_cancel", "self._async_sent_scenario(root, uri)"),
+                            (1297, "_async_sent_scenario", "self._async_assert_freed(completed)"),
+                            (1154, "_async_assert_freed", 'self.assertEqual(record["refs"], 0, record)'))
                   unittest_frame = (r'  File "/[^"\n]*/unittest/(?:case|result)\.py", line [1-9][0-9]*, in \w+\n'
                                     r"    [^\n]+\n(?:    [ ~^]*[~^][ ~^]*\n)?")
                   pattern = r"(?m)^Traceback \(most recent call last\):\n(?:" + unittest_frame + ")*"
@@ -2776,6 +2925,7 @@ jobs:
                               "HTTP200/delete/refusal sequence differs")
                   quic_evidence(events)
                   async_evidence(events)
+                  accepted_evidence(events)
               else:
                   require(rc > 0 and rc != 124, "Restored command unexpectedly passed or timed out")
                   require(collections.Counter(event["test"] for event in outcomes) == wanted and
@@ -2871,12 +3021,12 @@ jobs:
                   raise
               publish(acceptance, dict(status="PASS", expected=expected, candidate=CANDIDATE, control=CONTROL,
                   variant=VARIANT, workflow=os.environ["WORKFLOW_SHA"],
-                  claims="full28: original27 plus worker1 real ASYNC release/cancel" if VARIANT == "fixed" else
+                  claims="full29: original28 plus one worker1 real HTTP ACCEPTED URI reuse" if VARIANT == "fixed" else
                          "one ordinary refs1 failure followed by separate guarded recovery" if VARIANT == "async-omit-release" else
                          "narrow restored field/unlock only; lifecycle negative gaps remain"))
               publish(Path(os.environ["HSS_CONTROL"]) / "task-map.json", dict(product_controls="EXECUTED",
                   candidate=CANDIDATE, control=CONTROL, workflow=os.environ["WORKFLOW_SHA"], variant=VARIANT,
-                  runtime_tests=expected, fixtures=33, original_tasks="OPEN", acceptance="bounded-only"))
+                  runtime_tests=expected, fixtures=39, original_tasks="OPEN", acceptance="bounded-only"))
 
           def validate_http_name(events, console, rc, logs):
               test = "test_http.TestHttpNameOwnership.test_app_name_ownership"
@@ -3721,7 +3871,7 @@ jobs:
           python3 "$TOOLS/control.py" fixture-python-style build-root/test/venv/bin/black --check -t py39 \
             src/plugins/http_static/test_lifetime_fixtures.py test/asf/test_http_static.py
 
-      - name: Execute exactly thirty-three standalone fixtures
+      - name: Execute exactly thirty-nine standalone fixtures
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -3733,7 +3883,7 @@ jobs:
           from pathlib import Path
           import re
           text = (Path(os.environ["EVIDENCE"]) / "fixtures/console.log").read_text()
-          assert "Ran 33 tests in " in text and "\nOK\n" in text, text
+          assert "Ran 39 tests in " in text and "\nOK\n" in text, text
           tree = ast.parse((Path(os.environ["TOOLS"]) / "control.py").read_text())
           functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and
                        node.name in ("require", "infrastructure_text")]
@@ -4018,11 +4168,11 @@ jobs:
               finished = record(enter=1, send=3, cleanup=4, sends=1, cleanups=1, duplicate=1, final=5, freed=6,
                                 releases=2, cachefree=1, vecfree=1, poolput=1, **{"async": 2})
               trace = ('Traceback (most recent call last):\n'
-                       '  File "/fixture/test/asf/test_http_static.py", line 1137, in test_http_static_async_release_cancel\n'
+                       '  File "/fixture/test/asf/test_http_static.py", line 1371, in test_http_static_async_release_cancel\n'
                        '    self._async_sent_scenario(root, uri)\n'
-                       '  File "/fixture/test/asf/test_http_static.py", line 1063, in _async_sent_scenario\n'
+                       '  File "/fixture/test/asf/test_http_static.py", line 1297, in _async_sent_scenario\n'
                        '    self._async_assert_freed(completed)\n'
-                       '  File "/fixture/test/asf/test_http_static.py", line 920, in _async_assert_freed\n'
+                       '  File "/fixture/test/asf/test_http_static.py", line 1154, in _async_assert_freed\n'
                        '    self.assertEqual(record["refs"], 0, record)\nAssertionError: 1 != 0 : refs retained\n')
               if negative:
                   leaked = dict(finished, refs=1, omitted=1, poolput=0, cachefree=0, vecfree=0, final=0, freed=0, releases=1)
@@ -4111,7 +4261,7 @@ jobs:
               invalid_traces.append("".join(lines[:index] + lines[index + 1:]))
           invalid_traces.append("".join([lines[0], *lines[3:5], *lines[1:3], *lines[5:]]))
           for before, after in (("test/asf/test_http_static.py", "test/asf/test_other.py"),
-                                ("line 1137", "line 1138"), ("line 1063", "line 1064"), ("line 920", "line 921"),
+                                ("line 1371", "line 1372"), ("line 1297", "line 1298"), ("line 1154", "line 1155"),
                                 ("in _async_sent_scenario", "in _other_scenario"),
                                 ("self._async_sent_scenario(root, uri)", "self._async_sent_scenario(uri, root)"),
                                 ("self._async_assert_freed(completed)", "self._async_assert_freed(other)"),
@@ -4171,6 +4321,81 @@ jobs:
           rejects_async(pre_recovery(idle.splitlines(keepends=True)[0]), True)
           control["validate"](pre_recovery(idle, True), trace, 2, [control["ASYNC_TEST"]], "async-omit-release", logs)
           print(f"Pure-memory ASYNC fixtures passed: fixed, ordinary omission, legal caret traces and latest idle recovery; {rejected} invalid inputs rejected")
+          accepted_fields = control["ACCEPTED_FIELDS"]
+          accepted_test = control["ACCEPTED_TEST"]
+          events = []
+          def accepted_emit(kind, **values):
+              events.append(dict(kind=kind, pid=1, seq=len(events) + 1, **values))
+          def accepted_cli(command, reply=""):
+              accepted_emit("cli_reply", command=command, retval=0, reply=reply)
+          def accepted_status(**values):
+              record = dict.fromkeys(accepted_fields, 0)
+              record.update(token=201, enabled=1, epoch=5, generation=6, app=7, worker=8,
+                            listener=9, thread=1, handle=(1 << 32) + 10, protocol=7, builtin=1,
+                            event=11, enqueued=1, head=12, current_head=12, held=1)
+              record.update(values)
+              accepted_cli("test http static accepted status",
+                           " ".join(f"{key} {record[key]}" for key in accepted_fields))
+          accepted_emit("startTest", test=accepted_test)
+          accepted_cli("test http static async start")
+          accepted_cli("http static listener add uri tcp://10.10.1.2:8093 www-root /old max-age 123")
+          accepted_cli("test http static accepted start 201 listener 9")
+          accepted_cli("test http static accepted identity listener 9", "listener 9 epoch 5 generation 6 app 7")
+          accepted_emit("helper", test=accepted_test, helper="_response", client=20, response={"requested": True})
+          accepted_status(queued=1)
+          accepted_cli("http static listener del uri tcp://10.10.1.2:8093")
+          captured = dict(captured=2, captures=1, retained=1, refs=1, retiring=1, queued=1)
+          accepted_status(**captured)
+          accepted_cli("http static listener add uri tcp://10.10.1.2:8093 www-root /new max-age 456")
+          accepted_cli("test http static accepted identity listener 11", "listener 11 epoch 15 generation 6 app 7")
+          accepted_status(**captured)
+          accepted_cli("test http static accepted release")
+          released = dict(captured=2, captures=1, released=3, transferred=4, callback=5, ready=6,
+                          advanced=7, ack=8, callbacks=1, advances=1, rx_ready=1, transfers=1,
+                          refs_before=1, refs_after=1, head_after=13, current_head=13, refs=1, retiring=1)
+          accepted_status(**released)
+          for client, body, cache in ((20, "old accepted config", "max-age=123"),
+                                      (21, "new accepted config", "max-age=456")):
+              accepted_emit("helper", test=accepted_test, helper="_response", client=client,
+                            response=dict(status=200, body=body, cache=cache, server="http_static_server_6"))
+          closed = dict(released, cleaned=9, freed=10, cleanups=1, poolput=1, refs=0)
+          accepted_status(**closed)
+          accepted_cli("http static listener del uri tcp://10.10.1.2:8093")
+          accepted_cli("test http static accepted release")
+          accepted_status(**closed)
+          accepted_cli("http static server disable")
+          accepted_cli("test http static async status",
+                       "async-ledger enabled 1 overflow 0 live 0 baseline 0 destroys 0 detaches 0 owners 0\n")
+          accepted_cli("test http static accepted clear")
+          accepted_cli("test http static async clear")
+          accepted_emit("addSuccess", test=accepted_test)
+          accepted_emit("stopTest", test=accepted_test)
+          control["accepted_evidence"](events)
+          rejected = 0
+          def rejects_accepted(changed):
+              global rejected
+              try:
+                  control["accepted_evidence"](changed)
+              except (AssertionError, ValueError, KeyError, IndexError, StopIteration):
+                  rejected += 1
+              else:
+                  raise AssertionError("Invalid ACCEPTED evidence was accepted")
+          for index, event in enumerate(events):
+              if event["kind"] in ("cli_reply", "helper", "addSuccess"):
+                  rejects_accepted(events[:index] + events[index + 1:])
+          for before, after in (("overflow 0", "overflow 1"), ("thread 1", "thread 0"),
+                                ("protocol 7", "protocol 6"), ("event 11", "event 12"),
+                                ("enqueued 1", "enqueued 0"), ("captures 1", "captures 2"),
+                                ("refs_before 1", "refs_before 2"), ("refs_after 1", "refs_after 0"),
+                                ("callback 5", "callback 3"), ("ack 8", "ack 6"),
+                                ("head_after 13", "head_after 12"), ("poolput 1", "poolput 0"),
+                                ("epoch 15", "epoch 5"), ("cleaned 9", "cleaned 11")):
+              changed = copy.deepcopy(events)
+              for event in changed:
+                  if event["kind"] == "cli_reply":
+                      event["reply"] = event["reply"].replace(before, after)
+              rejects_accepted(changed)
+          print(f"Pure-memory ACCEPTED verifier checks passed; {rejected} invalid inputs rejected; no runtime claim")
           PY
 
       - &hss_mutate
@@ -4355,11 +4580,11 @@ jobs:
     env:
       VARIANT_NAME: fixed
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: b230ba5d6bd0ef362fd8c9d80e8a1a95a367c111
+      CANDIDATE_SHA: f89072eefd4dae7c7392b2a828ffb297b47bd9a9
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: 29d53a203ac7e84c2c6328699fd3a6607ede25f3
-      CONTROL_SHA: e132784bb0d70718857144840244913220e18779
-      CONTROL_TREE: 5e28f65ab2030e35bafd0af4390fc5ff0c2a8776
+      CANDIDATE_TREE: 7d86133605624990b0342f9074d78e1c9dd265b2
+      CONTROL_SHA: 8e85e05616a1b86b9b3e95354415e28047967217
+      CONTROL_TREE: 5cde6288d912293c9bac96da4fcfd126a6604b48
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
