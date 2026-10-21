@@ -48,11 +48,11 @@ jobs:
     env:
       VARIANT_NAME: ${{ matrix.variant }}
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: d03ce59a82d80f84661120acade463828e88a518
+      CANDIDATE_SHA: adfc1f1ece072db95dbf5e85badf6d5f9ff56546
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: d7294ec676db157f0c47c618bbe39c5d38763563
-      CONTROL_SHA: 2faf558df6edb4be2083df5bde1a456a9597ed5e
-      CONTROL_TREE: 2ee54cbd40274ef591132742a8873512c0401531
+      CANDIDATE_TREE: b61038e27b53c2855bad9ab15cb51dc0d6128238
+      CONTROL_SHA: 88cf2970ee9ddd39d3265b3cfb53c00c23e46e60
+      CONTROL_TREE: 1c26c674f437f58f10e45833f669706d783fea6b
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
@@ -84,7 +84,7 @@ jobs:
           printf '%s\n' bootstrap checkout prepare dependencies feature-list pinned-python black-version \
             fixture-python-style fixtures mutate fallback-version build binaries namespace environment runtime tests http-name http-name-runtime collect \
             > "$EVIDENCE/planned-phases.txt"
-          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 2ff4cf5eb2a84522213e1182ff1b3934153645d7 ca0843b651f6f9c1fca0635c61e6916112759fda 6459dbc8f8c82f18e00e72bc9e4676bbada62484 66a74121133e2716031d33385e16f32bc6ffe993 d03ce59a82d80f84661120acade463828e88a518; do
+          for commit in b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c 40b52275db082d350158684cdb117e9f43450418 2ff4cf5eb2a84522213e1182ff1b3934153645d7 ca0843b651f6f9c1fca0635c61e6916112759fda 6459dbc8f8c82f18e00e72bc9e4676bbada62484 dee4c6f4b61e1b55d257f6c814bb3b49723a2d57 adfc1f1ece072db95dbf5e85badf6d5f9ff56546; do
             printf 'style-%s\napi-%s\nmessage-%s\n' "$commit" "$commit" "$commit" >> "$EVIDENCE/planned-phases.txt"
           done
           {
@@ -1158,6 +1158,20 @@ jobs:
               outcomes = {"bootstrap": "BOOTSTRAP_OUTCOME", "checkout": "CHECKOUT_OUTCOME",
                           "fallback-version": "VERSION_OUTCOME", "namespace": "NAMESPACE_OUTCOME"}
               for name in (root / "planned-phases.txt").read_text().splitlines():
+                  if name == "diagnostic-contract":
+                      outcome = os.environ.get("DIAGNOSTIC_OUTCOME", "unknown")
+                      launch = Path(os.environ["HSS_CONTROL"]) / "diagnostic-started.json"
+                      phase = dict(status="not_run" if outcome == "skipped" else "unknown/incomplete",
+                          rc=None, action_outcome=outcome, launch=None)
+                      try:
+                          raw = read_regular(launch, LIMIT, time.monotonic() + 5)
+                      except FileNotFoundError:
+                          pass
+                      else:
+                          phase["launch"] = json.loads(raw)
+                          phase["launch_receipt"] = dict(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                      phases[name] = phase
+                      continue
                   paths = (root / name / "result.json", root / f"{name}-result.json")
                   found = next((path for path in paths if path.is_file()), None)
                   if found is not None:
@@ -1194,6 +1208,14 @@ jobs:
                   else:
                       phases[name] = dict(status="not_run", rc=None, reason="No phase result; inspect earlier failure")
               return phases
+
+          def final_dependency(control):
+              try:
+                  control.dependency_checkpoint("final")
+              except (OSError, ValueError, KeyError, TypeError, AssertionError, subprocess.SubprocessError) as error:
+                  return dict(status="failed", rc=1, complete=False,
+                      error=f"{type(error).__name__}: {error}"[:512])
+              return dict(status="completed", rc=0, complete=True)
 
           def worker(request, adapter=None):
               import control
@@ -1240,9 +1262,12 @@ jobs:
                           with (control.OUT / name).open("wb") as stream:
                               subprocess.run(args, stdout=stream, stderr=subprocess.STDOUT,
                                              check=True, timeout=max(.01, remaining(request["deadline"])))
-                      control.dependency_checkpoint("final")
+                      result["dependency_validation"] = final_dependency(control)
                       control.collect(control.OUT / "final-diagnostics")
-                      snapshot = dict(authority="provisional/pre-final", phases=phase_records(control.OUT))
+                      snapshot = dict(authority="provisional/pre-final", workflow=os.environ["WORKFLOW_SHA"],
+                          candidate=os.environ["CANDIDATE_SHA"], control=os.environ["CONTROL_SHA"],
+                          phases=phase_records(control.OUT))
+                      snapshot["phases"]["dependency-final"] = result["dependency_validation"]
                       control.publish(control.OUT / "phase-status.json", snapshot)
                       control.publish(directory / "phase-pre-final.json", snapshot)
                   elif request["mode"] == "upload":
@@ -1344,6 +1369,67 @@ jobs:
                   raise ValueError("Invalid inventory relative path")
               return value
 
+          def diagnostic_requirements(load):
+              expected = {}
+              def record(name, cap=collection.LIMIT):
+                  raw = load(name, cap)
+                  expected["control/" + relative(name)] = fingerprint(raw)
+                  value = json.loads(raw)
+                  if not isinstance(value, dict):
+                      raise ValueError("Nonobject diagnostic upload record")
+                  return value
+              pointer = record("final-collection.json")
+              identity = pointer["identity"]
+              if (not isinstance(identity, str) or len(identity) != 32 or
+                      any(char not in "0123456789abcdef" for char in identity)):
+                  raise ValueError("Invalid diagnostic collector identity")
+              request = record(f"{identity}/request.json")
+              result = record(f"{identity}/result.json")
+              worker = record(f"{identity}/worker.json")
+              snapshot = record(f"{identity}/phase-pre-final.json")
+              index = record(f"{identity}/index-receipt.json", 2 * 1024 * 1024)
+              if (request.get("mode") != "final" or request.get("identity") != identity or
+                      result != pointer or result.get("identity") != identity or result.get("worker") != worker or
+                      result.get("complete") is not True or not collection.receipt_complete(request, worker,
+                          result["pid"], result["status"], result["rc"], result["cleanup_complete"]) or
+                      {key: result["index"][key] for key in ("bytes", "sha256")} != expected[f"control/{identity}/index-receipt.json"] or
+                      index.get("phase-status.json") != expected[f"control/{identity}/phase-pre-final.json"] or
+                      snapshot.get("authority") != "provisional/pre-final" or
+                      any(snapshot.get(key) != os.environ[env] for key, env in
+                          (("workflow", "WORKFLOW_SHA"), ("candidate", "CANDIDATE_SHA"), ("control", "CONTROL_SHA")))):
+                  raise ValueError("Unbound diagnostic phase snapshot")
+              task = record("task-map.json")
+              if (task.get("diagnostic_acceptance") != "independent" or task.get("product_controls") != "NOT_RUN" or
+                      any(task.get(key) != snapshot[key] for key in ("workflow", "candidate", "control"))):
+                  raise ValueError("Diagnostic task identity differs")
+              phase = snapshot["phases"]["diagnostic-contract"]
+              early = (phase.get("action_outcome") == "skipped" and phase.get("status") == "not_run" and
+                  phase.get("rc") is None and phase.get("launch") is None)
+              if early:
+                  summary = record("phase-status.json")
+                  if (summary.get("complete") is not False or summary.get("product_acceptance") is not False or
+                          not any(type(item.get("rc")) is int and item["rc"] != 0
+                              for name, item in snapshot["phases"].items() if name != "diagnostic-contract")):
+                      raise ValueError("Early diagnostic bundle lacks an observed failure")
+                  return expected
+              launch = record("diagnostic-started.json")
+              if (phase.get("launch") != launch or phase.get("launch_receipt") != expected["control/diagnostic-started.json"] or
+                      launch != dict(schema="hss-diagnostic-launch-v1", workflow=os.environ["WORKFLOW_SHA"],
+                          candidate=os.environ["CANDIDATE_SHA"], control=os.environ["CONTROL_SHA"],
+                          run=os.environ["GITHUB_RUN_ID"], attempt=os.environ["GITHUB_RUN_ATTEMPT"]) or
+                      phase.get("action_outcome") not in ("success", "failure", "cancelled")):
+                  raise ValueError("Missing or contradictory diagnostic launch receipt")
+              record("diagnostic-contract/watchdog.json")
+              report = record("diagnostic-contract/diagnostic-contract.json")
+              observed = report["observations"]["test_live_setup_failure_query_once"]["observed"]
+              witness = observed["event_witness"]
+              event = "control/diagnostic-contract/" + relative(Path(witness["path"]).name)
+              expected[event] = {key: witness[key] for key in ("bytes", "sha256")}
+              slot = observed["slots"][0]
+              for name, receipt in observed["verified_streams"].items():
+                  expected["control/diagnostic-contract/live/" + relative(slot["slot"]) + "/" + relative(name)] = receipt
+              return expected
+
           def terminal(load, workflow, collection_rc, diagnostic=True):
               summary = dict(schema="hss-terminal-v1", authority="terminal", complete=False,
                   product_acceptance=False, workflow=workflow, collection_rc=collection_rc,
@@ -1441,7 +1527,7 @@ jobs:
                           report.get("failures") != [] or report.get("errors") != [] or report.get("skips") != [] or
                           report.get("product_acceptance") is not False or watchdog.get("product_acceptance") is not False):
                       raise ValueError("Incomplete or foreign diagnostic terminal evidence")
-                  summary["phases"]["diagnostic-contract"].update(status="completed", complete=True)
+                  summary["phases"]["diagnostic-contract"].update(status="completed", complete=True, rc=0)
                   summary["product_controls"] = "NOT_RUN"
               except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
                   summary["errors"].append(f"diagnostic: {type(error).__name__}: {error}"[:512])
@@ -1575,20 +1661,11 @@ jobs:
                   os.replace(pending, target)
                   return fingerprint(raw)
               if os.environ.get("GITHUB_JOB") == "diagnostic":
-                  required.update(("control/task-map.json", "control/diagnostic-contract/watchdog.json",
-                      "control/diagnostic-contract/diagnostic-contract.json"))
                   try:
-                      report = json.loads(read(roots["control"] / "diagnostic-contract/diagnostic-contract.json", collection.LIMIT))
-                      observed = report["observations"]["test_live_setup_failure_query_once"]["observed"]
-                      witness = observed["event_witness"]
-                      event = "control/diagnostic-contract/" + relative(Path(witness["path"]).name)
-                      expected[event] = {key: witness[key] for key in ("bytes", "sha256")}
-                      slot = observed["slots"][0]
-                      for name, receipt in observed["verified_streams"].items():
-                          expected["control/diagnostic-contract/live/" + relative(slot["slot"]) + "/" + relative(name)] = receipt
+                      expected.update(diagnostic_requirements(lambda name, cap: read(roots["control"] / relative(name), cap)))
                       required.update(expected)
-                  except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
-                      setup_errors.append(f"Required D1 evidence: {type(error).__name__}: {error}"[:512])
+                  except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError) as error:
+                      setup_errors.append(f"Required diagnostic evidence: {type(error).__name__}: {error}"[:512])
               excluded = {"control/" + request["identity"]}
               manifest = inventory(walk(roots, check, excluded), required, copy, check)
               for row in manifest["entries"]:
@@ -1681,8 +1758,12 @@ jobs:
                       raise ValueError("Incomplete or invalid excluded upload entry")
               required = {"evidence/evidence-index.json", "control/phase-status.json", "control/final-collection.json"}
               if os.environ.get("GITHUB_JOB") == "diagnostic":
-                  required.update(("control/task-map.json", "control/diagnostic-contract/watchdog.json",
-                      "control/diagnostic-contract/diagnostic-contract.json"))
+                  expected = diagnostic_requirements(load)
+                  required.update(expected)
+                  receipts = {row["path"]: {key: row[key] for key in ("bytes", "sha256")}
+                      for row in manifest["entries"] if row["included"]}
+                  if any(receipts.get(name) != receipt for name, receipt in expected.items()):
+                      raise ValueError("Diagnostic upload evidence changed")
               if not required <= included or copied != manifest["bytes"] or manifest["actual_read_bytes"] < copied:
                   raise ValueError("Upload inventory required entries or byte totals disagree")
 
@@ -1704,9 +1785,12 @@ jobs:
                   upload_complete(load, result, healthy, Path(os.environ["RUNNER_TEMP"]) / "hss-upload")
                   with open(os.environ["GITHUB_ENV"], "a") as stream:
                       stream.write("HSS_UPLOAD_READY=true\n")
-              except (OSError, ValueError, KeyError, TypeError) as error:
+              except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError) as error:
                   control.publish(healthy / "upload-publication-error.json", dict(complete=False, error=str(error)[:512]))
+                  print(f"Upload publication failed: {type(error).__name__}: {str(error)[:512]}", file=sys.stderr, flush=True)
                   return 1
+              if not summary["complete"]:
+                  print("Terminal remains incomplete: " + str(summary["errors"][-8:])[:4096], file=sys.stderr, flush=True)
               return 0 if summary["complete"] and result["complete"] else 1
 
           if __name__ == "__main__":
@@ -1749,12 +1833,12 @@ jobs:
           CLASSES = ("TestHttpStaticCli", "TestHttpStaticCliWorker")
           ASYNC_TEST = "test_http_static.TestHttpStaticCliWorker.test_http_static_async_release_cancel"
           BUILD_IDENTITIES = {
-              "fixed": ("4c998afbbe0fb6fb00f546c795551223dc825266", "d7294ec676db157f0c47c618bbe39c5d38763563"),
-              "cache-limit": ("3f4027039d2128e9c04dd5ee8c1c503918dc89e7", "e459a96f95b63210ff7afedc5aa9e8b592cb3dc6"),
-              "api-protocol": ("9be90d745ea02afaa6471ca1cc163d95d9f397af", "079baa60ee78727aaed6f9ae816e44982ab58df2"),
-              "original-endpoint": ("3f220c1d3b4469bec620d5c14f75e36b4737314f", "43cbc1a6a9b47d3873f6b88726ac5c07efd156b8"),
-              "read-error-unlock": ("404e94c25c913ffa91fd96004a15f58fb16c11f2", "1b6b785ed70081fda1fea048fc860ad6e9688434"),
-              "async-omit-release": ("80b9be05f58700ff0ac258c83ff65913c02a5979", "2ee54cbd40274ef591132742a8873512c0401531")}
+              "fixed": ("4c998afbbe0fb6fb00f546c795551223dc825266", "b61038e27b53c2855bad9ab15cb51dc0d6128238"),
+              "cache-limit": ("3f4027039d2128e9c04dd5ee8c1c503918dc89e7", "34b75b4004d85de3f2f1c0cd5fd13335f6930245"),
+              "api-protocol": ("9be90d745ea02afaa6471ca1cc163d95d9f397af", "9a0dd806f53a56ad098fac1b1a35d729e3be76ce"),
+              "original-endpoint": ("5f7fadd9551879e6aca0d782e9471728216583d4", "5d6d21ad7d8a1743f4f656718ca8ad0239554fc4"),
+              "read-error-unlock": ("404e94c25c913ffa91fd96004a15f58fb16c11f2", "95179618b7cfc384be437792255d35f323761356"),
+              "async-omit-release": ("dc37ac9d514466df0ac805d90c6652b2d6e74bd5", "1c26c674f437f58f10e45833f669706d783fea6b")}
           RECIPES = {
               "cache-limit": ("rmp->cache_size_limit = htonl (l->cache ? l->cache->cache_limit : 0);",
                               "rmp->cache_size_limit = htonl (hsm->default_listener.cache ? hsm->default_listener.cache->cache_limit : 0);"),
@@ -1784,6 +1868,30 @@ jobs:
 
           def save(name, value):
               publish(OUT / name, value)
+
+          def error_tail_text(raw):
+              text = raw[-16384:].decode("utf-8", errors="replace")
+              return "\n".join("| " + "".join(char for char in line if char == "\t" or char.isprintable())
+                  for line in text.splitlines())
+
+          def error_tail(path):
+              descriptor = None
+              try:
+                  descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                  before = os.fstat(descriptor)
+                  require(stat.S_ISREG(before.st_mode) and before.st_size <= 8 * 1024 * 1024 + 512,
+                      "Failure console is nonregular or exceeds cap")
+                  os.lseek(descriptor, max(0, before.st_size - 16384), os.SEEK_SET)
+                  raw = os.read(descriptor, 16384)
+                  after = os.fstat(descriptor)
+                  require((after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns),
+                      "Failure console changed")
+                  print(f"Failure console tail: {path}\n{error_tail_text(raw)}", flush=True)
+              except (OSError, AssertionError) as error:
+                  print(f"Failure console tail unavailable: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
+              finally:
+                  if descriptor is not None:
+                      os.close(descriptor)
 
           def capture(process, deadline, stream):
               tail = bytearray()
@@ -1933,6 +2041,8 @@ jobs:
               if result.get("cleanup_complete") and result["status"] != "completed" and label != "tests":
                   record_interruptions(result, result_path)
               print(f"{label}: {result['status']}, rc={result['rc']}; raw log: {directory / 'console.log'}", flush=True)
+              if label == "mutate" and result["rc"] != 0:
+                  error_tail(directory / "console.log")
               return result["rc"], tail.decode(errors="replace")
 
           def record_interruptions(parent, parent_path):
@@ -2059,7 +2169,7 @@ jobs:
 
           def source_identity():
               require(git("rev-list", "--parents", "-n", "1", CANDIDATE).split() ==
-                      [CANDIDATE, "66a74121133e2716031d33385e16f32bc6ffe993"],
+                      [CANDIDATE, "dee4c6f4b61e1b55d257f6c814bb3b49723a2d57"],
                       "Candidate must have exactly the frozen ASYNC parent")
               require(git("rev-parse", f"{CANDIDATE}^{{tree}}") == os.environ["CANDIDATE_TREE"],
                       "Candidate tree differs from frozen ASYNC source")
@@ -2158,8 +2268,8 @@ jobs:
               require(not git("diff", "--name-only"), "Tracked source changed before mutation")
               original = Path(SOURCE).read_bytes()
               if VARIANT == "async-omit-release":
-                  require(git("rev-parse", f"{CANDIDATE}:{SOURCE}") == "85b8b09100d57a7acbb570b31509fdae6e78e7eb" and
-                          git("rev-parse", f"{CONTROL}:{SOURCE}") == "80b9be05f58700ff0ac258c83ff65913c02a5979",
+                  require(git("rev-parse", f"{CANDIDATE}:{SOURCE}") == "185f0ec8b3da984104b3fa70307ec44f6a60c919" and
+                          git("rev-parse", f"{CONTROL}:{SOURCE}") == "dc37ac9d514466df0ac805d90c6652b2d6e74bd5",
                           "Omitted-release source blobs differ")
                   Path(SOURCE).write_bytes(content(CONTROL, SOURCE))
               elif VARIANT != "fixed":
@@ -2896,7 +3006,40 @@ jobs:
 
           def final_collect():
               result = supervise_collection("final", OUT)
+              if not result["complete"]:
+                  print(json.dumps(result), file=sys.stderr, flush=True)
               require(result["complete"], "Final collection/index incomplete; inspect healthy control records")
+              dependency = result["worker"]["dependency_validation"]
+              require(dependency["complete"], f"Final dependency validation failed: {dependency}")
+
+          def guarded_dependencies(checkpoint, run):
+              checkpoint("before-python", normalize=True, clean=True)
+              status = 125
+              try:
+                  status, _ = run("diagnostic-dependencies", ["make", "UNATTENDED=yes", "test-dep"])
+              finally:
+                  try:
+                      checkpoint("after-python", clean=True)
+                  except (OSError, ValueError, KeyError, TypeError, AssertionError, subprocess.SubprocessError) as error:
+                      print(f"Diagnostic dependency after-check failed: {type(error).__name__}: {error}",
+                          file=sys.stderr, flush=True)
+                      if status == 0:
+                          status = 1
+              return status
+
+          def diagnostic_dependencies():
+              result = dict(action="diagnostic-dependency-guard", start=time.time(), status="running", rc=None)
+              save("diagnostic-dependency-guard-result.json", result)
+              try:
+                  status = guarded_dependencies(dependency_checkpoint, command)
+                  result.update(status="completed" if status == 0 else "failed", rc=status)
+                  return status
+              except (OSError, ValueError, KeyError, TypeError, AssertionError, subprocess.SubprocessError) as error:
+                  result.update(status="failed", rc=1, error=f"{type(error).__name__}: {error}"[:512])
+                  raise
+              finally:
+                  result["end"] = time.time()
+                  save("diagnostic-dependency-guard-result.json", result)
 
           if __name__ == "__main__":
               action = sys.argv[1]
@@ -2905,8 +3048,16 @@ jobs:
               if action == "collect":
                   final_collect()
               elif action == "diagnostic-contract":
+                  publish(Path(os.environ["HSS_CONTROL"]) / "diagnostic-started.json",
+                      dict(schema="hss-diagnostic-launch-v1", workflow=os.environ["WORKFLOW_SHA"],
+                          candidate=CANDIDATE, control=CONTROL, run=os.environ["GITHUB_RUN_ID"],
+                          attempt=os.environ["GITHUB_RUN_ATTEMPT"]))
                   import diagnostic_contract
                   raise SystemExit(diagnostic_contract.supervise_contract())
+              elif action == "error-tail":
+                  error_tail(Path(sys.argv[2]))
+              elif action == "diagnostic-dependencies":
+                  raise SystemExit(diagnostic_dependencies())
               elif action == "dependency-check":
                   label = sys.argv[2]
                   require(label in ("before-python", "after-python", "final"), "Unknown dependency checkpoint")
@@ -4100,6 +4251,7 @@ jobs:
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
           VERSION_OUTCOME: ${{ steps.version.outcome }}
           NAMESPACE_OUTCOME: ${{ steps.namespace.outcome }}
+          DIAGNOSTIC_OUTCOME: ${{ steps.diagnostic_contract.outcome }}
         run: |
           set -uo pipefail
           export EVIDENCE="${EVIDENCE:-$RUNNER_TEMP/hss-evidence}"
@@ -4142,6 +4294,12 @@ jobs:
               "$collection_status" "$delivery_status" "$record_status" >&2; then :; else
             console_status=$?
             if [ "$record_status" -eq 0 ]; then record_status=$console_status; fi
+          fi
+          if [ "$collection_status" -ne 0 ]; then
+            timeout --signal=TERM --kill-after=1s 5s python3 "$TOOLS/control.py" error-tail "$HSS_CONTROL/final-console.log" || :
+          fi
+          if [ "$delivery_status" -ne 0 ]; then
+            timeout --signal=TERM --kill-after=1s 5s python3 "$TOOLS/control.py" error-tail "$HSS_CONTROL/delivery-console.log" || :
           fi
           if [ "$collection_status" -ne 0 ]; then exit "$collection_status"; fi
           if [ "$delivery_status" -ne 0 ]; then exit "$delivery_status"; fi
@@ -4197,11 +4355,11 @@ jobs:
     env:
       VARIANT_NAME: fixed
       WORKFLOW_SHA: ${{ github.sha }}
-      CANDIDATE_SHA: d03ce59a82d80f84661120acade463828e88a518
+      CANDIDATE_SHA: adfc1f1ece072db95dbf5e85badf6d5f9ff56546
       CHECK_BASE_SHA: d71243491366c793325a970433498ea412eba530
-      CANDIDATE_TREE: d7294ec676db157f0c47c618bbe39c5d38763563
-      CONTROL_SHA: 2faf558df6edb4be2083df5bde1a456a9597ed5e
-      CONTROL_TREE: 2ee54cbd40274ef591132742a8873512c0401531
+      CANDIDATE_TREE: b61038e27b53c2855bad9ab15cb51dc0d6128238
+      CONTROL_SHA: 88cf2970ee9ddd39d3265b3cfb53c00c23e46e60
+      CONTROL_TREE: 1c26c674f437f58f10e45833f669706d783fea6b
       FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
       CLANG_FORMAT_VER: "19"
       GIT_CONFIG_COUNT: "1"
@@ -4216,13 +4374,13 @@ jobs:
         timeout-minutes: 1
         run: |
           set -euo pipefail
-          printf '%s\n' bootstrap checkout prepare dependencies diagnostic-dependencies mutate fallback-version build binaries namespace environment diagnostic-contract collect > "$EVIDENCE/planned-phases.txt"
+          printf '%s\n' bootstrap checkout prepare dependencies diagnostic-dependency-guard diagnostic-dependencies mutate fallback-version build binaries namespace environment diagnostic-contract collect > "$EVIDENCE/planned-phases.txt"
           printf '{"product_controls":"NOT_RUN","historical_run":"39494180264","diagnostic_acceptance":"independent","candidate":"%s","control":"%s","workflow":"%s"}\n' \
             "$CANDIDATE_SHA" "$CONTROL_SHA" "$WORKFLOW_SHA" > "$HSS_CONTROL/task-map.json"
       - *hss_dependencies
       - name: Prepare pinned diagnostic Python environment
         timeout-minutes: 15
-        run: python3 "$TOOLS/control.py" diagnostic-dependencies make UNATTENDED=yes test-dep
+        run: python3 "$TOOLS/control.py" diagnostic-dependencies
       - *hss_mutate
       - *hss_version
       - *hss_build
@@ -4230,6 +4388,7 @@ jobs:
       - *hss_namespace
       - *hss_environment
       - name: Execute unique D1 through D5 diagnostic contract
+        id: diagnostic_contract
         timeout-minutes: 7
         run: python3 "$TOOLS/control.py" diagnostic-contract
       - *hss_retain
