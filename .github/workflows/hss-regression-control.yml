@@ -2879,6 +2879,23 @@ jobs:
                       "DESTROY negative lifecycle value")
               return record
 
+          def destroy_initial(record):
+              require(record["enabled"] == 1 and record["overflow"] == 0 and record["epoch"] > 0 and
+                      record["thread"] in (0, 1) and record["gate"] == record["thread"] and
+                      record["app_live"] == record["cert_live"] == 1 and
+                      record["inflight"] == int(record["token"] == 302), "DESTROY initial arm state differs")
+              require(all(record[key] == 0 for key in ("bound", "published", "detach", "cert_delete", "freed",
+                      "app_before", "app_after", "cert_before", "cert_after", "detach_rv", "cert_rv",
+                      "held", "reset", "transport", "cleanup", "done", "ack", "remaining",
+                      "resets", "transports", "cleanups")), "DESTROY initial arm prematurely published or cleaned")
+              require(record["captured"] in (0, 1), "DESTROY initial capture count differs")
+              if record["thread"]:
+                  require(record["captured"] == 1 and record["handle"] >> 32 == 1,
+                          "DESTROY initial worker session identity differs")
+              elif not record["captured"]:
+                  require(all(record[key] == 0 for key in ("handle", "hs_index", "listener")),
+                          "DESTROY initial empty owner identity differs")
+
           def destroy_witness(record, identity, phase):
               binding = ("token", "epoch", "generation", "app", "cert", "thread", "handle",
                          "hs_index", "listener", "captured")
@@ -2996,8 +3013,12 @@ jobs:
                       require(all(record[key] == identity[key] for key in
                               ("token", "epoch", "generation", "app", "cert", "thread", "handle", "hs_index", "listener", "captured")),
                               "DESTROY snapshot identity changed")
+                      if event["seq"] < disables[token - 301]["seq"]:
+                          destroy_initial(record)
+                          continue
                       require(record["enabled"] == record["bound"] == 1 and record["overflow"] == 0 and
-                              record["detach_rv"] == record["cert_rv"] == 0, "DESTROY snapshot reported real owner failure")
+                              record["published"] > 0 and record["detach_rv"] == record["cert_rv"] == 0,
+                              "DESTROY published snapshot reported real owner failure")
                       if held[0][0]["seq"] <= event["seq"] < releases[token]["seq"]:
                           destroy_witness(record, identity, "held")
                       elif record["freed"]:
@@ -4625,10 +4646,13 @@ jobs:
               def status(token, owner, phase="initial", idle=False):
                   record = dict.fromkeys(destroy_fields, 0)
                   record.update(token=token, enabled=1, epoch=token, generation=token + 10, app=token + 20,
-                      cert=token + 30, bound=1, published=1, app_live=1, cert_live=1, inflight=int(not idle),
-                      thread=owner, handle=(owner << 32) + token, hs_index=token, listener=token, captured=owner)
-                  if owner:
-                      record.update(held=2, gate=1)
+                      cert=token + 30, app_live=1, cert_live=1, inflight=int(token == 302),
+                      thread=owner, handle=((1 << 32) + token) if owner else 0,
+                      hs_index=token if owner else 0, listener=token if owner else 0, captured=owner, gate=owner)
+                  if phase != "initial":
+                      record.update(bound=1, published=1, inflight=int(not idle))
+                      if owner and phase != "published":
+                          record.update(held=2)
                   if phase == "held" and not owner:
                       record.update(done=3, ack=4, remaining=1)
                   if phase == "freed":
@@ -4653,6 +4677,11 @@ jobs:
                   for owner in (0, 1):
                       status(token, owner)
                   cli("http static server disable")
+                  status(token, 0, "published")
+                  status(token, 0, "held")
+                  status(token, 1, "published")
+                  status(token, 1, "published")
+                  status(token, 1, "held")
                   for retained in range(301, token + 1):
                       for owner in (0, 1):
                           status(retained, owner, "held")
@@ -4797,6 +4826,38 @@ jobs:
           changed = copy.deepcopy(destroy_events)
           event = next(event for event in changed if event.get("command") == "test http static destroy clear")
           event.update(retval=-1, reply="unexpected clear failure")
+          rejects_destroy(changed)
+          initial_defaults = ("bound", "published", "detach", "cert_delete", "freed", "app_before", "app_after",
+                              "cert_before", "cert_after", "detach_rv", "cert_rv", "held", "reset", "transport",
+                              "cleanup", "done", "ack", "remaining", "resets", "transports", "cleanups")
+          for token in (301, 302):
+              for owner in (0, 1):
+                  command = f"test http static destroy status {token} owner {owner}"
+                  for key, value in [*((key, 1) for key in initial_defaults),
+                                     ("gate", 1 - owner), ("app_live", 0), ("cert_live", 0),
+                                     ("inflight", int(token != 302)), ("epoch", 0), ("captured", 2)]:
+                      changed = copy.deepcopy(destroy_events)
+                      event = next(event for event in changed if event.get("command") == command)
+                      parts = event["reply"].split()
+                      parts[parts.index(key) + 1] = str(value)
+                      event["reply"] = " ".join(parts)
+                      rejects_destroy(changed)
+          for key, value in (("bound", 0), ("published", 0), ("overflow", 1), ("detach_rv", -1), ("cert_rv", -1)):
+              changed = copy.deepcopy(destroy_events)
+              event = next(event for event in changed if event.get("command") == status_command and
+                           "bound 1" in event["reply"] and "held 0" in event["reply"])
+              parts = event["reply"].split()
+              parts[parts.index(key) + 1] = str(value)
+              event["reply"] = " ".join(parts)
+              rejects_destroy(changed)
+          changed = copy.deepcopy(destroy_events)
+          event = next(event for event in changed if event.get("command") == status_command)
+          event["reply"] = event["reply"].replace("bound 0", "bound 1").replace("published 0", "published 1")
+          rejects_destroy(changed)
+          changed = copy.deepcopy(destroy_events)
+          status_events = [event for event in changed if event.get("command") == status_command]
+          event = next(event for event in status_events if "held 2" in event["reply"])
+          event["reply"] = status_events[0]["reply"]
           rejects_destroy(changed)
           print(f"Pure-memory DESTROY verifier checks passed; {rejected} invalid inputs rejected; no runtime claim")
           PY
