@@ -1576,5 +1576,180 @@ class TestAcceptedWitness(unittest.TestCase):
         self.assertIn("ack", calls)
 
 
+class TestDestroyOwnerWitnesses(unittest.TestCase):
+    def witness(self, thread=1, held=False):
+        record = dict.fromkeys(
+            (
+                "token enabled overflow epoch generation app cert bound published detach "
+                "cert_delete freed app_before app_after cert_before cert_after detach_rv "
+                "cert_rv app_live cert_live inflight thread handle hs_index listener captured "
+                "gate held reset transport cleanup done ack remaining resets transports cleanups"
+            ).split(),
+            0,
+        )
+        record.update(
+            token=301,
+            enabled=1,
+            epoch=1,
+            generation=7,
+            app=4,
+            cert=5,
+            bound=1,
+            published=1,
+            thread=thread,
+            handle=(1 << 32) | 3 if thread else 0,
+            hs_index=2 if thread else 0,
+            listener=6 if thread else 0,
+            captured=thread,
+            held=2 if thread else 0,
+            reset=3 if thread else 0,
+            transport=4 if thread else 0,
+            cleanup=5 if thread else 0,
+            done=6,
+            ack=7,
+            remaining=int(thread == 0),
+            resets=thread,
+            transports=thread,
+            cleanups=thread,
+            detach=8,
+            cert_delete=9,
+            freed=10,
+            app_before=1,
+            cert_before=1,
+        )
+        if held:
+            record.update(
+                detach=0, cert_delete=0, freed=0, app_live=1, cert_live=1, inflight=1
+            )
+            if thread:
+                record.update(
+                    gate=1,
+                    reset=0,
+                    transport=0,
+                    cleanup=0,
+                    done=0,
+                    ack=0,
+                    resets=0,
+                    transports=0,
+                    cleanups=0,
+                )
+        return record
+
+    def test_destroy_main_and_worker_positive_order(self):
+        for thread in (0, 1):
+            for phase in ("held", "freed"):
+                record = self.witness(thread, held=phase == "held")
+                helper("_destroy_assert_witness")(self, record, record.copy(), phase)
+
+    def test_destroy_identity_and_pool_state_are_required(self):
+        record = self.witness()
+        for field in (
+            "epoch",
+            "generation",
+            "app",
+            "cert",
+            "handle",
+            "hs_index",
+            "listener",
+        ):
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                helper("_destroy_assert_witness")(
+                    self, dict(record, **{field: record[field] + 1}), record, "freed"
+                )
+        for field, value in (
+            ("overflow", 1),
+            ("remaining", 1),
+            ("cert_before", 0),
+            ("app_after", 1),
+            ("cert_after", 1),
+            ("cert_rv", -1),
+            ("detach_rv", -1),
+        ):
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                helper("_destroy_assert_witness")(
+                    self, dict(record, **{field: value}), record, "freed"
+                )
+
+    def test_destroy_cleanup_ack_and_last_detach_order_are_required(self):
+        record = self.witness()
+        for before, after in (
+            ("reset", "transport"),
+            ("transport", "cleanup"),
+            ("cleanup", "done"),
+            ("done", "ack"),
+            ("ack", "detach"),
+            ("detach", "cert_delete"),
+            ("cert_delete", "freed"),
+        ):
+            with self.subTest(after=after), self.assertRaises(AssertionError):
+                helper("_destroy_assert_witness")(
+                    self, dict(record, **{after: record[before]}), record, "freed"
+                )
+
+    def test_destroy_held_owner_cannot_claim_cleanup_or_detach(self):
+        record = self.witness(held=True)
+        for field in ("done", "ack", "cleanup", "detach", "cert_delete", "freed"):
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                helper("_destroy_assert_witness")(
+                    self, dict(record, **{field: 12}), record, "held"
+                )
+
+    def test_destroy_static_slots_and_post_atomic_lifetime(self):
+        source = (ROOT / "src/plugins/http_static/static_server.c").read_text()
+        ledger = source.split("#define HSS_DESTROY_RECORDS", 1)[1].split(
+            "static u64\nhss_destroy_sequence", 1
+        )[0]
+        self.assertIn("records[HSS_DESTROY_RECORDS]", ledger)
+        self.assertIn("owners[HSS_DESTROY_OWNERS]", ledger)
+        self.assertNotIn("*", ledger)
+        self.assertIn("u32 enabled;", ledger)
+        owner = source.split("\nhss_destroy_sessions (", 1)[1].split(
+            "\nstatic uword", 1
+        )[0]
+        tail = owner.split("remaining = clib_atomic_sub_fetch", 1)[1]
+        tail = tail.split("#else", 1)[0].split(";", 1)[1]
+        self.assertNotIn("ctx->", tail)
+        self.assertNotIn("hss_destroy_record (ctx)", tail)
+        self.assertIn("owner->remaining = remaining", tail)
+        self.assertLess(owner.index("owner->gate"), owner.index("session_reset (s)"))
+        self.assertLess(owner.index("hss_session_cleanup (hs)"), owner.index("owner->done ="))
+        self.assertLess(owner.index("owner->done ="), owner.index("clib_atomic_sub_fetch"))
+
+    def test_destroy_clear_checks_all_inflight_and_teardown_releases_first(self):
+        source = (ROOT / "src/plugins/http_static/static_server.c").read_text()
+        inflight = source.split("\nhss_destroy_inflight (", 1)[1].split("#endif", 1)[0]
+        self.assertIn("hss_async_pending_detaches", inflight)
+        self.assertIn("vec_len (hss_pending_destroys[i])", inflight)
+        command = source.split("\nhss_destroy_command_fn (", 1)[1].split(
+            "\nVLIB_CLI_COMMAND", 1
+        )[0]
+        clear = command.split('if (unformat (input, "clear"))', 1)[1].split(
+            'if (unformat (input, "release all"))', 1
+        )[0]
+        self.assertLess(clear.index("hss_destroy_inflight"), clear.index("clib_memset"))
+        worker = next(
+            owner
+            for owner in SUITE.body
+            if isinstance(owner, ast.ClassDef)
+            and owner.name == "TestHttpStaticCliWorker"
+        )
+        teardown = next(
+            node for node in worker.body if getattr(node, "name", None) == "_destroy_teardown"
+        )
+        text = ast.unparse(teardown)
+        self.assertLess(text.index("release all"), text.index("_stop_client"))
+        self.assertLess(text.index("release all"), text.index("server disable"))
+        test = next(
+            node
+            for node in worker.body
+            if getattr(node, "name", None) == "test_http_static_destroy_owner_generations"
+        )
+        text = ast.unparse(test)
+        self.assertIn("(301, 302)", text)
+        self.assertIn("(302, 301)", text)
+        self.assertIn("pending=True", text)
+        self.assertIn("_assert_closed", text)
+
+
 if __name__ == "__main__":
     unittest.main()

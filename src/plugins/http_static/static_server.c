@@ -1573,11 +1573,122 @@ typedef struct
   u32 app_index;
   u32 ckpair_index;
   u32 pending_threads;
+#if CLIB_DEBUG > 0
+  u32 observation;
+  u64 observation_epoch;
+#endif
 } hss_destroy_ctx_t;
 
 static hss_destroy_ctx_t ***hss_pending_destroys;
 #if CLIB_DEBUG > 0
 static u32 hss_async_pending_detaches;
+
+#define HSS_DESTROY_RECORDS 2
+#define HSS_DESTROY_OWNERS  2
+
+typedef struct
+{
+  u64 handle;
+  u64 held;
+  u64 reset;
+  u64 transport;
+  u64 cleanup;
+  u64 done;
+  u64 ack;
+  u32 hs_index;
+  u32 listener;
+  u32 captured;
+  u32 resets;
+  u32 transports;
+  u32 cleanups;
+  u32 remaining;
+  u32 gate;
+} hss_destroy_owner_t;
+
+typedef struct
+{
+  hss_destroy_owner_t owners[HSS_DESTROY_OWNERS];
+  u64 epoch;
+  u64 published;
+  u64 detach;
+  u64 cert_delete;
+  u64 freed;
+  u32 token;
+  u32 generation;
+  u32 app;
+  u32 cert;
+  u32 bound;
+  u32 overflow;
+  u32 app_before;
+  u32 app_after;
+  u32 cert_before;
+  u32 cert_after;
+  int detach_rv;
+  int cert_rv;
+} hss_destroy_record_t;
+
+static struct
+{
+  hss_destroy_record_t records[HSS_DESTROY_RECORDS];
+  u64 sequence;
+  u64 epoch;
+  u32 enabled;
+  u32 count;
+} hss_destroy_test;
+
+static u64
+hss_destroy_sequence (void)
+{
+  return clib_atomic_add_fetch (&hss_destroy_test.sequence, 1);
+}
+
+static hss_destroy_record_t *
+hss_destroy_record (hss_destroy_ctx_t *ctx)
+{
+  hss_destroy_record_t *record;
+
+  if (!hss_destroy_test.enabled || ctx->observation >= HSS_DESTROY_RECORDS)
+    return 0;
+  record = &hss_destroy_test.records[ctx->observation];
+  if (record->epoch != ctx->observation_epoch)
+    return 0;
+  return record;
+}
+
+static void
+hss_destroy_bind (hss_destroy_ctx_t *ctx)
+{
+  hss_destroy_record_t *record;
+  u32 i;
+
+  ctx->observation = ~0;
+  if (!hss_destroy_test.enabled)
+    return;
+  for (i = 0; i < hss_destroy_test.count; i++)
+    {
+      record = &hss_destroy_test.records[i];
+      if (record->app != ctx->app_index || record->bound)
+	continue;
+      record->bound = 1;
+      record->published = hss_destroy_sequence ();
+      ctx->observation = i;
+      ctx->observation_epoch = record->epoch;
+      return;
+    }
+}
+
+static u32
+hss_destroy_inflight (void)
+{
+  u32 i;
+
+  if (hss_async_pending_detaches)
+    return 1;
+  for (i = 0; i < vec_len (hss_pending_destroys); i++)
+    if (vec_len (hss_pending_destroys[i]))
+      return 1;
+  return 0;
+}
 #endif
 
 static void
@@ -1588,12 +1699,37 @@ hss_detach_rpc (void *arg)
   int rv;
 
   ASSERT (vlib_thread_is_main_w_barrier ());
+#if CLIB_DEBUG > 0
+  hss_destroy_record_t *record = hss_destroy_record (ctx);
+  int cert_rv;
+
+  if (record)
+    {
+      record->app_before = application_get_if_valid (ctx->app_index) != 0;
+      record->cert_before = app_cert_key_pair_get_if_valid (ctx->ckpair_index) != 0;
+      record->detach = hss_destroy_sequence ();
+    }
+#endif
   rv = vnet_application_detach (&da);
   if (rv)
     clib_warning ("failed to detach http_static app %u", ctx->app_index);
+#if CLIB_DEBUG > 0
+  cert_rv = vnet_app_del_cert_key_pair (ctx->ckpair_index);
+  if (record)
+    {
+      record->detach_rv = rv;
+      record->cert_rv = cert_rv;
+      record->cert_delete = hss_destroy_sequence ();
+      record->app_after = application_get_if_valid (ctx->app_index) != 0;
+      record->cert_after = app_cert_key_pair_get_if_valid (ctx->ckpair_index) != 0;
+    }
+#else
   vnet_app_del_cert_key_pair (ctx->ckpair_index);
+#endif
   clib_mem_free (ctx);
 #if CLIB_DEBUG > 0
+  if (record)
+    record->freed = hss_destroy_sequence ();
   if (!rv)
     hss_async_pending_detaches--;
 #endif
@@ -1609,6 +1745,19 @@ hss_destroy_sessions (hss_destroy_ctx_t *ctx)
   hss_session_t *hs;
   session_t *s;
   u8 pending = 0;
+#if CLIB_DEBUG > 0
+  hss_destroy_record_t *record = hss_destroy_record (ctx);
+  hss_destroy_owner_t *owner =
+    record && thread_index < HSS_DESTROY_OWNERS ? &record->owners[thread_index] : 0;
+  u32 remaining;
+
+  if (owner && owner->gate)
+    {
+      if (!owner->held)
+	owner->held = hss_destroy_sequence ();
+      return 0;
+    }
+#endif
 
   pool_foreach (map, app->worker_maps)
     {
@@ -1625,15 +1774,56 @@ hss_destroy_sessions (hss_destroy_ctx_t *ctx)
       if (hs->app_index != ctx->app_index)
 	continue;
       s = session_get_from_handle (hs->vpp_session_handle);
+#if CLIB_DEBUG > 0
+      if (owner && (owner->handle != hs->vpp_session_handle ||
+		    owner->hs_index != hs->session_index || owner->listener != hs->listener_index))
+	clib_atomic_fetch_or (&record->overflow, 1);
+#endif
       s->opaque = ~0;
       session_reset (s);
+#if CLIB_DEBUG > 0
+      if (owner)
+	{
+	  owner->resets++;
+	  owner->reset = hss_destroy_sequence ();
+	}
+#endif
       /* A queued reset does not stop HTTP from reading response pointers. */
       if (s->session_state < SESSION_STATE_TRANSPORT_CLOSED)
-	transport_reset (session_get_transport_proto (s), s->connection_index, thread_index);
+	{
+	  transport_reset (session_get_transport_proto (s), s->connection_index, thread_index);
+#if CLIB_DEBUG > 0
+	  if (owner)
+	    {
+	      owner->transports++;
+	      owner->transport = hss_destroy_sequence ();
+	    }
+#endif
+	}
       hss_session_cleanup (hs);
+#if CLIB_DEBUG > 0
+      if (owner)
+	{
+	  owner->cleanups++;
+	  owner->cleanup = hss_destroy_sequence ();
+	}
+#endif
     }
 
+#if CLIB_DEBUG > 0
+  if (owner)
+    owner->done = hss_destroy_sequence ();
+  /* Cache the static owner slot before the last ACK can release ctx. */
+  remaining = clib_atomic_sub_fetch (&ctx->pending_threads, 1);
+  if (owner)
+    {
+      owner->remaining = remaining;
+      owner->ack = hss_destroy_sequence ();
+    }
+  if (remaining == 0)
+#else
   if (clib_atomic_sub_fetch (&ctx->pending_threads, 1) == 0)
+#endif
     vlib_rpc_call_main_thread (hss_detach_rpc, (u8 *) &ctx, sizeof (ctx));
   return 1;
 }
@@ -1693,6 +1883,9 @@ hss_destroy (vlib_main_t *vm)
   *ctx = (hss_destroy_ctx_t) { .app_index = hsm->app_index,
 			       .ckpair_index = hsm->ckpair_index,
 			       .pending_threads = vec_len (hsm->sessions) };
+#if CLIB_DEBUG > 0
+  hss_destroy_bind (ctx);
+#endif
   clib_memset (&hsm->default_listener, 0, sizeof (hsm->default_listener));
   hsm->default_listener_index = ~0;
   hsm->have_default_listener = 0;
@@ -1713,6 +1906,133 @@ hss_destroy (vlib_main_t *vm)
 }
 
 #if CLIB_DEBUG > 0
+static void
+hss_destroy_status (vlib_main_t *vm, hss_destroy_record_t *record, u32 thread)
+{
+  hss_destroy_owner_t *owner = &record->owners[thread];
+
+  vlib_cli_output (
+    vm,
+    "token %u enabled %u overflow %u epoch %llu generation %u app %u cert %u "
+    "bound %u published %llu detach %llu cert_delete %llu freed %llu "
+    "app_before %u app_after %u cert_before %u cert_after %u detach_rv %d cert_rv %d "
+    "app_live %u cert_live %u inflight %u thread %u handle %llu hs_index %u listener %u "
+    "captured %u gate %u held %llu reset %llu transport %llu cleanup %llu done %llu "
+    "ack %llu remaining %u resets %u transports %u cleanups %u",
+    record->token, hss_destroy_test.enabled, record->overflow, record->epoch, record->generation,
+    record->app, record->cert, record->bound, record->published, record->detach,
+    record->cert_delete, record->freed, record->app_before, record->app_after, record->cert_before,
+    record->cert_after, record->detach_rv, record->cert_rv,
+    record->freed ? record->app_after : application_get_if_valid (record->app) != 0,
+    record->freed ? record->cert_after : app_cert_key_pair_get_if_valid (record->cert) != 0,
+    hss_destroy_inflight (), thread, owner->handle, owner->hs_index, owner->listener,
+    owner->captured, owner->gate, owner->held, owner->reset, owner->transport, owner->cleanup,
+    owner->done, owner->ack, owner->remaining, owner->resets, owner->transports, owner->cleanups);
+}
+
+static clib_error_t *
+hss_destroy_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  hss_destroy_record_t *record;
+  hss_destroy_record_t armed = {};
+  hss_destroy_owner_t *owner;
+  hss_session_t *hs;
+  u32 token, thread, i;
+
+  ASSERT (vlib_thread_is_main_w_barrier ());
+  if (unformat (input, "start"))
+    {
+      if (hss_destroy_test.enabled || hss_destroy_inflight () || vlib_num_workers () != 1)
+	return clib_error_return (0, "destroy start requires idle main and one worker");
+      hss_destroy_test.enabled = 1;
+      return 0;
+    }
+  if (!hss_destroy_test.enabled)
+    return clib_error_return (0, "destroy observation disabled");
+  if (unformat (input, "clear"))
+    {
+      if (hss_destroy_inflight ())
+	return clib_error_return (0, "destroy clear requires all owners and detach RPCs drained");
+      clib_memset (&hss_destroy_test, 0, sizeof (hss_destroy_test));
+      return 0;
+    }
+  if (unformat (input, "release all"))
+    {
+      for (i = 0; i < hss_destroy_test.count; i++)
+	hss_destroy_test.records[i].owners[1].gate = 0;
+      vlib_node_set_interrupt_pending (vlib_get_main_by_index (1), hss_destroy_node.index);
+      return 0;
+    }
+  if (unformat (input, "arm %u", &token))
+    {
+      if (!token || !hss_main.is_init || hss_destroy_test.count == HSS_DESTROY_RECORDS ||
+	  vec_len (hss_main.sessions) != HSS_DESTROY_OWNERS)
+	return clib_error_return (0, "destroy arm requires a live app and a free record");
+      for (i = 0; i < hss_destroy_test.count; i++)
+	if (hss_destroy_test.records[i].token == token ||
+	    hss_destroy_test.records[i].app == hss_main.app_index)
+	  return clib_error_return (0, "destroy identity already armed");
+      armed.token = token;
+      armed.app = hss_main.app_index;
+      armed.cert = hss_main.ckpair_index;
+      armed.generation = hss_main.app_generation - 1;
+      for (thread = 0; thread < HSS_DESTROY_OWNERS; thread++)
+	{
+	  owner = &armed.owners[thread];
+	  pool_foreach (hs, hss_main.sessions[thread])
+	    {
+	      if (hs->app_index != armed.app)
+		continue;
+	      if (owner->captured++)
+		return clib_error_return (0, "destroy observation permits one session per owner");
+	      owner->handle = hs->vpp_session_handle;
+	      owner->hs_index = hs->session_index;
+	      owner->listener = hs->listener_index;
+	    }
+	}
+      if (armed.owners[1].captured != 1)
+	return clib_error_return (0, "destroy arm requires a real worker session");
+      armed.epoch = ++hss_destroy_test.epoch;
+      armed.owners[1].gate = 1;
+      hss_destroy_test.records[hss_destroy_test.count++] = armed;
+      return 0;
+    }
+  if (unformat (input, "status %u owner %u", &token, &thread))
+    {
+      if (thread >= HSS_DESTROY_OWNERS)
+	return clib_error_return (0, "destroy owner out of range");
+      for (i = 0; i < hss_destroy_test.count; i++)
+	{
+	  record = &hss_destroy_test.records[i];
+	  if (record->token == token)
+	    {
+	      hss_destroy_status (vm, record, thread);
+	      return 0;
+	    }
+	}
+      return clib_error_return (0, "destroy token unavailable");
+    }
+  if (unformat (input, "release %u", &token))
+    {
+      for (i = 0; i < hss_destroy_test.count; i++)
+	if (hss_destroy_test.records[i].token == token)
+	  {
+	    hss_destroy_test.records[i].owners[1].gate = 0;
+	    vlib_node_set_interrupt_pending (vlib_get_main_by_index (1), hss_destroy_node.index);
+	    return 0;
+	  }
+      return clib_error_return (0, "destroy token unavailable");
+    }
+  return clib_error_return (0, "unknown destroy observation command");
+}
+
+VLIB_CLI_COMMAND (hss_destroy_command, static) = {
+  .path = "test http static destroy",
+  .short_help = "test http static destroy start|arm <token>|status <token> owner <0|1>|"
+		"release <token>|release all|clear",
+  .function = hss_destroy_command_fn,
+};
+
 static u32
 hss_accept_capture_count (void)
 {

@@ -874,6 +874,187 @@ class TestHttpStaticCliWorker(TestHttpStaticCli):
 
     vpp_worker_count = 1
 
+    def _destroy_cli(self, command):
+        reply = self.vapi.cli_return_response(f"test http static destroy {command}")
+        self.assertEqual(reply.retval, 0, reply.reply)
+        return reply.reply
+
+    def _destroy_status(self, token, owner):
+        output = self._destroy_cli(f"status {token} owner {owner}")
+        fields = (
+            "token enabled overflow epoch generation app cert bound published detach "
+            "cert_delete freed app_before app_after cert_before cert_after detach_rv "
+            "cert_rv app_live cert_live inflight thread handle hs_index listener captured "
+            "gate held reset transport cleanup done ack remaining resets transports cleanups"
+        ).split()
+        parts = output.split()
+        self.assertEqual(parts[::2], fields, output)
+        return dict(zip(fields, map(int, parts[1::2])))
+
+    def _destroy_wait(self, token, owner, field):
+        deadline = time.monotonic() + 10
+        while True:
+            record = self._destroy_status(token, owner)
+            if record[field] or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        self.assertGreater(record[field], 0, record)
+        return record
+
+    def _destroy_assert_witness(self, record, identity, phase):
+        for field in (
+            "token",
+            "epoch",
+            "generation",
+            "app",
+            "cert",
+            "thread",
+            "handle",
+            "hs_index",
+            "listener",
+            "captured",
+        ):
+            self.assertEqual(record[field], identity[field], (field, record, identity))
+        self.assertEqual(record["enabled"], 1, record)
+        self.assertEqual(record["overflow"], 0, record)
+        self.assertEqual(record["bound"], 1, record)
+        self.assertGreater(record["published"], 0, record)
+        self.assertIn(phase, ("held", "freed"))
+        if record["thread"] == 1:
+            self.assertEqual(record["captured"], 1, record)
+            self.assertEqual(record["handle"] >> 32, 1, record)
+            self.assertLess(record["published"], record["held"], record)
+        if phase == "held":
+            for field in ("detach", "cert_delete", "freed"):
+                self.assertEqual(record[field], 0, (field, record))
+            self.assertEqual(record["app_live"], 1, record)
+            self.assertEqual(record["cert_live"], 1, record)
+            self.assertEqual(record["inflight"], 1, record)
+            if record["thread"] == 1:
+                self.assertEqual(record["gate"], 1, record)
+                for field in ("reset", "transport", "cleanup", "done", "ack"):
+                    self.assertEqual(record[field], 0, (field, record))
+                for field in ("resets", "transports", "cleanups"):
+                    self.assertEqual(record[field], 0, (field, record))
+                return
+            self.assertEqual(record["remaining"], 1, record)
+        else:
+            for field in ("app_before", "cert_before"):
+                self.assertEqual(record[field], 1, (field, record))
+            for field in (
+                "app_after",
+                "cert_after",
+                "app_live",
+                "cert_live",
+                "detach_rv",
+                "cert_rv",
+                "gate",
+            ):
+                self.assertEqual(record[field], 0, (field, record))
+            self.assertLess(record["ack"], record["detach"], record)
+            self.assertLess(record["detach"], record["cert_delete"], record)
+            self.assertLess(record["cert_delete"], record["freed"], record)
+            self.assertEqual(record["remaining"], int(record["thread"] == 0), record)
+        self.assertLess(record["published"], record["done"], record)
+        self.assertLess(record["done"], record["ack"], record)
+        self.assertEqual(record["resets"], record["captured"], record)
+        self.assertEqual(record["cleanups"], record["captured"], record)
+        if record["captured"]:
+            self.assertEqual(record["transports"], 1, record)
+            self.assertGreater(record["reset"], record["published"], record)
+            if record["thread"] == 1:
+                self.assertLess(record["held"], record["reset"], record)
+            for before, after in zip(
+                ("reset", "transport", "cleanup"), ("transport", "cleanup", "done")
+            ):
+                self.assertLess(record[before], record[after], (before, after, record))
+        else:
+            self.assertEqual(record["transports"], 0, record)
+
+    def _destroy_teardown(self):
+        with self.subTest(cleanup="release destroy owners"):
+            self._destroy_cli("release all")
+        for client in self._destroy_clients:
+            with self.subTest(cleanup="stop destroy client"):
+                self._stop_client(client)
+        with self.subTest(cleanup="disable destroy server"):
+            self.vapi.cli("http static server disable")
+        with self.subTest(cleanup="drain destroy owners and detach RPCs"):
+            deadline = time.monotonic() + 10
+            while True:
+                reply = self.vapi.cli_return_response("test http static destroy clear")
+                if reply.retval == 0:
+                    break
+                self.assertIn("all owners and detach RPCs drained", reply.reply)
+                self.assertLess(time.monotonic(), deadline, reply.reply)
+                time.sleep(0.01)
+
+    def test_http_static_destroy_owner_generations(self):
+        """Two real worker responses retain distinct destroy owners until release."""
+        if config.vpp_tag != "vpp_debug":
+            self.skipTest("destroy owner ledger requires debug VPP")
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        with open(os.path.join(root.name, "large.txt"), "wb") as output:
+            output.write(b"x" * (8 << 20))
+        self._destroy_cli("start")
+        self._destroy_clients = []
+        self.addCleanup(self._destroy_teardown)
+        identities = {}
+        pending = {}
+        for token in (301, 302):
+            self.vapi.cli(
+                f"http static server uri http://10.10.1.2:8094 www-root {root.name}"
+            )
+            client = self._client(8094, "/large.txt", pending=True)
+            self._destroy_clients.append(client)
+            response = self._response(client)
+            self.assertEqual(response["status"], 200)
+            self._destroy_cli(f"arm {token}")
+            identities[token] = {
+                owner: self._destroy_status(token, owner) for owner in (0, 1)
+            }
+            self.assertEqual(
+                response["server"],
+                f"http_static_server_{identities[token][1]['generation']}",
+            )
+            pending[token] = client
+            self.vapi.cli("http static server disable")
+            self._destroy_wait(token, 0, "ack")
+            self._destroy_wait(token, 1, "held")
+            for retained in identities:
+                for owner in (0, 1):
+                    self._destroy_assert_witness(
+                        self._destroy_status(retained, owner),
+                        identities[retained][owner],
+                        "held",
+                    )
+        for field in ("epoch", "generation", "app", "cert", "handle"):
+            self.assertNotEqual(
+                identities[301][1][field], identities[302][1][field], field
+            )
+        self.vapi.cli("http static server uri http://10.10.1.2:8094 url-handlers")
+        active = self._client(8094)
+        self._destroy_clients.append(active)
+        self.assertEqual(self._response(active)["status"], 200)
+        for token in (302, 301):
+            self._destroy_cli(f"release {token}")
+            self._destroy_wait(token, 1, "freed")
+            for owner in (0, 1):
+                self._destroy_assert_witness(
+                    self._destroy_status(token, owner), identities[token][owner], "freed"
+                )
+            self._assert_closed(self._response(pending[token], "drain"))
+            if token == 302:
+                for owner in (0, 1):
+                    self._destroy_assert_witness(
+                        self._destroy_status(301, owner), identities[301][owner], "held"
+                    )
+        fresh = self._client(8094)
+        self._destroy_clients.append(fresh)
+        self.assertEqual(self._response(fresh)["status"], 200)
+        self.assertEqual(self._destroy_status(301, 0)["inflight"], 0)
+
     def _accepted_cli(self, command):
         reply = self.vapi.cli_return_response(f"test http static accepted {command}")
         self.assertEqual(reply.retval, 0, reply.reply)
