@@ -1027,22 +1027,30 @@ jobs:
                   report["job_step_timestamps"] = "VERIFIED: GitHub API actual completed execution job and every step"
               raw = fetch("/actions/jobs/" + str(job["id"]) + "/logs", output / "job.log")
               logs = raw.decode(errors="replace")
-              block = re.search(r"##\[group\]Initialize containers(.*?)(?:##\[endgroup\])", logs, re.S)
-              if block is None:
-                  raise RuntimeError("Actual container initialization log unavailable; identity UNVERIFIED")
-              initialization = block.group(1)
+              blocks = re.findall(r"##\[group\]Starting job container\r?\n(.*?)##\[endgroup\]", logs, re.S)
+              if len(blocks) != 1 or "##[group]" in blocks[0]:
+                  raise RuntimeError("Actual container initialization log unavailable or ambiguous; identity UNVERIFIED")
+              initialization = blocks[0]
               (output / "container-initialization.log").write_text(initialization)
-              pull = re.search(r"docker pull debian:trixie\s*\n(.*?)(?=\[command\]|$)", initialization, re.S)
-              create = re.search(r"docker create [^\n]* debian:trixie[^\n]*\n[^\n]*?\b([0-9a-f]{64})\s*\n", initialization)
-              image_digest = re.findall(r"Digest: (sha256:[0-9a-f]{64})", pull.group(1)) if pull else []
-              if len(image_digest) != 1 or create is None:
+              normalized = re.sub(r"(?m)^\d{4}-\d{2}-\d{2}T[0-9:.]+Z ", "", initialization).replace("\r\n", "\n")
+              commands = re.findall(r"^##\[command\]([^\n]+)\n(.*?)(?=^##\[command\]|\Z)", normalized, re.M | re.S)
+              bindings = [(command, result) for command, result in commands
+                          if re.match(r"/usr/bin/docker (?:pull|create|start)(?: |$)", command)]
+              if len(bindings) != 3 or bindings[0][0] != "/usr/bin/docker pull debian:trixie":
+                  raise RuntimeError("Actual pull/create/start sequence UNVERIFIED")
+              pull, create, start = bindings
+              image_digest = re.findall(r"^Digest: (sha256:[0-9a-f]{64})$", pull[1], re.M)
+              if (len(image_digest) != 1
+                      or re.findall(r"^Digest: (sha256:[0-9a-f]{64})$", normalized, re.M) != image_digest
+                      or not re.fullmatch(r'/usr/bin/docker create [^\n]+ debian:trixie "-f" "/dev/null"', create[0])
+                      or not re.fullmatch(r"[0-9a-f]{64}", create[1].strip())):
                   raise RuntimeError("Actual pull digest/create container binding UNVERIFIED")
-              container_id = create.group(1)
-              if not re.search(r"docker start " + container_id + r"\b", initialization):
+              container_id = create[1].strip()
+              if start[0] != "/usr/bin/docker start " + container_id or start[1].strip() != container_id:
                   raise RuntimeError("Actual container start identity UNVERIFIED")
               report["container_identity"] = {"status": "VERIFIED", "actual_digest": image_digest[0],
                   "container_id": container_id, "requested_tag": "debian:trixie",
-                  "source": "Same execution job Initialize containers pull/digest/create/start records",
+                  "source": "Same execution job Starting job container pull/digest/create/start records",
                   "raw_log_sha256": sha(raw), "initialization_sha256": sha(initialization.encode())}
               if os.environ["EXECUTION_RESULT"] != "success" or job.get("conclusion") != "success":
                   issues.append("Positive execution job did not succeed")
