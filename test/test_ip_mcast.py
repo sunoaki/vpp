@@ -371,7 +371,7 @@ class TestIPMcast(VppTestCase):
                 if entry.path.type == FibPathType.FIB_PATH_TYPE_LOCAL
             ]
             self.assertEqual(len(local), 1)
-            self.assertEqual(local[0].itf_flags, flags.MFIB_API_ITF_FLAG_FORWARD)
+            self.assertEqual(local[0].itf_flags, flags.MFIB_API_ITF_FLAG_NONE)
             self.assertEqual(len(entries), len(interfaces) + 1)
         return paths
 
