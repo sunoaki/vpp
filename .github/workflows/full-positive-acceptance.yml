@@ -335,16 +335,111 @@ jobs:
               return {"path": str(path), "sha256": digest(path.read_bytes()), "size": info.st_size,
                       "inode": info.st_ino, "major": os.major(info.st_dev), "minor": os.minor(info.st_dev)}
 
+          def install_layout(cache, manifest, config, install, report):
+              keys = ["CMAKE_INSTALL_PREFIX", "VPP_LIBRARY_DIR", "CMAKE_INSTALL_LIBDIR"]
+              values = {key: [] for key in keys}
+              for line in cache.splitlines():
+                  match = re.fullmatch(r"([^:#=]+):[^=]+=(.*)", line)
+                  if match and match.group(1) in values:
+                      values[match.group(1)].append(match.group(2))
+              report["cache_values"] = values
+              if any(len(values[key]) != 1 for key in keys[:2]) or len(values[keys[2]]) > 1:
+                  raise RuntimeError("Missing or duplicate install cache key")
+              prefix, library = [values[key][0] for key in keys[:2]]
+              generated = re.findall(r'^#define CLIB_LIB_DIR "([^"\n]+)"$', config, re.M)
+              report["generated_library_dirs"] = generated
+              report["cmake_install_libdir"] = "cached" if values[keys[2]] else "normal variable not cached; generated CLIB_LIB_DIR cross-check required"
+              if prefix != str(install):
+                  raise RuntimeError("Install prefix differs from fixed candidate root")
+              relative = Path(library)
+              if (not library or relative.is_absolute() or ".." in relative.parts
+                      or str(relative) != library or library == "."
+                      or generated != [library] or values[keys[2]] not in ([], [library])):
+                  raise RuntimeError("Noncanonical or conflicting install library directory")
+              selected = {}
+              for name in ["linux_nl_plugin.so", "linux_cp_unittest_plugin.so"]:
+                  expected = install / relative / "vpp_plugins" / name
+                  matches = [line for line in manifest.splitlines() if Path(line).name == name]
+                  report["plugins"][name] = {"query": str(expected), "manifest_paths": matches,
+                      "manifest_count": len(matches)}
+                  if matches != [str(expected)]:
+                      raise RuntimeError("Missing, duplicate or conflicting install manifest entry: " + name)
+                  selected[name] = expected
+              return selected
+
+          def installed_plugins():
+              install = candidate / "build-root/install-vpp_debug-native/vpp"
+              build = candidate / "build-root/build-vpp_debug-native/vpp"
+              report = {"status": "INCOMPLETE", "identity": attribution(), "install_root": str(install),
+                        "plugins": {}, "inputs": [], "skipped_directory_links": []}
+              evidence = root / "install-layout"
+              evidence.mkdir()
+              reserve(65536)
+              try:
+                  for name in ["CMakeCache.txt", "install_manifest.txt", "CMakeFiles/vppinfra/config.h"]:
+                      source = build / name
+                      record = {"path": str(source), "status": "PENDING"}
+                      report["inputs"].append(record)
+                      if not source.resolve().is_relative_to(build.resolve()):
+                          raise RuntimeError("Install metadata resolves outside fresh build root: " + name)
+                      record.update(copy_file(source, evidence / name, required=True))
+                      if record["status"] != "copied":
+                          raise RuntimeError("Required install metadata not archived: " + name)
+                  selected = install_layout((evidence / "CMakeCache.txt").read_text(),
+                      (evidence / "install_manifest.txt").read_text(),
+                      (evidence / "CMakeFiles/vppinfra/config.h").read_text(), install, report)
+                  if install.is_symlink() or not install.is_dir():
+                      raise RuntimeError("Unsafe or missing fixed installation root")
+                  resolved_root = install.resolve(strict=True)
+                  if resolved_root != install:
+                      raise RuntimeError("Fixed installation root resolves through an alias")
+                  found = {name: set() for name in selected}
+                  def walk_error(error):
+                      raise error
+                  for directory, directories, filenames in os.walk(install, followlinks=False, onerror=walk_error):
+                      for name in directories + filenames:
+                          path = Path(directory) / name
+                          if name in found:
+                              found[name].add(path)
+                      for name in directories:
+                          path = Path(directory) / name
+                          if path.is_symlink():
+                              report["skipped_directory_links"].append(str(path))
+                  for name, expected in selected.items():
+                      if expected.exists() or expected.is_symlink():
+                          found[name].add(expected)
+                      paths = sorted(found[name])
+                      item = report["plugins"][name]
+                      item.update(found_count=len(paths), found_paths=[str(path) for path in paths],
+                                  resolved_paths=[])
+                      for path in paths:
+                          resolved = path.resolve(strict=True)
+                          item["resolved_paths"].append(str(resolved))
+                          if not resolved.is_relative_to(resolved_root) or not resolved.is_file():
+                              raise RuntimeError("External or nonregular installed plugin: " + name)
+                      if paths != [expected]:
+                          raise RuntimeError("Missing, duplicate or conflicting installed plugin: " + name)
+                      directory = expected.parent.resolve(strict=True)
+                      if not directory.is_relative_to(resolved_root) or not directory.is_dir():
+                          raise RuntimeError("External plugin directory: " + name)
+                      selected[name] = expected.resolve(strict=True)
+                  report["status"] = "PASS"
+                  return selected
+              except Exception as error:
+                  report.update(status="FAIL/INCOMPLETE", error=str(error))
+                  raise
+              finally:
+                  payload = (json.dumps(report, indent=2) + "\n").encode()
+                  reserve(len(payload))
+                  (evidence / "discovery.json").write_bytes(payload)
+
           def elf():
               install = candidate / "build-root/install-vpp_debug-native/vpp"
+              selected = installed_plugins()
               files = {}
-              for name in ["linux_nl_plugin.so", "linux_cp_unittest_plugin.so"]:
-                  paths = [install / lib / "vpp_plugins" / name for lib in ["lib", "lib64"]]
-                  paths = list({p.resolve() for p in paths if p.is_file()})
-                  if len(paths) != 1 or not paths[0].is_relative_to(install.resolve()):
-                      raise RuntimeError(f"Ambiguous or external installed plugin: {name}")
-                  files[name] = file_identity(paths[0])
-                  notes = subprocess.check_output(["readelf", "-n", str(paths[0])])
+              for name, path in selected.items():
+                  files[name] = file_identity(path)
+                  notes = subprocess.check_output(["readelf", "-n", str(path)])
                   (root / (name + ".notes.txt")).write_bytes(notes)
                   match = re.search(rb"Build ID: (\w+)", notes)
                   files[name]["build_id"] = match.group(1).decode() if match else None
