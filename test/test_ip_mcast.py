@@ -15,6 +15,7 @@ from vpp_ip_route import (
 )
 from vpp_gre_interface import VppGreInterface
 from vpp_lo_interface import VppLoInterface
+from vpp_neighbor import find_nbr
 from vpp_papi import VppEnum
 from config import config
 
@@ -431,6 +432,17 @@ class TestIPMcast(VppTestCase):
             if address.prefix in prefixes:
                 address.remove_vpp_config()
 
+    def mfib_restore_ip4_neighbor(self):
+        self.pg0.resolve_arp()
+        self.assertTrue(
+            find_nbr(
+                self,
+                self.pg0.sw_if_index,
+                self.pg0.remote_ip4,
+                mac=self.pg0.remote_mac,
+            )
+        )
+
     def mfib_address_removal(self, baseline, extras, remove_index):
         addresses = [
             VppIpInterfaceAddress(self, self.pg0, address, 24) for address in extras
@@ -462,6 +474,7 @@ class TestIPMcast(VppTestCase):
             self.mfib_remove_addresses(addresses)
         self.mfib_assert_addresses(self.pg0, [self.pg0.local_ip4_prefix])
         self.mfib_assert_special_paths(baseline)
+        self.mfib_restore_ip4_neighbor()
 
     def test_mfib_ip4_address_lifetime(self):
         """IPv4 special ACCEPT survives removal of any non-final address"""
@@ -483,6 +496,16 @@ class TestIPMcast(VppTestCase):
         finally:
             self.pg0.admin_up()
         self.mfib_assert_special_paths(baseline)
+        self.mfib_restore_ip4_neighbor()
+        self.pg0.resolve_ndp()
+        self.assertTrue(
+            find_nbr(
+                self,
+                self.pg0.sw_if_index,
+                self.pg0.remote_ip6,
+                mac=self.pg0.remote_mac,
+            )
+        )
         self.assertEqual(self.mfib_fib_pool_counts(), pools)
 
     def mfib_rebound_addresses(self, baseline):
@@ -531,8 +554,9 @@ class TestIPMcast(VppTestCase):
             self.pg0.set_table_ip4(0)
             if not self.pg0.has_ip4_config:
                 self.pg0.config_ip4()
-        self.mfib_assert_addresses(self.pg0, [self.pg0.local_ip4_prefix])
-        self.mfib_assert_special_paths(baseline)
+            self.mfib_assert_addresses(self.pg0, [self.pg0.local_ip4_prefix])
+            self.mfib_assert_special_paths(baseline)
+            self.mfib_restore_ip4_neighbor()
         self.assertEqual(self.mfib_fib_pool_counts(), pools)
 
     def mfib_delete_addressed_loopback(self, baseline, table_id):
