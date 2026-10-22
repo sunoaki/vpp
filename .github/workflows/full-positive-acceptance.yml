@@ -168,7 +168,13 @@ jobs:
                   record["status"] = "required-limit-INCOMPLETE" if required else "omitted-optional-limit"
                   return record
               destination.parent.mkdir(parents=True, exist_ok=True)
-              shutil.copyfile(source, destination, follow_symlinks=False)
+              if (not destination.parent.resolve().is_relative_to(root.resolve())
+                      or destination.is_symlink() or destination.exists()):
+                  raise RuntimeError("Unsafe or existing evidence destination: " + str(destination))
+              with source.open("rb") as reader, destination.open("xb") as writer:
+                  shutil.copyfileobj(reader, writer)
+              if destination.stat().st_size != size or digest(destination.read_bytes()) != record["sha256"]:
+                  raise RuntimeError("Copied evidence bytes differ: " + str(source))
               record.update(stored=str(destination.relative_to(root)), status="copied")
               return record
 
@@ -477,6 +483,53 @@ jobs:
                   record.update(resolution="UNRESOLVED", reason=str(error))
               return record
 
+          def artifact_path(value):
+              path = Path(value)
+              if (not value or path.is_absolute() or str(path) != value
+                      or any(not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,199}", part)
+                             or part.endswith(".") for part in path.parts)):
+                  raise RuntimeError("Unsafe artifact path: " + repr(value))
+              return path
+
+          def snapshot_name(index, optional, suffix):
+              if not 1 <= index <= limit_count:
+                  raise RuntimeError("Snapshot file identifier exceeds evidence limit")
+              suffix = suffix if suffix in {".txt", ".log", ".pcap", ".pcapng"} else ".bin"
+              return Path("optional" if optional else "files") / f"{index:04d}{suffix}"
+
+          def snapshot_mapping(snapshot, base, entries):
+              copied, seen, sources = [], set(), set()
+              for record in snapshot["files"]:
+                  if record.get("status") != "copied":
+                      if record.get("required"):
+                          raise RuntimeError("Mandatory snapshot mapping not copied")
+                      continue
+                  stored = str(artifact_path(record["stored"]))
+                  source, owner = Path(record["path"]), Path(record["source_root"])
+                  relative = Path(record["source_relative"])
+                  area = "files" if record["required"] else "optional"
+                  if (type(record["required"]) is not bool
+                          or (record["required"] != (source.name == "log.txt"))
+                          or not source.is_absolute() or not owner.is_absolute() or str(source) != record["path"]
+                          or str(owner) != record["source_root"] or ".." in source.parts or ".." in owner.parts
+                          or relative.is_absolute() or ".." in relative.parts
+                          or str(relative) != record["source_relative"] or source != owner / relative
+                          or source == owner or not source.is_relative_to(owner)
+                          or Path(stored).parent != Path(base) / area
+                          or not re.fullmatch(r"[0-9]{4}\.(?:txt|log|pcap|pcapng|bin)", Path(stored).name)
+                          or stored.casefold() in seen or str(source) in sources):
+                      raise RuntimeError("Ambiguous or unsafe snapshot mapping")
+                  seen.add(stored.casefold())
+                  sources.add(str(source))
+                  entry = entries.get(stored)
+                  if entry is None or any(entry[key] != record[key] for key in ["size", "sha256"]):
+                      raise RuntimeError("Snapshot mapping bytes differ from manifest: " + stored)
+                  copied.append(record)
+              actual = {name for name in entries if Path(name).parent in {Path(base) / "files", Path(base) / "optional"}}
+              if {record["stored"] for record in copied} != actual:
+                  raise RuntimeError("Snapshot mapping file set differs from manifest")
+              return copied
+
           def snapshot(destination):
               records, issues = [], []
               roots = sorted(Path("/tmp").glob("vpp-unittest-*"))
@@ -505,13 +558,14 @@ jobs:
                               records.append(link_record(path, allowed))
                           elif stat.S_ISREG(path.lstat().st_mode):
                               files.append((path.name != "log.txt", path, directory))
-              for optional, path, directory in sorted(files, key=lambda item: (item[0], str(item[1]))):
-                  area = "optional" if optional else "files"
-                  target = destination / area / directory.name / path.relative_to(directory)
+              for index, (optional, path, directory) in enumerate(sorted(files, key=lambda item: (item[0], str(item[1]))), 1):
+                  record = {"path": str(path), "source_root": str(directory),
+                            "source_relative": str(path.relative_to(directory)), "required": not optional}
                   try:
-                      record = copy_file(path, target, required=not optional)
-                  except OSError as error:
-                      record = {"path": str(path), "status": "copy-INCOMPLETE", "error": str(error)}
+                      target = destination / snapshot_name(index, optional, path.suffix)
+                      record.update(copy_file(path, target, required=not optional))
+                  except (OSError, RuntimeError) as error:
+                      record.update(status="copy-INCOMPLETE", error=str(error))
                   records.append(record)
                   if record["status"] == "copy-INCOMPLETE" or (not optional and record["status"] != "copied"):
                       issues.append(str(path))
@@ -549,18 +603,42 @@ jobs:
                   count = re.fullmatch(r"(\d+) test\(s\)", content)
                   selected_classes[name] = int(count.group(1)) if count else len(content.split(", "))
               results, skips, raw_logs, startups = {}, [], [], []
-              for log in sorted((directory / "files").glob("vpp-unittest-*/log.txt")):
+              snapshot_data = load(directory / "snapshot.json")
+              entries = {}
+              for area in ["files", "optional"]:
+                  for log in (directory / area).glob("*"):
+                      if log.is_symlink() or not log.is_file() or not log.resolve().is_relative_to(directory.resolve()):
+                          raise RuntimeError("Unsafe snapshot copy")
+                      entries[str(log.relative_to(root))] = {"size": log.stat().st_size, "sha256": digest(log.read_bytes())}
+              mapped = snapshot_mapping(snapshot_data, str(directory.relative_to(root)), entries)
+              classes_with_logs = set()
+              for record in mapped:
+                  if not record["required"]:
+                      continue
+                  owner = Path(record["source_root"])
+                  cls_name = owner.name.removeprefix("vpp-unittest-")
+                  if owner.parent != Path("/tmp") or not owner.name.startswith("vpp-unittest-"):
+                      continue
+                  if (record["source_relative"] != "log.txt" or cls_name not in selected_classes
+                          or cls_name in classes_with_logs):
+                      raise RuntimeError("Ambiguous or unexpected authoritative class log")
+                  classes_with_logs.add(cls_name)
+                  log = root / record["stored"]
                   contents = log.read_text(errors="replace")
-                  raw_logs.append({"path": str(log.relative_to(root)), "sha256": digest(log.read_bytes())})
+                  raw_logs.append({"path": record["stored"], "source": record["path"], "sha256": record["sha256"]})
                   for raw in re.findall(r"vpp_cmdline args: (.+)", contents):
                       argv = ast.literal_eval(raw)
                       workers = argv[argv.index("corelist-workers") + 1].split(",") if "corelist-workers" in argv else []
-                      startups.append({"class": log.parent.name.removeprefix("vpp-unittest-"),
+                      startups.append({"class": cls_name,
                                        "argv": argv, "configured_worker_cores": workers,
                                        "configured_worker_count": len(workers)})
                   for callback, cls, method in callbacks.findall(contents):
+                      if cls != cls_name:
+                          raise RuntimeError("Callback class differs from authoritative source log")
                       results.setdefault(cls + "." + method, []).append(callback)
                   skips.extend(line for line in contents.splitlines() if "addSkip" in line)
+              if classes_with_logs != set(selected_classes):
+                  raise RuntimeError("Missing authoritative class log mapping")
               actual_classes = {}
               for name in results:
                   cls = name.split(".")[0]
@@ -742,13 +820,20 @@ jobs:
                   raise RuntimeError("; ".join(errors))
 
           def seal():
-              records = []
+              records, seen = [], set()
               for path in sorted(root.rglob("*")):
-                  if path.is_symlink():
-                      raise RuntimeError("Symlink in evidence output")
+                  name = str(artifact_path(str(path.relative_to(root))))
+                  if name.casefold() in seen:
+                      raise RuntimeError("Case-insensitive artifact path collision: " + name)
+                  seen.add(name.casefold())
+                  if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()):
+                      raise RuntimeError("Symlink or external path in evidence output")
                   if path.is_file() and path != root / "artifact-manifest.json":
-                      records.append({"path": str(path.relative_to(root)), "size": path.stat().st_size,
+                      records.append({"path": name, "size": path.stat().st_size,
                                       "sha256": digest(path.read_bytes())})
+              entries = {entry["path"]: entry for entry in records}
+              for path in root.rglob("snapshot.json"):
+                  snapshot_mapping(load(path), str(path.parent.relative_to(root)), entries)
               payload = json.dumps(records, indent=2) + "\n"
               if (len(records) + 1 > limit_count - 128 or
                   sum(item["size"] for item in records) + len(payload.encode()) > limit_bytes - 64 * 1024 * 1024 or
@@ -941,7 +1026,51 @@ jobs:
           import hashlib
           import json
           import os
+          import re
           from pathlib import Path
+
+          def verify_snapshot_download(base, entries):
+              indexed = {entry["path"]: entry for entry in entries}
+              if len(indexed) != len(entries) or len({name.casefold() for name in indexed}) != len(entries):
+                  raise RuntimeError("Duplicate artifact paths")
+              for name in indexed:
+                  if (Path(name).is_absolute() or str(Path(name)) != name or
+                          any(not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,199}", part)
+                              or part.endswith(".") for part in Path(name).parts)):
+                      raise RuntimeError("Unsafe artifact path")
+              if "final-diagnostics/snapshot.json" not in indexed:
+                  raise RuntimeError("Final snapshot mapping missing")
+              snapshots = {str(Path(name).parent) for name in indexed if Path(name).name == "snapshot.json"}
+              for name in indexed:
+                  relative = Path(name)
+                  if relative.parent.name in {"files", "optional"} and str(relative.parent.parent) not in snapshots:
+                      raise RuntimeError("Snapshot copy has no mapping")
+              for path in base.rglob("snapshot.json"):
+                  mapped, sources = set(), set()
+                  parent = path.parent.relative_to(base)
+                  for item in json.loads(path.read_text())["files"]:
+                      if item.get("status") != "copied":
+                          if item.get("required"):
+                              raise RuntimeError("Mandatory mapping not copied")
+                          continue
+                      stored = item["stored"]
+                      source, owner, relative = Path(item["path"]), Path(item["source_root"]), Path(item["source_relative"])
+                      if (type(item["required"]) is not bool or item["required"] != (source.name == "log.txt")
+                              or not source.is_absolute() or not owner.is_absolute() or ".." in source.parts or ".." in owner.parts
+                              or str(source) != item["path"] or str(owner) != item["source_root"]
+                              or relative.is_absolute() or ".." in relative.parts or str(relative) != item["source_relative"]
+                              or source != owner / relative or source == owner
+                              or Path(stored).parent != parent / ("files" if item["required"] else "optional")
+                              or not re.fullmatch(r"[0-9]{4}\.(?:txt|log|pcap|pcapng|bin)", Path(stored).name)
+                              or stored in mapped or str(source) in sources or stored not in indexed
+                              or any(indexed[stored][key] != item[key] for key in ["size", "sha256"])):
+                          raise RuntimeError("Snapshot mapping mismatch")
+                      mapped.add(stored)
+                      sources.add(str(source))
+                  actual = {name for name in indexed if Path(name).parent in {parent / "files", parent / "optional"}}
+                  if mapped != actual:
+                      raise RuntimeError("Snapshot file set mismatch")
+
           steps = json.loads(os.environ["STEP_RESULTS"])
           required = ["identity", "dependencies", "style", "provenance", "build", "elf",
                       "runtime", "preflight", "suites", "drift", "collect", "upload", "archive", "download"]
@@ -966,6 +1095,7 @@ jobs:
                   path = downloaded / relative
                   if path.is_symlink() or not path.is_file() or path.stat().st_size != entry["size"] or hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]:
                       failed.append("downloaded bytes: " + str(relative))
+              verify_snapshot_download(downloaded, entries)
           status = downloaded / "suite-status.json"
           expected = ["linux_cp", "linux_cp_lifecycle", "linux_cp_netlink", "gre", "gre_teib",
                       "ip_mcast", "ip4", "ipsec_esp", "fib"]
@@ -1031,6 +1161,48 @@ jobs:
           import time
           from pathlib import Path
 
+          def verify_snapshot_download(base, entries):
+              indexed = {entry["path"]: entry for entry in entries}
+              if len(indexed) != len(entries) or len({name.casefold() for name in indexed}) != len(entries):
+                  raise RuntimeError("Duplicate artifact paths")
+              for name in indexed:
+                  if (Path(name).is_absolute() or str(Path(name)) != name or
+                          any(not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,199}", part)
+                              or part.endswith(".") for part in Path(name).parts)):
+                      raise RuntimeError("Unsafe artifact path")
+              if "final-diagnostics/snapshot.json" not in indexed:
+                  raise RuntimeError("Final snapshot mapping missing")
+              snapshots = {str(Path(name).parent) for name in indexed if Path(name).name == "snapshot.json"}
+              for name in indexed:
+                  relative = Path(name)
+                  if relative.parent.name in {"files", "optional"} and str(relative.parent.parent) not in snapshots:
+                      raise RuntimeError("Snapshot copy has no mapping")
+              for path in base.rglob("snapshot.json"):
+                  mapped, sources = set(), set()
+                  parent = path.parent.relative_to(base)
+                  for item in json.loads(path.read_text())["files"]:
+                      if item.get("status") != "copied":
+                          if item.get("required"):
+                              raise RuntimeError("Mandatory mapping not copied")
+                          continue
+                      stored = item["stored"]
+                      source, owner, relative = Path(item["path"]), Path(item["source_root"]), Path(item["source_relative"])
+                      if (type(item["required"]) is not bool or item["required"] != (source.name == "log.txt")
+                              or not source.is_absolute() or not owner.is_absolute() or ".." in source.parts or ".." in owner.parts
+                              or str(source) != item["path"] or str(owner) != item["source_root"]
+                              or relative.is_absolute() or ".." in relative.parts or str(relative) != item["source_relative"]
+                              or source != owner / relative or source == owner
+                              or Path(stored).parent != parent / ("files" if item["required"] else "optional")
+                              or not re.fullmatch(r"[0-9]{4}\.(?:txt|log|pcap|pcapng|bin)", Path(stored).name)
+                              or stored in mapped or str(source) in sources or stored not in indexed
+                              or any(indexed[stored][key] != item[key] for key in ["size", "sha256"])):
+                          raise RuntimeError("Snapshot mapping mismatch")
+                      mapped.add(stored)
+                      sources.add(str(source))
+                  actual = {name for name in indexed if Path(name).parent in {parent / "files", parent / "optional"}}
+                  if mapped != actual:
+                      raise RuntimeError("Snapshot file set mismatch")
+
           output = Path(os.environ["RUNNER_TEMP"]) / "execution-archive"
           output.mkdir()
           evidence = Path(os.environ["RUNNER_TEMP"]) / "completed-execution"
@@ -1081,6 +1253,7 @@ jobs:
                   data = (evidence / relative).read_bytes()
                   if len(data) != entry["size"] or sha(data) != entry["sha256"]:
                       raise RuntimeError("Downloaded execution byte mismatch: " + str(relative))
+              verify_snapshot_download(evidence, entries)
               save(output / "execution-artifact-files.json", {"manifest_size": manifest_path.stat().st_size,
                    "manifest_sha256": sha(manifest_path.read_bytes()), "files": entries})
               for name in ["identity.json", "provenance.json", "acceptance-groups.json", "worker-contract.json"]:
