@@ -2773,28 +2773,124 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
                 )
             self._router_absent(proto, table)
 
+    def _router_broadcast_state(self, phy):
+        import json
+
+        result = subprocess.run(
+            [
+                "ip",
+                "netns",
+                "exec",
+                self.ns_name,
+                "ip",
+                "-j",
+                "addr",
+                "show",
+                "dev",
+                "hbcast",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        links = json.loads(result.stdout)
+        self.assertEqual(len(links), 1, result.stdout)
+        interfaces = self.vapi.sw_interface_dump(sw_if_index=phy.sw_if_index)
+        self.assertEqual(len(interfaces), 1, interfaces)
+        state = {
+            "linux_flags": links[0]["flags"],
+            "linux_addresses": [
+                f"{address['local']}/{address['prefixlen']}"
+                for address in links[0].get("addr_info", [])
+                if address["family"] == "inet"
+            ],
+            "vpp_flags": int(interfaces[0].flags),
+            "vpp_addresses": [
+                str(address.prefix)
+                for address in self.vapi.ip_address_dump(
+                    phy.sw_if_index, is_ipv6=False
+                )
+            ],
+        }
+        self.logger.info("broadcast %s/hbcast state: %s", phy.name, state)
+        return state
+
+    def _router_broadcast_wait(self, phy, present=True):
+        def address_state():
+            state = self._router_broadcast_state(phy)
+            addresses = (
+                phy.local_ip4_prefix in state["linux_addresses"],
+                phy.local_ip4_prefix in state["vpp_addresses"],
+            )
+            if present:
+                return (
+                    "UP" in state["linux_flags"],
+                    bool(state["vpp_flags"] & 1),
+                    *addresses,
+                )
+            return addresses
+
+        self.poll_for(
+            f"broadcast {phy.name}/hbcast address {phy.local_ip4_prefix} "
+            + ("present and interfaces up" if present else "removed on both sides"),
+            address_state,
+            (True, True, True, True) if present else (False, False),
+        )
+
     def test_router_broadcast_recovery(self):
         """Permanent limited broadcast receive survives repeated real recovery"""
-        self.create_pg_interfaces(range(1))
-        phy = self.pg0
-        phy.admin_up()
-        phy.config_ip4()
-        self.vapi.cli(f"lcp create {phy.name} host-if hbcast netns {self.ns_name}")
-        host = HostInterface(self, self.ns_name, "hbcast")
-        packet = (
-            Ether(src=phy.remote_mac, dst="ff:ff:ff:ff:ff:ff")
-            / IP(src=phy.remote_ip4, dst="255.255.255.255")
-            / UDP(sport=18888, dport=18888)
-            / Raw(b"lcp broadcast ownership")
+        import sys
+        from asfframework import VppDiedError
+        from vpp_papi import VPPIOError
+        from vpp_papi_exceptions import (
+            CliFailedCommandError,
+            CliSyntaxError,
+            UnexpectedApiReturnValueError,
         )
+
+        cleanup_errors = []
+        operation_errors = (
+            AssertionError,
+            OSError,
+            subprocess.SubprocessError,
+            RuntimeError,
+            ValueError,
+            VPPIOError,
+            VppDiedError,
+            CliFailedCommandError,
+            CliSyntaxError,
+            UnexpectedApiReturnValueError,
+        )
+        phy = host = None
+        pair_attempted = address_attempted = False
+        cycle = "setup"
         try:
+            self.create_pg_interfaces(range(1))
+            phy = self.pg0
+            phy.admin_up()
+            pair_attempted = True
+            self.vapi.cli(
+                f"lcp create {phy.name} host-if hbcast netns {self.ns_name}"
+            )
+            host = HostInterface(self, self.ns_name, "hbcast")
+            address_attempted = True
+            phy.config_ip4()
             for cycle in range(4):
+                self.logger.info("broadcast recovery cycle %d: before send", cycle)
+                self._router_broadcast_wait(phy)
                 self.assertIn(
                     "broadcast refs:1 local:1", self._router("ip4 table 0 state")
                 )
+                payload = f"lcp broadcast ownership cycle {cycle}".encode()
+                packet = (
+                    Ether(src=phy.remote_mac, dst="ff:ff:ff:ff:ff:ff")
+                    / IP(src=phy.remote_ip4, dst="255.255.255.255")
+                    / UDP(sport=18888, dport=18888)
+                    / Raw(payload)
+                )
                 host.enable_capture()
                 phy.add_stream([packet])
-                self.pg_start(trace=False)
+                self.pg_start(trace=True)
                 captured = host.get_capture(
                     expected_count=1,
                     timeout=5,
@@ -2802,19 +2898,95 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
                         pkt.haslayer(UDP) and pkt[UDP].dport == 18888
                     ),
                 )
-                self.assertEqual(captured[0][IP].dst, "255.255.255.255")
+                received = captured[0]
+                self.assertEqual(received[Ether].src, phy.remote_mac)
+                self.assertEqual(received[Ether].dst, "ff:ff:ff:ff:ff:ff")
+                self.assertEqual(received[IP].src, phy.remote_ip4)
+                self.assertEqual(received[IP].dst, "255.255.255.255")
+                self.assertEqual(received[UDP].sport, 18888)
+                self.assertEqual(received[UDP].dport, 18888)
+                self.assertEqual(bytes(received[UDP].payload), payload)
                 host.disable_capture()
+                self.logger.info(
+                    "broadcast recovery cycle %d: received %r", cycle, payload
+                )
                 if cycle == 3:
                     break
                 stats = self._netlink_stats()
-                self._invoke_netlink_error_callback()
+                self.logger.info(
+                    "broadcast recovery cycle %d: before error %s", cycle, stats
+                )
+                self.logger.info("%s", self._invoke_netlink_error_callback())
                 self._check_recovery(
                     self._netlink_count(stats, "synchronization attempts"),
                     self._netlink_count(stats, "synchronization completed"),
-                    "broadcast receive ownership",
+                    f"broadcast receive ownership cycle {cycle}",
                 )
+                self.logger.info(
+                    "broadcast recovery cycle %d: recovered %s",
+                    cycle,
+                    self._netlink_stats(),
+                )
+                self._router_broadcast_wait(phy)
         finally:
-            host.disable_capture()
-            self.vapi.cli(f"lcp delete {phy.name}")
-            phy.unconfig_ip4()
-            phy.admin_down()
+            primary_error = sys.exc_info()[1]
+            self.logger.info("broadcast recovery cycle %s: cleanup", cycle)
+            if phy is not None and pair_attempted:
+                try:
+                    self._router_broadcast_state(phy)
+                except operation_errors as error:
+                    cleanup_errors.append(f"interface snapshot: {error!r}")
+            if primary_error is not None:
+                self.logger.error(
+                    "broadcast cycle %s failed: %r; HostInterface removes its raw "
+                    "pcap before returning a capture failure; it is unavailable here",
+                    cycle,
+                    primary_error,
+                )
+                for command in ("show trace", "show errors", "show interface address"):
+                    try:
+                        self.logger.error("%s:\n%s", command, self.vapi.cli(command))
+                    except operation_errors as error:
+                        cleanup_errors.append(f"{command}: {error!r}")
+            if host is not None:
+                try:
+                    host.disable_capture()
+                except operation_errors as error:
+                    cleanup_errors.append(f"stop capture: {error!r}")
+            if address_attempted:
+                try:
+                    self.vapi.sw_interface_add_del_address(
+                        sw_if_index=phy.sw_if_index,
+                        prefix=phy.local_ip4_prefix,
+                        is_add=0,
+                    )
+                    phy.has_ip4_config = False
+                except operation_errors as error:
+                    cleanup_errors.append(f"remove test IPv4 address: {error!r}")
+                try:
+                    self._router_broadcast_wait(phy, present=False)
+                except operation_errors as error:
+                    cleanup_errors.append(f"wait for IPv4 removal: {error!r}")
+            if pair_attempted:
+                pair_present = True
+                try:
+                    pairs = self.vapi.vpp.details_iter(self.vapi.lcp_itf_pair_get)
+                    pair_present = any(
+                        pair.phy_sw_if_index == phy.sw_if_index for pair in pairs
+                    )
+                except operation_errors as error:
+                    cleanup_errors.append(f"look up test pair: {error!r}")
+                if pair_present:
+                    try:
+                        self.vapi.cli(f"lcp delete {phy.name}")
+                    except operation_errors as error:
+                        cleanup_errors.append(f"delete test pair: {error!r}")
+            if phy is not None:
+                try:
+                    phy.admin_down()
+                except operation_errors as error:
+                    cleanup_errors.append(f"physical interface down: {error!r}")
+            for error in cleanup_errors:
+                self.logger.error("broadcast cleanup failed: %s", error)
+            if cleanup_errors and primary_error is None:
+                self.fail("broadcast cleanup failed: " + "; ".join(cleanup_errors))
