@@ -603,6 +603,8 @@ jobs:
                   count = re.fullmatch(r"(\d+) test\(s\)", content)
                   selected_classes[name] = int(count.group(1)) if count else len(content.split(", "))
               results, skips, raw_logs, startups = {}, [], [], []
+              framework_prechecks = []
+              command_log = (root / "commands" / suite / "command.log").read_text(errors="replace")
               snapshot_data = load(directory / "snapshot.json")
               entries = {}
               for area in ["files", "optional"]:
@@ -617,6 +619,36 @@ jobs:
                       continue
                   owner = Path(record["source_root"])
                   cls_name = owner.name.removeprefix("vpp-unittest-")
+                  if cls_name == "SanityTestCase":
+                      if (owner != Path("/tmp/vpp-unittest-SanityTestCase")
+                              or record["source_relative"] != "log.txt"
+                              or cls_name in selected_classes or framework_prechecks):
+                          raise RuntimeError("Ambiguous framework sanity log")
+                      contents = (root / record["stored"]).read_text(errors="replace")
+                      markers = ["--- setUpClass() for SanityTestCase called ---",
+                                 "--- END setUpClass() SanityTestCase ---",
+                                 "--- START tearDownClass() SanityTestCase ---",
+                                 "--- END tearDownClass() SanityTestCase ---"]
+                      positions = [contents.find(marker) for marker in markers]
+                      sanity_startups = re.findall(r"vpp_cmdline args: (.+)", contents)
+                      if (any(contents.count(marker) != 1 for marker in markers)
+                              or positions != sorted(positions) or len(sanity_startups) != 1
+                              or callbacks.search(contents) or "addSkip" in contents
+                              or command_log.splitlines().count("Running sanity test case.") != 1
+                              or command_log.splitlines().count("Sanity test case passed.") != 1
+                              or "Sanity test case failed." in command_log
+                              or "Couldn't run sanity test case." in command_log):
+                          raise RuntimeError("Incomplete framework sanity precheck evidence")
+                      argv = ast.literal_eval(sanity_startups[0])
+                      if (not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv)
+                              or argv.count("runtime-dir") != 1
+                              or argv[argv.index("runtime-dir") + 1:argv.index("runtime-dir") + 2] != [str(owner)]):
+                          raise RuntimeError("Framework sanity startup source mismatch")
+                      framework_prechecks.append({"class": cls_name, "result": "passed", "argv": argv,
+                          "command_log": str((root / "commands" / suite / "command.log").relative_to(root)),
+                          "raw_log": {"path": record["stored"], "source": record["path"],
+                                      "size": record["size"], "sha256": record["sha256"]}})
+                      continue
                   if owner.parent != Path("/tmp") or not owner.name.startswith("vpp-unittest-"):
                       continue
                   if (record["source_relative"] != "log.txt" or cls_name not in selected_classes
@@ -658,7 +690,6 @@ jobs:
                       required.append(name)
                       if results.get(name) != ["addSuccess"]:
                           issues.append("Required non-skip unique success missing: " + name)
-              command_log = (root / "commands" / suite / "command.log").read_text(errors="replace")
               if not re.search(r"vpp_worker_count=0(?:[,\)])", command_log) or not re.search(r"retries=0(?:[,\)])", command_log):
                   issues.append("Harness global worker/retry config missing")
               started_classes = {entry["class"] for entry in startups}
@@ -681,7 +712,7 @@ jobs:
                                       "class_worker_overrides": "Existing class declarations remain authoritative; see vpp_cmdline logs"},
                    "actual_startups": startups,
                    "all_classes_zero_workers": bool(startups) and all(entry["configured_worker_count"] == 0 for entry in startups),
-                   "raw_logs": raw_logs, "issues": issues})
+                   "framework_prechecks": framework_prechecks, "raw_logs": raw_logs, "issues": issues})
               if issues:
                   raise RuntimeError("; ".join(issues))
 
