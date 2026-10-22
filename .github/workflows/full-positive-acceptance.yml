@@ -800,13 +800,13 @@ jobs:
                   stop = threading.Event()
                   watcher = None
                   try:
-                      command(suite + "-list", ["make", "UNATTENDED=yes", "TEST_JOBS=1", "VPP_WORKER_COUNT=0", "RETRIES=0", "TEST=" + suite, "test-list"], seconds=300)
+                      command(suite + "-list", ["make", "UNATTENDED=yes", "TEST_JOBS=1", "USE_SMT=yes", "VPP_WORKER_COUNT=0", "RETRIES=0", "TEST=" + suite, "test-list"], seconds=300)
                       if suite == "linux_cp_netlink":
                           watcher = threading.Thread(target=watch_processes, args=(stop, directory / "loaded"))
                           watcher.start()
                       run_error = None
                       try:
-                          command(suite, ["make", "UNATTENDED=yes", "TEST_JOBS=1", "VPP_WORKER_COUNT=0", "RETRIES=0", "TEST=" + suite, "test-debug"], seconds=1200)
+                          command(suite, ["make", "UNATTENDED=yes", "TEST_JOBS=1", "USE_SMT=yes", "VPP_WORKER_COUNT=0", "RETRIES=0", "TEST=" + suite, "test-debug"], seconds=1200)
                       except Exception as error:
                           run_error = error
                       finally:
