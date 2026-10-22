@@ -10,7 +10,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: full-positive-804eef504fc180007afe666eb9a3223f0b3e2b44
+  group: full-positive-52cca2ee39809d2be0fe00b09c16c4e42f517cd8
   cancel-in-progress: false
 
 jobs:
@@ -35,9 +35,9 @@ jobs:
       run:
         shell: bash
     env:
-      CANDIDATE_SHA: 804eef504fc180007afe666eb9a3223f0b3e2b44
-      CANDIDATE_TREE: 98ad6c032f4320c52efd8599ebc1be49179209c7
-      CANDIDATE_PARENT: cce149c4d1ccd2d4ab88d07acc92478a82a2b100
+      CANDIDATE_SHA: 52cca2ee39809d2be0fe00b09c16c4e42f517cd8
+      CANDIDATE_TREE: de6ce044e43ab118181aaebdb0f66ade8b5d6fc3
+      CANDIDATE_PARENT: 804eef504fc180007afe666eb9a3223f0b3e2b44
       CANDIDATE_BASE: 415599eade17cc745989b5c92e7f3c12e5d0ce60
       CLANG_FORMAT_VER: "19"
       CCACHE_COMPRESS: "true"
@@ -64,7 +64,7 @@ jobs:
       - name: Check out the exact candidate
         uses: actions/checkout@v4
         with:
-          ref: 804eef504fc180007afe666eb9a3223f0b3e2b44
+          ref: 52cca2ee39809d2be0fe00b09c16c4e42f517cd8
           path: candidate
           fetch-depth: 0
           fetch-tags: true
@@ -73,7 +73,7 @@ jobs:
       - name: Check out an independent style workspace
         uses: actions/checkout@v4
         with:
-          ref: 804eef504fc180007afe666eb9a3223f0b3e2b44
+          ref: 52cca2ee39809d2be0fe00b09c16c4e42f517cd8
           path: style-source
           fetch-depth: 0
           fetch-tags: true
@@ -248,7 +248,8 @@ jobs:
               chain = ["415599eade17cc745989b5c92e7f3c12e5d0ce60",
                        "626c341265faa473681e373013645701fc12aedd",
                        "cce149c4d1ccd2d4ab88d07acc92478a82a2b100",
-                       "804eef504fc180007afe666eb9a3223f0b3e2b44"]
+                       "804eef504fc180007afe666eb9a3223f0b3e2b44",
+                       "52cca2ee39809d2be0fe00b09c16c4e42f517cd8"]
               if (base != chain[0] or parent != chain[-2] or source_sha != chain[-1]
                       or text("rev-list", "--reverse", f"{base}..{source_sha}").splitlines() != chain[1:]):
                   raise RuntimeError("Candidate fixed commit chain mismatch")
@@ -286,7 +287,8 @@ jobs:
               chain = ["415599eade17cc745989b5c92e7f3c12e5d0ce60",
                        "626c341265faa473681e373013645701fc12aedd",
                        "cce149c4d1ccd2d4ab88d07acc92478a82a2b100",
-                       "804eef504fc180007afe666eb9a3223f0b3e2b44"]
+                       "804eef504fc180007afe666eb9a3223f0b3e2b44",
+                       "52cca2ee39809d2be0fe00b09c16c4e42f517cd8"]
               if (base != chain[0] or parent != chain[-2] or source_sha != chain[-1]
                       or commits != chain[1:]):
                   raise RuntimeError("Unexpected style commit range")
@@ -1026,7 +1028,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: full-positive-804eef504fc180007afe666eb9a3223f0b3e2b44-${{ github.run_id }}-${{ github.run_attempt }}
+          name: full-positive-52cca2ee39809d2be0fe00b09c16c4e42f517cd8-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/full-positive-evidence/
           retention-days: 7
           if-no-files-found: error
@@ -1168,7 +1170,7 @@ jobs:
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
               summary.write("Positive execution: " + report["positive_execution"] + "; complete evidence pending post-job archive.\n\n")
               summary.write("all_classes_zero_workers=UNFULFILLED: existing full-module worker2 classes retained.\n\n")
-              summary.write("Candidate: 804eef504fc180007afe666eb9a3223f0b3e2b44 / 98ad6c032f4320c52efd8599ebc1be49179209c7\n\n")
+              summary.write("Candidate: 52cca2ee39809d2be0fe00b09c16c4e42f517cd8 / de6ce044e43ab118181aaebdb0f66ade8b5d6fc3\n\n")
               summary.write("Artifact: " + os.environ["ARTIFACT_URL"] + "\n\n")
               summary.write("CI01 OPEN; negative UNFULFILLED/HOLD; merge HOLD; final r5 SEALED.\n")
           if failed:
@@ -1259,8 +1261,8 @@ jobs:
           report = {"status": "INCOMPLETE", "started_at": time.time(),
                     "execution_result": os.environ["EXECUTION_RESULT"],
                     "carrier_sha": os.environ["GITHUB_SHA"],
-                    "candidate_sha": "804eef504fc180007afe666eb9a3223f0b3e2b44",
-                    "candidate_tree": "98ad6c032f4320c52efd8599ebc1be49179209c7",
+                    "candidate_sha": "52cca2ee39809d2be0fe00b09c16c4e42f517cd8",
+                    "candidate_tree": "de6ce044e43ab118181aaebdb0f66ade8b5d6fc3",
                     "run_id": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
                     "execution_artifact_id": os.environ["EXECUTION_ARTIFACT_ID"],
                     "execution_artifact_digest": os.environ["EXECUTION_ARTIFACT_DIGEST"],
