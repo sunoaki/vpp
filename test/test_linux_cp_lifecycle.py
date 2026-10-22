@@ -284,7 +284,7 @@ class TestLinuxCPNamespaceOwnership(TestLinuxCPNetNSBase):
                 )
                 parents.append(pg.sw_if_index)
                 sub = self.vapi.create_vlan_subif(
-                    sw_if_index=pg.sw_if_index, vlan_id=100
+                    sw_if_index=pg.sw_if_index, vlan=100
                 ).sw_if_index
                 subinterfaces.append(sub)
                 subprocess.run(
