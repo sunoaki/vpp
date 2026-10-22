@@ -10,7 +10,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: full-positive-ac3e064c72e86112f5dea3a785fb729ce17efab0
+  group: full-positive-2acad5af5554791952ba6b6127c8dd28358da10e
   cancel-in-progress: false
 
 jobs:
@@ -35,8 +35,8 @@ jobs:
       run:
         shell: bash
     env:
-      CANDIDATE_SHA: ac3e064c72e86112f5dea3a785fb729ce17efab0
-      CANDIDATE_TREE: 2fe972200a100f4f28352517996e4a31c159be4a
+      CANDIDATE_SHA: 2acad5af5554791952ba6b6127c8dd28358da10e
+      CANDIDATE_TREE: a5a4f1b0b084bdc168ebfdbf8a22f8b1dbdf2815
       CANDIDATE_PARENT: 52cca2ee39809d2be0fe00b09c16c4e42f517cd8
       CANDIDATE_BASE: 415599eade17cc745989b5c92e7f3c12e5d0ce60
       CLANG_FORMAT_VER: "19"
@@ -64,7 +64,7 @@ jobs:
       - name: Check out the exact candidate
         uses: actions/checkout@v4
         with:
-          ref: ac3e064c72e86112f5dea3a785fb729ce17efab0
+          ref: 2acad5af5554791952ba6b6127c8dd28358da10e
           path: candidate
           fetch-depth: 0
           fetch-tags: true
@@ -73,7 +73,7 @@ jobs:
       - name: Check out an independent style workspace
         uses: actions/checkout@v4
         with:
-          ref: ac3e064c72e86112f5dea3a785fb729ce17efab0
+          ref: 2acad5af5554791952ba6b6127c8dd28358da10e
           path: style-source
           fetch-depth: 0
           fetch-tags: true
@@ -250,7 +250,7 @@ jobs:
                        "cce149c4d1ccd2d4ab88d07acc92478a82a2b100",
                        "804eef504fc180007afe666eb9a3223f0b3e2b44",
                        "52cca2ee39809d2be0fe00b09c16c4e42f517cd8",
-                       "ac3e064c72e86112f5dea3a785fb729ce17efab0"]
+                       "2acad5af5554791952ba6b6127c8dd28358da10e"]
               if (base != chain[0] or parent != chain[-2] or source_sha != chain[-1]
                       or text("rev-list", "--reverse", f"{base}..{source_sha}").splitlines() != chain[1:]):
                   raise RuntimeError("Candidate fixed commit chain mismatch")
@@ -290,7 +290,7 @@ jobs:
                        "cce149c4d1ccd2d4ab88d07acc92478a82a2b100",
                        "804eef504fc180007afe666eb9a3223f0b3e2b44",
                        "52cca2ee39809d2be0fe00b09c16c4e42f517cd8",
-                       "ac3e064c72e86112f5dea3a785fb729ce17efab0"]
+                       "2acad5af5554791952ba6b6127c8dd28358da10e"]
               if (base != chain[0] or parent != chain[-2] or source_sha != chain[-1]
                       or commits != chain[1:]):
                   raise RuntimeError("Unexpected style commit range")
@@ -1030,7 +1030,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: full-positive-ac3e064c72e86112f5dea3a785fb729ce17efab0-${{ github.run_id }}-${{ github.run_attempt }}
+          name: full-positive-2acad5af5554791952ba6b6127c8dd28358da10e-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/full-positive-evidence/
           retention-days: 7
           if-no-files-found: error
@@ -1172,7 +1172,7 @@ jobs:
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
               summary.write("Positive execution: " + report["positive_execution"] + "; complete evidence pending post-job archive.\n\n")
               summary.write("all_classes_zero_workers=UNFULFILLED: existing full-module worker2 classes retained.\n\n")
-              summary.write("Candidate: ac3e064c72e86112f5dea3a785fb729ce17efab0 / 2fe972200a100f4f28352517996e4a31c159be4a\n\n")
+              summary.write("Candidate: 2acad5af5554791952ba6b6127c8dd28358da10e / a5a4f1b0b084bdc168ebfdbf8a22f8b1dbdf2815\n\n")
               summary.write("Artifact: " + os.environ["ARTIFACT_URL"] + "\n\n")
               summary.write("CI01 OPEN; negative UNFULFILLED/HOLD; merge HOLD; final r5 SEALED.\n")
           if failed:
@@ -1263,8 +1263,8 @@ jobs:
           report = {"status": "INCOMPLETE", "started_at": time.time(),
                     "execution_result": os.environ["EXECUTION_RESULT"],
                     "carrier_sha": os.environ["GITHUB_SHA"],
-                    "candidate_sha": "ac3e064c72e86112f5dea3a785fb729ce17efab0",
-                    "candidate_tree": "2fe972200a100f4f28352517996e4a31c159be4a",
+                    "candidate_sha": "2acad5af5554791952ba6b6127c8dd28358da10e",
+                    "candidate_tree": "a5a4f1b0b084bdc168ebfdbf8a22f8b1dbdf2815",
                     "run_id": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
                     "execution_artifact_id": os.environ["EXECUTION_ARTIFACT_ID"],
                     "execution_artifact_digest": os.environ["EXECUTION_ARTIFACT_DIGEST"],
