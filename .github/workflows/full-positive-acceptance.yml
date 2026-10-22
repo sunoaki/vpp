@@ -644,16 +644,18 @@ jobs:
                                  "--- START tearDownClass() SanityTestCase ---",
                                  "--- END tearDownClass() SanityTestCase ---"]
                       positions = [contents.find(marker) for marker in markers]
-                      sanity_startups = re.findall(r"vpp_cmdline args: (.+)", contents)
+                      sanity_startups = list(re.finditer(r"vpp_cmdline args: (.+)", contents))
                       if (any(contents.count(marker) != 1 for marker in markers)
-                              or positions != sorted(positions) or len(sanity_startups) != 1
+                              or len(sanity_startups) != 1
+                              or not positions[0] < sanity_startups[0].start() < positions[1] < positions[2] < positions[3]
                               or callbacks.search(contents) or "addSkip" in contents
                               or command_log.splitlines().count("Running sanity test case.") != 1
                               or command_log.splitlines().count("Sanity test case passed.") != 1
+                              or command_log.splitlines().index("Running sanity test case.") >= command_log.splitlines().index("Sanity test case passed.")
                               or "Sanity test case failed." in command_log
                               or "Couldn't run sanity test case." in command_log):
                           raise RuntimeError("Incomplete framework sanity precheck evidence")
-                      argv = ast.literal_eval(sanity_startups[0])
+                      argv = ast.literal_eval(sanity_startups[0].group(1))
                       if (not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv)
                               or argv.count("runtime-dir") != 1
                               or argv[argv.index("runtime-dir") + 1:argv.index("runtime-dir") + 2] != [str(owner)]):
@@ -683,6 +685,8 @@ jobs:
                           raise RuntimeError("Callback class differs from authoritative source log")
                       results.setdefault(cls + "." + method, []).append(callback)
                   skips.extend(line for line in contents.splitlines() if "addSkip" in line)
+              if len(framework_prechecks) != 1:
+                  raise RuntimeError("Missing unique framework sanity precheck log")
               if classes_with_logs != set(selected_classes):
                   raise RuntimeError("Missing authoritative class log mapping")
               actual_classes = {}
