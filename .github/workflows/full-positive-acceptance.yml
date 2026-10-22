@@ -10,7 +10,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: full-positive-2acad5af5554791952ba6b6127c8dd28358da10e
+  group: full-positive-60c697b2d2486882128b3222e4ad9bd7bd097b32
   cancel-in-progress: false
 
 jobs:
@@ -35,9 +35,9 @@ jobs:
       run:
         shell: bash
     env:
-      CANDIDATE_SHA: 2acad5af5554791952ba6b6127c8dd28358da10e
-      CANDIDATE_TREE: a5a4f1b0b084bdc168ebfdbf8a22f8b1dbdf2815
-      CANDIDATE_PARENT: 52cca2ee39809d2be0fe00b09c16c4e42f517cd8
+      CANDIDATE_SHA: 60c697b2d2486882128b3222e4ad9bd7bd097b32
+      CANDIDATE_TREE: 17f8fa9e614ba98a9f2271843f14f1f402adc9e7
+      CANDIDATE_PARENT: 2acad5af5554791952ba6b6127c8dd28358da10e
       CANDIDATE_BASE: 415599eade17cc745989b5c92e7f3c12e5d0ce60
       CLANG_FORMAT_VER: "19"
       CCACHE_COMPRESS: "true"
@@ -64,7 +64,7 @@ jobs:
       - name: Check out the exact candidate
         uses: actions/checkout@v4
         with:
-          ref: 2acad5af5554791952ba6b6127c8dd28358da10e
+          ref: 60c697b2d2486882128b3222e4ad9bd7bd097b32
           path: candidate
           fetch-depth: 0
           fetch-tags: true
@@ -73,7 +73,7 @@ jobs:
       - name: Check out an independent style workspace
         uses: actions/checkout@v4
         with:
-          ref: 2acad5af5554791952ba6b6127c8dd28358da10e
+          ref: 60c697b2d2486882128b3222e4ad9bd7bd097b32
           path: style-source
           fetch-depth: 0
           fetch-tags: true
@@ -250,7 +250,8 @@ jobs:
                        "cce149c4d1ccd2d4ab88d07acc92478a82a2b100",
                        "804eef504fc180007afe666eb9a3223f0b3e2b44",
                        "52cca2ee39809d2be0fe00b09c16c4e42f517cd8",
-                       "2acad5af5554791952ba6b6127c8dd28358da10e"]
+                       "2acad5af5554791952ba6b6127c8dd28358da10e",
+                       "60c697b2d2486882128b3222e4ad9bd7bd097b32"]
               if (base != chain[0] or parent != chain[-2] or source_sha != chain[-1]
                       or text("rev-list", "--reverse", f"{base}..{source_sha}").splitlines() != chain[1:]):
                   raise RuntimeError("Candidate fixed commit chain mismatch")
@@ -290,7 +291,8 @@ jobs:
                        "cce149c4d1ccd2d4ab88d07acc92478a82a2b100",
                        "804eef504fc180007afe666eb9a3223f0b3e2b44",
                        "52cca2ee39809d2be0fe00b09c16c4e42f517cd8",
-                       "2acad5af5554791952ba6b6127c8dd28358da10e"]
+                       "2acad5af5554791952ba6b6127c8dd28358da10e",
+                       "60c697b2d2486882128b3222e4ad9bd7bd097b32"]
               if (base != chain[0] or parent != chain[-2] or source_sha != chain[-1]
                       or commits != chain[1:]):
                   raise RuntimeError("Unexpected style commit range")
@@ -605,7 +607,7 @@ jobs:
                   "linux_cp_lifecycle": {"TestLinuxCPLifecycle": ["test_default_namespace_resources", "test_default_namespace_failure", "test_pair_replace_resend", "test_pair_flags_pool_reuse", "test_vlan_resources"], "TestLinuxCPNamespaceOwnership": ["test_equal_ifindex_namespace_delete"]},
                   "linux_cp_netlink": {"TestLinuxCPNetlinkSocketOwnership": ["test_pair_add_during_netlink_recovery"], "TestLinuxCPNetlinkDumpCompletion": ["test_dump_completion_errors", "test_dump_completion_success"]},
                   "gre_teib": {"TestGreTeib": ["test_gre_teib_ipv4", "test_gre_teib_ipv6", "test_gre_teib_cross_mp"]},
-                  "ip_mcast": {"TestIPMcast": ["test_mfib_zero_flags_ip4", "test_mfib_zero_flags_ip6"], "TestMFIB": ["test_mfib"]},
+                  "ip_mcast": {"TestIPMcast": ["test_mfib_zero_flags_ip4", "test_mfib_zero_flags_ip6", "test_mfib_ip4_address_lifetime", "test_mfib_ip4_address_rebind", "test_mfib_ip4_interface_delete", "test_mfib_ip4_unnumbered_lifetime", "test_mfib_ip4_mixed_borrower_removal", "test_mfib_ip4_mixed_donor_removal"], "TestMFIB": ["test_mfib"]},
                   "ip4": {"TestIPv4IfAddrRoute": ["test_ipv4_local_export_withdraw_glean", "test_ipv4_local_export_withdraw_non_glean"]},
                   "ipsec_esp": {"TestIpsecEspTun": ["test_tun_df44"]},
                   "fib": {"TestFIB": ["test_fib"]}}
@@ -837,13 +839,13 @@ jobs:
                   save(root / "suite-status.json", states)
 
           def acceptance_groups():
-              buckets = {"original26": [], "fullfib1": [], "pair_ospf11": []}
+              buckets = {"original32": [], "fullfib1": [], "pair_ospf11": []}
               for suite, classes in groups().items():
                   inventory_path = root / "suites" / suite / "inventory.json"
                   actual = load(inventory_path).get("methods", {}) if inventory_path.exists() else {}
                   for cls, methods in classes.items():
                       group = "fullfib1" if suite == "fib" else "pair_ospf11" if cls in {
-                          "TestLinuxCPPairManagement", "TestLinuxCPOSPFMcast"} else "original26"
+                          "TestLinuxCPPairManagement", "TestLinuxCPOSPFMcast"} else "original32"
                       for method in methods:
                           name = cls + "." + method
                           buckets[group].append({"module": suite, "method": name,
@@ -1030,7 +1032,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: full-positive-2acad5af5554791952ba6b6127c8dd28358da10e-${{ github.run_id }}-${{ github.run_attempt }}
+          name: full-positive-60c697b2d2486882128b3222e4ad9bd7bd097b32-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/full-positive-evidence/
           retention-days: 7
           if-no-files-found: error
@@ -1157,7 +1159,7 @@ jobs:
               failed.append("complete suite success missing")
           grouped_path = downloaded / "acceptance-groups.json"
           grouped = json.loads(grouped_path.read_text()) if grouped_path.is_file() else {}
-          for name, count in {"original26": 26, "fullfib1": 1, "pair_ospf11": 11}.items():
+          for name, count in {"original32": 32, "fullfib1": 1, "pair_ospf11": 11}.items():
               if grouped.get(name, {}).get("required") != count or grouped[name].get("success") != count:
                   failed.append("Incomplete acceptance group: " + name)
           report = {"positive_execution": "FAIL" if failed else "PASS", "issues": failed,
@@ -1172,7 +1174,7 @@ jobs:
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
               summary.write("Positive execution: " + report["positive_execution"] + "; complete evidence pending post-job archive.\n\n")
               summary.write("all_classes_zero_workers=UNFULFILLED: existing full-module worker2 classes retained.\n\n")
-              summary.write("Candidate: 2acad5af5554791952ba6b6127c8dd28358da10e / a5a4f1b0b084bdc168ebfdbf8a22f8b1dbdf2815\n\n")
+              summary.write("Candidate: 60c697b2d2486882128b3222e4ad9bd7bd097b32 / 17f8fa9e614ba98a9f2271843f14f1f402adc9e7\n\n")
               summary.write("Artifact: " + os.environ["ARTIFACT_URL"] + "\n\n")
               summary.write("CI01 OPEN; negative UNFULFILLED/HOLD; merge HOLD; final r5 SEALED.\n")
           if failed:
@@ -1263,8 +1265,8 @@ jobs:
           report = {"status": "INCOMPLETE", "started_at": time.time(),
                     "execution_result": os.environ["EXECUTION_RESULT"],
                     "carrier_sha": os.environ["GITHUB_SHA"],
-                    "candidate_sha": "2acad5af5554791952ba6b6127c8dd28358da10e",
-                    "candidate_tree": "a5a4f1b0b084bdc168ebfdbf8a22f8b1dbdf2815",
+                    "candidate_sha": "60c697b2d2486882128b3222e4ad9bd7bd097b32",
+                    "candidate_tree": "17f8fa9e614ba98a9f2271843f14f1f402adc9e7",
                     "run_id": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
                     "execution_artifact_id": os.environ["EXECUTION_ARTIFACT_ID"],
                     "execution_artifact_digest": os.environ["EXECUTION_ARTIFACT_DIGEST"],
