@@ -21,6 +21,7 @@ jobs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
       artifact-url: ${{ steps.upload.outputs.artifact-url }}
       artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+      evidence-bytes: ${{ steps.capacity.outputs.evidence-bytes }}
     timeout-minutes: 360
     container:
       image: debian:trixie
@@ -96,6 +97,7 @@ jobs:
           import stat
           import subprocess
           import sys
+          import tempfile
           import threading
           import time
           from pathlib import Path
@@ -109,14 +111,31 @@ jobs:
           base = os.environ["CANDIDATE_BASE"]
           suites = ["linux_cp", "linux_cp_lifecycle", "linux_cp_netlink", "gre",
                     "gre_teib", "ip_mcast", "ip4", "ipsec_esp", "fib"]
-          limit_bytes = 256 * 1024 * 1024
+          limit_bytes = 15 * 1024 * 1024 * 1024
           limit_file = 32 * 1024 * 1024
           limit_count = 2000
+          mandatory_bytes = 14944 * 1024 * 1024
+          optional_bytes = 16 * 1024 * 1024
+          seal_bytes = 8 * 1024 * 1024
+          records_bytes = 64 * 1024 * 1024
+          metadata_bytes = 512 * 1024 * 1024
+          execution_bytes = mandatory_bytes + optional_bytes + seal_bytes
+          unallocated_bytes = 328 * 1024 * 1024
+          assert execution_bytes + records_bytes + unallocated_bytes == limit_bytes
+          assert 1488 + 256 + 128 + 128 == limit_count
+          evidence_lock = threading.RLock()
+          pending_writes = {}
+          seal_paths = {"artifact-manifest.json", "stages/collect.json", "integrity.json", "capacity.json"}
           callbacks = re.compile(r" --- (add\w+)\(\) (\w+)\.(\w+)\(")
 
+          def write_data(path, data):
+              with evidence_lock:
+                  reserve(len(data), destination=path, metadata=True)
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_bytes(data)
+
           def save(path, value):
-              path.parent.mkdir(parents=True, exist_ok=True)
-              path.write_text(json.dumps(value, indent=2) + "\n")
+              write_data(path, (json.dumps(value, indent=2) + "\n").encode())
 
           def load(path):
               return json.loads(path.read_text())
@@ -140,16 +159,53 @@ jobs:
                       "built_source_tree": load(provenance_path)["built_source_tree"]
                       if provenance_path.exists() else "UNAVAILABLE: build provenance not yet recorded"}
 
-          def pool_usage(optional):
+          def evidence_pool(path):
+              relative = path.relative_to(root)
+              if str(relative) in seal_paths:
+                  return "seal"
+              return "optional" if "optional" in relative.parts else "mandatory"
+
+          def is_metadata(path):
+              relative = path.relative_to(root)
+              return (evidence_pool(path) == "mandatory" and relative.parent.name != "files"
+                      and path.name not in {"command.log", "preflight.log"})
+
+          def pool_usage(pool):
               files = [p for p in root.rglob("*") if p.is_file() and not p.is_symlink()
-                       and ("optional" in p.relative_to(root).parts) == optional]
+                       and (is_metadata(p) if pool == "metadata" else evidence_pool(p) == pool)]
               return len(files), sum(p.stat().st_size for p in files)
 
-          def reserve(size, optional=False):
-              count, total = pool_usage(optional)
-              byte_budget, file_budget = (16 * 1024 * 1024, 256) if optional else (168 * 1024 * 1024, 1488)
-              if size > limit_file or count >= file_budget or total + size > byte_budget:
-                  raise RuntimeError("Evidence pool exceeded; mandatory evidence INCOMPLETE")
+          def check_disk(path, pending):
+              directory = path if path.is_dir() else path.parent
+              while not directory.exists():
+                  directory = directory.parent
+              usage = shutil.disk_usage(directory)
+              print(json.dumps({"disk_path": str(directory), "disk_used_bytes": usage.used,
+                    "disk_free_bytes": usage.free, "pending_write_bytes": pending}), flush=True)
+              if usage.free < pending:
+                  raise RuntimeError("Insufficient actual disk space for pending evidence bytes")
+
+          def reserve(size, optional=False, destination=None, metadata=False):
+              pool = evidence_pool(destination) if destination is not None else "optional" if optional else "mandatory"
+              budgets = {"mandatory": (mandatory_bytes, 1488), "optional": (optional_bytes, 256),
+                         "seal": (seal_bytes, 128)}
+              byte_budget, file_budget = budgets[pool]
+              count, total = pool_usage(pool)
+              pending = 0
+              for path, maximum in pending_writes.items():
+                  if evidence_pool(path) == pool:
+                      exists = path.is_file()
+                      count += not exists
+                      pending += max(0, maximum - (path.stat().st_size if exists else 0))
+              old = destination.stat().st_size if destination is not None and destination.is_file() else None
+              if (size > limit_file or count + (old is None) > file_budget
+                      or total + pending - (old or 0) + size > byte_budget):
+                  raise RuntimeError("Evidence " + pool + " pool exceeded; evidence INCOMPLETE")
+              if metadata and pool == "mandatory":
+                  _, used = pool_usage("metadata")
+                  if used - (old or 0) + size > metadata_bytes:
+                      raise RuntimeError("Evidence metadata budget exceeded; evidence INCOMPLETE")
+              check_disk(destination or root, pending + max(0, size - (old or 0)))
 
           def copy_file(source, destination, required=False):
               if source.is_symlink() or not source.is_file():
@@ -162,19 +218,29 @@ jobs:
                   for part in iter(lambda: stream.read(1024 * 1024), b""):
                       sha.update(part)
               record = {"path": str(source), "size": size, "sha256": sha.hexdigest()}
-              try:
-                  reserve(size, optional=not required)
-              except RuntimeError:
-                  record["status"] = "required-limit-INCOMPLETE" if required else "omitted-optional-limit"
-                  return record
-              destination.parent.mkdir(parents=True, exist_ok=True)
-              if (not destination.parent.resolve().is_relative_to(root.resolve())
-                      or destination.is_symlink() or destination.exists()):
-                  raise RuntimeError("Unsafe or existing evidence destination: " + str(destination))
-              with source.open("rb") as reader, destination.open("xb") as writer:
-                  shutil.copyfileobj(reader, writer)
-              if destination.stat().st_size != size or digest(destination.read_bytes()) != record["sha256"]:
-                  raise RuntimeError("Copied evidence bytes differ: " + str(source))
+              with evidence_lock:
+                  try:
+                      reserve(size, destination=destination, metadata=is_metadata(destination))
+                  except RuntimeError as error:
+                      record.update(status="required-limit-INCOMPLETE" if required else "omitted-optional-limit",
+                                    error=str(error))
+                      return record
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  if (not destination.parent.resolve().is_relative_to(root.resolve())
+                          or destination.is_symlink() or destination.exists()):
+                      raise RuntimeError("Unsafe or existing evidence destination: " + str(destination))
+                  with source.open("rb") as reader, destination.open("xb") as writer:
+                      remaining = size
+                      while remaining:
+                          part = reader.read(min(1024 * 1024, remaining))
+                          if not part:
+                              raise RuntimeError("Evidence source shortened during copy")
+                          writer.write(part)
+                          remaining -= len(part)
+                      if reader.read(1):
+                          raise RuntimeError("Evidence source grew during copy")
+                  if destination.stat().st_size != size or digest(destination.read_bytes()) != record["sha256"]:
+                      raise RuntimeError("Copied evidence bytes differ: " + str(source))
               record.update(stored=str(destination.relative_to(root)), status="copied")
               return record
 
@@ -184,8 +250,11 @@ jobs:
               save(directory / "command.json", {"argv": args, "cwd": str(cwd),
                                                "start": time.time(), "timeout": seconds,
                                                "identity": attribution()})
+              log = directory / "command.log"
               try:
-                  reserve(limit_file)
+                  with evidence_lock:
+                      reserve(limit_file, destination=log)
+                      pending_writes[log] = limit_file
               except RuntimeError as error:
                   save(directory / "result.json", {"status": "NOT_RUN/INCOMPLETE", "end": time.time(),
                        "error": str(error), "identity": attribution()})
@@ -199,8 +268,15 @@ jobs:
           printf '%s\\n' "${codes[1]}" > "$3/capture-returncode.txt"
           test "${codes[0]}" = 0 && test "${codes[1]}" = 0
           '''
-              result = subprocess.run(["bash", "-c", script, "acceptance", str(seconds),
-                                       str(directory / "command.log"), str(directory), *args], cwd=cwd)
+              with tempfile.TemporaryDirectory(prefix="full-positive-command-") as temporary:
+                  try:
+                      result = subprocess.run(["bash", "-c", script, "acceptance", str(seconds),
+                                               str(log), temporary, *args], cwd=cwd)
+                  finally:
+                      with evidence_lock:
+                          pending_writes.pop(log)
+                  for name in ["raw-returncode.txt", "capture-returncode.txt"]:
+                      write_data(directory / name, (Path(temporary) / name).read_bytes())
               save(directory / "result.json", {"returncode": result.returncode, "end": time.time()})
               if result.returncode:
                   raise RuntimeError(f"Command failed: {label}")
@@ -267,7 +343,7 @@ jobs:
               if text("rev-parse", "HEAD", cwd=carrier) != os.environ["GITHUB_SHA"]:
                   raise RuntimeError("Carrier SHA mismatch")
               data = manifest()
-              (root / "candidate-manifest.nul").write_bytes(data)
+              write_data(root / "candidate-manifest.nul", data)
               save(root / "identity.json", {
                   "candidate_sha": source_sha, "candidate_tree": source_tree,
                   "sole_parent": parent, "base": base, "manifest_sha256": digest(data),
@@ -336,8 +412,8 @@ jobs:
                   if not raw.strip() or len(raw) > 4096:
                       raise RuntimeError("Invalid tag version")
                   origin = "git describe --long --match v*"
-              (root / "build-version.raw").write_bytes(raw)
-              index = root / "source.index"
+              write_data(root / "build-version.raw", raw)
+              index = Path(os.environ["RUNNER_TEMP"]) / "full-positive-source.index"
               env = dict(os.environ, GIT_INDEX_FILE=str(index))
               try:
                   subprocess.run(["git", "read-tree", source_sha], cwd=candidate, env=env, check=True)
@@ -347,7 +423,7 @@ jobs:
               finally:
                   index.unlink(missing_ok=True)
               built_manifest = git("ls-tree", "-r", "-z", built_tree)
-              (root / "built-source-manifest.nul").write_bytes(built_manifest)
+              write_data(root / "built-source-manifest.nul", built_manifest)
               save(root / "provenance.json", {"candidate_sha": source_sha, "candidate_tree": source_tree,
                    "built_source_tree": built_tree, "built_manifest_sha256": digest(built_manifest),
                    "replacement_count": 0, "version": {"source": origin, "blob": blob(raw), "sha256": digest(raw)},
@@ -459,9 +535,7 @@ jobs:
                   report.update(status="FAIL/INCOMPLETE", error=str(error))
                   raise
               finally:
-                  payload = (json.dumps(report, indent=2) + "\n").encode()
-                  reserve(len(payload))
-                  (evidence / "discovery.json").write_bytes(payload)
+                  save(evidence / "discovery.json", report)
 
           def elf():
               install = candidate / "build-root/install-vpp_debug-native/vpp"
@@ -470,12 +544,12 @@ jobs:
               for name, path in selected.items():
                   files[name] = file_identity(path)
                   notes = subprocess.check_output(["readelf", "-n", str(path)])
-                  (root / (name + ".notes.txt")).write_bytes(notes)
+                  write_data(root / (name + ".notes.txt"), notes)
                   match = re.search(rb"Build ID: (\w+)", notes)
                   files[name]["build_id"] = match.group(1).decode() if match else None
               provider = files["linux_nl_plugin.so"]
               dynamic = subprocess.check_output(["readelf", "--dyn-syms", "--wide", provider["path"]])
-              (root / "linux_nl_plugin.so.dynsym.txt").write_bytes(dynamic)
+              write_data(root / "linux_nl_plugin.so.dynsym.txt", dynamic)
               for symbol in ["lcp_nl_test_set_sync_pause", "lcp_nl_test_inject_dump"]:
                   rows = [line.split() for line in dynamic.decode().splitlines() if line.split() and line.split()[-1] == symbol]
                   if len(rows) != 1 or rows[0][3:6] != ["FUNC", "GLOBAL", "DEFAULT"] or not rows[0][6].isdigit():
@@ -582,26 +656,39 @@ jobs:
                               records.append(link_record(path, allowed))
                           elif stat.S_ISREG(path.lstat().st_mode):
                               files.append((path.name != "log.txt", path, directory))
-              for index, (optional, path, directory) in enumerate(sorted(files, key=lambda item: (item[0], str(item[1]))), 1):
+              outputs = {False: 0, True: 0}
+              pending = sum(path.stat().st_size for optional, path, _ in files if not optional)
+              try:
+                  check_disk(root, pending)
+              except RuntimeError as error:
+                  print("Snapshot pending-copy warning: " + str(error), flush=True)
+              for optional, path, directory in sorted(files, key=lambda item: (item[0], str(item[1]))):
                   record = {"path": str(path), "source_root": str(directory),
                             "source_relative": str(path.relative_to(directory)), "required": not optional}
                   try:
-                      target = destination / snapshot_name(index, optional, path.suffix)
+                      target = destination / snapshot_name(outputs[optional] + 1, optional, path.suffix)
                       record.update(copy_file(path, target, required=not optional))
+                      if record["status"] == "copied":
+                          outputs[optional] += 1
                   except (OSError, RuntimeError) as error:
                       record.update(status="copy-INCOMPLETE", error=str(error))
                   records.append(record)
                   if record["status"] == "copy-INCOMPLETE" or (not optional and record["status"] != "copied"):
                       issues.append(str(path))
-              save(destination / "snapshot.json", {"at": time.time(), "identity": attribution(),
-                   "files": records, "issues": issues,
-                   "capacity_policy": {"mandatory_bytes": 168 * 1024 * 1024, "mandatory_files": 1488,
-                       "optional_bytes": 16 * 1024 * 1024, "optional_files": 256,
-                       "seal_reserve_bytes": 8 * 1024 * 1024, "seal_reserve_files": 128,
-                       "post_job_reserved_bytes": 64 * 1024 * 1024, "post_job_reserved_files": 128,
+              mapping = destination / "snapshot.json"
+              save(mapping, {"at": time.time(), "identity": attribution(),
+                   "files": records, "issue_count": len(issues), "first_issue": issues[0] if issues else None,
+                   "pending_mandatory_bytes": pending,
+                   "capacity_policy": {"overall_bytes": limit_bytes, "execution_bytes": execution_bytes,
+                       "unallocated_bytes": unallocated_bytes,
+                       "mandatory_bytes": mandatory_bytes, "mandatory_files": 1488,
+                       "metadata_bytes": metadata_bytes,
+                       "optional_bytes": optional_bytes, "optional_files": 256,
+                       "seal_reserve_bytes": seal_bytes, "seal_reserve_files": 128,
+                       "post_job_reserved_bytes": records_bytes, "post_job_reserved_files": 128,
                        "overflow": "Mandatory FAIL/INCOMPLETE; optional omitted with size/hash; records retained"}})
               if issues:
-                  raise RuntimeError("Mandatory snapshot evidence INCOMPLETE: " + repr(issues))
+                  raise RuntimeError(f"Snapshot evidence INCOMPLETE: {len(issues)} issue(s); first={issues[0]}; mapping={mapping.relative_to(root)}")
 
           def groups():
               return {
@@ -782,8 +869,8 @@ jobs:
                               continue
                           directory = output / key
                           directory.mkdir(parents=True)
-                          (directory / "cmdline.raw").write_bytes(cmdline)
-                          (directory / "maps.txt").write_bytes(maps)
+                          write_data(directory / "cmdline.raw", cmdline)
+                          write_data(directory / "maps.txt", maps)
                           classes = re.findall(r"vpp-unittest-(\w+)", cmdline.decode(errors="replace"))
                           observed[key] = {"pid": int(proc.name), "start_ticks": start,
                               "classes": sorted(set(classes)), "plugins": found,
@@ -878,7 +965,7 @@ jobs:
               if errors:
                   raise RuntimeError("; ".join(errors))
 
-          def seal():
+          def physical_records():
               records, seen = [], set()
               for path in sorted(root.rglob("*")):
                   name = str(artifact_path(str(path.relative_to(root))))
@@ -890,15 +977,44 @@ jobs:
                   if path.is_file() and path != root / "artifact-manifest.json":
                       records.append({"path": name, "size": path.stat().st_size,
                                       "sha256": digest(path.read_bytes())})
-              entries = {entry["path"]: entry for entry in records}
-              for path in root.rglob("snapshot.json"):
-                  snapshot_mapping(load(path), str(path.parent.relative_to(root)), entries)
-              payload = json.dumps(records, indent=2) + "\n"
+              return records
+
+          def integrity():
+              entries = {entry["path"]: entry for entry in physical_records()}
+              issues = []
+              if "final-diagnostics/snapshot.json" not in entries:
+                  issues.append("Final snapshot mapping missing")
+              for path in sorted(root.rglob("snapshot.json")):
+                  try:
+                      snapshot_data = load(path)
+                      if snapshot_data.get("issue_count"):
+                          raise RuntimeError("Snapshot has capture issues")
+                      snapshot_mapping(snapshot_data, str(path.parent.relative_to(root)), entries)
+                  except Exception as error:
+                      issues.append(str(path.relative_to(root)) + ": " + str(error))
+              save(root / "integrity.json", {"status": "FAIL/INCOMPLETE" if issues else "PASS", "issues": issues})
+              return issues
+
+          def seal():
+              pools = {name: {"files": pool_usage(name)[0], "bytes": pool_usage(name)[1]}
+                       for name in ["mandatory", "optional", "seal", "metadata"]}
+              save(root / "capacity.json", {"identity": attribution(), "pools_before_seal": pools,
+                   "overall_bytes": limit_bytes, "execution_bytes": execution_bytes,
+                   "records_reserved_bytes": records_bytes, "unallocated_bytes": unallocated_bytes,
+                   "pending_download_bytes": sum(pool_usage(name)[1] for name in ["mandatory", "optional", "seal"]),
+                   "disk": shutil.disk_usage(root)._asdict()})
+              records = physical_records()
+              payload = (json.dumps(records, indent=2) + "\n").encode()
               if (len(records) + 1 > limit_count - 128 or
-                  sum(item["size"] for item in records) + len(payload.encode()) > limit_bytes - 64 * 1024 * 1024 or
-                  len(payload.encode()) > limit_file or any(item["size"] > limit_file for item in records)):
+                  sum(item["size"] for item in records) + len(payload) > execution_bytes or
+                  len(payload) > limit_file or any(item["size"] > limit_file for item in records)):
                   raise RuntimeError("Artifact limits exceeded; evidence INCOMPLETE, records retained without truncation")
-              (root / "artifact-manifest.json").write_text(payload)
+              for pool, byte_budget, file_budget in [("mandatory", mandatory_bytes, 1488),
+                      ("optional", optional_bytes, 256), ("seal", seal_bytes, 128), ("metadata", metadata_bytes, 1488)]:
+                  count, total = pool_usage(pool)
+                  if total > byte_budget or count > file_budget:
+                      raise RuntimeError("Final evidence pool exceeded: " + pool)
+              write_data(root / "artifact-manifest.json", payload)
 
           stage = sys.argv[1]
           started = time.time()
@@ -921,6 +1037,8 @@ jobs:
                   verify_source()
               elif stage == "elf":
                   elf()
+              elif stage == "preflight":
+                  command("preflight", ["bash", str(Path(os.environ["RUNNER_TEMP"]) / "full-positive-preflight.sh")], seconds=240)
               elif stage == "suites":
                   run_suites()
               elif stage == "drift":
@@ -931,16 +1049,28 @@ jobs:
                   raise RuntimeError("Unknown stage")
           except Exception as error:
               stage_error = str(error)
-          save(root / "stages" / (stage + ".json"), {"status": "FAIL" if stage_error else "PASS",
-               "error": stage_error, "start": started, "end": time.time(), "identity": attribution()})
           if stage == "collect":
+              collect_error, seal_error = stage_error, None
+              try:
+                  integrity_issues = integrity()
+                  if integrity_issues:
+                      seal_error = f"Evidence integrity INCOMPLETE: {len(integrity_issues)} issue(s); see integrity.json"
+              except Exception as error:
+                  seal_error = str(error)
+              save(root / "stages/collect.json", {"status": "FAIL" if collect_error or seal_error else "PASS",
+                   "collect_error": collect_error, "seal_error": seal_error,
+                   "start": started, "end": time.time(), "identity": attribution()})
               try:
                   seal()
               except Exception as error:
-                  stage_error = str(error)
-                  save(root / "stages/collect.json", {"status": "FAIL", "error": stage_error,
-                       "start": started, "end": time.time(), "identity": attribution()})
+                  seal_error = str(error) if not seal_error else seal_error + "; " + str(error)
+                  save(root / "stages/collect.json", {"status": "FAIL", "collect_error": collect_error,
+                       "seal_error": seal_error, "start": started, "end": time.time(), "identity": attribution()})
                   raise
+              stage_error = collect_error or seal_error
+          else:
+              save(root / "stages" / (stage + ".json"), {"status": "FAIL" if stage_error else "PASS",
+                   "error": stage_error, "start": started, "end": time.time(), "identity": attribution()})
           if stage_error:
               raise SystemExit(stage_error)
           PY
@@ -983,7 +1113,8 @@ jobs:
         timeout-minutes: 5
         run: |
           set -Eeuo pipefail
-          exec > >(tee "${ACCEPTANCE_ROOT}/preflight.log") 2>&1
+          cat > "${RUNNER_TEMP}/full-positive-preflight.sh" <<'SH'
+          set -Eeuo pipefail
           namespace="vpp-full-positive-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           cleanup() {
             result=$?
@@ -1012,6 +1143,8 @@ jobs:
           done
           ip netns exec "$namespace" ip tuntap add dev vpp-ci-tap mode tap
           ip netns exec "$namespace" ip link del vpp-ci-tap
+          SH
+          python3 "${RUNNER_TEMP}/full-positive.py" preflight
 
       - name: Run all nine complete modules and seal each result
         id: suites
@@ -1030,6 +1163,26 @@ jobs:
           set -Eeuo pipefail
           test -f "${RUNNER_TEMP}/full-positive.py"
           python3 "${RUNNER_TEMP}/full-positive.py" collect
+
+      - name: Check actual evidence copy space
+        id: capacity
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import shutil
+          from pathlib import Path
+          root = Path(os.environ["ACCEPTANCE_ROOT"])
+          size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+          usage = shutil.disk_usage(root)
+          print(json.dumps({"execution_bytes": size, "pending_download_bytes": size,
+                "disk_used_bytes": usage.used, "disk_free_bytes": usage.free}))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("evidence-bytes=" + str(size) + "\n")
+          if size > (14944 + 16 + 8) * 1048576 or usage.free < size:
+              raise SystemExit("Actual evidence copy exceeds execution budget or available disk")
+          PY
 
       - name: Upload positive evidence
         id: upload
@@ -1053,7 +1206,26 @@ jobs:
         run: |
           set -Eeuo pipefail
           archive="${RUNNER_TEMP}/full-positive-artifact.zip"
-          curl --fail --silent --show-error --location --max-time 300 --max-filesize 314572800 \
+          curl --fail --silent --show-error --max-time 60 --max-filesize 1048576 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" \
+            --output "${RUNNER_TEMP}/full-positive-artifact-api.json"
+          python3 - <<'PY'
+          import json
+          import os
+          import shutil
+          from pathlib import Path
+          metadata = json.loads((Path(os.environ["RUNNER_TEMP"]) / "full-positive-artifact-api.json").read_text())
+          size = metadata["size_in_bytes"]
+          usage = shutil.disk_usage(os.environ["RUNNER_TEMP"])
+          print(json.dumps({"pending_archive_bytes": size, "disk_used_bytes": usage.used,
+                "disk_free_bytes": usage.free}))
+          if (str(metadata["id"]) != os.environ["ARTIFACT_ID"] or type(size) is not int
+                  or not 0 <= size <= 15 * 1024 ** 3 or usage.free < size):
+              raise SystemExit("Actual archive download exceeds budget or available disk")
+          PY
+          curl --fail --silent --show-error --location --max-time 300 --max-filesize 16106127360 \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H 'Accept: application/vnd.github+json' \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
@@ -1061,6 +1233,7 @@ jobs:
           expected="${ARTIFACT_DIGEST#sha256:}"
           test "${#expected}" = 64
           printf '%s  %s\n' "$expected" "$archive" | sha256sum --check --strict
+          rm -- "$archive"
 
       - name: Download the actual uploaded archive
         id: download
@@ -1088,6 +1261,41 @@ jobs:
           import re
           from pathlib import Path
 
+          def verify_transport(base, entries):
+              manifest = base / "artifact-manifest.json"
+              indexed = {entry["path"]: entry for entry in entries}
+              actual = {str(path.relative_to(base)) for path in base.rglob("*")
+                        if path.is_file() and path != manifest}
+              if (len(indexed) != len(entries) or len({name.casefold() for name in indexed}) != len(entries)
+                      or set(indexed) != actual or any(path.is_symlink() for path in base.rglob("*"))):
+                  raise RuntimeError("Downloaded transport file set mismatch")
+              totals = {"mandatory": [0, 0], "optional": [0, 0], "seal": [1, manifest.stat().st_size]}
+              metadata = 0
+              for name, entry in indexed.items():
+                  relative = Path(name)
+                  if (not name or relative.is_absolute() or str(relative) != name
+                          or any(not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,199}", part)
+                                 or part.endswith(".") for part in relative.parts)):
+                      raise RuntimeError("Unsafe transport path")
+                  data = (base / relative).read_bytes()
+                  if (type(entry["size"]) is not int or not 0 <= entry["size"] <= 33554432
+                          or len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != entry["sha256"]):
+                      raise RuntimeError("Downloaded transport byte mismatch: " + name)
+                  pool = "seal" if name in {"stages/collect.json", "integrity.json", "capacity.json"} else "optional" if "optional" in relative.parts else "mandatory"
+                  totals[pool][0] += 1
+                  totals[pool][1] += len(data)
+                  if pool == "mandatory" and relative.parent.name != "files" and relative.name not in {"command.log", "preflight.log"}:
+                      metadata += len(data)
+              for pool, byte_budget, file_budget in [("mandatory", 14944 * 1048576, 1488),
+                      ("optional", 16 * 1048576, 256), ("seal", 8 * 1048576, 128)]:
+                  if totals[pool][0] > file_budget or totals[pool][1] > byte_budget:
+                      raise RuntimeError("Downloaded transport pool exceeded: " + pool)
+              if (manifest.stat().st_size > 33554432 or metadata > 512 * 1048576
+                      or sum(item[0] for item in totals.values()) > 1872
+                      or sum(item[1] for item in totals.values()) > (14944 + 16 + 8) * 1048576):
+                  raise RuntimeError("Downloaded transport limits exceeded")
+              print(json.dumps({"downloaded_pools": totals, "metadata_bytes": metadata}))
+
           def verify_snapshot_download(base, entries):
               indexed = {entry["path"]: entry for entry in entries}
               if len(indexed) != len(entries) or len({name.casefold() for name in indexed}) != len(entries):
@@ -1107,7 +1315,10 @@ jobs:
               for path in base.rglob("snapshot.json"):
                   mapped, sources = set(), set()
                   parent = path.parent.relative_to(base)
-                  for item in json.loads(path.read_text())["files"]:
+                  snapshot_data = json.loads(path.read_text())
+                  if snapshot_data.get("issue_count"):
+                      raise RuntimeError("Snapshot capture issues: " + str(path.relative_to(base)))
+                  for item in snapshot_data["files"]:
                       if item.get("status") != "copied":
                           if item.get("required"):
                               raise RuntimeError("Mandatory mapping not copied")
@@ -1139,22 +1350,14 @@ jobs:
           if not manifest.is_file() or manifest.is_symlink():
               failed.append("downloaded manifest missing")
           else:
-              entries = json.loads(manifest.read_text())
-              listed = [entry["path"] for entry in entries]
-              actual = {str(path.relative_to(downloaded)) for path in downloaded.rglob("*")
-                        if path.is_file() and path != manifest}
-              if len(listed) != len(set(listed)) or set(listed) != actual:
-                  failed.append("Manifest and actual downloaded file sets differ (only root manifest excluded)")
-              if any(path.is_symlink() for path in downloaded.rglob("*")):
-                  failed.append("Symlink in downloaded evidence")
-              for entry in entries:
-                  relative = Path(entry["path"])
-                  if relative.is_absolute() or ".." in relative.parts or str(relative) != entry["path"]:
-                      raise SystemExit("Unsafe artifact manifest path")
-                  path = downloaded / relative
-                  if path.is_symlink() or not path.is_file() or path.stat().st_size != entry["size"] or hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]:
-                      failed.append("downloaded bytes: " + str(relative))
-              verify_snapshot_download(downloaded, entries)
+              try:
+                  entries = json.loads(manifest.read_text())
+                  verify_transport(downloaded, entries)
+                  verify_snapshot_download(downloaded, entries)
+                  if json.loads((downloaded / "integrity.json").read_text())["status"] != "PASS":
+                      raise RuntimeError("Downloaded evidence integrity INCOMPLETE")
+              except Exception as error:
+                  failed.append(str(error))
           status = downloaded / "suite-status.json"
           expected = ["linux_cp", "linux_cp_lifecycle", "linux_cp_netlink", "gre", "gre_teib",
                       "ip_mcast", "ip4", "ipsec_esp", "fib"]
@@ -1192,6 +1395,23 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
+      - name: Check actual completed evidence copy space
+        if: needs.full-positive.outputs.artifact-id != ''
+        env:
+          EVIDENCE_BYTES: ${{ needs.full-positive.outputs.evidence-bytes }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import shutil
+          size = int(os.environ["EVIDENCE_BYTES"])
+          usage = shutil.disk_usage(os.environ["RUNNER_TEMP"])
+          print(json.dumps({"pending_download_bytes": size, "disk_used_bytes": usage.used,
+                "disk_free_bytes": usage.free}))
+          if not 0 <= size <= (14944 + 16 + 8) * 1048576 or usage.free < size:
+              raise SystemExit("Completed evidence copy exceeds budget or actual disk")
+          PY
+
       - name: Download execution evidence by immutable artifact id
         id: download
         if: needs.full-positive.outputs.artifact-id != ''
@@ -1216,9 +1436,45 @@ jobs:
           import json
           import os
           import re
+          import shutil
           import subprocess
           import time
           from pathlib import Path
+
+          def verify_transport(base, entries):
+              manifest = base / "artifact-manifest.json"
+              indexed = {entry["path"]: entry for entry in entries}
+              actual = {str(path.relative_to(base)) for path in base.rglob("*")
+                        if path.is_file() and path != manifest}
+              if (len(indexed) != len(entries) or len({name.casefold() for name in indexed}) != len(entries)
+                      or set(indexed) != actual or any(path.is_symlink() for path in base.rglob("*"))):
+                  raise RuntimeError("Downloaded transport file set mismatch")
+              totals = {"mandatory": [0, 0], "optional": [0, 0], "seal": [1, manifest.stat().st_size]}
+              metadata = 0
+              for name, entry in indexed.items():
+                  relative = Path(name)
+                  if (not name or relative.is_absolute() or str(relative) != name
+                          or any(not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,199}", part)
+                                 or part.endswith(".") for part in relative.parts)):
+                      raise RuntimeError("Unsafe transport path")
+                  data = (base / relative).read_bytes()
+                  if (type(entry["size"]) is not int or not 0 <= entry["size"] <= 33554432
+                          or len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != entry["sha256"]):
+                      raise RuntimeError("Downloaded transport byte mismatch: " + name)
+                  pool = "seal" if name in {"stages/collect.json", "integrity.json", "capacity.json"} else "optional" if "optional" in relative.parts else "mandatory"
+                  totals[pool][0] += 1
+                  totals[pool][1] += len(data)
+                  if pool == "mandatory" and relative.parent.name != "files" and relative.name not in {"command.log", "preflight.log"}:
+                      metadata += len(data)
+              for pool, byte_budget, file_budget in [("mandatory", 14944 * 1048576, 1488),
+                      ("optional", 16 * 1048576, 256), ("seal", 8 * 1048576, 128)]:
+                  if totals[pool][0] > file_budget or totals[pool][1] > byte_budget:
+                      raise RuntimeError("Downloaded transport pool exceeded: " + pool)
+              if (manifest.stat().st_size > 33554432 or metadata > 512 * 1048576
+                      or sum(item[0] for item in totals.values()) > 1872
+                      or sum(item[1] for item in totals.values()) > (14944 + 16 + 8) * 1048576):
+                  raise RuntimeError("Downloaded transport limits exceeded")
+              print(json.dumps({"downloaded_pools": totals, "metadata_bytes": metadata}))
 
           def verify_snapshot_download(base, entries):
               indexed = {entry["path"]: entry for entry in entries}
@@ -1239,7 +1495,10 @@ jobs:
               for path in base.rglob("snapshot.json"):
                   mapped, sources = set(), set()
                   parent = path.parent.relative_to(base)
-                  for item in json.loads(path.read_text())["files"]:
+                  snapshot_data = json.loads(path.read_text())
+                  if snapshot_data.get("issue_count"):
+                      raise RuntimeError("Snapshot capture issues: " + str(path.relative_to(base)))
+                  for item in snapshot_data["files"]:
                       if item.get("status") != "copied":
                           if item.get("required"):
                               raise RuntimeError("Mandatory mapping not copied")
@@ -1282,10 +1541,26 @@ jobs:
           def sha(data):
               return hashlib.sha256(data).hexdigest()
 
+          def reserve_record(path, size):
+              files = [item for item in output.iterdir() if item.is_file() and item != path]
+              used = sum(item.stat().st_size for item in files)
+              manifest_reserve = 0 if path.name == "artifact-manifest.json" else 1048576
+              usage = shutil.disk_usage(output)
+              print(json.dumps({"records_used_bytes": used, "pending_write_bytes": size,
+                    "disk_used_bytes": usage.used, "disk_free_bytes": usage.free}), flush=True)
+              if (size > 33554432 or len(files) + 1 + bool(manifest_reserve) > 128
+                      or used + size + manifest_reserve > 67108864 or usage.free < size):
+                  raise RuntimeError("Completed-job pending write exceeds bounded budget or actual disk")
+
+          def write_record(path, data):
+              reserve_record(path, len(data))
+              path.write_bytes(data)
+
           def save(path, value):
-              path.write_text(json.dumps(value, indent=2) + "\n")
+              write_record(path, (json.dumps(value, indent=2) + "\n").encode())
 
           def fetch(suffix, destination, maximum=33554432):
+              reserve_record(destination, maximum)
               url = os.environ["GITHUB_API_URL"] + "/repos/" + os.environ["GITHUB_REPOSITORY"] + suffix
               result = subprocess.run(["curl", "--fail", "--silent", "--show-error", "--location",
                   "--max-time", "120", "--max-filesize", str(maximum),
@@ -1298,26 +1573,22 @@ jobs:
           try:
               manifest_path = evidence / "artifact-manifest.json"
               entries = json.loads(manifest_path.read_text())
-              listed = [entry["path"] for entry in entries]
-              actual = {str(path.relative_to(evidence)) for path in evidence.rglob("*")
-                        if path.is_file() and path != manifest_path}
-              if len(listed) != len(set(listed)) or set(listed) != actual:
-                  raise RuntimeError("Downloaded execution file set differs from manifest")
-              if any(path.is_symlink() for path in evidence.rglob("*")):
-                  raise RuntimeError("Downloaded execution contains symlinks")
-              for entry in entries:
-                  relative = Path(entry["path"])
-                  if relative.is_absolute() or ".." in relative.parts or str(relative) != entry["path"]:
-                      raise RuntimeError("Unsafe execution manifest path")
-                  data = (evidence / relative).read_bytes()
-                  if len(data) != entry["size"] or sha(data) != entry["sha256"]:
-                      raise RuntimeError("Downloaded execution byte mismatch: " + str(relative))
-              verify_snapshot_download(evidence, entries)
+              verify_transport(evidence, entries)
               save(output / "execution-artifact-files.json", {"manifest_size": manifest_path.stat().st_size,
                    "manifest_sha256": sha(manifest_path.read_bytes()), "files": entries})
-              for name in ["identity.json", "provenance.json", "acceptance-groups.json", "worker-contract.json"]:
-                  data = (evidence / name).read_bytes()
-                  (output / name).write_bytes(data)
+              write_record(output / "execution-artifact-manifest.json", manifest_path.read_bytes())
+              for name in ["identity.json", "provenance.json", "acceptance-groups.json", "worker-contract.json",
+                           "integrity.json", "capacity.json", "stages/collect.json"]:
+                  try:
+                      write_record(output / Path(name).name, (evidence / name).read_bytes())
+                  except Exception as error:
+                      issues.append("Execution identity material INCOMPLETE: " + name + ": " + str(error))
+              try:
+                  verify_snapshot_download(evidence, entries)
+                  if json.loads((evidence / "integrity.json").read_text())["status"] != "PASS":
+                      raise RuntimeError("Execution evidence integrity INCOMPLETE")
+              except Exception as error:
+                  issues.append(str(error))
               provenance = json.loads((output / "provenance.json").read_text())
               report["built_source_tree"] = provenance["built_source_tree"]
               report["acceptance_groups"] = json.loads((output / "acceptance-groups.json").read_text())
@@ -1358,7 +1629,7 @@ jobs:
               if len(blocks) != 1 or "##[group]" in blocks[0]:
                   raise RuntimeError("Actual container initialization log unavailable or ambiguous; identity UNVERIFIED")
               initialization = blocks[0]
-              (output / "container-initialization.log").write_text(initialization)
+              write_record(output / "container-initialization.log", initialization.encode())
               normalized = re.sub(r"(?m)^\d{4}-\d{2}-\d{2}T[0-9:.]+Z ", "", initialization).replace("\r\n", "\n")
               commands = re.findall(r"^##\[command\]([^\n]+)\n(.*?)(?=^##\[command\]|\Z)", normalized, re.M | re.S)
               bindings = [(command, result) for command, result in commands
@@ -1390,7 +1661,7 @@ jobs:
           payload = (json.dumps(files, indent=2) + "\n").encode()
           if len(files) + 1 > 128 or any(item["size"] > 33554432 for item in files) or sum(item["size"] for item in files) + len(payload) > 67108864:
               raise SystemExit("Completed-job archive limits exceeded; INCOMPLETE (raw records retained)")
-          (output / "artifact-manifest.json").write_bytes(payload)
+          write_record(output / "artifact-manifest.json", payload)
           print(json.dumps(report, indent=2))
           if issues:
               raise SystemExit(1)
@@ -1445,8 +1716,13 @@ jobs:
           entries = json.loads(manifest.read_text())
           paths = [entry["path"] for entry in entries]
           actual = {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file() and path != manifest}
-          if len(paths) != len(set(paths)) or set(paths) != actual or any(path.is_symlink() for path in root.rglob("*")):
+          if (len(paths) != len(set(paths)) or len({name.casefold() for name in paths}) != len(paths)
+                  or set(paths) != actual or any(path.is_symlink() for path in root.rglob("*"))):
               raise SystemExit("Completed-job artifact file set mismatch")
+          if (len(entries) + 1 > 128 or manifest.stat().st_size > 33554432
+                  or any(type(item["size"]) is not int or not 0 <= item["size"] <= 33554432 for item in entries)
+                  or sum(item["size"] for item in entries) + manifest.stat().st_size > 67108864):
+              raise SystemExit("Completed-job downloaded limits exceeded")
           for entry in entries:
               relative = Path(entry["path"])
               if relative.is_absolute() or ".." in relative.parts or str(relative) != entry["path"]:
