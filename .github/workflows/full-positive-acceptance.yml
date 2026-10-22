@@ -171,9 +171,12 @@ jobs:
                       and path.name not in {"command.log", "preflight.log"})
 
           def pool_usage(pool):
-              files = [p for p in root.rglob("*") if p.is_file() and not p.is_symlink()
+              files = [p for p in root.rglob("*") if p not in pending_writes
+                       and p.is_file() and not p.is_symlink()
                        and (is_metadata(p) if pool == "metadata" else evidence_pool(p) == pool)]
-              return len(files), sum(p.stat().st_size for p in files)
+              active = [maximum for path, maximum in pending_writes.items()
+                        if (is_metadata(path) if pool == "metadata" else evidence_pool(path) == pool)]
+              return len(files) + len(active), sum(p.stat().st_size for p in files) + sum(active)
 
           def check_disk(path, pending):
               directory = path if path.is_dir() else path.parent
@@ -191,21 +194,17 @@ jobs:
                          "seal": (seal_bytes, 128)}
               byte_budget, file_budget = budgets[pool]
               count, total = pool_usage(pool)
-              pending = 0
-              for path, maximum in pending_writes.items():
-                  if evidence_pool(path) == pool:
-                      exists = path.is_file()
-                      count += not exists
-                      pending += max(0, maximum - (path.stat().st_size if exists else 0))
+              if destination in pending_writes:
+                  raise RuntimeError("Evidence destination has an active command reservation")
               old = destination.stat().st_size if destination is not None and destination.is_file() else None
               if (size > limit_file or count + (old is None) > file_budget
-                      or total + pending - (old or 0) + size > byte_budget):
+                      or total - (old or 0) + size > byte_budget):
                   raise RuntimeError("Evidence " + pool + " pool exceeded; evidence INCOMPLETE")
               if metadata and pool == "mandatory":
                   _, used = pool_usage("metadata")
                   if used - (old or 0) + size > metadata_bytes:
                       raise RuntimeError("Evidence metadata budget exceeded; evidence INCOMPLETE")
-              check_disk(destination or root, pending + max(0, size - (old or 0)))
+              check_disk(destination or root, sum(pending_writes.values()) + max(0, size - (old or 0)))
 
           def copy_file(source, destination, required=False):
               if source.is_symlink() or not source.is_file():
@@ -229,18 +228,25 @@ jobs:
                   if (not destination.parent.resolve().is_relative_to(root.resolve())
                           or destination.is_symlink() or destination.exists()):
                       raise RuntimeError("Unsafe or existing evidence destination: " + str(destination))
-                  with source.open("rb") as reader, destination.open("xb") as writer:
-                      remaining = size
-                      while remaining:
-                          part = reader.read(min(1024 * 1024, remaining))
-                          if not part:
-                              raise RuntimeError("Evidence source shortened during copy")
-                          writer.write(part)
-                          remaining -= len(part)
-                      if reader.read(1):
-                          raise RuntimeError("Evidence source grew during copy")
-                  if destination.stat().st_size != size or digest(destination.read_bytes()) != record["sha256"]:
-                      raise RuntimeError("Copied evidence bytes differ: " + str(source))
+                  created = False
+                  try:
+                      with source.open("rb") as reader, destination.open("xb") as writer:
+                          created = True
+                          remaining = size
+                          while remaining:
+                              part = reader.read(min(1024 * 1024, remaining))
+                              if not part:
+                                  raise RuntimeError("Evidence source shortened during copy")
+                              writer.write(part)
+                              remaining -= len(part)
+                          if reader.read(1):
+                              raise RuntimeError("Evidence source grew during copy")
+                      if destination.stat().st_size != size or digest(destination.read_bytes()) != record["sha256"]:
+                          raise RuntimeError("Copied evidence bytes differ: " + str(source))
+                  except (OSError, RuntimeError):
+                      if created:
+                          destination.unlink(missing_ok=True)
+                      raise
               record.update(stored=str(destination.relative_to(root)), status="copied")
               return record
 
