@@ -3,7 +3,7 @@ name: Full positive acceptance
 
 on:
   push:
-    branches: [validation/full-positive-20261022]
+    branches: [validation/m39-collector-diag-20261024]
 
 permissions:
   contents: read
