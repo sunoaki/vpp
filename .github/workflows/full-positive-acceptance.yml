@@ -709,6 +709,24 @@ jobs:
                   "ipsec_esp": {"TestIpsecEspTun": ["test_tun_df44"]},
                   "fib": {"TestFIB": ["test_fib"]}}
 
+          def configured_worker_cores(argv):
+              if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
+                  raise RuntimeError("Startup argv must be a list of strings")
+              count = argv.count("corelist-workers")
+              if count == 0:
+                  return []
+              if count != 1 or argv.index("corelist-workers") + 1 == len(argv):
+                  raise RuntimeError("Missing or duplicate worker core configuration")
+              value = argv[argv.index("corelist-workers") + 1]
+              if value == "":
+                  return []
+              if not re.fullmatch(r"[0-9]+(?:,[0-9]+)*", value):
+                  raise RuntimeError("Malformed worker core configuration")
+              cores = value.split(",")
+              if len({int(core) for core in cores}) != len(cores):
+                  raise RuntimeError("Duplicate worker CPU in startup argv")
+              return cores
+
           def inventory(suite, directory):
               selected = (root / "commands" / (suite + "-list") / "command.log").read_text(errors="replace")
               match = re.search(r"total: (\d+) test\(s\) selected", selected)
@@ -779,10 +797,11 @@ jobs:
                   raw_logs.append({"path": record["stored"], "source": record["path"], "sha256": record["sha256"]})
                   for raw in re.findall(r"vpp_cmdline args: (.+)", contents):
                       argv = ast.literal_eval(raw)
-                      workers = argv[argv.index("corelist-workers") + 1].split(",") if "corelist-workers" in argv else []
+                      workers = configured_worker_cores(argv)
                       startups.append({"class": cls_name,
                                        "argv": argv, "configured_worker_cores": workers,
-                                       "configured_worker_count": len(workers)})
+                                       "configured_worker_count": len(workers),
+                                       "actual_worker_threads": "UNKNOWN"})
                   for callback, cls, method in callbacks.findall(contents):
                       if cls != cls_name:
                           raise RuntimeError("Callback class differs from authoritative source log")
