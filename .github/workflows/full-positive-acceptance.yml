@@ -89,6 +89,7 @@ jobs:
           mkdir "$ACCEPTANCE_ROOT"
           cat > "${RUNNER_TEMP}/full-positive.py" <<'PY'
           import ast
+          import atexit
           import hashlib
           import json
           import os
@@ -100,7 +101,107 @@ jobs:
           import tempfile
           import threading
           import time
+          from contextlib import contextmanager
           from pathlib import Path
+
+          diag_lock = threading.Lock()
+          diag_stop = threading.Event()
+          diag_enabled = False
+          diag_stack, diag_totals = [], {}
+          diag_file, diag_snapshot = "", ""
+
+          @contextmanager
+          def diag_phase(phase):
+              frame = None
+              try:
+                  if diag_enabled and threading.current_thread() is threading.main_thread():
+                      frame = {"phase": phase, "since": time.monotonic(), "bytes": 0}
+                      with diag_lock:
+                          diag_stack.append(frame)
+              except Exception:
+                  frame = None
+              try:
+                  yield
+              finally:
+                  try:
+                      if frame is not None:
+                          elapsed = time.monotonic() - frame["since"]
+                          with diag_lock:
+                              diag_stack.remove(frame)
+                              total = diag_totals.setdefault(phase, {"seconds": 0, "bytes": 0, "calls": 0})
+                              total["seconds"] += elapsed
+                              total["bytes"] += frame["bytes"]
+                              total["calls"] += 1
+                  except Exception:
+                      pass
+
+          def diag_operation(phase):
+              def decorate(function):
+                  def measured(*args, **kwargs):
+                      with diag_phase(phase):
+                          return function(*args, **kwargs)
+                  return measured
+              return decorate
+
+          def diag_progress(path=None, snapshot=None, size=0):
+              global diag_file, diag_snapshot
+              try:
+                  if diag_enabled and threading.current_thread() is threading.main_thread():
+                      with diag_lock:
+                          if path is not None:
+                              diag_file = str(path)[-512:]
+                          if snapshot is not None:
+                              diag_snapshot = str(snapshot.relative_to(root))[-128:]
+                          if size and diag_stack:
+                              diag_stack[-1]["bytes"] += size
+              except Exception:
+                  pass
+
+          def diag_heartbeat(stage):
+              started, lines = time.monotonic(), 0
+              while True:
+                  try:
+                      with diag_lock:
+                          now = time.monotonic()
+                          record = {"stage": stage, "file": diag_file, "snapshot": diag_snapshot,
+                              "active": [{"phase": item["phase"], "age_s": now - item["since"],
+                                          "bytes": item["bytes"]} for item in diag_stack],
+                              "totals": {name: dict(total) for name, total in diag_totals.items()}}
+                      record.update(wall_time=time.time(), elapsed_s=now - started,
+                                    event="stop" if diag_stop.is_set() else "heartbeat",
+                                    timing="inclusive; parent seconds include child seconds")
+                      if lines < 2400:
+                          lines += 1
+                          os.write(1, ("DIAG " + json.dumps(record, separators=(",", ":")) + "\n").encode())
+                  except Exception:
+                      pass
+                  if diag_stop.is_set():
+                      break
+                  diag_stop.wait(5)
+
+          def diag_start(stage):
+              global diag_enabled
+              if stage not in {"suites", "collect"}:
+                  return
+              watcher = None
+
+              def finish():
+                  global diag_enabled
+                  try:
+                      diag_stop.set()
+                      if watcher is not None and watcher.ident is not None:
+                          watcher.join(timeout=1)
+                  except Exception:
+                      pass
+                  diag_enabled = False
+
+              try:
+                  watcher = threading.Thread(target=diag_heartbeat, args=(stage,), daemon=True)
+                  atexit.register(finish)
+                  diag_enabled = True
+                  watcher.start()
+              except Exception:
+                  finish()
 
           root = Path(os.environ["ACCEPTANCE_ROOT"])
           workspace = Path(os.environ["GITHUB_WORKSPACE"])
@@ -171,13 +272,15 @@ jobs:
                       and path.name not in {"command.log", "preflight.log"})
 
           def pool_usage(pool):
-              files = [p for p in root.rglob("*") if p not in pending_writes
-                       and p.is_file() and not p.is_symlink()
-                       and (is_metadata(p) if pool == "metadata" else evidence_pool(p) == pool)]
-              active = [maximum for path, maximum in pending_writes.items()
-                        if (is_metadata(path) if pool == "metadata" else evidence_pool(path) == pool)]
-              return len(files) + len(active), sum(p.stat().st_size for p in files) + sum(active)
+              with diag_phase("metadata_scan" if pool == "metadata" else "pool_usage"):
+                  files = [p for p in root.rglob("*") if p not in pending_writes
+                           and p.is_file() and not p.is_symlink()
+                           and (is_metadata(p) if pool == "metadata" else evidence_pool(p) == pool)]
+                  active = [maximum for path, maximum in pending_writes.items()
+                            if (is_metadata(path) if pool == "metadata" else evidence_pool(path) == pool)]
+                  return len(files) + len(active), sum(p.stat().st_size for p in files) + sum(active)
 
+          @diag_operation("diskcheck")
           def check_disk(path, pending):
               directory = path if path.is_dir() else path.parent
               while not directory.exists():
@@ -188,6 +291,7 @@ jobs:
               if usage.free < pending:
                   raise RuntimeError("Insufficient actual disk space for pending evidence bytes")
 
+          @diag_operation("reserve")
           def reserve(size, optional=False, destination=None, metadata=False):
               pool = evidence_pool(destination) if destination is not None else "optional" if optional else "mandatory"
               budgets = {"mandatory": (mandatory_bytes, 1488), "optional": (optional_bytes, 256),
@@ -206,18 +310,30 @@ jobs:
                       raise RuntimeError("Evidence metadata budget exceeded; evidence INCOMPLETE")
               check_disk(destination or root, sum(pending_writes.values()) + max(0, size - (old or 0)))
 
+          @contextmanager
+          def diag_copy_lock():
+              with diag_phase("lockwait"):
+                  evidence_lock.acquire()
+              try:
+                  yield
+              finally:
+                  evidence_lock.release()
+
           def copy_file(source, destination, required=False):
+              diag_progress(path=source)
               if source.is_symlink() or not source.is_file():
                   if required:
                       raise RuntimeError(f"Missing or unsafe required file: {source}")
                   return {"path": str(source), "status": "unsafe-or-missing"}
               size = source.stat().st_size
               sha = hashlib.sha256()
-              with source.open("rb") as stream:
-                  for part in iter(lambda: stream.read(1024 * 1024), b""):
-                      sha.update(part)
+              with diag_phase("source_hash"):
+                  with source.open("rb") as stream:
+                      for part in iter(lambda: stream.read(1024 * 1024), b""):
+                          sha.update(part)
+                          diag_progress(size=len(part))
               record = {"path": str(source), "size": size, "sha256": sha.hexdigest()}
-              with evidence_lock:
+              with diag_copy_lock():
                   try:
                       reserve(size, destination=destination, metadata=is_metadata(destination))
                   except RuntimeError as error:
@@ -230,19 +346,22 @@ jobs:
                       raise RuntimeError("Unsafe or existing evidence destination: " + str(destination))
                   created = False
                   try:
-                      with source.open("rb") as reader, destination.open("xb") as writer:
-                          created = True
-                          remaining = size
-                          while remaining:
-                              part = reader.read(min(1024 * 1024, remaining))
-                              if not part:
-                                  raise RuntimeError("Evidence source shortened during copy")
-                              writer.write(part)
-                              remaining -= len(part)
-                          if reader.read(1):
-                              raise RuntimeError("Evidence source grew during copy")
-                      if destination.stat().st_size != size or digest(destination.read_bytes()) != record["sha256"]:
-                          raise RuntimeError("Copied evidence bytes differ: " + str(source))
+                      with diag_phase("copy"):
+                          with source.open("rb") as reader, destination.open("xb") as writer:
+                              created = True
+                              remaining = size
+                              while remaining:
+                                  part = reader.read(min(1024 * 1024, remaining))
+                                  if not part:
+                                      raise RuntimeError("Evidence source shortened during copy")
+                                  writer.write(part)
+                                  remaining -= len(part)
+                                  diag_progress(size=len(part))
+                              if reader.read(1):
+                                  raise RuntimeError("Evidence source grew during copy")
+                      with diag_phase("destverify"):
+                          if destination.stat().st_size != size or digest(destination.read_bytes()) != record["sha256"]:
+                              raise RuntimeError("Copied evidence bytes differ: " + str(source))
                   except (OSError, RuntimeError):
                       if created:
                           destination.unlink(missing_ok=True)
@@ -634,36 +753,41 @@ jobs:
                   raise RuntimeError("Snapshot mapping file set differs from manifest")
               return copied
 
+          @diag_operation("snapshot")
           def snapshot(destination):
+              diag_progress(path="", snapshot=destination)
               records, issues = [], []
-              roots = sorted(Path("/tmp").glob("vpp-unittest-*"))
-              roots += [Path("/tmp/vpp-failed-unittests"), candidate / "build-root/test-logs"]
-              allowed = [directory for directory in roots if not directory.is_symlink()]
-              files = []
-              for directory in roots:
-                  if directory.is_symlink():
-                      records.append(link_record(directory, allowed))
-                      continue
-                  if not directory.is_dir():
-                      records.append({"path": str(directory), "status": "missing"})
-                      continue
-                  for current, directories, names in os.walk(directory, followlinks=False):
-                      retained = []
-                      for name in sorted(directories):
-                          path = Path(current) / name
-                          if path.is_symlink():
-                              records.append(link_record(path, allowed))
-                          else:
-                              retained.append(name)
-                      directories[:] = retained
-                      for name in sorted(names):
-                          path = Path(current) / name
-                          if path.is_symlink():
-                              records.append(link_record(path, allowed))
-                          elif stat.S_ISREG(path.lstat().st_mode):
-                              files.append((path.name != "log.txt", path, directory))
+              with diag_phase("enumeration"):
+                  roots = sorted(Path("/tmp").glob("vpp-unittest-*"))
+                  roots += [Path("/tmp/vpp-failed-unittests"), candidate / "build-root/test-logs"]
+                  allowed = [directory for directory in roots if not directory.is_symlink()]
+                  files = []
+                  for directory in roots:
+                      diag_progress(path=directory)
+                      if directory.is_symlink():
+                          records.append(link_record(directory, allowed))
+                          continue
+                      if not directory.is_dir():
+                          records.append({"path": str(directory), "status": "missing"})
+                          continue
+                      for current, directories, names in os.walk(directory, followlinks=False):
+                          retained = []
+                          for name in sorted(directories):
+                              path = Path(current) / name
+                              if path.is_symlink():
+                                  records.append(link_record(path, allowed))
+                              else:
+                                  retained.append(name)
+                          directories[:] = retained
+                          for name in sorted(names):
+                              path = Path(current) / name
+                              if path.is_symlink():
+                                  records.append(link_record(path, allowed))
+                              elif stat.S_ISREG(path.lstat().st_mode):
+                                  files.append((path.name != "log.txt", path, directory))
               outputs = {False: 0, True: 0}
-              pending = sum(path.stat().st_size for optional, path, _ in files if not optional)
+              with diag_phase("pending_mandatory"):
+                  pending = sum(path.stat().st_size for optional, path, _ in files if not optional)
               try:
                   check_disk(root, pending)
               except RuntimeError as error:
@@ -673,7 +797,8 @@ jobs:
                             "source_relative": str(path.relative_to(directory)), "required": not optional}
                   try:
                       target = destination / snapshot_name(outputs[optional] + 1, optional, path.suffix)
-                      record.update(copy_file(path, target, required=not optional))
+                      with diag_phase("optional" if optional else "mandatory"):
+                          record.update(copy_file(path, target, required=not optional))
                       if record["status"] == "copied":
                           outputs[optional] += 1
                   except (OSError, RuntimeError) as error:
@@ -682,17 +807,19 @@ jobs:
                   if record["status"] == "copy-INCOMPLETE" or (not optional and record["status"] != "copied"):
                       issues.append(str(path))
               mapping = destination / "snapshot.json"
-              save(mapping, {"at": time.time(), "identity": attribution(),
-                   "files": records, "issue_count": len(issues), "first_issue": issues[0] if issues else None,
-                   "pending_mandatory_bytes": pending,
-                   "capacity_policy": {"overall_bytes": limit_bytes, "execution_bytes": execution_bytes,
-                       "unallocated_bytes": unallocated_bytes,
-                       "mandatory_bytes": mandatory_bytes, "mandatory_files": 1488,
-                       "metadata_bytes": metadata_bytes,
-                       "optional_bytes": optional_bytes, "optional_files": 256,
-                       "seal_reserve_bytes": seal_bytes, "seal_reserve_files": 128,
-                       "post_job_reserved_bytes": records_bytes, "post_job_reserved_files": 128,
-                       "overflow": "Mandatory FAIL/INCOMPLETE; optional omitted with size/hash; records retained"}})
+              diag_progress(path=mapping)
+              with diag_phase("map_save"):
+                  save(mapping, {"at": time.time(), "identity": attribution(),
+                       "files": records, "issue_count": len(issues), "first_issue": issues[0] if issues else None,
+                       "pending_mandatory_bytes": pending,
+                       "capacity_policy": {"overall_bytes": limit_bytes, "execution_bytes": execution_bytes,
+                           "unallocated_bytes": unallocated_bytes,
+                           "mandatory_bytes": mandatory_bytes, "mandatory_files": 1488,
+                           "metadata_bytes": metadata_bytes,
+                           "optional_bytes": optional_bytes, "optional_files": 256,
+                           "seal_reserve_bytes": seal_bytes, "seal_reserve_files": 128,
+                           "post_job_reserved_bytes": records_bytes, "post_job_reserved_files": 128,
+                           "overflow": "Mandatory FAIL/INCOMPLETE; optional omitted with size/hash; records retained"}})
               if issues:
                   raise RuntimeError(f"Snapshot evidence INCOMPLETE: {len(issues)} issue(s); first={issues[0]}; mapping={mapping.relative_to(root)}")
 
@@ -972,27 +1099,33 @@ jobs:
                   "status": "PASS" if all(item["status"] == "PASS" for item in entries) else "INCOMPLETE",
                   "methods": entries} for name, entries in buckets.items()})
 
+          @diag_operation("collect")
           def collect():
               errors = []
               try:
                   snapshot(root / "final-diagnostics")
               except Exception as error:
                   errors.append(str(error))
-              acceptance_groups()
-              save(root / "log-identities.json", {"identity": attribution(), "logs": [
-                  {"path": str(path.relative_to(root)), "identity": attribution(),
-                   "built_identity_scope": "Actual build input when available; pre-build commands precede this build"}
-                  for path in sorted(root.rglob("*")) if path.is_file() and not path.is_symlink()
-                  and (path.suffix in {".log", ".txt", ".raw"})]})
-              save(root / "worker-contract.json", {"all_classes_zero_workers": "UNFULFILLED",
-                   "reason": "Complete ip4 retains TestIPPuntHandoff worker2; complete ipsec_esp retains async/handoff worker2 classes",
-                   "required_classes_zero_workers": "Separate actual-startup gate for all 13 required classes; no substitute for all classes"})
+              with diag_phase("acceptance_groups"):
+                  acceptance_groups()
+              with diag_phase("log_identities"):
+                  save(root / "log-identities.json", {"identity": attribution(), "logs": [
+                      {"path": str(path.relative_to(root)), "identity": attribution(),
+                       "built_identity_scope": "Actual build input when available; pre-build commands precede this build"}
+                      for path in sorted(root.rglob("*")) if path.is_file() and not path.is_symlink()
+                      and (path.suffix in {".log", ".txt", ".raw"})]})
+              with diag_phase("worker_contract"):
+                  save(root / "worker-contract.json", {"all_classes_zero_workers": "UNFULFILLED",
+                       "reason": "Complete ip4 retains TestIPPuntHandoff worker2; complete ipsec_esp retains async/handoff worker2 classes",
+                       "required_classes_zero_workers": "Separate actual-startup gate for all 13 required classes; no substitute for all classes"})
               if errors:
                   raise RuntimeError("; ".join(errors))
 
+          @diag_operation("physical_records")
           def physical_records():
               records, seen = [], set()
               for path in sorted(root.rglob("*")):
+                  diag_progress(path=path)
                   name = str(artifact_path(str(path.relative_to(root))))
                   if name.casefold() in seen:
                       raise RuntimeError("Case-insensitive artifact path collision: " + name)
@@ -1004,6 +1137,7 @@ jobs:
                                       "sha256": digest(path.read_bytes())})
               return records
 
+          @diag_operation("integrity")
           def integrity():
               entries = {entry["path"]: entry for entry in physical_records()}
               issues = []
@@ -1020,6 +1154,7 @@ jobs:
               save(root / "integrity.json", {"status": "FAIL/INCOMPLETE" if issues else "PASS", "issues": issues})
               return issues
 
+          @diag_operation("seal")
           def seal():
               pools = {name: {"files": pool_usage(name)[0], "bytes": pool_usage(name)[1]}
                        for name in ["mandatory", "optional", "seal", "metadata"]}
@@ -1039,10 +1174,12 @@ jobs:
                   count, total = pool_usage(pool)
                   if total > byte_budget or count > file_budget:
                       raise RuntimeError("Final evidence pool exceeded: " + pool)
-              write_data(root / "artifact-manifest.json", payload)
+              with diag_phase("manifest_write"):
+                  write_data(root / "artifact-manifest.json", payload)
 
           stage = sys.argv[1]
           started = time.time()
+          diag_start(stage)
           stage_error = None
           try:
               if stage == "identity":
@@ -1082,15 +1219,17 @@ jobs:
                       seal_error = f"Evidence integrity INCOMPLETE: {len(integrity_issues)} issue(s); see integrity.json"
               except Exception as error:
                   seal_error = str(error)
-              save(root / "stages/collect.json", {"status": "FAIL" if collect_error or seal_error else "PASS",
-                   "collect_error": collect_error, "seal_error": seal_error,
-                   "start": started, "end": time.time(), "identity": attribution()})
+              with diag_phase("collect_stage_save"):
+                  save(root / "stages/collect.json", {"status": "FAIL" if collect_error or seal_error else "PASS",
+                       "collect_error": collect_error, "seal_error": seal_error,
+                       "start": started, "end": time.time(), "identity": attribution()})
               try:
                   seal()
               except Exception as error:
                   seal_error = str(error) if not seal_error else seal_error + "; " + str(error)
-                  save(root / "stages/collect.json", {"status": "FAIL", "collect_error": collect_error,
-                       "seal_error": seal_error, "start": started, "end": time.time(), "identity": attribution()})
+                  with diag_phase("collect_stage_save"):
+                      save(root / "stages/collect.json", {"status": "FAIL", "collect_error": collect_error,
+                           "seal_error": seal_error, "start": started, "end": time.time(), "identity": attribution()})
                   raise
               stage_error = collect_error or seal_error
           else:
