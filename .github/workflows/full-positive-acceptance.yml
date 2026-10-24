@@ -3,7 +3,7 @@ name: Full positive acceptance
 
 on:
   push:
-    branches: [validation/m39-collector-diag-20261024]
+    branches: [validation/m39-collector-budget-20261024]
 
 permissions:
   contents: read
@@ -280,6 +280,27 @@ jobs:
                             if (is_metadata(path) if pool == "metadata" else evidence_pool(path) == pool)]
                   return len(files) + len(active), sum(p.stat().st_size for p in files) + sum(active)
 
+          class SnapshotBudgetError(RuntimeError):
+              pass
+
+          class SnapshotBudget:
+              def __init__(self):
+                  self.usage = {pool: [0, 0] for pool in ["mandatory", "optional", "seal", "metadata"]}
+                  with diag_phase("pool_usage"):
+                      for path in root.rglob("*"):
+                          if path not in pending_writes and path.is_file() and not path.is_symlink():
+                              self.add(path, path.stat().st_size)
+                      for path, maximum in pending_writes.items():
+                          self.add(path, maximum)
+
+              def add(self, path, size):
+                  pools = [evidence_pool(path)]
+                  if is_metadata(path):
+                      pools.append("metadata")
+                  for pool in pools:
+                      self.usage[pool][0] += 1
+                      self.usage[pool][1] += size
+
           @diag_operation("diskcheck")
           def check_disk(path, pending):
               directory = path if path.is_dir() else path.parent
@@ -292,12 +313,12 @@ jobs:
                   raise RuntimeError("Insufficient actual disk space for pending evidence bytes")
 
           @diag_operation("reserve")
-          def reserve(size, optional=False, destination=None, metadata=False):
+          def reserve(size, optional=False, destination=None, metadata=False, snapshot_budget=None):
               pool = evidence_pool(destination) if destination is not None else "optional" if optional else "mandatory"
               budgets = {"mandatory": (mandatory_bytes, 1488), "optional": (optional_bytes, 256),
                          "seal": (seal_bytes, 128)}
               byte_budget, file_budget = budgets[pool]
-              count, total = pool_usage(pool)
+              count, total = pool_usage(pool) if snapshot_budget is None else snapshot_budget.usage[pool]
               if destination in pending_writes:
                   raise RuntimeError("Evidence destination has an active command reservation")
               old = destination.stat().st_size if destination is not None and destination.is_file() else None
@@ -305,7 +326,7 @@ jobs:
                       or total - (old or 0) + size > byte_budget):
                   raise RuntimeError("Evidence " + pool + " pool exceeded; evidence INCOMPLETE")
               if metadata and pool == "mandatory":
-                  _, used = pool_usage("metadata")
+                  _, used = pool_usage("metadata") if snapshot_budget is None else snapshot_budget.usage["metadata"]
                   if used - (old or 0) + size > metadata_bytes:
                       raise RuntimeError("Evidence metadata budget exceeded; evidence INCOMPLETE")
               check_disk(destination or root, sum(pending_writes.values()) + max(0, size - (old or 0)))
@@ -319,7 +340,7 @@ jobs:
               finally:
                   evidence_lock.release()
 
-          def copy_file(source, destination, required=False):
+          def copy_file(source, destination, required=False, snapshot_budget=None):
               diag_progress(path=source)
               if source.is_symlink() or not source.is_file():
                   if required:
@@ -335,7 +356,8 @@ jobs:
               record = {"path": str(source), "size": size, "sha256": sha.hexdigest()}
               with diag_copy_lock():
                   try:
-                      reserve(size, destination=destination, metadata=is_metadata(destination))
+                      reserve(size, destination=destination, metadata=is_metadata(destination),
+                              snapshot_budget=snapshot_budget)
                   except RuntimeError as error:
                       record.update(status="required-limit-INCOMPLETE" if required else "omitted-optional-limit",
                                     error=str(error))
@@ -363,9 +385,21 @@ jobs:
                           if destination.stat().st_size != size or digest(destination.read_bytes()) != record["sha256"]:
                               raise RuntimeError("Copied evidence bytes differ: " + str(source))
                   except (OSError, RuntimeError):
-                      if created:
-                          destination.unlink(missing_ok=True)
+                      try:
+                          if created:
+                              destination.unlink(missing_ok=True)
+                          if snapshot_budget is not None:
+                              try:
+                                  destination.lstat()
+                              except FileNotFoundError:
+                                  pass
+                              else:
+                                  raise OSError("Uncertain evidence destination after failed copy")
+                      except OSError as error:
+                          raise SnapshotBudgetError("Snapshot budget INCOMPLETE: " + str(destination)) from error
                       raise
+                  if snapshot_budget is not None:
+                      snapshot_budget.add(destination, size)
               record.update(stored=str(destination.relative_to(root)), status="copied")
               return record
 
@@ -792,20 +826,25 @@ jobs:
                   check_disk(root, pending)
               except RuntimeError as error:
                   print("Snapshot pending-copy warning: " + str(error), flush=True)
-              for optional, path, directory in sorted(files, key=lambda item: (item[0], str(item[1]))):
-                  record = {"path": str(path), "source_root": str(directory),
-                            "source_relative": str(path.relative_to(directory)), "required": not optional}
-                  try:
-                      target = destination / snapshot_name(outputs[optional] + 1, optional, path.suffix)
-                      with diag_phase("optional" if optional else "mandatory"):
-                          record.update(copy_file(path, target, required=not optional))
-                      if record["status"] == "copied":
-                          outputs[optional] += 1
-                  except (OSError, RuntimeError) as error:
-                      record.update(status="copy-INCOMPLETE", error=str(error))
-                  records.append(record)
-                  if record["status"] == "copy-INCOMPLETE" or (not optional and record["status"] != "copied"):
-                      issues.append(str(path))
+              with diag_copy_lock():
+                  snapshot_budget = SnapshotBudget()
+                  for optional, path, directory in sorted(files, key=lambda item: (item[0], str(item[1]))):
+                      record = {"path": str(path), "source_root": str(directory),
+                                "source_relative": str(path.relative_to(directory)), "required": not optional}
+                      try:
+                          target = destination / snapshot_name(outputs[optional] + 1, optional, path.suffix)
+                          with diag_phase("optional" if optional else "mandatory"):
+                              record.update(copy_file(path, target, required=not optional,
+                                                      snapshot_budget=snapshot_budget))
+                          if record["status"] == "copied":
+                              outputs[optional] += 1
+                      except SnapshotBudgetError:
+                          raise
+                      except (OSError, RuntimeError) as error:
+                          record.update(status="copy-INCOMPLETE", error=str(error))
+                      records.append(record)
+                      if record["status"] == "copy-INCOMPLETE" or (not optional and record["status"] != "copied"):
+                          issues.append(str(path))
               mapping = destination / "snapshot.json"
               diag_progress(path=mapping)
               with diag_phase("map_save"):
@@ -1059,7 +1098,7 @@ jobs:
                               stop.set()
                               watcher.join(timeout=10)
                               if watcher.is_alive():
-                                  run_error = RuntimeError("Process identity collection did not stop")
+                                  raise RuntimeError("Process identity collection did not stop; evidence INCOMPLETE")
                           snapshot(directory)
                       inventory_error = None
                       try:
