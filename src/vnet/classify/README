@@ -112,10 +112,11 @@ The "next_table_index" parameter is as described: the pool index in
 vnet_classify_main.tables of the next table to search. Code ~0 to
 indicate the end of the table list. 0 is a valid table index!
 
-The classifier refuses a next_table_index that names a table which does
-not exist, and one that would close a loop in the chain: packet
+A next_table_index passed to add_del_table is refused if it names a
+table which does not exist or would close a loop in the chain: packet
 processing walks the chain on every packet that misses, and could never
-leave a loop.
+leave a loop. The mask sort reorders the links among the tables already
+in that chain; it does not add a table to it.
 
 Deleting a table that something still names fails with
 VNET_API_ERROR_RSRC_IN_USE. The holders are the per-interface ACL,

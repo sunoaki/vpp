@@ -2014,15 +2014,32 @@ u32
 classify_sort_table_chain (vnet_classify_main_t * cm, u32 table_index)
 {
   /*
-   * Form a vector of all classifier tables in this chain.
+   * Form a vector of all classifier tables in this chain. The walk is
+   * bounded by the table pool and stops at an index the pool no longer
+   * holds, so a corrupt chain cannot loop here or dereference freed
+   * memory. Relinking the collected prefix also cuts such a chain short.
    */
   u32 *tables = 0;
   vnet_classify_table_t *t;
   u32 cti;
-  for (cti = table_index; cti != ~0; cti = t->next_table_index)
+  u32 depth;
+
+  for (cti = table_index, depth = 0; cti != ~0; depth++)
     {
+      if (depth >= vec_len (cm->tables))
+	break;
+      if (pool_is_free_index (cm->tables, cti))
+	break;
+
       vec_add1 (tables, cti);
       t = pool_elt_at_index (cm->tables, cti);
+      cti = t->next_table_index;
+    }
+
+  if (vec_len (tables) == 0)
+    {
+      vec_free (tables);
+      return table_index;
     }
 
   /*
