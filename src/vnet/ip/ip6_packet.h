@@ -602,8 +602,9 @@ typedef struct
  *
  * The complete header chain (up to the terminating header) is
  * returned in res.
- * A header is only reported when all of it lies inside those bounds,
- * so a header cut off by the end of the buffer is not returned.
+ * A fragment header is only reported when all 8 bytes of it lie inside
+ * those bounds. Lengths of other headers are not checked here, including
+ * the terminating header that is returned as the last entry.
  * Returns the index of the find_hdr_type if > 0. Otherwise
  * it returns the index of the last header.
  */
@@ -631,13 +632,12 @@ ip6_ext_header_walk (vlib_buffer_t *b, ip6_header_t *ip, int find_hdr_type,
   while (next_header)
     {
       /* A fragment header carries 8 bytes, and the recorded offset alone does
-       * not prove they all exist: the walk can be handed an offset that the
-       * preceding header only placed at the end of the bounds, in which case
-       * offset < max_offset < offset + 8. Reporting it would let a caller read
-       * and copy the 8 bytes past the end of the buffer.
+       * not prove they all exist: the preceding header can end exactly on the
+       * bound, leaving offset <= max_offset < offset + 8. Reporting it would
+       * let a caller read and copy the 8 bytes past the end of the buffer.
        */
       if (next_proto == IP_PROTOCOL_IPV6_FRAGMENTATION &&
-	  offset + sizeof (ip6_frag_hdr_t) > max_offset)
+	  offset <= max_offset && max_offset < offset + sizeof (ip6_frag_hdr_t))
 	break;
       /* Move on to next header */
       res->eh[i].offset = offset;
