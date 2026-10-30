@@ -122,6 +122,12 @@ lip_punt_xc_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    }
 
 	  lip0 = lcp_itf_pair_get (lipi0);
+	  if (PREDICT_FALSE (!lip0))
+	    {
+	      next0 = LIP_PUNT_XC_NEXT_DROP;
+	      goto trace0;
+	    }
+
 	  next0 = LIP_PUNT_XC_NEXT_IO;
 	  vnet_buffer (b0)->sw_if_index[VLIB_TX] =
 	    is_xc0 ? lip0->lip_phy_sw_if_index : lip0->lip_host_sw_if_index;
@@ -151,15 +157,13 @@ lip_punt_xc_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      t->is_xc = is_xc0;
 	      if (is_xc0)
 		{
-		  t->phy_sw_if_index =
-		    (lipi0 == INDEX_INVALID) ? ~0 : lip0->lip_phy_sw_if_index;
+		  t->phy_sw_if_index = lip0 ? lip0->lip_phy_sw_if_index : ~0;
 		  t->host_sw_if_index = sw_if_index0;
 		}
 	      else
 		{
 		  t->phy_sw_if_index = sw_if_index0;
-		  t->host_sw_if_index =
-		    (lipi0 == INDEX_INVALID) ? ~0 : lip0->lip_host_sw_if_index;
+		  t->host_sw_if_index = lip0 ? lip0->lip_host_sw_if_index : ~0;
 		}
 	    }
 
@@ -275,15 +279,22 @@ VLIB_NODE_FN (lcp_punt_l3_node)
 	    lcp_itf_pair_find_by_phy (vnet_buffer (b0)->sw_if_index[VLIB_RX]);
 	  if (lipi0 != INDEX_INVALID)
 	    {
+	      lip0 = lcp_itf_pair_get (lipi0);
+	      if (PREDICT_FALSE (!lip0))
+		{
+		  next0 = LCP_LOCAL_NEXT_DROP;
+		  goto trace0;
+		}
+
 	      /*
 	       * Avoid TTL check for packets which arrived on a tunnel and
 	       * are being punted to the local host.
 	       */
-	      lip0 = lcp_itf_pair_get (lipi0);
 	      if (lip0->lip_host_type == LCP_ITF_HOST_TUN)
 		b0->flags |= VNET_BUFFER_F_LOCALLY_ORIGINATED;
 	    }
 
+	trace0:
 	  if (PREDICT_FALSE ((b0->flags & VLIB_BUFFER_IS_TRACED)))
 	    {
 	      lcp_punt_l3_trace_t *t =
