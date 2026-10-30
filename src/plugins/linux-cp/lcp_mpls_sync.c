@@ -11,7 +11,9 @@
 #include <vnet/mpls/mpls.h>
 #include <vppinfra/linux/netns.h>
 
+#include <errno.h>
 #include <fcntl.h>
+#include <string.h>
 
 vlib_log_class_t lcp_mpls_sync_logger;
 
@@ -38,6 +40,8 @@ lcp_mpls_sync_state_cb (struct mpls_main_t *mm, uword opaque, u32 sw_if_index,
   int curr_ns_fd = -1;
   int vif_ns_fd = -1;
   int ctl_fd = -1;
+  int entered_dest_ns = 0;
+  int err;
   u8 *ctl_path = NULL;
 
   LCP_MPLS_SYNC_DBG ("sync_state_cb: called for sw_if_index %u", sw_if_index);
@@ -75,9 +79,39 @@ lcp_mpls_sync_state_cb (struct mpls_main_t *mm, uword opaque, u32 sw_if_index,
   if (lip->lip_namespace)
     {
       curr_ns_fd = clib_netns_open (NULL /* self */);
+      if (curr_ns_fd < 0)
+	{
+	  err = errno;
+	  vlib_log_err (lcp_mpls_sync_logger,
+			"sync_state_cb: failed to open current namespace "
+			"(curr ns fd %d, vif ns fd %d): %s (errno %d)",
+			curr_ns_fd, vif_ns_fd, strerror (err), err);
+	  goto SYNC_CLEANUP;
+	}
+
       vif_ns_fd = clib_netns_open (lip->lip_namespace);
-      if (vif_ns_fd != -1)
-	clib_setns (vif_ns_fd);
+      if (vif_ns_fd < 0)
+	{
+	  err = errno;
+	  vlib_log_err (lcp_mpls_sync_logger,
+			"sync_state_cb: failed to open namespace %s "
+			"(curr ns fd %d, vif ns fd %d): %s (errno %d)",
+			lip->lip_namespace, curr_ns_fd, vif_ns_fd, strerror (err),
+			err);
+	  goto SYNC_CLEANUP;
+	}
+
+      if (clib_setns (vif_ns_fd) < 0)
+	{
+	  err = errno;
+	  vlib_log_err (lcp_mpls_sync_logger,
+			"sync_state_cb: failed to set namespace %s "
+			"(curr ns fd %d, vif ns fd %d): %s (errno %d)",
+			lip->lip_namespace, curr_ns_fd, vif_ns_fd, strerror (err),
+			err);
+	  goto SYNC_CLEANUP;
+	}
+      entered_dest_ns = 1;
     }
 
   ctl_path = format (NULL, "/proc/sys/net/mpls/conf/%s/input%c",
@@ -115,11 +149,20 @@ SYNC_CLEANUP:
   if (vif_ns_fd != -1)
     close (vif_ns_fd);
 
-  if (curr_ns_fd != -1)
+  if (entered_dest_ns)
     {
-      clib_setns (curr_ns_fd);
-      close (curr_ns_fd);
+      if (clib_setns (curr_ns_fd) < 0)
+	{
+	  err = errno;
+	  vlib_log_err (lcp_mpls_sync_logger,
+			"sync_state_cb: failed to restore current namespace "
+			"(curr ns fd %d, vif ns fd %d): %s (errno %d)",
+			curr_ns_fd, vif_ns_fd, strerror (err), err);
+	}
     }
+
+  if (curr_ns_fd != -1)
+    close (curr_ns_fd);
 }
 
 static clib_error_t *
