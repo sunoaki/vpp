@@ -52,6 +52,11 @@ typedef enum vnet_classify_action_t_
 struct _vnet_classify_main;
 typedef struct _vnet_classify_main vnet_classify_main_t;
 
+/* Largest number of 16-byte vectors in a skip or match key.  The mask
+   holds this many match vectors and the dataplane reads the key from the
+   packet, so a table may not move the key any further out. */
+#define VNET_CLASSIFY_MAX_N_VECTORS 5
+
 #define foreach_size_in_u32x4                   \
 _(1)                                            \
 _(2)                                            \

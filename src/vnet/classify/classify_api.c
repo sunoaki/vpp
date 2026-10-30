@@ -57,9 +57,9 @@ static void vl_api_classify_pcap_lookup_table_t_handler
   u32 mask_len = ntohl (mp->mask_len);
   u32 sw_if_index = ntohl (mp->sw_if_index);
 
-  if (n_skip > 5 || n_match == 0 || n_match > 5 ||
-      mask_len != n_match * sizeof (u32x4) || sw_if_index == ~0 ||
-      sw_if_index >= vec_len (cm->classify_table_index_by_sw_if_index))
+  if (n_skip > VNET_CLASSIFY_MAX_N_VECTORS || n_match == 0 ||
+      n_match > VNET_CLASSIFY_MAX_N_VECTORS || mask_len != n_match * sizeof (u32x4) ||
+      sw_if_index == ~0 || sw_if_index >= vec_len (cm->classify_table_index_by_sw_if_index))
     {
       rv = VNET_API_ERROR_INVALID_VALUE;
       goto out;
@@ -203,8 +203,8 @@ static void vl_api_classify_trace_lookup_table_t_handler
   u32 n_skip = ntohl (mp->skip_n_vectors);
   u32 n_match = ntohl (mp->match_n_vectors);
   u32 mask_len = ntohl (mp->mask_len);
-  if (n_skip > 5
-      || n_match == 0 || n_match > 5 || mask_len != n_match * sizeof (u32x4))
+  if (n_skip > VNET_CLASSIFY_MAX_N_VECTORS || n_match == 0 ||
+      n_match > VNET_CLASSIFY_MAX_N_VECTORS || mask_len != n_match * sizeof (u32x4))
     {
       rv = VNET_API_ERROR_INVALID_VALUE;
       goto out;
