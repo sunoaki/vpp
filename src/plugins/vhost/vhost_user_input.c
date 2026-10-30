@@ -581,6 +581,36 @@ vhost_user_if_input (vlib_main_t *vm, vhost_user_main_t *vum,
 
       desc_data_offset = vui->virtio_net_hdr_sz;
 
+      /* The peer must leave room for the virtio-net header in the first
+       * descriptor. Otherwise desc_data_l below underflows and the frame
+       * would be copied from guest memory past the end of the descriptor. */
+      if (PREDICT_FALSE (desc_table[desc_current].len < desc_data_offset))
+	{
+	  vlib_increment_simple_counter (vnet_main.interface_main.sw_if_counters +
+					   VNET_INTERFACE_COUNTER_DROP,
+					 vm->thread_index, vui->sw_if_index, 1);
+
+	  /* Cancel speculation and give the buffer back */
+	  to_next--;
+	  n_left_to_next++;
+	  cpu->rx_buffers[cpu->rx_buffers_len++] = bi_current;
+
+	  /* consume the descriptor and return it as used */
+	  last_avail_idx++;
+	  last_used_idx++;
+	  n_left--;
+
+	  /*
+	   * The trace below derives the first avail index from n_rx_packets,
+	   * so end the batch here instead of pairing a later frame with this
+	   * descriptor.
+	   */
+	  if (PREDICT_FALSE (n_trace != 0))
+	    break;
+
+	  continue;
+	}
+
       if (enable_csum)
 	{
 	  vnet_virtio_net_hdr_mrg_rxbuf_t *hdr;
