@@ -5,6 +5,8 @@
 
 #include <vnet/classify/vnet_classify.h>
 #include <vnet/classify/in_out_acl.h>
+#include <vnet/classify/policer_classify.h>
+#include <vnet/classify/flow_classify.h>
 #include <vnet/ip/ip.h>
 #include <vnet/api_errno.h>	/* for API error numbers */
 #include <vnet/l2/l2_classify.h>	/* for L2_INPUT_CLASSIFY_NEXT_xxx */
@@ -170,6 +172,142 @@ vnet_classify_new_table (vnet_classify_main_t *cm, const u8 *mask,
 
   clib_mem_set_heap (oldheap);
   return (t);
+}
+
+static int
+vnet_classify_index_vector_holds (u32 * indices, u32 table_index)
+{
+  u32 i;
+
+  for (i = 0; i < vec_len (indices); i++)
+    if (indices[i] == table_index)
+      return 1;
+
+  return 0;
+}
+
+/*
+ * The dataplane reaches a table through a per-interface binding vector or
+ * through another table's next_table_index.  A table that either still
+ * names must not be freed: the holder would dereference a freed pool
+ * element on the next packet.
+ */
+static int
+vnet_classify_table_is_bound (vnet_classify_main_t * cm, u32 table_index)
+{
+  in_out_acl_main_t *am = &in_out_acl_main;
+  policer_classify_main_t *pcm = &policer_classify_main;
+  flow_classify_main_t *fcm = &flow_classify_main;
+  u32 group, ti;
+
+  if (vlib_global_main.trace_filter.classify_table_index == table_index)
+    return 1;
+
+  if (vnet_classify_index_vector_holds
+      (cm->classify_table_index_by_sw_if_index, table_index))
+    return 1;
+
+  for (group = 0; group < IN_OUT_ACL_N_TABLE_GROUPS; group++)
+    for (ti = 0; ti < IN_OUT_ACL_N_TABLES; ti++)
+      if (vnet_classify_index_vector_holds
+	  (am->classify_table_index_by_sw_if_index[group][ti], table_index))
+	return 1;
+
+  for (ti = 0; ti < POLICER_CLASSIFY_N_TABLES; ti++)
+    if (vnet_classify_index_vector_holds
+	(pcm->classify_table_index_by_sw_if_index[ti], table_index))
+      return 1;
+
+  for (ti = 0; ti < FLOW_CLASSIFY_N_TABLES; ti++)
+    if (vnet_classify_index_vector_holds
+	(fcm->classify_table_index_by_sw_if_index[ti], table_index))
+      return 1;
+
+  return 0;
+}
+
+/*
+ * Report whether deleting table_index would leave a reference to a freed
+ * table.  A delete frees the table itself and, with del_chain, every table
+ * chained after it, so each of them is checked.  The predecessor of a chain
+ * member is exempt because it is part of the same delete.
+ *
+ * A chain visits each table at most once, so it cannot be longer than the
+ * table pool; walking further means the chain loops, which is itself a
+ * reason to refuse the delete.
+ */
+static int
+vnet_classify_table_in_use (vnet_classify_main_t * cm, u32 table_index,
+			    int del_chain)
+{
+  vnet_classify_table_t *t;
+  u32 member = table_index;
+  u32 previous = ~0;
+  u32 depth;
+  uword referrer;
+
+  for (depth = 0; member != ~0; depth++)
+    {
+      if (depth >= vec_len (cm->tables))
+	return 1;
+
+      if (pool_is_free_index (cm->tables, member))
+	break;
+
+      if (vnet_classify_table_is_bound (cm, member))
+	return 1;
+
+      pool_foreach_index (referrer, cm->tables)
+	{
+	  t = pool_elt_at_index (cm->tables, referrer);
+	  if (t->next_table_index == member && referrer != previous)
+	    return 1;
+	}
+
+      if (!del_chain)
+	break;
+
+      t = pool_elt_at_index (cm->tables, member);
+      previous = member;
+      member = t->next_table_index;
+    }
+
+  return 0;
+}
+
+/*
+ * A next_table_index names either a live table or the end of the chain.  It
+ * may not name a free table, and it may not close a loop: the dataplane
+ * chain walks could never leave one.
+ */
+static int
+vnet_classify_next_table_index_is_valid (vnet_classify_main_t * cm,
+					 u32 table_index,
+					 u32 next_table_index)
+{
+  vnet_classify_table_t *t;
+  u32 index;
+  u32 depth;
+
+  if (next_table_index == ~0)
+    return 1;
+
+  for (index = next_table_index, depth = 0; index != ~0; depth++)
+    {
+      if (depth >= vec_len (cm->tables))
+	return 0;
+
+      if (index == table_index)
+	return 0;
+
+      if (pool_is_free_index (cm->tables, index))
+	return 0;
+
+      t = pool_elt_at_index (cm->tables, index);
+      index = t->next_table_index;
+    }
+
+  return 1;
 }
 
 void
@@ -826,11 +964,20 @@ vnet_classify_add_del_table (vnet_classify_main_t *cm, const u8 *mask,
 
 	  t = vnet_classify_new_table (cm, mask, nbuckets, memory_size,
 				       skip, match);
+	  *table_index = t - cm->tables;
+
+	  if (!vnet_classify_next_table_index_is_valid (cm, *table_index,
+							next_table_index))
+	    {
+	      vnet_classify_delete_table_index (cm, *table_index, 0);
+	      *table_index = ~0;
+	      return VNET_API_ERROR_INVALID_VALUE;
+	    }
+
 	  t->next_table_index = next_table_index;
 	  t->miss_next_index = miss_next_index;
 	  t->current_data_flag = current_data_flag;
 	  t->current_data_offset = current_data_offset;
-	  *table_index = t - cm->tables;
 	}
       else			/* update */
 	{
@@ -838,11 +985,19 @@ vnet_classify_add_del_table (vnet_classify_main_t *cm, const u8 *mask,
 	  if (pool_is_free_index (cm->tables, *table_index))
 	    return VNET_API_ERROR_CLASSIFY_TABLE_NOT_FOUND;
 
+	  if (!vnet_classify_next_table_index_is_valid (cm, *table_index,
+							next_table_index))
+	    return VNET_API_ERROR_INVALID_VALUE;
+
 	  t = pool_elt_at_index (cm->tables, *table_index);
 	  t->next_table_index = next_table_index;
 	}
       return 0;
     }
+
+  if (!pool_is_free_index (cm->tables, *table_index)
+      && vnet_classify_table_in_use (cm, *table_index, del_chain))
+    return VNET_API_ERROR_RSRC_IN_USE;
 
   vnet_classify_delete_table_index (cm, *table_index, del_chain);
   return 0;
@@ -1813,7 +1968,15 @@ classify_set_trace_chain (vnet_classify_main_t * cm, u32 table_index)
       u32 old_table_index;
 
       old_table_index = vlib_global_main.trace_filter.classify_table_index;
-      vnet_classify_delete_table_index (cm, old_table_index, 1);
+
+      /*
+       * Drop this reference before asking whether the chain is still in
+       * use: another binding may name the same table.
+       */
+      vlib_global_main.trace_filter.classify_table_index = ~0;
+
+      if (!vnet_classify_table_in_use (cm, old_table_index, 1))
+	vnet_classify_delete_table_index (cm, old_table_index, 1);
     }
 
   vlib_global_main.trace_filter.classify_table_index = table_index;
@@ -1837,34 +2000,33 @@ classify_set_pcap_chain (vnet_classify_main_t * cm,
 			 u32 sw_if_index, u32 table_index)
 {
   vnet_main_t *vnm = vnet_get_main ();
+  u32 old_table_index = ~0;
 
   if (sw_if_index != ~0 && table_index != ~0)
     vec_validate_init_empty (cm->classify_table_index_by_sw_if_index,
 			     sw_if_index, ~0);
 
-  if (table_index == ~0)
-    {
-      u32 old_table_index = ~0;
-
-      if (sw_if_index < vec_len (cm->classify_table_index_by_sw_if_index))
-	old_table_index =
-	  cm->classify_table_index_by_sw_if_index[sw_if_index];
-
-      vnet_classify_delete_table_index (cm, old_table_index, 1);
-    }
-
   /*
-   * Put the table index where device drivers can find them.
-   * This table index will be either a valid table or a ~0 to clear it.
+   * Put the table index where device drivers can find them.  This happens
+   * before the old chain is deleted, so that no packet finds a freed table
+   * there.  This table index will be either a valid table or a ~0 to clear
+   * it.
    */
   if (vec_len (cm->classify_table_index_by_sw_if_index) > sw_if_index)
-    cm->classify_table_index_by_sw_if_index[sw_if_index] = table_index;
+    {
+      old_table_index = cm->classify_table_index_by_sw_if_index[sw_if_index];
+      cm->classify_table_index_by_sw_if_index[sw_if_index] = table_index;
+    }
   if (sw_if_index > 0)
     {
       vnet_hw_interface_t *hi;
       hi = vnet_get_sup_hw_interface (vnm, sw_if_index);
       hi->trace_classify_table_index = table_index;
     }
+
+  if (table_index == ~0
+      && !vnet_classify_table_in_use (cm, old_table_index, 1))
+    vnet_classify_delete_table_index (cm, old_table_index, 1);
 }
 
 

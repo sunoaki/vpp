@@ -112,6 +112,17 @@ The "next_table_index" parameter is as described: the pool index in
 vnet_classify_main.tables of the next table to search. Code ~0 to
 indicate the end of the table list. 0 is a valid table index!
 
+The classifier refuses a next_table_index that names a table which does
+not exist, and one that would close a loop in the chain: packet
+processing walks the chain on every packet that misses, and could never
+leave a loop.
+
+Deleting a table that something still names - a per-interface ACL,
+policer or flow-classify binding, a pcap or trace chain, or another
+table's next_table_index - fails with VNET_API_ERROR_RSRC_IN_USE.
+Remove the binding, or delete the whole chain from its head with
+del_chain, first.
+
 We often create classification tables in reverse order -
 last-table-searched to first-table-searched - so we can easily set
 this parameter. Of course, one can manually adjust the data structure
