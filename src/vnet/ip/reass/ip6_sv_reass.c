@@ -16,6 +16,7 @@
 #include <vnet/ip/ip6_to_ip4.h>
 #include <vppinfra/bihash_48_8.h>
 #include <vnet/ip/reass/ip6_sv_reass.h>
+#include <vnet/ip/reass/ip6_reass.h>
 #include <vnet/ip/ip6_inlines.h>
 
 #define MSEC_PER_SEC			1000
@@ -601,9 +602,11 @@ ip6_sv_reass_update (vlib_main_t *vm, vlib_node_runtime_t *node,
 
   u32 fragment_first = fvnb->ip.reass.fragment_first =
     ip6_frag_hdr_offset_bytes (frag_hdr);
-  u32 fragment_length =
-    vlib_buffer_length_in_chain (vm, fb) -
-    (fvnb->ip.reass.ip6_frag_hdr_offset + sizeof (*frag_hdr));
+  u32 fragment_length;
+  if (!ip6_reass_fragment_data_len (vm, fb, &fragment_length))
+    {
+      return IP6_SV_REASS_RC_INVALID_FRAG_LEN;
+    }
   if (0 == fragment_length)
     {
       return IP6_SV_REASS_RC_INVALID_FRAG_LEN;
@@ -692,12 +695,15 @@ always_inline bool
 ip6_sv_reass_verify_fragment_multiple_8 (vlib_main_t *vm, vlib_buffer_t *b,
 					 ip6_frag_hdr_t *frag_hdr)
 {
-  vnet_buffer_opaque_t *vnb = vnet_buffer (b);
   ip6_header_t *ip = vlib_buffer_get_current (b);
   int more_fragments = ip6_frag_hdr_more (frag_hdr);
-  u32 fragment_length =
-    vlib_buffer_length_in_chain (vm, b) -
-    (vnb->ip.reass.ip6_frag_hdr_offset + sizeof (*frag_hdr));
+  u32 fragment_length;
+
+  if (!ip6_reass_fragment_data_len (vm, b, &fragment_length))
+    {
+      ip6_reass_set_payload_length_error (b);
+      return false;
+    }
   if (more_fragments && 0 != fragment_length % 8)
     {
       icmp6_error_set_vnet_buffer (
@@ -713,11 +719,14 @@ always_inline bool
 ip6_sv_reass_verify_packet_size_lt_64k (vlib_main_t *vm, vlib_buffer_t *b,
 					ip6_frag_hdr_t *frag_hdr)
 {
-  vnet_buffer_opaque_t *vnb = vnet_buffer (b);
   u32 fragment_first = ip6_frag_hdr_offset_bytes (frag_hdr);
-  u32 fragment_length =
-    vlib_buffer_length_in_chain (vm, b) -
-    (vnb->ip.reass.ip6_frag_hdr_offset + sizeof (*frag_hdr));
+  u32 fragment_length;
+
+  if (!ip6_reass_fragment_data_len (vm, b, &fragment_length))
+    {
+      ip6_reass_set_payload_length_error (b);
+      return false;
+    }
   if (fragment_first + fragment_length > 65535)
     {
       ip6_header_t *ip0 = vlib_buffer_get_current (b);
