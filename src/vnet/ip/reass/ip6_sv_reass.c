@@ -593,9 +593,13 @@ ip6_sv_reass_update (vlib_main_t *vm, vlib_node_runtime_t *node,
 
   vec_add1 (reass->cached_buffers, bi0);
 
+  /* The offset is relative to the first buffer and the whole header has to be
+   * in it: the header fields are read and the buffered fragment is handed to
+   * the next node from that buffer alone.
+   */
   if (fb->current_length < sizeof (*fip) ||
       fvnb->ip.reass.ip6_frag_hdr_offset == 0 ||
-      fvnb->ip.reass.ip6_frag_hdr_offset >= fb->current_length)
+      fvnb->ip.reass.ip6_frag_hdr_offset + sizeof (ip6_frag_hdr_t) > fb->current_length)
     {
       return IP6_SV_REASS_RC_INTERNAL_ERROR;
     }

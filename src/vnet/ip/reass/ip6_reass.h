@@ -26,9 +26,10 @@
  * trailers from being counted as fragment data.
  *
  * Returns false, leaving *fragment_data_len untouched, when the Payload
- * Length field does not reach past the fragment header or when the buffer
- * chain is shorter than the packet the Payload Length field declares. Both
- * cases would underflow the subtraction above.
+ * Length field ends before the fragment data or when the buffer chain is
+ * shorter than the packet the Payload Length field declares. The first
+ * condition protects the subtraction above; the second rejects a frame that
+ * cannot back the declared length.
  *
  * @param vm vlib main
  * @param b fragment buffer, IPv6 header at vlib_buffer_get_current
