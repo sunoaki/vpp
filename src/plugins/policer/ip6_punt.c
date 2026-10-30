@@ -21,8 +21,13 @@ static char *ip6_punt_policer_handoff_error_strings[] = { "congestion drop" };
 VLIB_NODE_FN (ip6_punt_policer_handoff_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 {
-  return policer_handoff (vm, node, frame, ip6_punt_policer_cfg.fq_index,
-			  ip6_punt_policer_cfg.policer_index);
+  u32 policer_index = ip6_punt_policer_cfg.policer_index;
+
+  if (PREDICT_FALSE (!policer_index_is_valid (&policer_main, policer_index)))
+    return ip_punt_policer_drop_all (vm, node, frame, ip6_punt_policer_node.index,
+				     IP_PUNT_POLICER_ERROR_INVALID_INDEX);
+
+  return policer_handoff (vm, node, frame, ip6_punt_policer_cfg.fq_index, policer_index);
 }
 
 VLIB_REGISTER_NODE (ip6_punt_policer_handoff_node) = {
