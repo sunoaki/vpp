@@ -782,24 +782,43 @@ ip6_full_reass_finalize (vlib_main_t * vm, vlib_node_runtime_t * node,
 		    }
 		}
 	      total_length += tmp->current_length;
+	      if (tmp->flags & VLIB_BUFFER_NEXT_PRESENT)
+		{
+		  tmp_bi = tmp->next_buffer;
+		  tmp = vlib_get_buffer (vm, tmp->next_buffer);
+		}
+	      else
+		{
+		  break;
+		}
 	    }
 	  else
 	    {
+	      u32 to_be_freed_bi = tmp_bi;
 	      if (reass->first_bi == tmp_bi)
 		{
 		  rv = IP6_FULL_REASS_RC_INTERNAL_ERROR;
 		  goto free_buffers_and_return;
 		}
-	      vec_add1 (vec_drop_compress, tmp_bi);
-	    }
-	  if (tmp->flags & VLIB_BUFFER_NEXT_PRESENT)
-	    {
-	      tmp_bi = tmp->next_buffer;
-	      tmp = vlib_get_buffer (vm, tmp->next_buffer);
-	    }
-	  else
-	    {
-	      break;
+	      /*
+	       * Unlink the buffer before queueing it for drop. vlib_buffer_free
+	       * walks the chain, so a buffer still marked as chained would take
+	       * the buffers behind it along with it.
+	       */
+	      if (tmp->flags & VLIB_BUFFER_NEXT_PRESENT)
+		{
+		  tmp->flags &= ~VLIB_BUFFER_NEXT_PRESENT;
+		  tmp_bi = tmp->next_buffer;
+		  tmp->next_buffer = 0;
+		  tmp = vlib_get_buffer (vm, tmp_bi);
+		  vec_add1 (vec_drop_compress, to_be_freed_bi);
+		}
+	      else
+		{
+		  tmp->next_buffer = 0;
+		  vec_add1 (vec_drop_compress, to_be_freed_bi);
+		  break;
+		}
 	    }
 	}
       sub_chain_bi =
