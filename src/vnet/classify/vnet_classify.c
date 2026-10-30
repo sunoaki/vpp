@@ -176,7 +176,7 @@ vnet_classify_new_table (vnet_classify_main_t *cm, const u8 *mask,
 }
 
 static int
-vnet_classify_index_vector_holds (u32 * indices, u32 table_index)
+vnet_classify_index_vector_holds (u32 *indices, u32 table_index)
 {
   u32 i;
 
@@ -188,8 +188,7 @@ vnet_classify_index_vector_holds (u32 * indices, u32 table_index)
 }
 
 static int
-vnet_classify_index_vectors_hold (u32 ** indices_by_type, u32 n_types,
-				  u32 table_index)
+vnet_classify_index_vectors_hold (u32 **indices_by_type, u32 n_types, u32 table_index)
 {
   u32 ti;
 
@@ -212,7 +211,7 @@ vnet_classify_index_vectors_hold (u32 ** indices_by_type, u32 n_types,
  * function only reads their state.
  */
 static int
-vnet_classify_table_is_bound (vnet_classify_main_t * cm, u32 table_index)
+vnet_classify_table_is_bound (vnet_classify_main_t *cm, u32 table_index)
 {
   in_out_acl_main_t *am = &in_out_acl_main;
   policer_classify_main_t *pcm = &policer_classify_main;
@@ -226,43 +225,41 @@ vnet_classify_table_is_bound (vnet_classify_main_t * cm, u32 table_index)
   if (vlib_global_main.trace_filter.classify_table_index == table_index)
     return 1;
 
-  if (vnet_classify_index_vector_holds
-      (cm->classify_table_index_by_sw_if_index, table_index))
+  if (vnet_classify_index_vector_holds (cm->classify_table_index_by_sw_if_index, table_index))
     return 1;
 
   for (group = 0; group < IN_OUT_ACL_N_TABLE_GROUPS; group++)
-    if (vnet_classify_index_vectors_hold
-	(am->classify_table_index_by_sw_if_index[group],
-	 ARRAY_LEN (am->classify_table_index_by_sw_if_index[group]),
-	 table_index))
+    if (vnet_classify_index_vectors_hold (
+	  am->classify_table_index_by_sw_if_index[group],
+	  ARRAY_LEN (am->classify_table_index_by_sw_if_index[group]), table_index))
       return 1;
 
-  if (vnet_classify_index_vectors_hold
-      (pcm->classify_table_index_by_sw_if_index,
-       ARRAY_LEN (pcm->classify_table_index_by_sw_if_index), table_index))
+  if (vnet_classify_index_vectors_hold (pcm->classify_table_index_by_sw_if_index,
+					ARRAY_LEN (pcm->classify_table_index_by_sw_if_index),
+					table_index))
     return 1;
 
-  if (vnet_classify_index_vectors_hold
-      (fcm->classify_table_index_by_sw_if_index,
-       ARRAY_LEN (fcm->classify_table_index_by_sw_if_index), table_index))
+  if (vnet_classify_index_vectors_hold (fcm->classify_table_index_by_sw_if_index,
+					ARRAY_LEN (fcm->classify_table_index_by_sw_if_index),
+					table_index))
     return 1;
 
-  if (vnet_classify_index_vectors_hold
-      (l2im->classify_table_index_by_sw_if_index,
-       ARRAY_LEN (l2im->classify_table_index_by_sw_if_index), table_index))
+  if (vnet_classify_index_vectors_hold (l2im->classify_table_index_by_sw_if_index,
+					ARRAY_LEN (l2im->classify_table_index_by_sw_if_index),
+					table_index))
     return 1;
 
-  if (vnet_classify_index_vectors_hold
-      (l2om->classify_table_index_by_sw_if_index,
-       ARRAY_LEN (l2om->classify_table_index_by_sw_if_index), table_index))
+  if (vnet_classify_index_vectors_hold (l2om->classify_table_index_by_sw_if_index,
+					ARRAY_LEN (l2om->classify_table_index_by_sw_if_index),
+					table_index))
     return 1;
 
-  if (vnet_classify_index_vector_holds
-      (ip4_main.lookup_main.classify_table_index_by_sw_if_index, table_index))
+  if (vnet_classify_index_vector_holds (ip4_main.lookup_main.classify_table_index_by_sw_if_index,
+					table_index))
     return 1;
 
-  if (vnet_classify_index_vector_holds
-      (ip6_main.lookup_main.classify_table_index_by_sw_if_index, table_index))
+  if (vnet_classify_index_vector_holds (ip6_main.lookup_main.classify_table_index_by_sw_if_index,
+					table_index))
     return 1;
 
   /* A live classify DPO is a FIB entry the ip_classify node follows. */
@@ -287,8 +284,7 @@ vnet_classify_table_is_bound (vnet_classify_main_t * cm, u32 table_index)
  * reason to refuse the delete.
  */
 static int
-vnet_classify_table_in_use (vnet_classify_main_t * cm, u32 table_index,
-			    int del_chain)
+vnet_classify_table_in_use (vnet_classify_main_t *cm, u32 table_index, int del_chain)
 {
   vnet_classify_table_t *t;
   u32 member = table_index;
@@ -331,8 +327,7 @@ vnet_classify_table_in_use (vnet_classify_main_t * cm, u32 table_index,
  * chain walks could never leave one.
  */
 static int
-vnet_classify_next_table_index_is_valid (vnet_classify_main_t * cm,
-					 u32 table_index,
+vnet_classify_next_table_index_is_valid (vnet_classify_main_t *cm, u32 table_index,
 					 u32 next_table_index)
 {
   vnet_classify_table_t *t;
@@ -1016,8 +1011,7 @@ vnet_classify_add_del_table (vnet_classify_main_t *cm, const u8 *mask,
 				       skip, match);
 	  *table_index = t - cm->tables;
 
-	  if (!vnet_classify_next_table_index_is_valid (cm, *table_index,
-							next_table_index))
+	  if (!vnet_classify_next_table_index_is_valid (cm, *table_index, next_table_index))
 	    {
 	      vnet_classify_delete_table_index (cm, *table_index, 0);
 	      *table_index = ~0;
@@ -1035,8 +1029,7 @@ vnet_classify_add_del_table (vnet_classify_main_t *cm, const u8 *mask,
 	  if (pool_is_free_index (cm->tables, *table_index))
 	    return VNET_API_ERROR_CLASSIFY_TABLE_NOT_FOUND;
 
-	  if (!vnet_classify_next_table_index_is_valid (cm, *table_index,
-							next_table_index))
+	  if (!vnet_classify_next_table_index_is_valid (cm, *table_index, next_table_index))
 	    return VNET_API_ERROR_INVALID_VALUE;
 
 	  t = pool_elt_at_index (cm->tables, *table_index);
@@ -1045,8 +1038,8 @@ vnet_classify_add_del_table (vnet_classify_main_t *cm, const u8 *mask,
       return 0;
     }
 
-  if (!pool_is_free_index (cm->tables, *table_index)
-      && vnet_classify_table_in_use (cm, *table_index, del_chain))
+  if (!pool_is_free_index (cm->tables, *table_index) &&
+      vnet_classify_table_in_use (cm, *table_index, del_chain))
     return VNET_API_ERROR_RSRC_IN_USE;
 
   vnet_classify_delete_table_index (cm, *table_index, del_chain);
@@ -2074,8 +2067,7 @@ classify_set_pcap_chain (vnet_classify_main_t * cm,
       hi->trace_classify_table_index = table_index;
     }
 
-  if (table_index == ~0
-      && !vnet_classify_table_in_use (cm, old_table_index, 1))
+  if (table_index == ~0 && !vnet_classify_table_in_use (cm, old_table_index, 1))
     vnet_classify_delete_table_index (cm, old_table_index, 1);
 }
 
