@@ -29,6 +29,7 @@ vnet_is_packet_traced_inline (vlib_buffer_t * b,
   vnet_classify_table_t *t;
   vnet_classify_entry_t *e;
   u64 hash;
+  u32 depth;
 
   /*$$$ add custom classifiers here, if any */
   if (func != 0)
@@ -61,12 +62,21 @@ vnet_is_packet_traced_inline (vlib_buffer_t * b,
   /*
    * Look for a hit in a less-specific table.
    * Performance hint: for this use-case, don't go there.
+   *
+   * A chain visits each table at most once, so it cannot be longer than
+   * the table pool.  The bound ends the walk on a chained table that is
+   * already gone, and on a chain that loops instead of following it
+   * forever.
    */
-  while (1)
+  for (depth = 0; depth < vec_len (vcm->tables); depth++)
     {
       /* Most likely, we're done right now */
       if (PREDICT_TRUE (t->next_table_index == ~0))
 	return 0;
+
+      if (pool_is_free_index (vcm->tables, t->next_table_index))
+	return 0;
+
       t = pool_elt_at_index (vcm->tables, t->next_table_index);
 
       /* Compute hash for this table */
@@ -82,5 +92,7 @@ vnet_is_packet_traced_inline (vlib_buffer_t * b,
 	  return 1;
 	}
     }
-  /* NOTREACHED */
+
+  /* The chain is longer than the pool or it loops: no further table. */
+  return 0;
 }

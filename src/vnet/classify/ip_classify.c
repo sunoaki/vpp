@@ -234,18 +234,27 @@ ip_classify_inline (vlib_main_t * vm,
 		}
 	      else
 		{
-		  while (1)
+		  u32 chain_limit = vec_len (vcm->tables);
+		  u32 chain_depth;
+
+		  /*
+		   * A chain visits each table at most once, so it cannot be
+		   * longer than the table pool.  The bound ends the walk on a
+		   * chained table that is already gone, and on a chain that
+		   * loops instead of following it forever.
+		   */
+		  for (chain_depth = 0; chain_depth < chain_limit; chain_depth++)
 		    {
-		      if (t0->next_table_index != ~0)
-			t0 = pool_elt_at_index (vcm->tables,
-						t0->next_table_index);
-		      else
+		      if (t0->next_table_index == ~0 ||
+			  pool_is_free_index (vcm->tables, t0->next_table_index))
 			{
 			  next0 = (t0->miss_next_index < n_next) ?
 			    t0->miss_next_index : next0;
 			  misses++;
 			  break;
 			}
+
+		      t0 = pool_elt_at_index (vcm->tables, t0->next_table_index);
 
 		      hash0 = vnet_classify_hash_packet (t0, h0);
 		      e0 = vnet_classify_find_entry (t0, h0, hash0, now);
@@ -261,6 +270,9 @@ ip_classify_inline (vlib_main_t * vm,
 			  break;
 			}
 		    }
+
+		  if (chain_depth == chain_limit)
+		    misses++;
 		}
 	    }
 

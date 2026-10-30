@@ -525,6 +525,7 @@ vnet_l2_input_classify_set_tables (u32 sw_if_index,
 {
   l2_input_classify_main_t *cm = &l2_input_classify_main;
   vnet_classify_main_t *vcm = cm->vnet_classify_main;
+  u32 **tables_by_type = cm->classify_table_index_by_sw_if_index;
 
   /* Assume that we've validated sw_if_index in the API layer */
 
@@ -540,26 +541,13 @@ vnet_l2_input_classify_set_tables (u32 sw_if_index,
       pool_is_free_index (vcm->tables, other_table_index))
     return VNET_API_ERROR_NO_SUCH_TABLE3;
 
-  vec_validate
-    (cm->classify_table_index_by_sw_if_index[L2_INPUT_CLASSIFY_TABLE_IP4],
-     sw_if_index);
+  vec_validate_init_empty (tables_by_type[L2_INPUT_CLASSIFY_TABLE_IP4], sw_if_index, ~0);
+  vec_validate_init_empty (tables_by_type[L2_INPUT_CLASSIFY_TABLE_IP6], sw_if_index, ~0);
+  vec_validate_init_empty (tables_by_type[L2_INPUT_CLASSIFY_TABLE_OTHER], sw_if_index, ~0);
 
-  vec_validate
-    (cm->classify_table_index_by_sw_if_index[L2_INPUT_CLASSIFY_TABLE_IP6],
-     sw_if_index);
-
-  vec_validate
-    (cm->classify_table_index_by_sw_if_index[L2_INPUT_CLASSIFY_TABLE_OTHER],
-     sw_if_index);
-
-  cm->classify_table_index_by_sw_if_index[L2_INPUT_CLASSIFY_TABLE_IP4]
-    [sw_if_index] = ip4_table_index;
-
-  cm->classify_table_index_by_sw_if_index[L2_INPUT_CLASSIFY_TABLE_IP6]
-    [sw_if_index] = ip6_table_index;
-
-  cm->classify_table_index_by_sw_if_index[L2_INPUT_CLASSIFY_TABLE_OTHER]
-    [sw_if_index] = other_table_index;
+  tables_by_type[L2_INPUT_CLASSIFY_TABLE_IP4][sw_if_index] = ip4_table_index;
+  tables_by_type[L2_INPUT_CLASSIFY_TABLE_IP6][sw_if_index] = ip6_table_index;
+  tables_by_type[L2_INPUT_CLASSIFY_TABLE_OTHER][sw_if_index] = other_table_index;
 
   return 0;
 }
