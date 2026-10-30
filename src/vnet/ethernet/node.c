@@ -69,8 +69,8 @@ typedef enum
 
 // Parse the ethernet header to extract vlan tags and innermost ethertype
 static_always_inline void
-parse_header (ethernet_input_variant_t variant, vlib_buffer_t * b0, u16 * type, u16 * orig_type,
-	      u16 * outer_id, u16 * inner_id, u32 * match_flags, u8 * error0)
+parse_header (ethernet_input_variant_t variant, vlib_buffer_t *b0, u16 *type, u16 *orig_type,
+	      u16 *outer_id, u16 *inner_id, u32 *match_flags, u8 *error0)
 {
   u8 vlan_count;
 
