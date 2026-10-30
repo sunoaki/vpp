@@ -424,7 +424,7 @@ af_xdp_device_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_fra
 
   vlib_increment_combined_counter (vnm->interface_main.combined_sw_if_counters +
 				     VNET_INTERFACE_COUNTER_RX,
-				   vm->thread_index, ad->hw_if_index, n_rx_packets, n_rx_bytes);
+				   vm->thread_index, ad->sw_if_index, n_rx_packets, n_rx_bytes);
 
 refill:
   af_xdp_device_input_refill_inline (vm, node, ad, rxq);
