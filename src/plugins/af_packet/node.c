@@ -544,10 +544,9 @@ done:
   vlib_error_count (vm, node->node_index, AF_PACKET_INPUT_ERROR_TIMEDOUT_BLK,
 		    timedout_blk);
 
-  vlib_increment_combined_counter
-    (vnet_get_main ()->interface_main.combined_sw_if_counters
-     + VNET_INTERFACE_COUNTER_RX,
-     vlib_get_thread_index (), apif->sw_if_index, n_rx_packets, n_rx_bytes);
+  vlib_increment_combined_counter (
+    vnet_get_main ()->interface_main.combined_sw_if_counters + VNET_INTERFACE_COUNTER_RX,
+    vlib_get_thread_index (), apif->sw_if_index, n_rx_packets, n_rx_bytes);
 
   vnet_device_increment_rx_packets (thread_index, n_rx_packets);
   return n_rx_packets;
@@ -778,8 +777,7 @@ af_packet_v2_device_input_fn (vlib_main_t *vm, vlib_node_runtime_t *node,
   rx_queue->next_rx_frame = rx_frame;
 
   vlib_increment_combined_counter (
-    vnet_get_main ()->interface_main.combined_sw_if_counters +
-      VNET_INTERFACE_COUNTER_RX,
+    vnet_get_main ()->interface_main.combined_sw_if_counters + VNET_INTERFACE_COUNTER_RX,
     vlib_get_thread_index (), apif->sw_if_index, n_rx_packets, n_rx_bytes);
 
   vnet_device_increment_rx_packets (thread_index, n_rx_packets);
