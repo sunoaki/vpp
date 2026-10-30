@@ -147,6 +147,28 @@ vnet_classify_new_table (vnet_classify_main_t *cm, const u8 *mask,
   oldheap = clib_mem_set_heap (t->mheap);
 
   clib_spinlock_init (&t->writer_lock);
+
+  /*
+   * The dataplane inserts sessions and must not grow a vector while it
+   * holds a packet: growing one allocates from the table heap with a
+   * fail-fast allocator.  Size the vectors the insert path touches here,
+   * where the table heap is still empty.
+   *
+   * freelists is indexed by the page number, so cover the largest page
+   * the heap can hold plus the two levels a resplit can add.
+   */
+  {
+    u32 entry_bytes = sizeof (vnet_classify_entry_t) +
+		      match_n_vectors * sizeof (u32x4);
+    u32 max_entries = memory_size / entry_bytes;
+    u32 max_pages = max_entries / t->entries_per_page;
+    u32 max_log2_pages = max_pages ? max_log2 (max_pages) : 0;
+
+    vec_validate (t->working_copies, vlib_get_n_threads () - 1);
+    vec_validate (t->working_copy_lengths, vlib_get_n_threads () - 1);
+    vec_validate (t->freelists, max_log2_pages + 2);
+  }
+
   clib_mem_set_heap (oldheap);
   return (t);
 }
@@ -179,25 +201,31 @@ vnet_classify_entry_alloc (vnet_classify_table_t * t, u32 log2_pages)
   void *oldheap;
 
   CLIB_SPINLOCK_ASSERT_LOCKED (&t->writer_lock);
+
+  /* The freelist vector is sized at table creation to the largest page
+     the table heap can hold; anything beyond that cannot be allocated. */
+  if (log2_pages >= vec_len (t->freelists))
+    return 0;
+
   required_length =
     (sizeof (vnet_classify_entry_t) + (t->match_n_vectors * sizeof (u32x4)))
     * t->entries_per_page * (1 << log2_pages);
 
-  if (log2_pages >= vec_len (t->freelists) || t->freelists[log2_pages] == 0)
+  if (t->freelists[log2_pages] == 0)
     {
       oldheap = clib_mem_set_heap (t->mheap);
 
-      vec_validate (t->freelists, log2_pages);
-
-      rv = clib_mem_alloc_aligned (required_length, CLIB_CACHE_LINE_BYTES);
+      rv = clib_mem_alloc_aligned_or_null (required_length,
+					   CLIB_CACHE_LINE_BYTES);
       clib_mem_set_heap (oldheap);
-      goto initialize;
+      if (PREDICT_FALSE (rv == 0))
+	return 0;
     }
-  rv = t->freelists[log2_pages];
-  t->freelists[log2_pages] = rv->next_free;
-
-initialize:
-  ASSERT (rv);
+  else
+    {
+      rv = t->freelists[log2_pages];
+      t->freelists[log2_pages] = rv->next_free;
+    }
 
   clib_memset (rv, 0xff, required_length);
   return rv;
@@ -215,13 +243,13 @@ vnet_classify_entry_free (vnet_classify_table_t * t,
   t->freelists[log2_pages] = v;
 }
 
-static inline void make_working_copy
-  (vnet_classify_table_t * t, vnet_classify_bucket_t * b)
+static inline int
+make_working_copy (vnet_classify_table_t * t, vnet_classify_bucket_t * b)
 {
   vnet_classify_entry_t *v;
   vnet_classify_bucket_t working_bucket __attribute__ ((aligned (8)));
   void *oldheap;
-  vnet_classify_entry_t *working_copy;
+  vnet_classify_entry_t *working_copy, *new_working_copy;
   clib_thread_index_t thread_index = vlib_get_thread_index ();
   int working_copy_length, required_length;
 
@@ -250,10 +278,17 @@ static inline void make_working_copy
 
   if (required_length > working_copy_length)
     {
+      new_working_copy =
+	clib_mem_alloc_aligned_or_null (required_length,
+					CLIB_CACHE_LINE_BYTES);
+      if (PREDICT_FALSE (new_working_copy == 0))
+	{
+	  clib_mem_set_heap (oldheap);
+	  return -1;
+	}
       if (working_copy)
 	clib_mem_free (working_copy);
-      working_copy =
-	clib_mem_alloc_aligned (required_length, CLIB_CACHE_LINE_BYTES);
+      working_copy = new_working_copy;
       t->working_copies[thread_index] = working_copy;
     }
 
@@ -268,17 +303,24 @@ static inline void make_working_copy
   CLIB_MEMORY_BARRIER ();
   b->as_u64 = working_bucket.as_u64;
   t->working_copies[thread_index] = working_copy;
+  return 0;
 }
 
 static vnet_classify_entry_t *
 split_and_rehash (vnet_classify_table_t * t,
 		  vnet_classify_entry_t * old_values, u32 old_log2_pages,
-		  u32 new_log2_pages)
+		  u32 new_log2_pages, int *alloc_failed)
 {
   vnet_classify_entry_t *new_values, *v, *new_v;
   int i, j, length_in_entries;
 
+  *alloc_failed = 0;
   new_values = vnet_classify_entry_alloc (t, new_log2_pages);
+  if (PREDICT_FALSE (new_values == 0))
+    {
+      *alloc_failed = 1;
+      return 0;
+    }
   length_in_entries = (1 << old_log2_pages) * t->entries_per_page;
 
   for (i = 0; i < length_in_entries; i++)
@@ -324,12 +366,19 @@ split_and_rehash (vnet_classify_table_t * t,
 static vnet_classify_entry_t *
 split_and_rehash_linear (vnet_classify_table_t * t,
 			 vnet_classify_entry_t * old_values,
-			 u32 old_log2_pages, u32 new_log2_pages)
+			 u32 old_log2_pages, u32 new_log2_pages,
+			 int *alloc_failed)
 {
   vnet_classify_entry_t *new_values, *v, *new_v;
   int i, j, new_length_in_entries, old_length_in_entries;
 
+  *alloc_failed = 0;
   new_values = vnet_classify_entry_alloc (t, new_log2_pages);
+  if (PREDICT_FALSE (new_values == 0))
+    {
+      *alloc_failed = 1;
+      return 0;
+    }
   new_length_in_entries = (1 << new_log2_pages) * t->entries_per_page;
   old_length_in_entries = (1 << old_log2_pages) * t->entries_per_page;
 
@@ -423,6 +472,7 @@ vnet_classify_add_del (vnet_classify_table_t *t, vnet_classify_entry_t *add_v,
   u8 *key_minus_skip;
   int resplit_once = 0;
   int mark_bucket_linear;
+  int alloc_failed = 0;
 
   ASSERT ((add_v->flags & VNET_CLASSIFY_ENTRY_FREE) == 0);
 
@@ -448,6 +498,11 @@ vnet_classify_add_del (vnet_classify_table_t *t, vnet_classify_entry_t *add_v,
 	}
 
       v = vnet_classify_entry_alloc (t, 0 /* new_log2_pages */ );
+      if (PREDICT_FALSE (v == 0))
+	{
+	  rv = -1;
+	  goto unlock;
+	}
       clib_memcpy_fast (v, add_v, sizeof (vnet_classify_entry_t) +
 			t->match_n_vectors * sizeof (u32x4));
       v->flags &= ~(VNET_CLASSIFY_ENTRY_FREE);
@@ -462,7 +517,11 @@ vnet_classify_add_del (vnet_classify_table_t *t, vnet_classify_entry_t *add_v,
       goto unlock;
     }
 
-  make_working_copy (t, b);
+  if (PREDICT_FALSE (make_working_copy (t, b) != 0))
+    {
+      rv = -1;
+      goto unlock;
+    }
 
   save_v = vnet_classify_get_entry (t, t->saved_bucket.offset);
   value_index = hash & ((1 << t->saved_bucket.log2_pages) - 1);
@@ -551,7 +610,10 @@ vnet_classify_add_del (vnet_classify_table_t *t, vnet_classify_entry_t *add_v,
 
   mark_bucket_linear = 0;
 
-  new_v = split_and_rehash (t, working_copy, old_log2_pages, new_log2_pages);
+  new_v = split_and_rehash (t, working_copy, old_log2_pages, new_log2_pages,
+			    &alloc_failed);
+  if (PREDICT_FALSE (alloc_failed))
+    goto table_full;
 
   if (new_v == 0)
     {
@@ -560,7 +622,9 @@ vnet_classify_add_del (vnet_classify_table_t *t, vnet_classify_entry_t *add_v,
       new_log2_pages++;
 
       new_v = split_and_rehash (t, working_copy, old_log2_pages,
-				new_log2_pages);
+				new_log2_pages, &alloc_failed);
+      if (PREDICT_FALSE (alloc_failed))
+	goto table_full;
       if (new_v == 0)
 	{
 	mark_linear:
@@ -569,7 +633,9 @@ vnet_classify_add_del (vnet_classify_table_t *t, vnet_classify_entry_t *add_v,
 	linear_resplit:
 	  /* pinned collisions, use linear search */
 	  new_v = split_and_rehash_linear (t, working_copy, old_log2_pages,
-					   new_log2_pages);
+					   new_log2_pages, &alloc_failed);
+	  if (PREDICT_FALSE (alloc_failed))
+	    goto table_full;
 	  /* A new linear-search bucket? */
 	  if (!t->saved_bucket.linear_search)
 	    t->linear_buckets++;
@@ -626,6 +692,11 @@ expand_ok:
   t->active_elements++;
   v = vnet_classify_get_entry (t, t->saved_bucket.offset);
   vnet_classify_entry_free (t, v, old_log2_pages);
+  goto unlock;
+
+table_full:
+  rv = -1;
+  b->as_u64 = t->saved_bucket.as_u64;
 
 unlock:
   clib_spinlock_unlock (&t->writer_lock);
