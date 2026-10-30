@@ -43,8 +43,7 @@ nat_syslog_nat44_apmap (u32 ssubix, u32 sfibix, ip4_address_t * isaddr,
   else
     {
       fib = fib_table_get_or_null (sfibix, FIB_PROTOCOL_IP4);
-      syslog_msg_add_sd_param (&syslog_msg, SVLAN_SDPARAM_NAME, "%d",
-			       fib ? fib->ft_table_id : ~0);
+      syslog_msg_add_sd_param (&syslog_msg, SVLAN_SDPARAM_NAME, "%d", fib ? fib->ft_table_id : ~0);
     }
   syslog_msg_add_sd_param (&syslog_msg, IATYP_SDPARAM_NAME, IATYP_IPV4);
   syslog_msg_add_sd_param (&syslog_msg, ISADDR_SDPARAM_NAME, "%U",
@@ -121,8 +120,7 @@ nat_syslog_nat64_sess (u32 sfibix, ip6_address_t * isaddr, u16 isport,
 		   is_add ? SADD_MSGID : SDEL_MSGID);
 
   syslog_msg_sd_init (&syslog_msg, NSESS_SDID);
-  syslog_msg_add_sd_param (&syslog_msg, SVLAN_SDPARAM_NAME, "%d",
-			   fib ? fib->ft_table_id : ~0);
+  syslog_msg_add_sd_param (&syslog_msg, SVLAN_SDPARAM_NAME, "%d", fib ? fib->ft_table_id : ~0);
   syslog_msg_add_sd_param (&syslog_msg, IATYP_SDPARAM_NAME, IATYP_IPV6);
   syslog_msg_add_sd_param (&syslog_msg, ISADDR_SDPARAM_NAME, "%U",
 			   format_ip6_address, isaddr);
