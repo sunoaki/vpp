@@ -636,8 +636,8 @@ ip6_ext_header_walk (vlib_buffer_t *b, ip6_header_t *ip, int find_hdr_type,
        * bound, leaving offset <= max_offset < offset + 8. Reporting it would
        * let a caller read and copy the 8 bytes past the end of the buffer.
        */
-      if (next_proto == IP_PROTOCOL_IPV6_FRAGMENTATION &&
-	  offset <= max_offset && max_offset < offset + sizeof (ip6_frag_hdr_t))
+      if (next_proto == IP_PROTOCOL_IPV6_FRAGMENTATION && offset <= max_offset &&
+	  max_offset < offset + sizeof (ip6_frag_hdr_t))
 	break;
       /* Move on to next header */
       res->eh[i].offset = offset;
