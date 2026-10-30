@@ -414,7 +414,7 @@ nat64_cli_bib_walk (nat64_db_bib_entry_t * bibe, void *ctx)
   vlib_main_t *vm = ctx;
   fib_table_t *fib;
 
-  fib = fib_table_get (bibe->fib_index, FIB_PROTOCOL_IP6);
+  fib = fib_table_get_or_null (bibe->fib_index, FIB_PROTOCOL_IP6);
   if (!fib)
     return -1;
 
@@ -501,7 +501,7 @@ nat64_cli_st_walk (nat64_db_st_entry_t * ste, void *arg)
   if (!bibe)
     return -1;
 
-  fib = fib_table_get (bibe->fib_index, FIB_PROTOCOL_IP6);
+  fib = fib_table_get_or_null (bibe->fib_index, FIB_PROTOCOL_IP6);
   if (!fib)
     return -1;
 
