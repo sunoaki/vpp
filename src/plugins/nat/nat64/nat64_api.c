@@ -247,9 +247,9 @@ nat64_api_bib_walk (nat64_db_bib_entry_t * bibe, void *arg)
   nat64_api_walk_ctx_t *ctx = arg;
   fib_table_t *fib;
 
-  fib = fib_table_get (bibe->fib_index, FIB_PROTOCOL_IP6);
+  fib = fib_table_get_or_null (bibe->fib_index, FIB_PROTOCOL_IP6);
   if (!fib)
-    return -1;
+    return 0;
 
   rmp = vl_msg_api_alloc (sizeof (*rmp));
   clib_memset (rmp, 0, sizeof (*rmp));
@@ -301,11 +301,11 @@ nat64_api_st_walk (nat64_db_st_entry_t * ste, void *arg)
 
   bibe = nat64_db_bib_entry_by_index (ctx->db, ste->proto, ste->bibe_index);
   if (!bibe)
-    return -1;
+    return 0;
 
-  fib = fib_table_get (bibe->fib_index, FIB_PROTOCOL_IP6);
+  fib = fib_table_get_or_null (bibe->fib_index, FIB_PROTOCOL_IP6);
   if (!fib)
-    return -1;
+    return 0;
 
   rmp = vl_msg_api_alloc (sizeof (*rmp));
   clib_memset (rmp, 0, sizeof (*rmp));
