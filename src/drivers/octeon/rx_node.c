@@ -440,9 +440,9 @@ oct_rx_node_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
   vlib_put_next_frame (vm, node, ctx->next_index, ctx->n_left_to_next);
 
-  vlib_increment_combined_counter (
-    vnm->interface_main.combined_sw_if_counters + VNET_INTERFACE_COUNTER_RX,
-    thr_idx, ctx->hw_if_index, ctx->n_rx_pkts, ctx->n_rx_bytes);
+  vlib_increment_combined_counter (vnm->interface_main.combined_sw_if_counters +
+				     VNET_INTERFACE_COUNTER_RX,
+				   thr_idx, ctx->sw_if_index, ctx->n_rx_pkts, ctx->n_rx_bytes);
 
 refill:
   n_enq = crq->n_enq - ctx->n_segs;
