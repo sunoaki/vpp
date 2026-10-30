@@ -96,8 +96,7 @@ lcp_mpls_sync_state_cb (struct mpls_main_t *mm, uword opaque, u32 sw_if_index,
 	  vlib_log_err (lcp_mpls_sync_logger,
 			"sync_state_cb: failed to open namespace %s "
 			"(curr ns fd %d, vif ns fd %d): %s (errno %d)",
-			lip->lip_namespace, curr_ns_fd, vif_ns_fd, strerror (err),
-			err);
+			lip->lip_namespace, curr_ns_fd, vif_ns_fd, strerror (err), err);
 	  goto SYNC_CLEANUP;
 	}
 
@@ -107,8 +106,7 @@ lcp_mpls_sync_state_cb (struct mpls_main_t *mm, uword opaque, u32 sw_if_index,
 	  vlib_log_err (lcp_mpls_sync_logger,
 			"sync_state_cb: failed to set namespace %s "
 			"(curr ns fd %d, vif ns fd %d): %s (errno %d)",
-			lip->lip_namespace, curr_ns_fd, vif_ns_fd, strerror (err),
-			err);
+			lip->lip_namespace, curr_ns_fd, vif_ns_fd, strerror (err), err);
 	  goto SYNC_CLEANUP;
 	}
       entered_dest_ns = 1;
