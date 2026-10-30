@@ -133,6 +133,10 @@ l2_efp_filter_process (vlib_buffer_t * b0, vtr_config_t * in_config)
 
   eth = vlib_buffer_get_current (b0);
 
+  /* The 8 bytes compared below end at eth + 11 + push_bytes. */
+  if (PREDICT_FALSE (vnet_buffer (b0)->l2.l2_len < 12 + in_config->push_bytes))
+    return 1;
+
   /*
    * If there are 2 tags pushed, they must match config->tags[0] and
    * config->tags[1].
