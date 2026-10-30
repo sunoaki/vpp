@@ -222,7 +222,7 @@ vl_api_lcp_itf_pair_get_v2_t_handler (vl_api_lcp_itf_pair_get_v2_t *mp)
   if (mp->sw_if_index == ~0)
     {
       REPLY_AND_DETAILS_MACRO_END (
-	VL_API_LCP_ITF_PAIR_GET_REPLY, lcp_itf_pair_pool,
+	VL_API_LCP_ITF_PAIR_GET_V2_REPLY, lcp_itf_pair_pool,
 	({ send_lcp_itf_pair_details (cursor, rp, mp->context); }));
     }
   else
