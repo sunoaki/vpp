@@ -245,7 +245,16 @@ lcp_itf_pair_add (u32 host_sw_if_index, u32 phy_sw_if_index, u8 *host_name,
   lipi = lcp_itf_pair_find_by_phy (phy_sw_if_index);
 
   if (lipi != INDEX_INVALID)
-    return VNET_API_ERROR_VALUE_EXIST;
+    {
+      /*
+       * The pair is still wanted, so it is not stale; clear the mark
+       * left by replace_begin so replace_end does not delete it.
+       */
+      lip = lcp_itf_pair_get (lipi);
+      if (lip)
+	lip->lip_flags &= ~LIP_FLAG_STALE;
+      return VNET_API_ERROR_VALUE_EXIST;
+    }
 
   LCP_ITF_PAIR_INFO ("add: host:%U phy:%U, host_if:%v vif:%d ns:%s",
 		     format_vnet_sw_if_index_name, vnet_get_main (),
@@ -254,9 +263,10 @@ lcp_itf_pair_add (u32 host_sw_if_index, u32 phy_sw_if_index, u8 *host_name,
 		     ns);
 
   /*
-   * Create a new pair.
+   * Create a new pair. A pool slot from the free list keeps the contents
+   * it had when it was released, so zero it before initializing the fields.
    */
-  pool_get (lcp_itf_pair_pool, lip);
+  pool_get_zero (lcp_itf_pair_pool, lip);
 
   lipi = lip - lcp_itf_pair_pool;
 
