@@ -216,11 +216,27 @@ tap_rx_dequeue (vlib_main_t *vm, vlib_node_runtime_t *node, tap_if_t *tif,
     {
       vnet_virtio_vring_used_elem_t *e = ring + (last & mask);
       u32 bi0 = ring_buffers[e->id];
-      u16 len = e->len - hdr_sz;
-      vlib_buffer_t *b0 = vlib_get_buffer (vm, bi0);
+      vlib_buffer_t *b0;
       vnet_virtio_net_hdr_v1_t *hdr;
       u16 num_buffers;
+      u16 len;
 
+      /* The host reports the frame length; it must at least cover the
+       * virtio-net header, or subtracting hdr_sz underflows len. */
+      if (PREDICT_FALSE (e->len < hdr_sz))
+	{
+	  vlib_increment_simple_counter (vnet_main.interface_main.sw_if_counters +
+					   VNET_INTERFACE_COUNTER_DROP,
+					 vm->thread_index, tif->sw_if_index, 1);
+	  vlib_buffer_free (vm, &bi0, 1);
+	  rxq->desc_in_use--;
+	  n_left--;
+	  last++;
+	  continue;
+	}
+
+      len = e->len - hdr_sz;
+      b0 = vlib_get_buffer (vm, bi0);
       hdr = (vnet_virtio_net_hdr_v1_t *) (b0->data + off - hdr_sz);
       num_buffers = hdr->num_buffers;
       b0->template = bt;

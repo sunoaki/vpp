@@ -523,6 +523,7 @@ vhost_user_if_input (vlib_main_t *vm, vhost_user_main_t *vum,
 				&next_index, &to_next, &n_left_to_next);
 
   u16 last_avail_idx = txvq->last_avail_idx;
+  u16 first_avail_idx = last_avail_idx;
   u16 last_used_idx = txvq->last_used_idx;
 
   while (n_left > 0)
@@ -580,6 +581,37 @@ vhost_user_if_input (vlib_main_t *vm, vhost_user_main_t *vum,
 	}
 
       desc_data_offset = vui->virtio_net_hdr_sz;
+
+      /* The peer must leave room for the virtio-net header in the first
+       * descriptor. Otherwise desc_data_l below underflows and the frame
+       * would be copied from guest memory past the end of the descriptor. */
+      if (PREDICT_FALSE (desc_table[desc_current].len < desc_data_offset))
+	{
+	  vlib_increment_simple_counter (vnet_main.interface_main.sw_if_counters +
+					   VNET_INTERFACE_COUNTER_DROP,
+					 vm->thread_index, vui->sw_if_index, 1);
+
+	  /* Cancel speculation and give the buffer back */
+	  to_next--;
+	  n_left_to_next++;
+	  cpu->rx_buffers[cpu->rx_buffers_len++] = bi_current;
+
+	  /* consume the descriptor and return it as used */
+	  last_avail_idx++;
+	  last_used_idx++;
+	  n_left--;
+
+	  /*
+	   * The trace below walks n_rx_packets avail entries starting at the
+	   * first entry of the batch, so it is only accurate while the frames
+	   * that were enqueued are contiguous in the avail ring. End the batch
+	   * here so that no frame is enqueued after this dropped entry.
+	   */
+	  if (PREDICT_FALSE (n_trace != 0))
+	    break;
+
+	  continue;
+	}
 
       if (enable_csum)
 	{
@@ -742,9 +774,8 @@ stop:
   /* packet trace if enabled */
   if (PREDICT_FALSE (n_trace))
     {
-      vhost_user_if_input_trace (vm, node, n_trace, vui, qid, next_index,
-				 last_avail_idx - n_rx_packets, n_rx_packets,
-				 to_next - n_rx_packets);
+      vhost_user_if_input_trace (vm, node, n_trace, vui, qid, next_index, first_avail_idx,
+				 n_rx_packets, to_next - n_rx_packets);
     }
 
   /* give buffers back to driver */
