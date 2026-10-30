@@ -10,9 +10,11 @@
 #include <vnet/ip/ip.h>
 #include <vnet/api_errno.h>	/* for API error numbers */
 #include <vnet/l2/l2_classify.h>	/* for L2_INPUT_CLASSIFY_NEXT_xxx */
+#include <vnet/l2/l2_rw.h>
 #include <vnet/dpo/classify_dpo.h>
 #include <vnet/fib/fib_table.h>
 #include <vppinfra/lock.h>
+#include <vppinfra/bitmap.h>
 #include <vnet/classify/trace_classify.h>
 #include <vppinfra/hash.h>
 #include <vppinfra/format.h>
@@ -200,15 +202,42 @@ vnet_classify_index_vectors_hold (u32 **indices_by_type, u32 n_types, u32 table_
 }
 
 /*
+ * The l2 rewrite node follows its table on every packet and checks neither
+ * the ~0 sentinel nor the pool state.  l2_rw_get_config initializes a slot
+ * when it creates it, but vec_validate leaves the slots below a skipped
+ * index untouched, so the bitmap, not the slot value, says whether the
+ * entry was ever initialized.
+ */
+static int
+vnet_classify_l2_rw_holds (u32 table_index)
+{
+  l2_rw_main_t *rwm = &l2_rw_main;
+  uword sw_if_index;
+
+  if (!rwm->configs_bitmap)
+    return 0;
+
+  for (sw_if_index = 0; sw_if_index < vec_len (rwm->configs); sw_if_index++)
+    {
+      if (!clib_bitmap_get (rwm->configs_bitmap, sw_if_index))
+	continue;
+      if (rwm->configs[sw_if_index].table_index == table_index)
+	return 1;
+    }
+
+  return 0;
+}
+
+/*
  * The dataplane reaches a table through a per-interface binding vector, a
  * classify DPO, or another table's next_table_index.  A table that any of
  * them still names must not be freed: the holder would dereference a freed
  * pool element on the next packet.
  *
  * Besides the bindings this module owns, table indices are held by the L2
- * input and output nodes and by the ip4/ip6 lookup main and its classify
- * DPOs.  Those modules create and clear the bindings themselves; this
- * function only reads their state.
+ * input, output and rewrite nodes and by the ip4/ip6 lookup main and its
+ * classify DPOs.  Those modules create and clear the bindings themselves;
+ * this function only reads their state.
  */
 static int
 vnet_classify_table_is_bound (vnet_classify_main_t *cm, u32 table_index)
@@ -260,6 +289,9 @@ vnet_classify_table_is_bound (vnet_classify_main_t *cm, u32 table_index)
 
   if (vnet_classify_index_vector_holds (ip6_main.lookup_main.classify_table_index_by_sw_if_index,
 					table_index))
+    return 1;
+
+  if (vnet_classify_l2_rw_holds (table_index))
     return 1;
 
   /* A live classify DPO is a FIB entry the ip_classify node follows. */

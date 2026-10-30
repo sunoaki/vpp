@@ -120,10 +120,10 @@ leave a loop.
 Deleting a table that something still names fails with
 VNET_API_ERROR_RSRC_IN_USE. The holders are the per-interface ACL,
 policer and flow-classify bindings, the L2 input and output classify
-bindings, the ip4/ip6 interface classify bindings and the classify DPOs
-their FIB entries point at, a pcap or trace chain, and another table's
-next_table_index. Remove the binding, or delete the whole chain from its
-head with del_chain, first.
+bindings, an l2 rewrite binding, the ip4/ip6 interface classify bindings
+and the classify DPOs their FIB entries point at, a pcap or trace chain,
+and another table's next_table_index. Remove the binding, or delete the
+whole chain from its head with del_chain, first.
 
 We often create classification tables in reverse order -
 last-table-searched to first-table-searched - so we can easily set
