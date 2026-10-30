@@ -20,8 +20,7 @@ lcp_itf_pair_sync_state (lcp_itf_pair_t *lip)
   vnet_sw_interface_t *sw;
   vnet_sw_interface_t *sup_sw;
   clib_error_t *error;
-  int curr_ns_fd = -1;
-  int vif_ns_fd = -1;
+  lcp_ns_switch_t ns_switch;
   u32 mtu;
   u32 netlink_mtu;
 
@@ -37,13 +36,8 @@ lcp_itf_pair_sync_state (lcp_itf_pair_t *lip)
   if (!sup_sw)
     return;
 
-  if (lip->lip_namespace)
-    {
-      curr_ns_fd = clib_netns_open (NULL /* self */);
-      vif_ns_fd = clib_netns_open (lip->lip_namespace);
-      if (vif_ns_fd != -1)
-	clib_setns (vif_ns_fd);
-    }
+  if (lcp_ns_switch_enter (&ns_switch, lip->lip_namespace, "sync_state") < 0)
+    return;
 
   LCP_ITF_PAIR_INFO ("sync_state: %U flags %u sup-flags %u mtu %u sup-mtu %u",
 		     format_lcp_itf_pair, lip, sw->flags, sup_sw->flags,
@@ -110,14 +104,7 @@ lcp_itf_pair_sync_state (lcp_itf_pair_t *lip)
       lcp_itf_set_interface_addr (lip);
     }
 
-  if (vif_ns_fd != -1)
-    close (vif_ns_fd);
-
-  if (curr_ns_fd != -1)
-    {
-      clib_setns (curr_ns_fd);
-      close (curr_ns_fd);
-    }
+  lcp_ns_switch_restore (&ns_switch, "sync_state");
 
   return;
 }
@@ -269,8 +256,7 @@ lcp_itf_ip4_add_del_interface_addr (ip4_main_t *im, uword opaque,
 {
   const lcp_itf_pair_t *lip;
   clib_error_t *error;
-  int curr_ns_fd = -1;
-  int vif_ns_fd = -1;
+  lcp_ns_switch_t ns_switch;
 
   if (!lcp_sync () || lcp_get_netlink_processing_active ())
     return;
@@ -283,13 +269,8 @@ lcp_itf_ip4_add_del_interface_addr (ip4_main_t *im, uword opaque,
   if (!lip)
     return;
 
-  if (lip->lip_namespace)
-    {
-      curr_ns_fd = clib_netns_open (NULL /* self */);
-      vif_ns_fd = clib_netns_open (lip->lip_namespace);
-      if (vif_ns_fd != -1)
-	clib_setns (vif_ns_fd);
-    }
+  if (lcp_ns_switch_enter (&ns_switch, lip->lip_namespace, "ip4_addr") < 0)
+    return;
 
   LCP_ITF_PAIR_DBG ("ip4_addr_%s: %U ip4 %U/%u", is_del ? "del" : "add",
 		    format_lcp_itf_pair, lip, format_ip4_address, address,
@@ -305,14 +286,7 @@ lcp_itf_ip4_add_del_interface_addr (ip4_main_t *im, uword opaque,
       clib_error_free (error);
     }
 
-  if (vif_ns_fd != -1)
-    close (vif_ns_fd);
-
-  if (curr_ns_fd != -1)
-    {
-      clib_setns (curr_ns_fd);
-      close (curr_ns_fd);
-    }
+  lcp_ns_switch_restore (&ns_switch, "ip4_addr");
   return;
 }
 
@@ -324,8 +298,7 @@ lcp_itf_ip6_add_del_interface_addr (ip6_main_t *im, uword opaque,
 {
   const lcp_itf_pair_t *lip;
   clib_error_t *error;
-  int curr_ns_fd = -1;
-  int vif_ns_fd = -1;
+  lcp_ns_switch_t ns_switch;
 
   if (!lcp_sync () || lcp_get_netlink_processing_active ())
     return;
@@ -338,13 +311,8 @@ lcp_itf_ip6_add_del_interface_addr (ip6_main_t *im, uword opaque,
   if (!lip)
     return;
 
-  if (lip->lip_namespace)
-    {
-      curr_ns_fd = clib_netns_open (NULL /* self */);
-      vif_ns_fd = clib_netns_open (lip->lip_namespace);
-      if (vif_ns_fd != -1)
-	clib_setns (vif_ns_fd);
-    }
+  if (lcp_ns_switch_enter (&ns_switch, lip->lip_namespace, "ip6_addr") < 0)
+    return;
   LCP_ITF_PAIR_DBG ("ip6_addr_%s: %U ip4 %U/%u", is_del ? "del" : "add",
 		    format_lcp_itf_pair, lip, format_ip6_address, address,
 		    address_length);
@@ -358,14 +326,7 @@ lcp_itf_ip6_add_del_interface_addr (ip6_main_t *im, uword opaque,
       clib_error_free (error);
     }
 
-  if (vif_ns_fd != -1)
-    close (vif_ns_fd);
-
-  if (curr_ns_fd != -1)
-    {
-      clib_setns (curr_ns_fd);
-      close (curr_ns_fd);
-    }
+  lcp_ns_switch_restore (&ns_switch, "ip6_addr");
 }
 
 static clib_error_t *

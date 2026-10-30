@@ -185,6 +185,44 @@ void lcp_itf_set_link_state (const lcp_itf_pair_t *lip, u8 state);
 /* Set any VPP L3 addresses on Linux host device */
 void lcp_itf_set_interface_addr (const lcp_itf_pair_t *lip);
 
+/**
+ * State of a switch into the namespace holding a pair's host interface
+ */
+typedef struct lcp_ns_switch_t_
+{
+  int curr_ns_fd;     /* descriptor of the namespace that was current */
+  int dest_ns_fd;     /* descriptor of the namespace to operate in */
+  u8 entered_dest_ns; /* set once the switch into dest_ns_fd succeeded */
+} lcp_ns_switch_t;
+
+/**
+ * Enter the namespace in which a pair's host interface lives.
+ *
+ * Open the current namespace, open the target namespace and switch into it.
+ * A failure to open either namespace or to switch into the target is logged
+ * with both descriptors and errno. On failure the descriptors opened so far
+ * are closed and the caller's namespace is left unchanged. A NULL or empty
+ * namespace performs no switch.
+ *
+ * @param sw switch state filled in by this function
+ * @param ns namespace to enter
+ * @param where caller tag used in failure logs
+ * @return 0 when namespace-bound operations may run, -1 when they must be
+ *         skipped
+ */
+extern int lcp_ns_switch_enter (lcp_ns_switch_t *sw, u8 *ns, const char *where);
+
+/**
+ * Return to the namespace that was current before lcp_ns_switch_enter().
+ *
+ * The switch is undone only when it actually happened. A failed restore is
+ * logged with both descriptors and errno. Descriptors are always closed.
+ *
+ * @param sw switch state filled in by lcp_ns_switch_enter()
+ * @param where caller tag used in failure logs
+ */
+extern void lcp_ns_switch_restore (lcp_ns_switch_t *sw, const char *where);
+
 /* Sync all state from VPP to a specific Linux device, all sub-interfaces
  * of a hardware interface, or all interfaces in the system.
  *

@@ -4,8 +4,10 @@
  */
 
 #define _GNU_SOURCE
+#include <errno.h>
 #include <fcntl.h>
 #include <ctype.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <net/if.h>
 
@@ -486,6 +488,87 @@ lcp_itf_pair_del (u32 phy_sw_if_index)
   return 0;
 }
 
+int
+lcp_ns_switch_enter (lcp_ns_switch_t *sw, u8 *ns, const char *where)
+{
+  int err;
+
+  sw->curr_ns_fd = -1;
+  sw->dest_ns_fd = -1;
+  sw->entered_dest_ns = 0;
+
+  if (!ns || !ns[0])
+    return 0;
+
+  sw->curr_ns_fd = clib_netns_open (NULL /* self */);
+  if (sw->curr_ns_fd < 0)
+    {
+      err = errno;
+      LCP_ITF_PAIR_ERR ("%s: failed to open current namespace "
+			"(curr ns fd %d, dest ns fd %d): %s (errno %d)",
+			where, sw->curr_ns_fd, sw->dest_ns_fd, strerror (err), err);
+      return -1;
+    }
+
+  sw->dest_ns_fd = clib_netns_open (ns);
+  if (sw->dest_ns_fd < 0)
+    {
+      err = errno;
+      LCP_ITF_PAIR_ERR ("%s: failed to open namespace %s "
+			"(curr ns fd %d, dest ns fd %d): %s (errno %d)",
+			where, ns, sw->curr_ns_fd, sw->dest_ns_fd, strerror (err), err);
+      close (sw->curr_ns_fd);
+      sw->curr_ns_fd = -1;
+      return -1;
+    }
+
+  if (clib_setns (sw->dest_ns_fd) < 0)
+    {
+      err = errno;
+      LCP_ITF_PAIR_ERR ("%s: failed to set namespace %s "
+			"(curr ns fd %d, dest ns fd %d): %s (errno %d)",
+			where, ns, sw->curr_ns_fd, sw->dest_ns_fd, strerror (err), err);
+      close (sw->dest_ns_fd);
+      sw->dest_ns_fd = -1;
+      close (sw->curr_ns_fd);
+      sw->curr_ns_fd = -1;
+      return -1;
+    }
+
+  sw->entered_dest_ns = 1;
+  return 0;
+}
+
+void
+lcp_ns_switch_restore (lcp_ns_switch_t *sw, const char *where)
+{
+  int err;
+
+  if (sw->entered_dest_ns)
+    {
+      if (clib_setns (sw->curr_ns_fd) < 0)
+	{
+	  err = errno;
+	  LCP_ITF_PAIR_ERR ("%s: failed to restore current namespace "
+			    "(curr ns fd %d, dest ns fd %d): %s (errno %d)",
+			    where, sw->curr_ns_fd, sw->dest_ns_fd, strerror (err), err);
+	}
+      sw->entered_dest_ns = 0;
+    }
+
+  if (sw->dest_ns_fd != -1)
+    {
+      close (sw->dest_ns_fd);
+      sw->dest_ns_fd = -1;
+    }
+
+  if (sw->curr_ns_fd != -1)
+    {
+      close (sw->curr_ns_fd);
+      sw->curr_ns_fd = -1;
+    }
+}
+
 static void
 lcp_itf_pair_delete_by_index (index_t lipi)
 {
@@ -503,24 +586,13 @@ lcp_itf_pair_delete_by_index (index_t lipi)
 
   if (vnet_sw_interface_is_sub (vnet_get_main (), host_sw_if_index))
     {
-      int curr_ns_fd = -1;
-      int vif_ns_fd = -1;
-      if (ns)
-	{
-	  curr_ns_fd = clib_netns_open (NULL /* self */);
-	  vif_ns_fd = clib_netns_open ((u8 *) ns);
-	  if (vif_ns_fd != -1)
-	    clib_setns (vif_ns_fd);
-	}
+      lcp_ns_switch_t ns_switch;
 
-      lcp_netlink_del_link ((const char *) host_name);
-      if (vif_ns_fd != -1)
-	close (vif_ns_fd);
-
-      if (curr_ns_fd != -1)
+      /* Delete the host link only in the namespace that holds it */
+      if (lcp_ns_switch_enter (&ns_switch, ns, "itf_pair_delete") == 0)
 	{
-	  clib_setns (curr_ns_fd);
-	  close (curr_ns_fd);
+	  lcp_netlink_del_link ((const char *) host_name);
+	  lcp_ns_switch_restore (&ns_switch, "itf_pair_delete");
 	}
 
       vnet_delete_sub_interface (host_sw_if_index);
@@ -661,20 +733,13 @@ void
 lcp_itf_set_link_state (const lcp_itf_pair_t *lip, u8 state)
 {
   clib_error_t *error;
-  int curr_ns_fd, vif_ns_fd;
+  lcp_ns_switch_t ns_switch;
 
   if (!lip)
     return;
 
-  curr_ns_fd = vif_ns_fd = -1;
-
-  if (lip->lip_namespace)
-    {
-      curr_ns_fd = clib_netns_open (NULL /* self */);
-      vif_ns_fd = clib_netns_open (lip->lip_namespace);
-      if (vif_ns_fd != -1)
-	clib_setns (vif_ns_fd);
-    }
+  if (lcp_ns_switch_enter (&ns_switch, lip->lip_namespace, "set_link_state") < 0)
+    return;
 
   /* Set the same link state on the netlink interface
    */
@@ -684,16 +749,7 @@ lcp_itf_set_link_state (const lcp_itf_pair_t *lip, u8 state)
       clib_error_free (error);
     }
 
-  if (vif_ns_fd != -1)
-    close (vif_ns_fd);
-
-  if (curr_ns_fd != -1)
-    {
-      clib_setns (curr_ns_fd);
-      close (curr_ns_fd);
-    }
-
-  return;
+  lcp_ns_switch_restore (&ns_switch, "set_link_state");
 }
 
 void
@@ -705,19 +761,13 @@ lcp_itf_set_interface_addr (const lcp_itf_pair_t *lip)
   ip_lookup_main_t *lm6 = &im6->lookup_main;
   ip_interface_address_t *ia = 0;
   clib_error_t *error;
-  int vif_ns_fd = -1;
-  int curr_ns_fd = -1;
+  lcp_ns_switch_t ns_switch;
 
   if (!lip)
     return;
 
-  if (lip->lip_namespace)
-    {
-      curr_ns_fd = clib_netns_open (NULL /* self */);
-      vif_ns_fd = clib_netns_open (lip->lip_namespace);
-      if (vif_ns_fd != -1)
-	clib_setns (vif_ns_fd);
-    }
+  if (lcp_ns_switch_enter (&ns_switch, lip->lip_namespace, "set_interface_addr") < 0)
+    return;
 
   /* Sync any IP4 addressing info into LCP */
   foreach_ip_interface_address (
@@ -747,14 +797,7 @@ lcp_itf_set_interface_addr (const lcp_itf_pair_t *lip)
 	}
     }));
 
-  if (vif_ns_fd != -1)
-    close (vif_ns_fd);
-
-  if (curr_ns_fd != -1)
-    {
-      clib_setns (curr_ns_fd);
-      close (curr_ns_fd);
-    }
+  lcp_ns_switch_restore (&ns_switch, "set_interface_addr");
 }
 
 typedef struct
@@ -890,7 +933,7 @@ lcp_itf_pair_create (u32 phy_sw_if_index, u8 *host_if_name,
   if (vnet_sw_interface_is_sub (vnm, phy_sw_if_index))
     {
       index_t parent_if_index;
-      int orig_ns_fd, ns_fd;
+      lcp_ns_switch_t ns_switch;
       clib_error_t *err;
       u16 outer_vlan, inner_vlan;
       u16 outer_proto, inner_proto;
@@ -937,18 +980,10 @@ lcp_itf_pair_create (u32 phy_sw_if_index, u8 *host_if_name,
       /*
        * see if the requested host interface has already been created
        */
-      orig_ns_fd = ns_fd = -1;
       err = NULL;
 
-      if (ns && ns[0] != 0)
-	{
-	  orig_ns_fd = clib_netns_open (NULL /* self */);
-	  ns_fd = clib_netns_open (ns);
-	  if (orig_ns_fd == -1 || ns_fd == -1)
-	    goto socket_close;
-
-	  clib_setns (ns_fd);
-	}
+      if (lcp_ns_switch_enter (&ns_switch, ns, "pair_create") < 0)
+	goto socket_close;
 
       vif_index = if_nametoindex ((const char *) host_if_name);
 
@@ -1031,13 +1066,7 @@ lcp_itf_pair_create (u32 phy_sw_if_index, u8 *host_if_name,
 	}
 
     socket_close:
-      if (orig_ns_fd != -1)
-	{
-	  clib_setns (orig_ns_fd);
-	  close (orig_ns_fd);
-	}
-      if (ns_fd != -1)
-	close (ns_fd);
+      lcp_ns_switch_restore (&ns_switch, "pair_create");
 
       if (err)
 	return VNET_API_ERROR_INVALID_ARGUMENT;
