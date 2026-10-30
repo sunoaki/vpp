@@ -523,6 +523,7 @@ vhost_user_if_input (vlib_main_t *vm, vhost_user_main_t *vum,
 				&next_index, &to_next, &n_left_to_next);
 
   u16 last_avail_idx = txvq->last_avail_idx;
+  u16 first_avail_idx = last_avail_idx;
   u16 last_used_idx = txvq->last_used_idx;
 
   while (n_left > 0)
@@ -601,9 +602,10 @@ vhost_user_if_input (vlib_main_t *vm, vhost_user_main_t *vum,
 	  n_left--;
 
 	  /*
-	   * The trace below derives the first avail index from n_rx_packets,
-	   * so end the batch here instead of pairing a later frame with this
-	   * descriptor.
+	   * The trace below walks n_rx_packets avail entries starting at the
+	   * first entry of the batch, so it is only accurate while the frames
+	   * that were enqueued are contiguous in the avail ring. End the batch
+	   * here so that no frame is enqueued after this dropped entry.
 	   */
 	  if (PREDICT_FALSE (n_trace != 0))
 	    break;
@@ -772,9 +774,8 @@ stop:
   /* packet trace if enabled */
   if (PREDICT_FALSE (n_trace))
     {
-      vhost_user_if_input_trace (vm, node, n_trace, vui, qid, next_index,
-				 last_avail_idx - n_rx_packets, n_rx_packets,
-				 to_next - n_rx_packets);
+      vhost_user_if_input_trace (vm, node, n_trace, vui, qid, next_index, first_avail_idx,
+				 n_rx_packets, to_next - n_rx_packets);
     }
 
   /* give buffers back to driver */
