@@ -229,7 +229,7 @@ netmap_device_input_fn (vlib_main_t * vm, vlib_node_runtime_t * node,
   vlib_increment_combined_counter
     (vnet_get_main ()->interface_main.combined_sw_if_counters
      + VNET_INTERFACE_COUNTER_RX,
-     vlib_get_thread_index (), nif->hw_if_index, n_rx_packets, n_rx_bytes);
+     vlib_get_thread_index (), nif->sw_if_index, n_rx_packets, n_rx_bytes);
 
   vnet_device_increment_rx_packets (thread_index, n_rx_packets);
 
