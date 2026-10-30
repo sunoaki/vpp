@@ -57,6 +57,18 @@ policer_mark (vlib_buffer_t *b, ip_dscp_t dscp)
     }
 }
 
+/*
+ * A policer index may point at a freed pool element after policer_del, or be
+ * larger than the pool when a classify entry carries a stale index. Both cases
+ * make the pool element access and the per-policer counter access invalid, so
+ * test the index before dereferencing it.
+ */
+static_always_inline bool
+policer_index_is_valid (policer_main_t *pm, u32 policer_index)
+{
+  return !pool_is_free_index (pm->policers, policer_index);
+}
+
 static_always_inline u8
 policer_police (vlib_main_t *vm, vlib_buffer_t *b, u32 policer_index, u64 time_in_policer_periods,
 		policer_result_e packet_color, bool handoff, u16 l2_overhead)
