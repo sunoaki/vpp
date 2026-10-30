@@ -1116,12 +1116,12 @@ bond_set_intf_weight (vlib_main_t * vm, bond_set_intf_weight_args_t * args)
   mif->weight = args->weight;
   vnm = vnet_get_main ();
   /*
-   * No need to sort the list if the affected member is not up (not in active
-   * member set), active member count is 1, or the current member is already the
-   * primary member and new weight > old weight.
+   * No need to sort the list if the affected member is not up, if the active
+   * member set holds fewer than two members, or if the current member is
+   * already the primary member and new weight > old weight.
    */
   if (!vnet_sw_interface_is_up (vnm, mif->sw_if_index) ||
-      (vec_len (bif->active_members) == 1) ||
+      (vec_len (bif->active_members) <= 1) ||
       ((bif->active_members[0] == mif->sw_if_index) &&
        (mif->weight >= old_weight)))
     return;
