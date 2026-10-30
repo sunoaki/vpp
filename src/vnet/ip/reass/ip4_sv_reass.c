@@ -25,6 +25,10 @@
 #define IP4_SV_REASS_MAX_REASSEMBLIES_DEFAULT	   1024
 #define IP4_SV_REASS_MAX_REASSEMBLY_LENGTH_DEFAULT 3
 #define IP4_SV_REASS_HT_LOAD_FACTOR		   (0.75)
+/* The call sites widen nbuckets * 1024 to uword, so this bound is not a hash
+ * sizing limit: it is a policy cap that makes the set API reject
+ * max_reassemblies above 1572864. */
+#define IP4_SV_REASS_MAX_NBUCKETS (1u << 21)
 
 typedef enum
 {
@@ -1477,20 +1481,19 @@ VLIB_NODE_FN (ip4_sv_reass_custom_context_node)
 
 #ifndef CLIB_MARCH_VARIANT
 always_inline u32
-ip4_sv_reass_get_nbuckets ()
+ip4_sv_reass_get_nbuckets (u32 max_reass_n)
 {
-  ip4_sv_reass_main_t *rm = &ip4_sv_reass_main;
-  u32 nbuckets;
-  u8 i;
+  u64 nbuckets;
+  u32 i = 0;
 
-  nbuckets = (u32) (rm->max_reass_n / IP4_SV_REASS_HT_LOAD_FACTOR);
+  nbuckets = (u64) max_reass_n / IP4_SV_REASS_HT_LOAD_FACTOR;
 
-  for (i = 0; i < 31; i++)
-    if ((1 << i) >= nbuckets)
-      break;
-  nbuckets = 1 << i;
+  /* round up to a power of two; the loop stops at 2^31 so the shift never
+   * reaches the sign bit */
+  while (i < 31 && (1ull << i) < nbuckets)
+    i++;
 
-  return nbuckets;
+  return 1u << i;
 }
 #endif /* CLIB_MARCH_VARIANT */
 
@@ -1533,13 +1536,16 @@ vnet_api_error_t
 ip4_sv_reass_set (u32 timeout_ms, u32 max_reassemblies,
 		  u32 max_reassembly_length, u32 expire_walk_interval_ms)
 {
-  u32 old_nbuckets = ip4_sv_reass_get_nbuckets ();
+  u32 new_nbuckets = ip4_sv_reass_get_nbuckets (max_reassemblies);
+  if (new_nbuckets > IP4_SV_REASS_MAX_NBUCKETS)
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  u32 old_nbuckets = ip4_sv_reass_get_nbuckets (ip4_sv_reass_main.max_reass_n);
   ip4_sv_reass_set_params (timeout_ms, max_reassemblies, max_reassembly_length,
 			   expire_walk_interval_ms);
   vlib_process_signal_event (ip4_sv_reass_main.vlib_main,
 			     ip4_sv_reass_main.ip4_sv_reass_expire_node_idx,
 			     IP4_EVENT_CONFIG_CHANGED, 0);
-  u32 new_nbuckets = ip4_sv_reass_get_nbuckets ();
   if (ip4_sv_reass_main.max_reass_n > 0 && new_nbuckets > old_nbuckets)
     {
       clib_bihash_16_8_t new_hash;
@@ -1607,7 +1613,7 @@ ip4_sv_reass_init_function (vlib_main_t *vm)
 			   IP4_SV_REASS_MAX_REASSEMBLY_LENGTH_DEFAULT,
 			   IP4_SV_REASS_EXPIRE_WALK_INTERVAL_DEFAULT_MS);
 
-  nbuckets = ip4_sv_reass_get_nbuckets ();
+  nbuckets = ip4_sv_reass_get_nbuckets (rm->max_reass_n);
   clib_bihash_init_16_8 (&rm->hash, "ip4-dr", nbuckets,
 			 (uword) nbuckets * 1024);
 
@@ -2195,6 +2201,10 @@ ip4_sv_reass_extended_unlock (vlib_buffer_t *b)
   ip4_sv_reass_per_thread_t *per_thread =
     &ip4_sv_reass_main
        .per_thread_data[vnet_buffer2 (b)->ip.reass.thread_index];
+
+  if (!vec_is_member (ip4_sv_reass_main.per_thread_data, per_thread))
+    return;
+
   clib_spinlock_unlock (&per_thread->lock);
 }
 
