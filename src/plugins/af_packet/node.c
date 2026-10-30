@@ -334,6 +334,17 @@ af_packet_v3_device_input_fn (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  (vnet_virtio_net_hdr_t *) ((u8 *) tph + tph->tp_mac -
 					     sizeof (vnet_virtio_net_hdr_t));
 
+	      /* A zero snaplen means the kernel captured no payload: the copy
+	       * loop below would not run and would leave first_bi0 and
+	       * first_b0 uninitialised. */
+	      if (PREDICT_FALSE (data_len == 0))
+		{
+		  vlib_increment_simple_counter (vnet_get_main ()->interface_main.sw_if_counters +
+						   VNET_INTERFACE_COUNTER_DROP,
+						 vm->thread_index, sw_if_index, 1);
+		  goto next_packet;
+		}
+
 	      // save current state and return
 	      if (PREDICT_FALSE (((data_len / n_buffer_bytes) + 1) >
 				 vec_len (apm->rx_buffers[thread_index])))
@@ -492,6 +503,7 @@ af_packet_v3_device_input_fn (vlib_main_t *vm, vlib_node_runtime_t *node,
 					       n_left_to_next, first_bi0,
 					       next0);
 
+	    next_packet:
 	      /* next packet */
 	      num_pkts--;
 	      rx_frame_offset += tph->tp_next_offset;
@@ -603,6 +615,18 @@ af_packet_v2_device_input_fn (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    vnet_hdr =
 	      (vnet_virtio_net_hdr_t *) ((u8 *) tph + tph->tp_mac -
 					 sizeof (vnet_virtio_net_hdr_t));
+
+	  /* A zero snaplen means the kernel captured no payload: the copy
+	   * loop below would not run and would leave first_bi0 and
+	   * first_b0 uninitialised. */
+	  if (PREDICT_FALSE (data_len == 0))
+	    {
+	      vlib_increment_simple_counter (vnet_get_main ()->interface_main.sw_if_counters +
+					       VNET_INTERFACE_COUNTER_DROP,
+					     vm->thread_index, sw_if_index, 1);
+	      goto next_packet;
+	    }
+
 	  while (data_len)
 	    {
 	      /* grab free buffer */
@@ -741,6 +765,7 @@ af_packet_v2_device_input_fn (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  vlib_validate_buffer_enqueue_x1 (vm, node, next_index, to_next,
 					   n_left_to_next, first_bi0, next0);
 
+	next_packet:
 	  /* next packet */
 	  tph->tp_status = TP_STATUS_KERNEL;
 	  rx_frame = (rx_frame + 1) % frame_num;
