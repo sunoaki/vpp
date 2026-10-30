@@ -1258,11 +1258,9 @@ rdma_device_input_inline (vlib_main_t * vm, vlib_node_runtime_t * node,
   /* reset flags to zero for the next run */
   if (use_mlx5dv)
     clib_memset_u16 (ptd->cqe_flags, 0, VLIB_FRAME_SIZE);
-  vlib_increment_combined_counter (vnm->interface_main.
-				   combined_sw_if_counters +
-				   VNET_INTERFACE_COUNTER_RX,
-				   vm->thread_index, rd->sw_if_index,
-				   n_rx_packets, n_rx_bytes);
+  vlib_increment_combined_counter (vnm->interface_main.combined_sw_if_counters +
+				     VNET_INTERFACE_COUNTER_RX,
+				   vm->thread_index, rd->sw_if_index, n_rx_packets, n_rx_bytes);
 refill:
   rdma_device_input_refill (vm, rd, rxq, &bt, use_mlx5dv, is_striding);
   return n_rx_packets;
