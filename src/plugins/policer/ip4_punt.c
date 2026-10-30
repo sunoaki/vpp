@@ -34,8 +34,13 @@ static char *ip4_punt_policer_handoff_error_strings[] = { "congestion drop" };
 VLIB_NODE_FN (ip4_punt_policer_handoff_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 {
-  return policer_handoff (vm, node, frame, ip4_punt_policer_cfg.fq_index,
-			  ip4_punt_policer_cfg.policer_index);
+  u32 policer_index = ip4_punt_policer_cfg.policer_index;
+
+  if (PREDICT_FALSE (!policer_index_is_valid (&policer_main, policer_index)))
+    return ip_punt_policer_drop_all (vm, node, frame, ip4_punt_policer_node.index,
+				     IP_PUNT_POLICER_ERROR_INVALID_INDEX);
+
+  return policer_handoff (vm, node, frame, ip4_punt_policer_cfg.fq_index, policer_index);
 }
 
 VLIB_REGISTER_NODE (ip4_punt_policer_handoff_node) = {
@@ -88,12 +93,16 @@ VNET_FEATURE_INIT (ip4_punt_policer_node) = {
 };
 
 #ifndef CLIB_MARCH_VARIANT
-void
+int
 ip4_punt_policer_add_del (u8 is_add, u32 policer_index)
 {
-  ip4_punt_policer_cfg.policer_index = policer_index;
+  if (is_add && !policer_index_is_valid (&policer_main, policer_index))
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  ip4_punt_policer_cfg.policer_index = is_add ? policer_index : ~0;
 
   vnet_feature_enable_disable ("ip4-punt", "ip4-punt-policer", 0, is_add, 0, 0);
+  return 0;
 }
 #endif /* CLIB_MARCH_VARIANT */
 
@@ -134,7 +143,8 @@ ip4_punt_police_cmd (vlib_main_t *vm, unformat_input_t *main_input, vlib_cli_com
   if (!is_add)
     policer_index = ~0;
 
-  ip4_punt_policer_add_del (is_add, policer_index);
+  if (ip4_punt_policer_add_del (is_add, policer_index))
+    error = clib_error_return (0, "unknown policer %u", policer_index);
 
 done:
   unformat_free (line_input);

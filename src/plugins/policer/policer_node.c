@@ -43,7 +43,8 @@ format_policer_trace (u8 *s, va_list *args)
 
 #define foreach_vnet_policer_error                                                                 \
   _ (TRANSMIT, "Packets Transmitted")                                                              \
-  _ (DROP, "Packets Dropped")
+  _ (DROP, "Packets Dropped")                                                                      \
+  _ (INVALID_INDEX, "Invalid policer index")
 
 typedef enum
 {
@@ -112,6 +113,7 @@ policer_node_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *f
 	  u32 sw_if_index0, sw_if_index1;
 	  u32 pi0 = 0, pi1 = 0;
 	  u8 act0, act1;
+	  bool pi0_valid, pi1_valid;
 
 	  /* Prefetch next iteration. */
 	  {
@@ -144,13 +146,25 @@ policer_node_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *f
 	  u16 l2_overhead0 = policer_l2_overhead (pm, dir, sw_if_index0, is_l2);
 	  u16 l2_overhead1 = policer_l2_overhead (pm, dir, sw_if_index1, is_l2);
 
-	  act0 = policer_police (vm, b0, pi0, time_in_policer_periods, POLICE_CONFORM, true,
-				 l2_overhead0);
+	  pi0_valid = policer_index_is_valid (pm, pi0);
+	  pi1_valid = policer_index_is_valid (pm, pi1);
 
-	  act1 = policer_police (vm, b1, pi1, time_in_policer_periods, POLICE_CONFORM, true,
-				 l2_overhead1);
+	  act0 = QOS_ACTION_DROP;
+	  if (PREDICT_TRUE (pi0_valid))
+	    act0 = policer_police (vm, b0, pi0, time_in_policer_periods, POLICE_CONFORM, true,
+				   l2_overhead0);
 
-	  if (PREDICT_FALSE (act0 == QOS_ACTION_HANDOFF))
+	  act1 = QOS_ACTION_DROP;
+	  if (PREDICT_TRUE (pi1_valid))
+	    act1 = policer_police (vm, b1, pi1, time_in_policer_periods, POLICE_CONFORM, true,
+				   l2_overhead1);
+
+	  if (PREDICT_FALSE (!pi0_valid))
+	    {
+	      next0 = VNET_POLICER_NEXT_DROP;
+	      b0->error = node->errors[VNET_POLICER_ERROR_INVALID_INDEX];
+	    }
+	  else if (PREDICT_FALSE (act0 == QOS_ACTION_HANDOFF))
 	    {
 	      next0 = VNET_POLICER_NEXT_HANDOFF;
 	      vnet_buffer (b0)->policer.index = pi0;
@@ -182,7 +196,12 @@ policer_node_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *f
 		}
 	    }
 
-	  if (PREDICT_FALSE (act1 == QOS_ACTION_HANDOFF))
+	  if (PREDICT_FALSE (!pi1_valid))
+	    {
+	      next1 = VNET_POLICER_NEXT_DROP;
+	      b1->error = node->errors[VNET_POLICER_ERROR_INVALID_INDEX];
+	    }
+	  else if (PREDICT_FALSE (act1 == QOS_ACTION_HANDOFF))
 	    {
 	      next1 = VNET_POLICER_NEXT_HANDOFF;
 	      vnet_buffer (b1)->policer.index = pi1;
@@ -243,6 +262,7 @@ policer_node_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *f
 	  u32 sw_if_index0;
 	  u32 pi0 = 0;
 	  u8 act0;
+	  bool pi0_valid;
 
 	  bi0 = from[0];
 	  to_next[0] = bi0;
@@ -258,10 +278,19 @@ policer_node_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *f
 
 	  u16 l2_overhead0 = policer_l2_overhead (pm, dir, sw_if_index0, is_l2);
 
-	  act0 = policer_police (vm, b0, pi0, time_in_policer_periods, POLICE_CONFORM, true,
-				 l2_overhead0);
+	  pi0_valid = policer_index_is_valid (pm, pi0);
 
-	  if (PREDICT_FALSE (act0 == QOS_ACTION_HANDOFF))
+	  act0 = QOS_ACTION_DROP;
+	  if (PREDICT_TRUE (pi0_valid))
+	    act0 = policer_police (vm, b0, pi0, time_in_policer_periods, POLICE_CONFORM, true,
+				   l2_overhead0);
+
+	  if (PREDICT_FALSE (!pi0_valid))
+	    {
+	      next0 = VNET_POLICER_NEXT_DROP;
+	      b0->error = node->errors[VNET_POLICER_ERROR_INVALID_INDEX];
+	    }
+	  else if (PREDICT_FALSE (act0 == QOS_ACTION_HANDOFF))
 	    {
 	      next0 = VNET_POLICER_NEXT_HANDOFF;
 	      vnet_buffer (b0)->policer.index = pi0;
@@ -485,7 +514,8 @@ format_policer_classify_trace (u8 *s, va_list *args)
   _ (MISS, "Policer classify misses")                                                              \
   _ (HIT, "Policer classify hits")                                                                 \
   _ (CHAIN_HIT, "Policer classify hits after chain walk")                                          \
-  _ (DROP, "Policer classify action drop")
+  _ (DROP, "Policer classify action drop")                                                         \
+  _ (INVALID_INDEX, "Policer classify hit with invalid policer index")
 
 typedef enum
 {
@@ -509,6 +539,7 @@ policer_classify_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_
   policer_classify_next_index_t next_index;
   policer_classify_main_t *pcm = &policer_classify_main;
   vnet_classify_main_t *vcm = pcm->vnet_classify_main;
+  policer_main_t *pm = &policer_main;
   f64 now = vlib_time_now (vm);
   u32 hits = 0;
   u32 misses = 0;
@@ -681,12 +712,20 @@ policer_classify_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_
 
 	      if (e0)
 		{
-		  act0 = policer_police (vm, b0, e0->next_index, time_in_policer_periods,
-					 e0->opaque_index, false, 0);
-		  if (PREDICT_FALSE (act0 == QOS_ACTION_DROP))
+		  if (PREDICT_FALSE (!policer_index_is_valid (pm, e0->next_index)))
 		    {
 		      next0 = POLICER_CLASSIFY_NEXT_INDEX_DROP;
-		      b0->error = node->errors[POLICER_CLASSIFY_ERROR_DROP];
+		      b0->error = node->errors[POLICER_CLASSIFY_ERROR_INVALID_INDEX];
+		    }
+		  else
+		    {
+		      act0 = policer_police (vm, b0, e0->next_index, time_in_policer_periods,
+					     e0->opaque_index, false, 0);
+		      if (PREDICT_FALSE (act0 == QOS_ACTION_DROP))
+			{
+			  next0 = POLICER_CLASSIFY_NEXT_INDEX_DROP;
+			  b0->error = node->errors[POLICER_CLASSIFY_ERROR_DROP];
+			}
 		    }
 		  hits++;
 		}
@@ -710,12 +749,21 @@ policer_classify_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_
 		      e0 = vnet_classify_find_entry (t0, (u8 *) h0, hash0, now);
 		      if (e0)
 			{
-			  act0 = policer_police (vm, b0, e0->next_index, time_in_policer_periods,
-						 e0->opaque_index, false, 0);
-			  if (PREDICT_FALSE (act0 == QOS_ACTION_DROP))
+			  if (PREDICT_FALSE (!policer_index_is_valid (pm, e0->next_index)))
 			    {
 			      next0 = POLICER_CLASSIFY_NEXT_INDEX_DROP;
-			      b0->error = node->errors[POLICER_CLASSIFY_ERROR_DROP];
+			      b0->error = node->errors[POLICER_CLASSIFY_ERROR_INVALID_INDEX];
+			    }
+			  else
+			    {
+			      act0 =
+				policer_police (vm, b0, e0->next_index, time_in_policer_periods,
+						e0->opaque_index, false, 0);
+			      if (PREDICT_FALSE (act0 == QOS_ACTION_DROP))
+				{
+				  next0 = POLICER_CLASSIFY_NEXT_INDEX_DROP;
+				  b0->error = node->errors[POLICER_CLASSIFY_ERROR_DROP];
+				}
 			    }
 			  hits++;
 			  chain_hits++;
