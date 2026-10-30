@@ -36,17 +36,14 @@
  * @return true when the length was computed
  */
 always_inline bool
-ip6_reass_fragment_data_len (vlib_main_t *vm, vlib_buffer_t *b,
-			     u32 *fragment_data_len)
+ip6_reass_fragment_data_len (vlib_main_t *vm, vlib_buffer_t *b, u32 *fragment_data_len)
 {
   ip6_header_t *ip = vlib_buffer_get_current (b);
   u32 fragment_data_offset =
     vnet_buffer (b)->ip.reass.ip6_frag_hdr_offset + sizeof (ip6_frag_hdr_t);
-  u32 packet_len =
-    sizeof (ip6_header_t) + clib_net_to_host_u16 (ip->payload_length);
+  u32 packet_len = sizeof (ip6_header_t) + clib_net_to_host_u16 (ip->payload_length);
 
-  if (packet_len < fragment_data_offset ||
-      vlib_buffer_length_in_chain (vm, b) < packet_len)
+  if (packet_len < fragment_data_offset || vlib_buffer_length_in_chain (vm, b) < packet_len)
     return false;
 
   *fragment_data_len = packet_len - fragment_data_offset;
@@ -67,10 +64,9 @@ ip6_reass_set_payload_length_error (vlib_buffer_t *b)
 {
   ip6_header_t *ip = vlib_buffer_get_current (b);
 
-  icmp6_error_set_vnet_buffer (
-    b, ICMP6_parameter_problem,
-    ICMP6_parameter_problem_erroneous_header_field,
-    (u8 *) &ip->payload_length - (u8 *) ip);
+  icmp6_error_set_vnet_buffer (b, ICMP6_parameter_problem,
+			       ICMP6_parameter_problem_erroneous_header_field,
+			       (u8 *) &ip->payload_length - (u8 *) ip);
 }
 
 #endif /* __included_ip6_reass_h__ */
