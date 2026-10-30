@@ -420,8 +420,7 @@ set_l2_xcrw_command_fn (vlib_main_t * vm,
 
   if (vec_len (rw) > rewrite_data_max)
     {
-      error = clib_error_return (0, "rewrite data is %u bytes, max is %u",
-				 (unsigned) vec_len (rw),
+      error = clib_error_return (0, "rewrite data is %u bytes, max is %u", (unsigned) vec_len (rw),
 				 (unsigned) rewrite_data_max);
       goto done;
     }

@@ -1120,10 +1120,8 @@ bond_set_intf_weight (vlib_main_t * vm, bond_set_intf_weight_args_t * args)
    * member set holds fewer than two members, or if the current member is
    * already the primary member and new weight > old weight.
    */
-  if (!vnet_sw_interface_is_up (vnm, mif->sw_if_index) ||
-      (vec_len (bif->active_members) <= 1) ||
-      ((bif->active_members[0] == mif->sw_if_index) &&
-       (mif->weight >= old_weight)))
+  if (!vnet_sw_interface_is_up (vnm, mif->sw_if_index) || (vec_len (bif->active_members) <= 1) ||
+      ((bif->active_members[0] == mif->sw_if_index) && (mif->weight >= old_weight)))
     return;
 
   bond_sort_members (bif);
