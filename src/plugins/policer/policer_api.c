@@ -433,9 +433,9 @@ vl_api_ip_punt_police_t_handler (vl_api_ip_punt_police_t *mp, vlib_main_t *vm)
   int rv = 0;
 
   if (mp->is_ip6)
-    ip6_punt_policer_add_del (mp->is_add, ntohl (mp->policer_index));
+    rv = ip6_punt_policer_add_del (mp->is_add, ntohl (mp->policer_index));
   else
-    ip4_punt_policer_add_del (mp->is_add, ntohl (mp->policer_index));
+    rv = ip4_punt_policer_add_del (mp->is_add, ntohl (mp->policer_index));
 
   REPLY_MACRO (VL_API_IP_PUNT_POLICE_REPLY);
 }

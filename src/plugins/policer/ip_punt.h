@@ -50,8 +50,8 @@ extern ip_punt_policer_t ip4_punt_policer_cfg;
 extern vlib_node_registration_t ip6_punt_policer_node;
 extern ip_punt_policer_t ip6_punt_policer_cfg;
 
-void ip4_punt_policer_add_del (u8 is_add, u32 policer_index);
-void ip6_punt_policer_add_del (u8 is_add, u32 policer_index);
+int ip4_punt_policer_add_del (u8 is_add, u32 policer_index);
+int ip6_punt_policer_add_del (u8 is_add, u32 policer_index);
 
 /*
  * Drop every buffer in the frame. The error is recorded against the caller's
