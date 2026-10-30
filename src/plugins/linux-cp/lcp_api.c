@@ -166,7 +166,9 @@ vl_api_lcp_itf_pair_add_del_v3_t_handler (vl_api_lcp_itf_pair_add_del_v3_t *mp)
 
 /*
  * Copy a NUL-terminated vector into a fixed-size API string field, keeping the
- * last byte of the field for the terminating NUL.
+ * last byte of the field for the terminating NUL. The whole field is cleared
+ * first because replies are allocated from uncleared shared memory and would
+ * otherwise send the tail of the previous message to the client.
  */
 static void
 lcp_api_copy_string (u8 *dst, size_t dst_size, u8 *src)
@@ -176,6 +178,7 @@ lcp_api_copy_string (u8 *dst, size_t dst_size, u8 *src)
   if (len > dst_size - 1)
     len = dst_size - 1;
 
+  clib_memset (dst, 0, dst_size);
   clib_memcpy (dst, src, len);
   dst[len] = 0;
 }
@@ -261,6 +264,8 @@ vl_api_lcp_default_ns_get_t_handler (vl_api_lcp_default_ns_get_t *mp)
 
   REPLY_MACRO_DETAILS2 (VL_API_LCP_DEFAULT_NS_GET_REPLY, ({
 			  char *ns = (char *) lcp_get_default_ns ();
+
+			  clib_memset (rmp->netns, 0, sizeof (rmp->netns));
 			  if (ns)
 			    clib_strncpy ((char *) rmp->netns, ns,
 					  LCP_NS_LEN - 1);
