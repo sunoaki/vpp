@@ -67,6 +67,8 @@ lcp_set_default_ns (u8 *ns)
   vec_validate_init_c_string (lcpm->default_namespace, p,
 			      clib_strnlen (p, LCP_NS_LEN));
   s = format (0, "/var/run/netns/%s%c", (char *) lcpm->default_namespace, 0);
+  if (lcpm->default_ns_fd >= 0)
+    close (lcpm->default_ns_fd);
   lcpm->default_ns_fd = open ((char *) s, O_RDONLY);
   vec_free (s);
 
