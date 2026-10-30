@@ -54,8 +54,8 @@ int ip4_punt_policer_add_del (u8 is_add, u32 policer_index);
 int ip6_punt_policer_add_del (u8 is_add, u32 policer_index);
 
 /*
- * Drop every buffer in the frame. The error is recorded against the caller's
- * node, which owns the error code.
+ * Drop every buffer in the frame. The error is recorded against error_node,
+ * which owns the error code.
  */
 always_inline uword
 ip_punt_policer_drop_all (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame,
