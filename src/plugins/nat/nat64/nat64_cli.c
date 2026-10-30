@@ -416,7 +416,7 @@ nat64_cli_bib_walk (nat64_db_bib_entry_t * bibe, void *ctx)
 
   fib = fib_table_get_or_null (bibe->fib_index, FIB_PROTOCOL_IP6);
   if (!fib)
-    return -1;
+    return 0;
 
   switch (bibe->proto)
     {
@@ -499,11 +499,11 @@ nat64_cli_st_walk (nat64_db_st_entry_t * ste, void *arg)
 
   bibe = nat64_db_bib_entry_by_index (ctx->db, ste->proto, ste->bibe_index);
   if (!bibe)
-    return -1;
+    return 0;
 
   fib = fib_table_get_or_null (bibe->fib_index, FIB_PROTOCOL_IP6);
   if (!fib)
-    return -1;
+    return 0;
 
   u32 vrf_id = fib->ft_table_id;
 
