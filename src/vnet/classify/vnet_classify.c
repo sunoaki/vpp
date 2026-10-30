@@ -10,6 +10,7 @@
 #include <vnet/ip/ip.h>
 #include <vnet/api_errno.h>	/* for API error numbers */
 #include <vnet/l2/l2_classify.h>	/* for L2_INPUT_CLASSIFY_NEXT_xxx */
+#include <vnet/dpo/classify_dpo.h>
 #include <vnet/fib/fib_table.h>
 #include <vppinfra/lock.h>
 #include <vnet/classify/trace_classify.h>
@@ -186,11 +187,29 @@ vnet_classify_index_vector_holds (u32 * indices, u32 table_index)
   return 0;
 }
 
+static int
+vnet_classify_index_vectors_hold (u32 ** indices_by_type, u32 n_types,
+				  u32 table_index)
+{
+  u32 ti;
+
+  for (ti = 0; ti < n_types; ti++)
+    if (vnet_classify_index_vector_holds (indices_by_type[ti], table_index))
+      return 1;
+
+  return 0;
+}
+
 /*
- * The dataplane reaches a table through a per-interface binding vector or
- * through another table's next_table_index.  A table that either still
- * names must not be freed: the holder would dereference a freed pool
- * element on the next packet.
+ * The dataplane reaches a table through a per-interface binding vector, a
+ * classify DPO, or another table's next_table_index.  A table that any of
+ * them still names must not be freed: the holder would dereference a freed
+ * pool element on the next packet.
+ *
+ * Besides the bindings this module owns, table indices are held by the L2
+ * input and output nodes and by the ip4/ip6 lookup main and its classify
+ * DPOs.  Those modules create and clear the bindings themselves; this
+ * function only reads their state.
  */
 static int
 vnet_classify_table_is_bound (vnet_classify_main_t * cm, u32 table_index)
@@ -198,7 +217,11 @@ vnet_classify_table_is_bound (vnet_classify_main_t * cm, u32 table_index)
   in_out_acl_main_t *am = &in_out_acl_main;
   policer_classify_main_t *pcm = &policer_classify_main;
   flow_classify_main_t *fcm = &flow_classify_main;
-  u32 group, ti;
+  l2_input_classify_main_t *l2im = &l2_input_classify_main;
+  l2_output_classify_main_t *l2om = &l2_output_classify_main;
+  classify_dpo_t *cd;
+  u32 group;
+  uword i;
 
   if (vlib_global_main.trace_filter.classify_table_index == table_index)
     return 1;
@@ -208,20 +231,47 @@ vnet_classify_table_is_bound (vnet_classify_main_t * cm, u32 table_index)
     return 1;
 
   for (group = 0; group < IN_OUT_ACL_N_TABLE_GROUPS; group++)
-    for (ti = 0; ti < IN_OUT_ACL_N_TABLES; ti++)
-      if (vnet_classify_index_vector_holds
-	  (am->classify_table_index_by_sw_if_index[group][ti], table_index))
+    if (vnet_classify_index_vectors_hold
+	(am->classify_table_index_by_sw_if_index[group],
+	 ARRAY_LEN (am->classify_table_index_by_sw_if_index[group]),
+	 table_index))
+      return 1;
+
+  if (vnet_classify_index_vectors_hold
+      (pcm->classify_table_index_by_sw_if_index,
+       ARRAY_LEN (pcm->classify_table_index_by_sw_if_index), table_index))
+    return 1;
+
+  if (vnet_classify_index_vectors_hold
+      (fcm->classify_table_index_by_sw_if_index,
+       ARRAY_LEN (fcm->classify_table_index_by_sw_if_index), table_index))
+    return 1;
+
+  if (vnet_classify_index_vectors_hold
+      (l2im->classify_table_index_by_sw_if_index,
+       ARRAY_LEN (l2im->classify_table_index_by_sw_if_index), table_index))
+    return 1;
+
+  if (vnet_classify_index_vectors_hold
+      (l2om->classify_table_index_by_sw_if_index,
+       ARRAY_LEN (l2om->classify_table_index_by_sw_if_index), table_index))
+    return 1;
+
+  if (vnet_classify_index_vector_holds
+      (ip4_main.lookup_main.classify_table_index_by_sw_if_index, table_index))
+    return 1;
+
+  if (vnet_classify_index_vector_holds
+      (ip6_main.lookup_main.classify_table_index_by_sw_if_index, table_index))
+    return 1;
+
+  /* A live classify DPO is a FIB entry the ip_classify node follows. */
+  pool_foreach_index (i, classify_dpo_pool)
+    {
+      cd = pool_elt_at_index (classify_dpo_pool, i);
+      if (cd->cd_table_index == table_index)
 	return 1;
-
-  for (ti = 0; ti < POLICER_CLASSIFY_N_TABLES; ti++)
-    if (vnet_classify_index_vector_holds
-	(pcm->classify_table_index_by_sw_if_index[ti], table_index))
-      return 1;
-
-  for (ti = 0; ti < FLOW_CLASSIFY_N_TABLES; ti++)
-    if (vnet_classify_index_vector_holds
-	(fcm->classify_table_index_by_sw_if_index[ti], table_index))
-      return 1;
+    }
 
   return 0;
 }
