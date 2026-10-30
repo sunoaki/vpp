@@ -794,6 +794,15 @@ lcp_nl_pair_add_cb (lcp_itf_pair_t *pair)
 {
   nl_main_t *nm = &nl_main;
 
+  /* While a synchronization is in progress, including the delay before the
+   * attempt when no socket is open, the notification socket is owned by the
+   * synchronization state machine, which opens it after the delay. Opening a
+   * socket here would leave it behind as a second socket when the state
+   * machine opens its own
+   */
+  if (nm->nl_status != NL_STATUS_NOTIF_PROC)
+    return;
+
   if (!nm->sk_route)
     {
       NL_INFO ("pair_add_cb: Opening netlink socket, LCP pairs %u", lcp_itf_num_pairs ());
@@ -966,6 +975,14 @@ lcp_nl_open_socket (void)
   int dest_ns_fd, curr_ns_fd = -1;
   int entered_dest_ns = 0;
   int err;
+
+  /* A socket must not be replaced in place: the old descriptor would stay
+   * registered in epoll and readable, while nm->sk_route points at the new
+   * socket that the read callback drains. Close what is open first, which
+   * removes the descriptor from the epoll set before it is freed
+   */
+  if (nm->sk_route)
+    lcp_nl_close_socket ();
 
   /* Allocate a new socket for both routes and acls
    * Notifications do not use sequence numbers, disable sequence number
