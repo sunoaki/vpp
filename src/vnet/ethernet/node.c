@@ -69,11 +69,8 @@ typedef enum
 
 // Parse the ethernet header to extract vlan tags and innermost ethertype
 static_always_inline void
-parse_header (ethernet_input_variant_t variant,
-	      vlib_buffer_t * b0,
-	      u16 * type,
-	      u16 * orig_type,
-	      u16 * outer_id, u16 * inner_id, u32 * match_flags)
+parse_header (ethernet_input_variant_t variant, vlib_buffer_t *b0, u16 *type, u16 *orig_type,
+	      u16 *outer_id, u16 *inner_id, u32 *match_flags, u8 *error0)
 {
   u8 vlan_count;
 
@@ -119,6 +116,15 @@ parse_header (ethernet_input_variant_t variant,
       ethernet_vlan_header_t *h0;
       u16 tag;
 
+      /* The ethertype only says a vlan header follows. Stop here if the
+	 frame ends before it: the advances below would wrap the unsigned
+	 current_length. */
+      if (PREDICT_FALSE (b0->current_length < sizeof (h0[0])))
+	{
+	  *error0 = ETHERNET_ERROR_RUNT_FRAME;
+	  return;
+	}
+
       *match_flags = SUBINT_CONFIG_VALID | SUBINT_CONFIG_MATCH_1_TAG;
 
       h0 = vlib_buffer_get_current (b0);
@@ -139,6 +145,12 @@ parse_header (ethernet_input_variant_t variant,
 	  // Double tagged packet
 	  *match_flags = SUBINT_CONFIG_VALID | SUBINT_CONFIG_MATCH_2_TAG;
 
+	  if (PREDICT_FALSE (b0->current_length < sizeof (h0[0])))
+	    {
+	      *error0 = ETHERNET_ERROR_RUNT_FRAME;
+	      return;
+	    }
+
 	  h0 = vlib_buffer_get_current (b0);
 
 	  tag = clib_net_to_host_u16 (h0->priority_cfi_and_id);
@@ -153,6 +165,12 @@ parse_header (ethernet_input_variant_t variant,
 	    {
 	      // More than double tagged packet
 	      *match_flags = SUBINT_CONFIG_VALID | SUBINT_CONFIG_MATCH_3_TAG;
+
+	      if (PREDICT_FALSE (b0->current_length < sizeof (h0[0])))
+		{
+		  *error0 = ETHERNET_ERROR_RUNT_FRAME;
+		  return;
+		}
 
 	      vlib_buffer_advance (b0, sizeof (h0[0]));
 	      vlan_count = 3;	// "unknown" number, aka, 3-or-more
@@ -565,6 +583,16 @@ eth_input_tag_lookup (vlib_main_t * vm, vnet_main_t * vnm,
 	  if (l->next == ETHERNET_INPUT_NEXT_PUNT)
 	    l->err = ETHERNET_ERROR_UNKNOWN_TYPE;
 	}
+    }
+
+  /* A frame can end before the vlan headers its ethertype chain claims.
+     l->adv is the number of header bytes still to consume; a shorter buffer
+     would wrap its unsigned current_length in the advance below. */
+  if (PREDICT_FALSE (l->adv > 0 && b->current_length < l->adv))
+    {
+      b->error = node->errors[ETHERNET_ERROR_RUNT_FRAME];
+      next[0] = ETHERNET_INPUT_NEXT_DROP;
+      return;
     }
 
   if (check_dmac && l->adv > 0 && dmac_bad)
@@ -1401,15 +1429,11 @@ ethernet_input_inline (vlib_main_t * vm,
 
 	  /* Slow-path for the tagged case */
 	slowpath:
-	  parse_header (variant,
-			b0,
-			&type0,
-			&orig_type0, &outer_id0, &inner_id0, &match_flags0);
+	  parse_header (variant, b0, &type0, &orig_type0, &outer_id0, &inner_id0, &match_flags0,
+			&error0);
 
-	  parse_header (variant,
-			b1,
-			&type1,
-			&orig_type1, &outer_id1, &inner_id1, &match_flags1);
+	  parse_header (variant, b1, &type1, &orig_type1, &outer_id1, &inner_id1, &match_flags1,
+			&error1);
 
 	  old_sw_if_index0 = vnet_buffer (b0)->sw_if_index[VLIB_RX];
 	  old_sw_if_index1 = vnet_buffer (b1)->sw_if_index[VLIB_RX];
@@ -1647,10 +1671,8 @@ ethernet_input_inline (vlib_main_t * vm,
 	    }
 
 	  /* Slow-path for the tagged case */
-	  parse_header (variant,
-			b0,
-			&type0,
-			&orig_type0, &outer_id0, &inner_id0, &match_flags0);
+	  parse_header (variant, b0, &type0, &orig_type0, &outer_id0, &inner_id0, &match_flags0,
+			&error0);
 
 	  old_sw_if_index0 = vnet_buffer (b0)->sw_if_index[VLIB_RX];
 
