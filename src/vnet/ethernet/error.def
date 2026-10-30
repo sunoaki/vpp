@@ -43,4 +43,5 @@ ethernet_error (UNKNOWN_TYPE, PUNT, "unknown ethernet type")
 ethernet_error (UNKNOWN_VLAN, DROP, "unknown vlan")
 ethernet_error (L3_MAC_MISMATCH, DROP, "l3 mac mismatch")
 ethernet_error (DOWN, DROP, "subinterface down")
+ethernet_error (RUNT_FRAME, DROP, "frame shorter than ethernet header")
 

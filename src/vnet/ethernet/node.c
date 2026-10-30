@@ -790,6 +790,48 @@ eth_input_process_frame_dmac_check (vnet_hw_interface_t * hi,
     }
 }
 
+/* Drop frames shorter than an ethernet header. current_length is unsigned,
+   so the fixed header advance below would wrap it, and the ethertype of such
+   a frame must not be read at all. The dropped frames are enqueued to the
+   drop node, and the surviving frames are compacted, in order, to the head of
+   buffer_indices and bufs. Returns the number of survivors. */
+static_always_inline u32
+eth_input_drop_runt_frames (vlib_main_t *vm, vlib_node_runtime_t *node, u32 *buffer_indices,
+			    vlib_buffer_t **bufs, u32 n_packets, u16 *nexts)
+{
+  u32 runts[VLIB_FRAME_SIZE];
+  u32 n_runt = 0, n_keep = 0;
+  u32 i;
+
+  for (i = 0; i < n_packets; i++)
+    {
+      if (PREDICT_TRUE (bufs[i]->current_length >= sizeof (ethernet_header_t)))
+	{
+	  if (n_keep != i)
+	    {
+	      buffer_indices[n_keep] = buffer_indices[i];
+	      bufs[n_keep] = bufs[i];
+	    }
+	  n_keep++;
+	}
+      else
+	runts[n_runt++] = buffer_indices[i];
+    }
+
+  if (n_runt == 0)
+    return n_packets;
+
+  for (i = 0; i < n_runt; i++)
+    {
+      vlib_get_buffer (vm, runts[i])->error = node->errors[ETHERNET_ERROR_RUNT_FRAME];
+      nexts[i] = ETHERNET_INPUT_NEXT_DROP;
+    }
+
+  vlib_buffer_enqueue_to_next (vm, node, runts, nexts, n_runt);
+
+  return n_keep;
+}
+
 /* process frame of buffers, store ethertype into array and update
    buffer metadata fields depending on interface being l2 or l3 assuming that
    packets are untagged. For tagged packets those fields are updated later.
@@ -824,6 +866,11 @@ eth_input_process_frame (vlib_main_t * vm, vlib_node_runtime_t * node,
   ethernet_interface_t *ei = ethernet_get_interface (em, hi->hw_if_index);
 
   vlib_get_buffers (vm, buffer_indices, b, n_left);
+
+  n_left = eth_input_drop_runt_frames (vm, node, buffer_indices, bufs, n_left, nexts);
+  if (n_left == 0)
+    return;
+  n_packets = n_left;
 
   while (n_left >= 20)
     {
@@ -1232,6 +1279,12 @@ ethernet_input_inline (vlib_main_t * vm,
 	  u64 dmacs[2];
 	  u8 dmacs_bad[2];
 
+	  /* Runt frames are dropped one at a time by the single packet
+	     loop below, before their ethertype is read. */
+	  if (PREDICT_FALSE (b[0]->current_length < sizeof (ethernet_header_t) ||
+			     b[1]->current_length < sizeof (ethernet_header_t)))
+	    break;
+
 	  /* Prefetch next iteration. */
 	  {
 	    vlib_prefetch_buffer_header (b[2], STORE);
@@ -1515,6 +1568,16 @@ ethernet_input_inline (vlib_main_t * vm,
 	  b += 1;
 
 	  error0 = ETHERNET_ERROR_NONE;
+
+	  /* Drop runt frames before reading the ethertype and before the
+	     header advance, which would underflow current_length. */
+	  if (PREDICT_FALSE (b0->current_length < sizeof (ethernet_header_t)))
+	    {
+	      error0 = ETHERNET_ERROR_RUNT_FRAME;
+	      next0 = ETHERNET_INPUT_NEXT_DROP;
+	      goto ship_it0;
+	    }
+
 	  e0 = vlib_buffer_get_current (b0);
 	  type0 = clib_net_to_host_u16 (e0->type);
 
