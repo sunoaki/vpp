@@ -58,9 +58,10 @@ l2pbb_configure (vlib_main_t * vlib_main,
       goto done;
     }
 
-  // Config for this interface should be already initialized
+  // Create the config for this interface if it does not exist yet
   ptr_config_t *in_config;
   ptr_config_t *out_config;
+  vec_validate (l2output_main.configs, sw_if_index);
   config = vec_elt_at_index (l2output_main.configs, sw_if_index);
   in_config = &(config->input_pbb_vtr);
   out_config = &(config->output_pbb_vtr);

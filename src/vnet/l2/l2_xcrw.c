@@ -127,8 +127,6 @@ VLIB_NODE_FN (l2_xcrw_node) (vlib_main_t * vm,
 	  vnet_buffer (b1)->sw_if_index[VLIB_TX] =
 	    adj1->rewrite_header.sw_if_index;
 
-	  em->counters[node_counter_base_index + next1]++;
-
 	  if (PREDICT_TRUE (next0 > 0))
 	    {
 	      u8 *h0 = vlib_buffer_get_current (b0);
@@ -386,6 +384,7 @@ set_l2_xcrw_command_fn (vlib_main_t * vm,
   u32 tx_fib_index = ~0;
   u32 next_node_index = ~0;
   u32 l2_sw_if_index;
+  u32 rewrite_data_max = sizeof (((l2_xcrw_adjacency_t *) 0)->rewrite_data);
   u8 *rw = 0;
   vnet_main_t *vnm = vnet_get_main ();
   int rv;
@@ -417,6 +416,13 @@ set_l2_xcrw_command_fn (vlib_main_t * vm,
       else if (unformat (line_input, "rw %U", unformat_hex_string, &rw));
       else
 	break;
+    }
+
+  if (vec_len (rw) > rewrite_data_max)
+    {
+      error = clib_error_return (0, "rewrite data is %u bytes, max is %u", (unsigned) vec_len (rw),
+				 (unsigned) rewrite_data_max);
+      goto done;
     }
 
   if (next_node_index == ~0)

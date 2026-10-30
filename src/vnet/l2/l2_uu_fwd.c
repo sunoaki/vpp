@@ -135,7 +135,7 @@ VLIB_NODE_FN (l2_uu_fwd_node) (vlib_main_t * vm,
 	      t->sw_if_index = bdc1->uu_fwd_sw_if_index;
 	    }
 	  if (PREDICT_FALSE ((node->flags & VLIB_NODE_FLAG_TRACE) &&
-			     (b1->flags & VLIB_BUFFER_IS_TRACED)))
+			     (b2->flags & VLIB_BUFFER_IS_TRACED)))
 	    {
 	      l2_uu_fwd_trace_t *t;
 
@@ -143,7 +143,7 @@ VLIB_NODE_FN (l2_uu_fwd_node) (vlib_main_t * vm,
 	      t->sw_if_index = bdc2->uu_fwd_sw_if_index;
 	    }
 	  if (PREDICT_FALSE ((node->flags & VLIB_NODE_FLAG_TRACE) &&
-			     (b1->flags & VLIB_BUFFER_IS_TRACED)))
+			     (b3->flags & VLIB_BUFFER_IS_TRACED)))
 	    {
 	      l2_uu_fwd_trace_t *t;
 
