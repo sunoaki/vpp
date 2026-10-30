@@ -167,10 +167,21 @@ acl_fill_5tuple_l4_and_pkt_data (acl_main_t * am, u32 sw_if_index0, vlib_buffer_
 	}
       else if (IP_PROTOCOL_TCP == proto)
 	{
-          ports[0] = clib_net_to_host_u16(tcph->src_port);
-          ports[1] = clib_net_to_host_u16(tcph->dst_port);
-	  tmp_pkt.tcp_flags = tcph->flags;
-	  tmp_pkt.tcp_flags_valid = 1;
+	  /*
+	   * offset_within_packet() above only guarantees 8 bytes, which
+	   * covers the ports but not the flags byte. A truncated TCP header
+	   * carries no usable L4 information, so leave the packet L4-invalid
+	   * instead of reading bytes past the end of the packet.
+	   */
+	  if (PREDICT_FALSE (l4_offset + sizeof (tcp_header_t) > b0->current_length))
+	    tmp_pkt.l4_valid = 0;
+	  else
+	    {
+	      ports[0] = clib_net_to_host_u16 (tcph->src_port);
+	      ports[1] = clib_net_to_host_u16 (tcph->dst_port);
+	      tmp_pkt.tcp_flags = tcph->flags;
+	      tmp_pkt.tcp_flags_valid = 1;
+	    }
 	}
       else if (IP_PROTOCOL_UDP == proto)
 	{

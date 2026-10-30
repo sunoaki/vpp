@@ -35,15 +35,16 @@ typedef struct
   u8 action;
 } acl_fa_trace_t;
 
-#define foreach_acl_fa_error \
-_(ACL_DROP, "ACL deny packets")  \
-_(ACL_PERMIT, "ACL permit packets")  \
-_(ACL_NEW_SESSION, "new sessions added") \
-_(ACL_EXIST_SESSION, "existing session packets") \
-_(ACL_CHECK, "checked packets") \
-_(ACL_RESTART_SESSION_TIMER, "restart session timer") \
-_(ACL_TOO_MANY_SESSIONS, "too many sessions to add new") \
-/* end  of errors */
+#define foreach_acl_fa_error                                                                       \
+  _ (ACL_DROP, "ACL deny packets")                                                                 \
+  _ (ACL_PERMIT, "ACL permit packets")                                                             \
+  _ (ACL_NEW_SESSION, "new sessions added")                                                        \
+  _ (ACL_EXIST_SESSION, "existing session packets")                                                \
+  _ (ACL_CHECK, "checked packets")                                                                 \
+  _ (ACL_RESTART_SESSION_TIMER, "restart session timer")                                           \
+  _ (ACL_TOO_MANY_SESSIONS, "too many sessions to add new")                                        \
+  _ (ACL_INVALID_LC_INDEX, "dropped packets with an invalid lookup context index")                 \
+  /* end  of errors */
 
 typedef enum
 {
@@ -307,6 +308,29 @@ acl_fa_node_common_prepare_fn (vlib_main_t * vm,
     }
 }
 
+/*
+ * acl_plugin_match_5tuple_inline() dereferences the lookup context and the
+ * per-context vectors by index without checking the index, while the
+ * interface vector that supplies the index holds ~0 for interfaces without
+ * an ACL, and a context can be released and recycled while frames are still
+ * queued to this node. Validate the index and its identity before matching.
+ */
+always_inline int
+acl_fa_lc_index_is_valid (acl_main_t *am, u32 lc_index, u32 sw_if_index0, int is_input)
+{
+  acl_lookup_context_t *acontext;
+
+  if (PREDICT_FALSE (lc_index == ~0 || pool_is_free_index (am->acl_lookup_contexts, lc_index)))
+    return 0;
+
+  if (PREDICT_FALSE (am->use_hash_acl_matching &&
+		     lc_index >= vec_len (am->hash_entry_vec_by_lc_index)))
+    return 0;
+
+  acontext = pool_elt_at_index (am->acl_lookup_contexts, lc_index);
+  return (acontext->context_user_id == am->interface_acl_user_id &&
+	  acontext->user_val1 == sw_if_index0 && acontext->user_val2 == (u32) is_input);
+}
 
 always_inline uword
 acl_fa_inner_node_fn (vlib_main_t * vm,
@@ -319,6 +343,7 @@ acl_fa_inner_node_fn (vlib_main_t * vm,
   u32 pkts_exist_session = 0;
   u32 pkts_new_session = 0;
   u32 pkts_acl_permit = 0;
+  u32 pkts_invalid_lc_index = 0;
   u32 trace_bitmap = 0;
   acl_main_t *am = &acl_main;
   vlib_node_runtime_t *error_node;
@@ -454,42 +479,49 @@ acl_fa_inner_node_fn (vlib_main_t * vm,
 
 	  if (acl_check_needed)
 	    {
-	      if (is_input)
-		lc_index0 = am->input_lc_index_by_sw_if_index[sw_if_index[0]];
-	      else
-		lc_index0 =
-		  am->output_lc_index_by_sw_if_index[sw_if_index[0]];
+	      u32 *lc_index_by_sw_if_index =
+		is_input ? am->input_lc_index_by_sw_if_index : am->output_lc_index_by_sw_if_index;
+
+	      if (PREDICT_TRUE (sw_if_index[0] < vec_len (lc_index_by_sw_if_index)))
+		lc_index0 = lc_index_by_sw_if_index[sw_if_index[0]];
 
 	      action = 0;	/* deny by default */
-	      int is_match = acl_plugin_match_5tuple_inline (am, lc_index0,
-							     (fa_5tuple_opaque_t *) & fa_5tuple[0], is_ip6,
-							     &action,
-							     &match_acl_pos,
-							     &match_acl_in_index,
-							     &match_rule_index,
-							     &trace_bitmap);
-	      if (PREDICT_FALSE
-		  (is_match && am->interface_acl_counters_enabled))
-		{
-		  u32 buf_len = vlib_buffer_length_in_chain (vm, b[0]);
-		  vlib_increment_combined_counter (am->combined_acl_counters +
-						   saved_matched_acl_index,
-						   thread_index,
-						   saved_matched_ace_index,
-						   saved_packet_count,
-						   saved_byte_count);
-		  saved_matched_acl_index = match_acl_in_index;
-		  saved_matched_ace_index = match_rule_index;
-		  saved_packet_count = 1;
-		  saved_byte_count = buf_len;
-		  /* prefetch the counter that we are going to increment */
-		  vlib_prefetch_combined_counter (am->combined_acl_counters +
-						  saved_matched_acl_index,
-						  thread_index,
-						  saved_matched_ace_index);
-		}
 
-	      b[0]->error = error_node->errors[action];
+	      if (PREDICT_FALSE (
+		    !acl_fa_lc_index_is_valid (am, lc_index0, sw_if_index[0], is_input)))
+		{
+		  /*
+		   * Without a usable lookup context the packet can not be
+		   * matched against the policy it was queued under: drop it
+		   * and account it under its own error.
+		   */
+		  b[0]->error = error_node->errors[ACL_FA_ERROR_ACL_INVALID_LC_INDEX];
+		  pkts_invalid_lc_index++;
+		}
+	      else
+		{
+		  int is_match = acl_plugin_match_5tuple_inline (
+		    am, lc_index0, (fa_5tuple_opaque_t *) &fa_5tuple[0], is_ip6, &action,
+		    &match_acl_pos, &match_acl_in_index, &match_rule_index, &trace_bitmap);
+
+		  if (PREDICT_FALSE (is_match && am->interface_acl_counters_enabled))
+		    {
+		      u32 buf_len = vlib_buffer_length_in_chain (vm, b[0]);
+		      vlib_increment_combined_counter (
+			am->combined_acl_counters + saved_matched_acl_index, thread_index,
+			saved_matched_ace_index, saved_packet_count, saved_byte_count);
+		      saved_matched_acl_index = match_acl_in_index;
+		      saved_matched_ace_index = match_rule_index;
+		      saved_packet_count = 1;
+		      saved_byte_count = buf_len;
+		      /* prefetch the counter that we are going to increment */
+		      vlib_prefetch_combined_counter (am->combined_acl_counters +
+							saved_matched_acl_index,
+						      thread_index, saved_matched_ace_index);
+		    }
+
+		  b[0]->error = error_node->errors[action];
+		}
 
 	      if (1 == action)
 		pkts_acl_permit++;
@@ -587,6 +619,8 @@ acl_fa_inner_node_fn (vlib_main_t * vm,
 			       pkts_new_session);
   vlib_node_increment_counter (vm, node->node_index,
 			       ACL_FA_ERROR_ACL_PERMIT, pkts_acl_permit);
+  vlib_node_increment_counter (vm, node->node_index, ACL_FA_ERROR_ACL_INVALID_LC_INDEX,
+			       pkts_invalid_lc_index);
   return frame->n_vectors;
 }
 
