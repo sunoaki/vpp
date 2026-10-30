@@ -753,7 +753,13 @@ vnet_classify_add_del_table (vnet_classify_main_t *cm, const u8 *mask,
 	  if (nbuckets == 0)
 	    return VNET_API_ERROR_INVALID_VALUE;
 
-	  if (match < 1 || match > 5)
+	  /* The dataplane reads the key at skip_n_vectors * 16 bytes into
+	     the packet; keep both counts inside the mask/key limit so the
+	     read stays within the buffer rather than running far past it. */
+	  if (skip > VNET_CLASSIFY_MAX_N_VECTORS)
+	    return VNET_API_ERROR_INVALID_VALUE;
+
+	  if (match < 1 || match > VNET_CLASSIFY_MAX_N_VECTORS)
 	    return VNET_API_ERROR_INVALID_VALUE;
 
 	  t = vnet_classify_new_table (cm, mask, nbuckets, memory_size,
