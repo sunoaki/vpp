@@ -117,8 +117,10 @@ send_ipip_tunnel_details (ipip_tunnel_t * t, vl_api_ipip_tunnel_dump_t * mp)
   ip46_type_t ip_type = is_ipv6 ? IP46_TYPE_IP6 : IP46_TYPE_IP4;
   fib_table_t *ft;
 
-  ft = fib_table_get (t->fib_index,
-		      (is_ipv6 ? FIB_PROTOCOL_IP6 : FIB_PROTOCOL_IP4));
+  ft = fib_table_get_or_null (t->fib_index,
+			       (is_ipv6 ? FIB_PROTOCOL_IP6 : FIB_PROTOCOL_IP4));
+  if (!ft)
+    return;
 
   REPLY_MACRO_DETAILS2 (
     VL_API_IPIP_TUNNEL_DETAILS, ({

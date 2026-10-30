@@ -401,8 +401,9 @@ gpe_native_fwd_rpaths_copy (vl_api_gpe_native_fwd_rpath_t * dst,
   vec_foreach (e, src)
   {
     clib_memset (&dst[i], 0, sizeof (*dst));
-    table = fib_table_get (e->frp_fib_index, dpo_proto_to_fib (e->frp_proto));
-    dst[i].fib_index = table->ft_table_id;
+    table = fib_table_get_or_null (e->frp_fib_index,
+				    dpo_proto_to_fib (e->frp_proto));
+    dst[i].fib_index = table ? table->ft_table_id : ~0;
     dst[i].nh_sw_if_index = e->frp_sw_if_index;
     ip_address_encode (&e->frp_addr, IP46_TYPE_ANY, &dst[i].nh_addr);
     i++;
