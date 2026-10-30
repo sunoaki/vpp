@@ -13,7 +13,9 @@
 extern ip_punt_policer_t ip6_punt_policer_cfg;
 
 #ifndef CLIB_MARCH_VARIANT
-ip_punt_policer_t ip6_punt_policer_cfg;
+ip_punt_policer_t ip6_punt_policer_cfg = {
+  .policer_index = ~0,
+};
 #endif /* CLIB_MARCH_VARIANT */
 
 static char *ip6_punt_policer_handoff_error_strings[] = { "congestion drop" };

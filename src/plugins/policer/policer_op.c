@@ -81,8 +81,10 @@ policer_del (vlib_main_t *vm, u32 policer_index)
     }
 
   /* Reject deletion if a punt policer still references it */
-  if (ip4_punt_policer_cfg.policer_index == policer_index ||
-      ip6_punt_policer_cfg.policer_index == policer_index)
+  if ((ip4_punt_policer_cfg.policer_index != ~0 &&
+       ip4_punt_policer_cfg.policer_index == policer_index) ||
+      (ip6_punt_policer_cfg.policer_index != ~0 &&
+       ip6_punt_policer_cfg.policer_index == policer_index))
     return VNET_API_ERROR_INSTANCE_IN_USE;
 
   policer = &pm->policers[policer_index];
