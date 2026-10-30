@@ -2201,6 +2201,10 @@ ip4_sv_reass_extended_unlock (vlib_buffer_t *b)
   ip4_sv_reass_per_thread_t *per_thread =
     &ip4_sv_reass_main
        .per_thread_data[vnet_buffer2 (b)->ip.reass.thread_index];
+
+  if (!vec_is_member (ip4_sv_reass_main.per_thread_data, per_thread))
+    return;
+
   clib_spinlock_unlock (&per_thread->lock);
 }
 
