@@ -127,8 +127,6 @@ VLIB_NODE_FN (l2_xcrw_node) (vlib_main_t * vm,
 	  vnet_buffer (b1)->sw_if_index[VLIB_TX] =
 	    adj1->rewrite_header.sw_if_index;
 
-	  em->counters[node_counter_base_index + next1]++;
-
 	  if (PREDICT_TRUE (next0 > 0))
 	    {
 	      u8 *h0 = vlib_buffer_get_current (b0);
