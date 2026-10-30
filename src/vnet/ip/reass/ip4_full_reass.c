@@ -29,6 +29,11 @@
 #define IP4_REASS_MAX_REASSEMBLIES_DEFAULT 1024
 #define IP4_REASS_MAX_REASSEMBLY_LENGTH_DEFAULT	  3
 #define IP4_REASS_HT_LOAD_FACTOR (0.75)
+/* The hash is sized as nbuckets * 1024 and the call sites compute that
+ * product in u32, so 2^21 buckets (2GB) is the largest power of two that
+ * keeps it below 2^32 and free of wrap. It caps max_reassemblies at about
+ * 1572864 / (workers + 1). */
+#define IP4_REASS_MAX_NBUCKETS (1u << 21)
 
 #define IP4_REASS_DEBUG_BUFFERS 0
 #if IP4_REASS_DEBUG_BUFFERS
@@ -1467,22 +1472,20 @@ ip4_full_reass_custom_register_next_node (uword node_index)
 }
 
 always_inline u32
-ip4_full_reass_get_nbuckets ()
+ip4_full_reass_get_nbuckets (u32 max_reass_n)
 {
-  ip4_full_reass_main_t *rm = &ip4_full_reass_main;
-  u32 nbuckets;
-  u8 i;
+  u64 nbuckets;
+  u32 i = 0;
 
   /* need more mem with more workers */
-  nbuckets = (u32) (rm->max_reass_n * (vlib_num_workers () + 1) /
-		    IP4_REASS_HT_LOAD_FACTOR);
+  nbuckets = (u64) max_reass_n * (vlib_num_workers () + 1) / IP4_REASS_HT_LOAD_FACTOR;
 
-  for (i = 0; i < 31; i++)
-    if ((1 << i) >= nbuckets)
-      break;
-  nbuckets = 1 << i;
+  /* round up to a power of two; the loop stops at 2^31 so the shift never
+   * reaches the sign bit */
+  while (i < 31 && (1ull << i) < nbuckets)
+    i++;
 
-  return nbuckets;
+  return 1u << i;
 }
 #endif /* CLIB_MARCH_VARIANT */
 
@@ -1525,13 +1528,16 @@ vnet_api_error_t
 ip4_full_reass_set (u32 timeout_ms, u32 max_reassemblies,
 		    u32 max_reassembly_length, u32 expire_walk_interval_ms)
 {
-  u32 old_nbuckets = ip4_full_reass_get_nbuckets ();
+  u32 new_nbuckets = ip4_full_reass_get_nbuckets (max_reassemblies);
+  if (new_nbuckets > IP4_REASS_MAX_NBUCKETS)
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  u32 old_nbuckets = ip4_full_reass_get_nbuckets (ip4_full_reass_main.max_reass_n);
   ip4_full_reass_set_params (timeout_ms, max_reassemblies,
 			     max_reassembly_length, expire_walk_interval_ms);
   vlib_process_signal_event (ip4_full_reass_main.vlib_main,
 			     ip4_full_reass_main.ip4_full_reass_expire_node_idx,
 			     IP4_EVENT_CONFIG_CHANGED, 0);
-  u32 new_nbuckets = ip4_full_reass_get_nbuckets ();
   if (ip4_full_reass_main.max_reass_n > 0 && new_nbuckets > old_nbuckets)
     {
       clib_bihash_16_8_t new_hash;
@@ -1598,7 +1604,7 @@ ip4_full_reass_init_function (vlib_main_t * vm)
 			     IP4_REASS_MAX_REASSEMBLY_LENGTH_DEFAULT,
 			     IP4_REASS_EXPIRE_WALK_INTERVAL_DEFAULT_MS);
 
-  nbuckets = ip4_full_reass_get_nbuckets ();
+  nbuckets = ip4_full_reass_get_nbuckets (rm->max_reass_n);
   clib_bihash_init_16_8 (&rm->hash, "ip4-dr", nbuckets, nbuckets * 1024);
 
   rm->fq_index = vlib_handoff_alloc_queues (&(vlib_handoff_alloc_queues_args_t){

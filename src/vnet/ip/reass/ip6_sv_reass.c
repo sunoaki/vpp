@@ -25,6 +25,10 @@
 #define IP6_SV_REASS_MAX_REASSEMBLIES_DEFAULT	   1024
 #define IP6_SV_REASS_MAX_REASSEMBLY_LENGTH_DEFAULT 3
 #define IP6_SV_REASS_HT_LOAD_FACTOR		   (0.75)
+/* The call sites widen nbuckets * 1024 to uword, so this bound is not a hash
+ * sizing limit: it is a policy cap that makes the set API reject
+ * max_reassemblies above 1572864. */
+#define IP6_SV_REASS_MAX_NBUCKETS (1u << 21)
 
 typedef enum
 {
@@ -1257,20 +1261,19 @@ VLIB_REGISTER_NODE (ip6_sv_reass_custom_context_node) = {
 
 #ifndef CLIB_MARCH_VARIANT
 static u32
-ip6_sv_reass_get_nbuckets ()
+ip6_sv_reass_get_nbuckets (u32 max_reass_n)
 {
-  ip6_sv_reass_main_t *rm = &ip6_sv_reass_main;
-  u32 nbuckets;
-  u8 i;
+  u64 nbuckets;
+  u32 i = 0;
 
-  nbuckets = (u32) (rm->max_reass_n / IP6_SV_REASS_HT_LOAD_FACTOR);
+  nbuckets = (u64) max_reass_n / IP6_SV_REASS_HT_LOAD_FACTOR;
 
-  for (i = 0; i < 31; i++)
-    if ((1 << i) >= nbuckets)
-      break;
-  nbuckets = 1 << i;
+  /* round up to a power of two; the loop stops at 2^31 so the shift never
+   * reaches the sign bit */
+  while (i < 31 && (1ull << i) < nbuckets)
+    i++;
 
-  return nbuckets;
+  return 1u << i;
 }
 #endif /* CLIB_MARCH_VARIANT */
 
@@ -1313,13 +1316,16 @@ vnet_api_error_t
 ip6_sv_reass_set (u32 timeout_ms, u32 max_reassemblies,
 		  u32 max_reassembly_length, u32 expire_walk_interval_ms)
 {
-  u32 old_nbuckets = ip6_sv_reass_get_nbuckets ();
+  u32 new_nbuckets = ip6_sv_reass_get_nbuckets (max_reassemblies);
+  if (new_nbuckets > IP6_SV_REASS_MAX_NBUCKETS)
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  u32 old_nbuckets = ip6_sv_reass_get_nbuckets (ip6_sv_reass_main.max_reass_n);
   ip6_sv_reass_set_params (timeout_ms, max_reassemblies, max_reassembly_length,
 			   expire_walk_interval_ms);
   vlib_process_signal_event (ip6_sv_reass_main.vlib_main,
 			     ip6_sv_reass_main.ip6_sv_reass_expire_node_idx,
 			     IP6_EVENT_CONFIG_CHANGED, 0);
-  u32 new_nbuckets = ip6_sv_reass_get_nbuckets ();
   if (ip6_sv_reass_main.max_reass_n > 0 && new_nbuckets > old_nbuckets)
     {
       clib_bihash_48_8_t new_hash;
@@ -1387,7 +1393,7 @@ ip6_sv_reass_init_function (vlib_main_t *vm)
 			   IP6_SV_REASS_MAX_REASSEMBLY_LENGTH_DEFAULT,
 			   IP6_SV_REASS_EXPIRE_WALK_INTERVAL_DEFAULT_MS);
 
-  nbuckets = ip6_sv_reass_get_nbuckets ();
+  nbuckets = ip6_sv_reass_get_nbuckets (rm->max_reass_n);
   clib_bihash_init_48_8 (&rm->hash, "ip6-sv-reass", nbuckets,
 			 (uword) nbuckets * 1024);
 

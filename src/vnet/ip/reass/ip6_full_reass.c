@@ -26,6 +26,11 @@
 #define IP6_FULL_REASS_MAX_REASSEMBLIES_DEFAULT 1024
 #define IP6_FULL_REASS_MAX_REASSEMBLY_LENGTH_DEFAULT 3
 #define IP6_FULL_REASS_HT_LOAD_FACTOR (0.75)
+/* The hash is sized as nbuckets * 1024 and the call sites compute that
+ * product in u32, so 2^21 buckets (2GB) is the largest power of two that
+ * keeps it below 2^32 and free of wrap. It caps max_reassemblies at about
+ * 1572864 / (workers + 1). */
+#define IP6_FULL_REASS_MAX_NBUCKETS (1u << 21)
 
 typedef enum
 {
@@ -1576,22 +1581,20 @@ ip6_full_reass_custom_register_next_node (uword node_index)
 }
 
 static u32
-ip6_full_reass_get_nbuckets ()
+ip6_full_reass_get_nbuckets (u32 max_reass_n)
 {
-  ip6_full_reass_main_t *rm = &ip6_full_reass_main;
-  u32 nbuckets;
-  u8 i;
+  u64 nbuckets;
+  u32 i = 0;
 
   /* need more mem with more workers */
-  nbuckets = (u32) (rm->max_reass_n * (vlib_num_workers () + 1) /
-		    IP6_FULL_REASS_HT_LOAD_FACTOR);
+  nbuckets = (u64) max_reass_n * (vlib_num_workers () + 1) / IP6_FULL_REASS_HT_LOAD_FACTOR;
 
-  for (i = 0; i < 31; i++)
-    if ((1 << i) >= nbuckets)
-      break;
-  nbuckets = 1 << i;
+  /* round up to a power of two; the loop stops at 2^31 so the shift never
+   * reaches the sign bit */
+  while (i < 31 && (1ull << i) < nbuckets)
+    i++;
 
-  return nbuckets;
+  return 1u << i;
 }
 #endif /* CLIB_MARCH_VARIANT */
 
@@ -1634,13 +1637,16 @@ vnet_api_error_t
 ip6_full_reass_set (u32 timeout_ms, u32 max_reassemblies,
 		    u32 max_reassembly_length, u32 expire_walk_interval_ms)
 {
-  u32 old_nbuckets = ip6_full_reass_get_nbuckets ();
+  u32 new_nbuckets = ip6_full_reass_get_nbuckets (max_reassemblies);
+  if (new_nbuckets > IP6_FULL_REASS_MAX_NBUCKETS)
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  u32 old_nbuckets = ip6_full_reass_get_nbuckets (ip6_full_reass_main.max_reass_n);
   ip6_full_reass_set_params (timeout_ms, max_reassemblies,
 			     max_reassembly_length, expire_walk_interval_ms);
   vlib_process_signal_event (ip6_full_reass_main.vlib_main,
 			     ip6_full_reass_main.ip6_full_reass_expire_node_idx,
 			     IP6_EVENT_CONFIG_CHANGED, 0);
-  u32 new_nbuckets = ip6_full_reass_get_nbuckets ();
   if (ip6_full_reass_main.max_reass_n > 0 && new_nbuckets > old_nbuckets)
     {
       clib_bihash_48_8_t new_hash;
@@ -1707,7 +1713,7 @@ ip6_full_reass_init_function (vlib_main_t * vm)
 			     IP6_FULL_REASS_MAX_REASSEMBLY_LENGTH_DEFAULT,
 			     IP6_FULL_REASS_EXPIRE_WALK_INTERVAL_DEFAULT_MS);
 
-  nbuckets = ip6_full_reass_get_nbuckets ();
+  nbuckets = ip6_full_reass_get_nbuckets (rm->max_reass_n);
   clib_bihash_init_48_8 (&rm->hash, "ip6-full-reass", nbuckets,
 			 nbuckets * 1024);
 
