@@ -148,6 +148,8 @@ lcp_itf_pair_get (u32 index)
     return NULL;
   if (index == INDEX_INVALID)
     return NULL;
+  if (index >= vec_len (lcp_itf_pair_pool))
+    return NULL;
 
   return pool_elt_at_index (lcp_itf_pair_pool, index);
 }
