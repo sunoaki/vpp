@@ -184,6 +184,11 @@ vnet_classify_index_vector_holds (u32 *indices, u32 table_index)
 {
   u32 i;
 
+  /* A vector only stores indices; the slot values are never dereferenced,
+     and unset slots hold ~0, which no live table index can equal. */
+  if (table_index == ~0)
+    return 0;
+
   for (i = 0; i < vec_len (indices); i++)
     if (indices[i] == table_index)
       return 1;
