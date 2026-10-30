@@ -887,9 +887,8 @@ ip6_full_reass_finalize (vlib_main_t * vm, vlib_node_runtime_t * node,
       rv = IP6_FULL_REASS_RC_INTERNAL_ERROR;
       goto free_buffers_and_return;
     }
-  u32 first_buf_data_len =
-    clib_min (first_b->current_length - frag_hdr_end_offset,
-	      ip6_full_reass_buffer_get_data_len (first_b));
+  u32 first_buf_data_len = clib_min (first_b->current_length - frag_hdr_end_offset,
+				     ip6_full_reass_buffer_get_data_len (first_b));
   memmove (frag_hdr, (u8 *) frag_hdr + sizeof (*frag_hdr), first_buf_data_len);
   first_b->current_length -= sizeof (*frag_hdr);
   ip->payload_length =
@@ -1009,8 +1008,7 @@ ip6_full_reass_update (vlib_main_t *vm, vlib_node_runtime_t *node,
    * in it: finalize removes the header from that buffer, and a header that
    * starts before the end of the buffer but ends after it cannot be removed.
    */
-  if (fb->current_length < sizeof (*fip) ||
-      fvnb->ip.reass.ip6_frag_hdr_offset == 0 ||
+  if (fb->current_length < sizeof (*fip) || fvnb->ip.reass.ip6_frag_hdr_offset == 0 ||
       fvnb->ip.reass.ip6_frag_hdr_offset + sizeof (ip6_frag_hdr_t) > fb->current_length)
     {
       return IP6_FULL_REASS_RC_INTERNAL_ERROR;
