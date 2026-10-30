@@ -12,6 +12,8 @@
 #include <vnet/l2/l2_classify.h>	/* for L2_INPUT_CLASSIFY_NEXT_xxx */
 #include <vnet/l2/l2_rw.h>
 #include <vnet/dpo/classify_dpo.h>
+#include <vnet/ipfix-export/flow_report.h>
+#include <vnet/ipfix-export/flow_report_classify.h>
 #include <vnet/fib/fib_table.h>
 #include <vppinfra/lock.h>
 #include <vppinfra/bitmap.h>
@@ -229,15 +231,34 @@ vnet_classify_l2_rw_holds (u32 table_index)
 }
 
 /*
+ * A flow report names a classify table and dereferences it when it sends
+ * a report, outside the packet path.  ipfix_classify_delete_table clears
+ * the slot, so a bound report is the only state this scan can see.
+ */
+static int
+vnet_classify_ipfix_report_holds (u32 table_index)
+{
+  flow_report_classify_main_t *fcm = &flow_report_classify_main;
+  uword i;
+
+  for (i = 0; i < vec_len (fcm->tables); i++)
+    if (fcm->tables[i].classify_table_index == table_index)
+      return 1;
+
+  return 0;
+}
+
+/*
  * The dataplane reaches a table through a per-interface binding vector, a
  * classify DPO, or another table's next_table_index.  A table that any of
  * them still names must not be freed: the holder would dereference a freed
  * pool element on the next packet.
  *
  * Besides the bindings this module owns, table indices are held by the L2
- * input, output and rewrite nodes and by the ip4/ip6 lookup main and its
- * classify DPOs.  Those modules create and clear the bindings themselves;
- * this function only reads their state.
+ * input, output and rewrite nodes, by the ip4/ip6 lookup main and its
+ * classify DPOs, and by the ipfix classify flow reports.  Those modules
+ * create and clear the bindings themselves; this function only reads their
+ * state.
  */
 static int
 vnet_classify_table_is_bound (vnet_classify_main_t *cm, u32 table_index)
@@ -292,6 +313,9 @@ vnet_classify_table_is_bound (vnet_classify_main_t *cm, u32 table_index)
     return 1;
 
   if (vnet_classify_l2_rw_holds (table_index))
+    return 1;
+
+  if (vnet_classify_ipfix_report_holds (table_index))
     return 1;
 
   /* A live classify DPO is a FIB entry the ip_classify node follows. */
