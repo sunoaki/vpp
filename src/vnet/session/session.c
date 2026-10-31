@@ -923,6 +923,8 @@ session_dgram_connect_notify (transport_connection_t *tc,
 			      session_handle_tu_t osh, session_t **new_session)
 {
   session_t *new_s;
+  svm_fifo_t *old_rx_fifo = 0;
+  u32 old_rx_slice = 0;
   int rx_attached = 0;
 
   /*
@@ -940,6 +942,8 @@ session_dgram_connect_notify (transport_connection_t *tc,
   if (!(new_s->flags & SESSION_F_PROXY))
     {
       /* New set of fifos attached to the same shared memory */
+      old_rx_fifo = new_s->rx_fifo;
+      old_rx_slice = old_rx_fifo->shr->slice_index;
       if (segment_manager_attach_fifo (&new_s->rx_fifo, new_s) < 0)
 	goto attach_error;
       rx_attached = 1;
@@ -961,7 +965,7 @@ session_dgram_connect_notify (transport_connection_t *tc,
 
 attach_error:
   if (rx_attached)
-    segment_manager_detach_fifo (&new_s->rx_fifo);
+    segment_manager_abort_fifo_attach (old_rx_fifo, &new_s->rx_fifo, old_rx_slice);
   /* The entry was pointed at new_s above: give it back to the session that
    * stays in use */
   if (!(tc->flags & TRANSPORT_CONNECTION_F_NO_LOOKUP))

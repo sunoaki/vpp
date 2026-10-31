@@ -1038,6 +1038,31 @@ fifo_segment_detach_fifo (fifo_segment_t *fs, svm_fifo_t **f)
   *f = 0;
 }
 
+void
+fifo_segment_abort_fifo_attach (fifo_segment_t *fs, svm_fifo_t *of, svm_fifo_t **f,
+				u32 old_slice_index)
+{
+  svm_fifo_t *nf = *f;
+  u32 slice_index = nf->shr->slice_index;
+  fifo_segment_slice_t *fss = fsh_slice_get (fs->h, slice_index);
+  fifo_slice_private_t *pfss = fs_slice_private_get (fs, slice_index);
+
+  ASSERT (of != nf && of->shr == nf->shr);
+  ASSERT (old_slice_index < fs->n_slices);
+
+  fss->virtual_mem -= svm_fifo_size (nf);
+  if (nf->flags & SVM_FIFO_F_LL_TRACKED)
+    pfss_fifo_del_active_list (pfss, nf);
+
+  fsh_slice_collect_chunks (fs->h, fss, svm_fifo_chunks_at_attach (of));
+  fss_fifo_free_list_push (fs->h, fss, svm_fifo_hdr_at_attach (of));
+  of->ooo_enq_lookup = nf->ooo_enq_lookup;
+  of->ooo_deq_lookup = nf->ooo_deq_lookup;
+  of->shr->slice_index = old_slice_index;
+  fs_fifo_free (fs, nf, slice_index);
+  *f = of;
+}
+
 int
 fifo_segment_attach_fifo (fifo_segment_t *fs, svm_fifo_t **f, u32 slice_index)
 {
