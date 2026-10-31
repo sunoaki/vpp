@@ -19,11 +19,11 @@ static lcp_adj_key_t *adj_keys;
  */
 BVT (clib_bihash) lcp_adj_tbl;
 
-static_always_inline void
+static_always_inline int
 lcp_adj_mk_key_adj (const ip_adjacency_t *adj, lcp_adj_key_t *key)
 {
-  lcp_adj_mk_key (adj->rewrite_header.data, adj->rewrite_header.data_bytes,
-		  adj->rewrite_header.sw_if_index, key);
+  return (lcp_adj_mk_key (adj->rewrite_header.data, adj->rewrite_header.data_bytes,
+			  adj->rewrite_header.sw_if_index, key));
 }
 
 static u8 *
@@ -40,9 +40,12 @@ lcp_adj_delegate_adj_deleted (adj_delegate_t *aed)
 
   adj = adj_get (aed->ad_adj_index);
 
-  lcp_adj_mk_key_adj (adj, &kv.k);
-
-  BV (clib_bihash_add_del) (&lcp_adj_tbl, &kv.kv, 0);
+  /*
+   * An over-long rewrite was never inserted, so there is no entry to
+   * delete for it.
+   */
+  if (lcp_adj_mk_key_adj (adj, &kv.k) == 0)
+    BV (clib_bihash_add_del) (&lcp_adj_tbl, &kv.kv, 0);
 
   if (aed->ad_index != INDEX_INVALID)
     pool_put_index (adj_keys, aed->ad_index);
@@ -53,9 +56,11 @@ lcp_adj_delegate_adj_deleted (adj_delegate_t *aed)
  * An existing hash entry may need to be deleted. This may occur when:
  * * The newly modified adj does not have IP_LOOKUP_NEXT_REWRITE as next idx
  * * The rewrite (== major component of hash key) changed
+ * * The rewrite does not fit the key, so it cannot be stored
  *
  * A new hash entry may need to be added. This may occur when:
  * * The newly modified adj has IP_LOOKUP_NEXT_REWRITE as next idx
+ * * The rewrite fits the key
  * * The rewrite changed or there was no existing hash entry
  */
 static void
@@ -64,31 +69,38 @@ lcp_adj_delegate_adj_modified (adj_delegate_t *aed)
   ip_adjacency_t *adj;
   lcp_adj_kv_t kv;
   lcp_adj_key_t *adj_key = NULL;
-  u8 save_adj, key_changed;
+  u8 key_valid, key_changed;
 
   key_changed = 0;
 
   adj = adj_get (aed->ad_adj_index);
-  save_adj = (IP_LOOKUP_NEXT_REWRITE == adj->lookup_next_index);
+
+  /*
+   * An entry is stored only for a rewrite adj whose rewrite fits the key.
+   * An over-long rewrite is not in the table, so it deletes any existing
+   * entry and does not add a new one.
+   */
+  key_valid = (IP_LOOKUP_NEXT_REWRITE == adj->lookup_next_index);
+  if (key_valid)
+    key_valid = (lcp_adj_mk_key_adj (adj, &kv.k) == 0);
 
   if (aed->ad_index != INDEX_INVALID)
     adj_key = pool_elt_at_index (adj_keys, aed->ad_index);
 
   /* return if there was no stored adj and we will not add one */
-  if (!adj_key && !save_adj)
+  if (!adj_key && !key_valid)
     return;
 
   /* build kv if a new entry should be stored */
-  if (save_adj)
+  if (key_valid)
     {
-      lcp_adj_mk_key_adj (adj, &kv.k);
       kv.v = aed->ad_adj_index;
       if (adj_key)
 	key_changed = (clib_memcmp (adj_key, &kv.k, sizeof (*adj_key)) != 0);
     }
 
   /* delete old entry if needed */
-  if (adj_key && ((save_adj && key_changed) || (!save_adj)))
+  if (adj_key && ((key_valid && key_changed) || (!key_valid)))
     {
       lcp_adj_kv_t old_kv;
 
@@ -97,7 +109,7 @@ lcp_adj_delegate_adj_modified (adj_delegate_t *aed)
 
       BV (clib_bihash_add_del) (&lcp_adj_tbl, &old_kv.kv, 0);
 
-      if (!save_adj)
+      if (!key_valid)
 	{
 	  pool_put (adj_keys, adj_key);
 	  aed->ad_index = INDEX_INVALID;
@@ -105,7 +117,7 @@ lcp_adj_delegate_adj_modified (adj_delegate_t *aed)
     }
 
   /* add new entry if needed */
-  if (save_adj)
+  if (key_valid)
     {
       BV (clib_bihash_add_del) (&lcp_adj_tbl, &kv.kv, 1);
 
@@ -138,9 +150,13 @@ lcp_adj_delegate_adj_created (adj_index_t ai)
   if (lip->lip_host_type == LCP_ITF_HOST_TUN)
     return;
 
-  if (IP_LOOKUP_NEXT_REWRITE == adj->lookup_next_index)
+  /*
+   * A rewrite that does not fit the key is not stored. The delegate is
+   * still added, with no key pool entry, so later modifications and the
+   * deletion of the adj find no entry to update.
+   */
+  if (IP_LOOKUP_NEXT_REWRITE == adj->lookup_next_index && lcp_adj_mk_key_adj (adj, &kv.k) == 0)
     {
-      lcp_adj_mk_key_adj (adj, &kv.k);
       pool_get (adj_keys, adj_key);
       clib_memcpy_fast (adj_key, &kv.k, sizeof (*adj_key));
       kv.v = ai;
