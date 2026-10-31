@@ -848,6 +848,13 @@ lcp_router_neigh_add (struct rtnl_neigh *rn)
 	  ip_neighbor_flags_t flags;
 	  int rv;
 
+	  if (nl_addr_get_len (ll) != sizeof (mac_address_t))
+	    {
+	      LCP_ROUTER_ERROR ("ignore neighbor with a %u byte lladdr",
+				nl_addr_get_len (ll));
+	      return;
+	    }
+
 	  lcp_router_mk_mac_addr (ll, &mac);
 
 	  if (state & (NUD_NOARP | NUD_PERMANENT))
