@@ -140,8 +140,8 @@ void fifo_segment_free_fifo (fifo_segment_t * fs, svm_fifo_t * f);
 void fifo_segment_free_client_fifo (fifo_segment_t *fs, svm_fifo_t *f);
 
 /* Abort a successful attach before old-owner detach; restore *f to of. */
-void fifo_segment_abort_fifo_attach (fifo_segment_t *fs, svm_fifo_t *of,
-				    svm_fifo_t **f, u32 old_slice_index);
+void fifo_segment_abort_fifo_attach (fifo_segment_t *fs, svm_fifo_t *of, svm_fifo_t **f,
+				     u32 old_slice_index);
 void fifo_segment_detach_fifo (fifo_segment_t *fs, svm_fifo_t **f);
 int fifo_segment_attach_fifo (fifo_segment_t *fs, svm_fifo_t **f,
 			      u32 slice_index);

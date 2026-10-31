@@ -146,7 +146,7 @@ void segment_manager_dealloc_fifos_ct (svm_fifo_t *rx_fifo, svm_fifo_t *tx_fifo,
 __clib_export void segment_manager_detach_fifo (svm_fifo_t **f);
 __clib_export int segment_manager_attach_fifo (svm_fifo_t **f, session_t *s);
 __clib_export void segment_manager_abort_fifo_attach (svm_fifo_t *of, svm_fifo_t **f,
-						    u32 old_slice_index);
+						      u32 old_slice_index);
 
 void segment_manager_set_watermarks (segment_manager_t * sm,
 				     u8 high_watermark, u8 low_watermark);

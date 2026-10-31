@@ -966,8 +966,7 @@ segment_manager_detach_fifo (svm_fifo_t **f)
 }
 
 void
-segment_manager_abort_fifo_attach (svm_fifo_t *of, svm_fifo_t **f,
-				   u32 old_slice_index)
+segment_manager_abort_fifo_attach (svm_fifo_t *of, svm_fifo_t **f, u32 old_slice_index)
 {
   segment_manager_t *sm;
   fifo_segment_t *fs;

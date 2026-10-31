@@ -2856,9 +2856,10 @@ sfifo_test_attach_prepare (sfifo_attach_test_t *test)
   test->deq_lookup = test->old_fifo->ooo_deq_lookup;
   clib_memset (test->data, 0x5a, sizeof (test->data));
   SFIFO_TEST (svm_fifo_enqueue (test->old_fifo, sizeof (test->data), test->data) ==
-		sizeof (test->data), "seed payload with existing lookup trees");
+		sizeof (test->data),
+	      "seed payload with existing lookup trees");
   SFIFO_TEST (!fifo_segment_prealloc_fifo_hdrs (fs, 1, 1) &&
-	      !fifo_segment_prealloc_fifo_chunks (fs, 1, 4096, 1),
+		!fifo_segment_prealloc_fifo_chunks (fs, 1, 4096, 1),
 	      "preallocate destination compensation");
   test->cached = fifo_segment_cached_bytes (fs);
   test->new_fifo = test->old_fifo;
@@ -2874,20 +2875,21 @@ sfifo_test_attach_check (sfifo_attach_test_t *test)
 
   rv = fifo_segment_attach_fifo (fs, &test->new_fifo, 1);
   SFIFO_TEST (!rv && test->new_fifo && test->new_fifo != old_fifo &&
-	      test->new_fifo->shr == old_fifo->shr, "attach RX FIFO");
+		test->new_fifo->shr == old_fifo->shr,
+	      "attach RX FIFO");
   fifo_segment_abort_fifo_attach (fs, old_fifo, &test->new_fifo, 0);
   SFIFO_TEST (test->new_fifo == old_fifo && old_fifo->shr->slice_index == 0 &&
-	      old_fifo->ooo_enq_lookup.nodes == test->enq_lookup.nodes &&
-	      old_fifo->ooo_deq_lookup.nodes == test->deq_lookup.nodes,
+		old_fifo->ooo_enq_lookup.nodes == test->enq_lookup.nodes &&
+		old_fifo->ooo_deq_lookup.nodes == test->deq_lookup.nodes,
 	      "abort restores original lookup aliases and shared slice");
-  SFIFO_TEST (fs->slices[0].active_fifos == old_fifo && !old_fifo->next &&
-	      !old_fifo->prev && !fs->slices[1].active_fifos &&
-	      fs->h->slices[0].virtual_mem == 4096 && !fs->h->slices[1].virtual_mem &&
-	      fifo_segment_num_fifos (fs) == 1 &&
-	      fifo_segment_cached_bytes (fs) == test->cached,
+  SFIFO_TEST (fs->slices[0].active_fifos == old_fifo && !old_fifo->next && !old_fifo->prev &&
+		!fs->slices[1].active_fifos && fs->h->slices[0].virtual_mem == 4096 &&
+		!fs->h->slices[1].virtual_mem && fifo_segment_num_fifos (fs) == 1 &&
+		fifo_segment_cached_bytes (fs) == test->cached,
 	      "abort restores lists, virtual memory and resource counts");
   SFIFO_TEST (svm_fifo_dequeue (old_fifo, sizeof (test->data), test->output) ==
-		sizeof (test->data) && !memcmp (test->data, test->output, sizeof (test->data)),
+		  sizeof (test->data) &&
+		!memcmp (test->data, test->output, sizeof (test->data)),
 	      "original payload survives abort");
   fifo_segment_free_fifo (fs, old_fifo);
   test->old_fifo = test->new_fifo = 0;
