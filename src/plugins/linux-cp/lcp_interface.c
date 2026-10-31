@@ -627,9 +627,32 @@ lcp_itf_pair_delete (u32 phy_sw_if_index)
 static clib_error_t *
 lcp_itf_interface_add_del (vnet_main_t *vnm, u32 sw_if_index, u32 is_add)
 {
-  if (!is_add)
-    /* remove any interface pair we have for this interface */
-    lcp_itf_pair_delete (sw_if_index);
+  lcp_itf_pair_t *lip;
+  index_t lipi;
+
+  if (is_add)
+    return (NULL);
+
+  /* remove any interface pair we have for this interface */
+  lipi = lcp_itf_pair_find_by_phy (sw_if_index);
+  if (lipi != INDEX_INVALID)
+    {
+      lcp_itf_pair_delete_by_index (lipi);
+      return (NULL);
+    }
+
+  /*
+   * The interface may be the host of a pair that outlives it, deleted on its
+   * own or as a sub-interface of a host that is being deleted. Remove the pair
+   * record only: the host link is already going away, and deleting it from
+   * here would re-enter this callback through vnet_delete_sw_interface().
+   * The re-entry finds no pair because lcp_itf_pair_del() clears
+   * lip_db_by_host before it releases the pair, so a pair is never left
+   * pointing at a sw_if_index that is about to be freed.
+   */
+  lip = lcp_itf_pair_get (lcp_itf_pair_find_by_host (sw_if_index));
+  if (lip)
+    lcp_itf_pair_del (lip->lip_phy_sw_if_index);
 
   return (NULL);
 }

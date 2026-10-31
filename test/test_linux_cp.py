@@ -2101,6 +2101,32 @@ for sequence in range(100, 130):
             False,
         )
 
+    def test_host_tap_delete_removes_pair(self):
+        """Deleting a pair's host tap removes the pair"""
+        self.create_pg_interfaces(range(1))
+        pg = self.pg_interfaces[0]
+
+        self.vapi.cli(f"lcp create {pg.name} host-if hdel0 netns {self.ns_name}")
+        pair = self._find_lcp_pair(pg.sw_if_index)
+        self.assertIsNotNone(pair, "LCP pair should exist")
+        self.assertTrue(
+            interface_exists(self.ns_name, "hdel0"),
+            "hdel0 should exist in namespace",
+        )
+
+        # Delete the host tap on its own, without going through the pair
+        self.vapi.tap_delete_v2(sw_if_index=pair.host_sw_if_index)
+
+        self.assertIsNone(
+            self._find_lcp_pair(pg.sw_if_index),
+            "LCP pair must be gone with its host tap",
+        )
+
+        # The phy outlived its host; deleting it again must not act on the
+        # freed host index
+        self.vapi.cli(f"lcp delete {pg.name}")
+        self.assertIsNone(self._find_lcp_pair(pg.sw_if_index))
+
     def test_pair_vlan_subinterface(self):
         """Create LCP pairs for VLAN sub-interfaces"""
         self.create_pg_interfaces(range(1))
@@ -2140,6 +2166,36 @@ for sequence in range(100, 130):
         # Clean up
         self.vapi.delete_subif(sub_sw_if_index)
         self.vapi.cli(f"lcp delete {pg.name}")
+
+    def test_parent_pair_delete_removes_subinterface_pair(self):
+        """Deleting a parent pair removes the pair of its VLAN sub-interface"""
+        self.create_pg_interfaces(range(1))
+        pg = self.pg_interfaces[0]
+
+        self.vapi.cli(f"lcp create {pg.name} host-if hpar0 netns {self.ns_name}")
+        self.assertTrue(interface_exists(self.ns_name, "hpar0"))
+
+        r = self.vapi.create_vlan_subif(pg.sw_if_index, 100)
+        sub_sw_if_index = r.sw_if_index
+
+        self.vapi.cli(f"lcp create pg0.100 host-if hpar0.100 netns {self.ns_name}")
+        self.assertIsNotNone(
+            self._find_lcp_pair(sub_sw_if_index), "sub-interface pair should exist"
+        )
+
+        # Deleting the parent pair deletes its tap, and with it the host
+        # sub-interface of the VLAN pair
+        self.vapi.cli(f"lcp delete {pg.name}")
+
+        self.assertIsNone(
+            self._find_lcp_pair(pg.sw_if_index), "parent pair should be gone"
+        )
+        self.assertIsNone(
+            self._find_lcp_pair(sub_sw_if_index),
+            "sub-interface pair must be gone with its host sub-interface",
+        )
+
+        self.vapi.delete_subif(sub_sw_if_index)
 
     def test_pair_auto_subinterface(self):
         """lcp-auto-subint creates pairs automatically for new sub-interfaces"""
