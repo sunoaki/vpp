@@ -636,7 +636,9 @@ class TestCacheWitnesses(unittest.TestCase):
         for broken in (None, "missing.txt", "/child", "missing evidence"):
             with self.subTest(broken=broken):
                 case_type = type(
-                    "CacheReadErrorFixture", (unittest.TestCase,), {method.__name__: method}
+                    "CacheReadErrorFixture",
+                    (unittest.TestCase,),
+                    {method.__name__: method},
                 )
                 case = case_type(method.__name__)
                 seen = []
@@ -644,7 +646,7 @@ class TestCacheWitnesses(unittest.TestCase):
                 def cli(command):
                     prefix = "test http static cache read-error "
                     self.assertTrue(command.startswith(prefix))
-                    invalid, valid = command[len(prefix):].split()
+                    invalid, valid = command[len(prefix) :].split()
                     self.assertEqual(Path(valid).read_text(), "cache remains usable")
                     self.assertFalse(Path(invalid).exists())
                     seen.append(invalid)
@@ -687,7 +689,8 @@ class TestCacheWitnesses(unittest.TestCase):
                     seen.append(mode)
                     message = (
                         "cache pressure: zero/finite owners passed"
-                        if mode == "pressure" else "cache clear: 121 states passed"
+                        if mode == "pressure"
+                        else "cache clear: 121 states passed"
                     )
                     return types.SimpleNamespace(
                         retval=-1 if broken == mode else 0,
@@ -712,7 +715,9 @@ class TestCacheWitnesses(unittest.TestCase):
         method = helper("test_http_static_cache_relocation")
         method.__globals__.update(
             config=types.SimpleNamespace(vpp_tag="vpp_debug"),
-            os=os, tempfile=tempfile, re=re,
+            os=os,
+            tempfile=tempfile,
+            re=re,
         )
         success = (
             "listener pool moved 1000 -> 2000\nlistener pool moved 2000 -> 3000\n"
@@ -742,7 +747,9 @@ class TestCacheWitnesses(unittest.TestCase):
                     ),
                 )
                 case._client = unittest.mock.Mock(return_value=object())
-                case._response = unittest.mock.Mock(return_value={"body": "stable cache"})
+                case._response = unittest.mock.Mock(
+                    return_value={"body": "stable cache"}
+                )
                 case._listener_states = unittest.mock.Mock(
                     side_effect=[
                         ({0: 1, 1: 0, 2: 0, 3: 0}, "before spare delete"),

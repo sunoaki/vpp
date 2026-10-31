@@ -541,7 +541,9 @@ else:
                 self._stop_client(client)
             deadline = time.monotonic() + 10
             while "path " in self.vapi.cli("show http static server sessions"):
-                self.assertLess(time.monotonic(), deadline, "cache owners did not detach")
+                self.assertLess(
+                    time.monotonic(), deadline, "cache owners did not detach"
+                )
                 time.sleep(0.05)
             self.assertIn("Cache cleared", self.vapi.cli("clear http static cache"))
             self.vapi.http_static_disable()
@@ -577,7 +579,9 @@ else:
             self.assertEqual(sorted(states.values()), [0, 0, 1], output)
             url_index = next(
                 int(index)
-                for index in re.findall(r"listener (\d+), uri 10\.10\.1\.2:8090,", output)
+                for index in re.findall(
+                    r"listener (\d+), uri 10\.10\.1\.2:8090,", output
+                )
             )
             self.assertIn(
                 "has no file cache",
@@ -588,10 +592,14 @@ else:
                 self.vapi.cli(f"clear http static cache index {url_index}"),
             )
             for _ in range(2):
-                reply = self.vapi.cli_return_response("test http static cache relocation")
+                reply = self.vapi.cli_return_response(
+                    "test http static cache relocation"
+                )
                 self.assertEqual(reply.retval, 0, reply.reply)
                 self.assertEqual(reply.reply.count("listener pool moved "), 2)
-                self.assertIn("2 explicit pool moves, unique stable hashes", reply.reply)
+                self.assertIn(
+                    "2 explicit pool moves, unique stable hashes", reply.reply
+                )
                 self.assertEqual(
                     self.vapi.cli("show bihash").count("Hash table 'http cache'"),
                     baseline + 2,
