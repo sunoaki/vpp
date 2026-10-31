@@ -311,7 +311,7 @@ hss_cache_add_and_attach (hss_cache_t *hc, u8 *path, u8 **data, u64 *data_len,
 
   /* Add to the lookup table */
 
-  kv.key = (u64) vec_dup (path);
+  kv.key = (u64) ce->filename;
   kv.value = ce_index;
 
   if (hc->debug_level > 1)
