@@ -554,8 +554,7 @@ try_file_handler (hss_session_t *hs)
 
   hs->data_offset = 0;
 
-  ce_index = hss_cache_lookup_and_attach (l->cache, path, &hs->data,
-					&hs->data_len, &last_modified);
+  ce_index = hss_cache_lookup_and_attach (l->cache, path, &hs->data, &hs->data_len, &last_modified);
   if (ce_index == ~0)
     {
       if (!file_path_is_valid (path))
@@ -574,8 +573,8 @@ try_file_handler (hss_session_t *hs)
 	  sc = try_index_file (l, hs, path);
 	  goto done;
 	}
-      ce_index = hss_cache_add_and_attach (l->cache, path, &hs->data,
-					 &hs->data_len, &last_modified);
+      ce_index =
+	hss_cache_add_and_attach (l->cache, path, &hs->data, &hs->data_len, &last_modified);
       if (ce_index == ~0)
 	{
 	  sc = HTTP_STATUS_INTERNAL_ERROR;
@@ -1748,8 +1747,7 @@ hss_test_cache_relocation_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	}
       pool_free (old);
       moved++;
-      vlib_cli_output (vm, "listener pool moved %llx -> %llx", old_base,
-		       pointer_to_uword (copy));
+      vlib_cli_output (vm, "listener pool moved %llx -> %llx", old_base, pointer_to_uword (copy));
     }
   vlib_cli_output (vm, "cache registry: %u explicit pool moves, unique stable hashes", moved);
   return 0;

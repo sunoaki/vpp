@@ -497,8 +497,7 @@ hss_cache_test_pressure (u8 **paths, uword limit)
   for (i = 0; i < 3; i++)
     {
       ce = pool_elt_at_index (hc.cache_pool, indices[i]);
-      if (ce->inuse != 1 || ce->data != saved_data[i] ||
-	  ce->last_modified != saved_modified[i] ||
+      if (ce->inuse != 1 || ce->data != saved_data[i] || ce->last_modified != saved_modified[i] ||
 	  hss_cache_lookup (&hc, paths[i]) != indices[i] ||
 	  memcmp (ce->data, copies[i], lengths[i]))
 	{
@@ -514,8 +513,7 @@ hss_cache_test_pressure (u8 **paths, uword limit)
       error = clib_error_return (0, "pressure fixture could not read fourth file");
       goto done;
     }
-  if (hss_cache_lookup (&hc, paths[0]) != ~0 ||
-      pool_elts (hc.cache_pool) != 3)
+  if (hss_cache_lookup (&hc, paths[0]) != ~0 || pool_elts (hc.cache_pool) != 3)
     {
       error = clib_error_return (0, "idle owner was not reclaimed after finite busy traversal");
       goto done;
@@ -635,7 +633,7 @@ hss_cache_test_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_co
     error = hss_cache_test_clear (paths);
   if (!error)
     vlib_cli_output (vm, pressure ? "cache pressure: zero/finite owners passed" :
-				  "cache clear: 121 states passed");
+				    "cache clear: 121 states passed");
 
 done:
   for (i = 0; i < 4; i++)
@@ -645,7 +643,8 @@ done:
 
 VLIB_CLI_COMMAND (hss_cache_test_command, static) = {
   .path = "test http static cache owners",
-  .short_help = "test http static cache owners <pressure|clear> <file-a> <file-b> <file-c> <file-d>",
+  .short_help =
+    "test http static cache owners <pressure|clear> <file-a> <file-b> <file-c> <file-d>",
   .function = hss_cache_test_command_fn,
 };
 
@@ -710,7 +709,7 @@ done:
 
 static clib_error_t *
 hss_cache_test_read_error_command_fn (vlib_main_t *vm, unformat_input_t *input,
-				    vlib_cli_command_t *cmd)
+				      vlib_cli_command_t *cmd)
 {
   u8 *invalid = 0, *valid = 0;
   clib_error_t *error;
