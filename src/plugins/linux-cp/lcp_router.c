@@ -1080,7 +1080,7 @@ lcp_router_table_state (u32 table_id, fib_protocol_t proto, lcp_router_table_sta
   return 1;
 }
 
-static void
+static int
 lcp_router_route_mk_prefix (struct rtnl_route *r, fib_prefix_t *p)
 {
   const struct nl_addr *addr = rtnl_route_get_dst (r);
@@ -1095,11 +1095,19 @@ lcp_router_route_mk_prefix (struct rtnl_route *r, fib_prefix_t *p)
   switch (p->fp_proto)
     {
     case FIB_PROTOCOL_MPLS:
+      /* The address is only as long as the netlink attribute that carried
+       * it; read the label only when all four bytes are present. */
+      if (blen < sizeof (entry))
+	{
+	  LCP_ROUTER_ERROR ("ignore mpls route with a %u byte dst address",
+			    blen);
+	  return -1;
+	}
       entry = ntohl (*baddr);
       p->fp_label = (entry & MPLS_LS_LABEL_MASK) >> MPLS_LS_LABEL_SHIFT;
       p->fp_len = 21;
       p->fp_eos = MPLS_NON_EOS;
-      return;
+      return 0;
     case FIB_PROTOCOL_IP4:
       memcpy (&paddr->ip4, baddr, blen);
       break;
@@ -1109,6 +1117,8 @@ lcp_router_route_mk_prefix (struct rtnl_route *r, fib_prefix_t *p)
     }
 
   p->fp_len = nl_addr_get_prefixlen (addr);
+
+  return 0;
 }
 
 static void
@@ -1345,7 +1355,8 @@ lcp_router_route_del (struct rtnl_route *rr)
   if (!lcp_router_route_type_valid[rtype] || (table_id == 255))
     return;
 
-  lcp_router_route_mk_prefix (rr, &pfx);
+  if (lcp_router_route_mk_prefix (rr, &pfx))
+    return;
   entry_flags = lcp_router_route_mk_entry_flags (rtype, table_id, rproto);
 
   /* Skip any kernel routes and IPv6 LL or multicast routes */
@@ -1445,7 +1456,8 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
   if (!lcp_router_route_type_valid[rtype] || (table_id == 255))
     return;
 
-  lcp_router_route_mk_prefix (rr, &pfx);
+  if (lcp_router_route_mk_prefix (rr, &pfx))
+    return;
   entry_flags = lcp_router_route_mk_entry_flags (rtype, table_id, rproto);
 
   /* Skip any kernel routes and IPv6 LL or multicast routes */
