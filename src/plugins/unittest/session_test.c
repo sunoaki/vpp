@@ -3189,7 +3189,7 @@ session_test_dtls_cleanup (vlib_main_t *vm)
       clib_error_free (test.error);
     }
   else if (SESSION_TEST_I (session_dtls_connected_count == 0,
-			  "DTLS failures did not notify application"))
+			   "DTLS failures did not notify application"))
     {
       result = 0;
       vlib_cli_output (vm, "DTLS cleanup: 4 modes passed on thread %u", transport_cl_thread ());

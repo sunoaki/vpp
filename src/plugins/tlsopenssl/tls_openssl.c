@@ -231,8 +231,9 @@ openssl_test_dtls_failures (vnet_connect_args_t *args)
 	  vec_free (ctx->ctx.srv_hostname);
 	  if (openssl_main.async)
 	    tls_async_evts_free_list (&ctx->ctx);
-	  return clib_error_return (0, "DTLS immediate failure retained hostname/async ownership "
-				      "(named %u, async %d, iteration %u)",
+	  return clib_error_return (0,
+				    "DTLS immediate failure retained hostname/async ownership "
+				    "(named %u, async %d, iteration %u)",
 				    ext->crypto.hostname[0] != 0, openssl_main.async, iteration);
 	}
     }
@@ -268,7 +269,7 @@ openssl_test_dtls_cleanup (vnet_connect_args_t *args)
       return clib_error_return (0, "DTLS cleanup test requires no active OpenSSL contexts");
 
   ext = session_endpoint_add_ext_cfg (&args->sep_ext, TRANSPORT_ENDPT_EXT_CFG_CRYPTO,
-				    sizeof (transport_endpt_crypto_cfg_t));
+				      sizeof (transport_endpt_crypto_cfg_t));
   ext->crypto.crypto_engine = CRYPTO_ENGINE_OPENSSL;
   for (int async = 0; async <= 1; async++)
     {
