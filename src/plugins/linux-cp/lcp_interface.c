@@ -366,8 +366,9 @@ lcp_itf_pair_add (u32 host_sw_if_index, u32 phy_sw_if_index, u8 *host_name,
 static clib_error_t *
 lcp_netlink_add_link_vlan (int parent, u32 vlan, u16 proto, const char *name)
 {
-  struct rtnl_link *link;
-  struct nl_sock *sk;
+  struct rtnl_link *link = NULL;
+  struct nl_sock *sk = NULL;
+  clib_error_t *error = NULL;
   int err;
 
   sk = nl_socket_alloc ();
@@ -375,7 +376,8 @@ lcp_netlink_add_link_vlan (int parent, u32 vlan, u16 proto, const char *name)
     {
       LCP_ITF_PAIR_ERR ("netlink_add_link_vlan: connect error: %s",
 			nl_geterror (err));
-      return clib_error_return (NULL, "Unable to connect socket: %d", err);
+      error = clib_error_return (NULL, "Unable to connect socket: %d", err);
+      goto done;
     }
 
   link = rtnl_link_vlan_alloc ();
@@ -389,36 +391,50 @@ lcp_netlink_add_link_vlan (int parent, u32 vlan, u16 proto, const char *name)
     {
       LCP_ITF_PAIR_ERR ("netlink_add_link_vlan: link add error: %s",
 			nl_geterror (err));
-      return clib_error_return (NULL, "Unable to add link %s: %d", name, err);
+      error = clib_error_return (NULL, "Unable to add link %s: %d", name, err);
     }
 
-  rtnl_link_put (link);
-  nl_close (sk);
+done:
+  if (link)
+    rtnl_link_put (link);
 
-  return NULL;
+  /* nl_close() only closes the descriptor, the socket handle would leak. */
+  if (sk)
+    nl_socket_free (sk);
+
+  return error;
 }
 
 static clib_error_t *
 lcp_netlink_del_link (const char *name)
 {
-  struct rtnl_link *link;
-  struct nl_sock *sk;
+  struct rtnl_link *link = NULL;
+  struct nl_sock *sk = NULL;
+  clib_error_t *error = NULL;
   int err;
 
   sk = nl_socket_alloc ();
   if ((err = nl_connect (sk, NETLINK_ROUTE)) < 0)
-    return clib_error_return (NULL, "Unable to connect socket: %d", err);
+    {
+      error = clib_error_return (NULL, "Unable to connect socket: %d", err);
+      goto done;
+    }
 
   link = rtnl_link_alloc ();
   rtnl_link_set_name (link, name);
 
   if ((err = rtnl_link_delete (sk, link)) < 0)
-    return clib_error_return (NULL, "Unable to del link %s: %d", name, err);
+    error = clib_error_return (NULL, "Unable to del link %s: %d", name, err);
 
-  rtnl_link_put (link);
-  nl_close (sk);
+done:
+  if (link)
+    rtnl_link_put (link);
 
-  return NULL;
+  /* nl_close() only closes the descriptor, the socket handle would leak. */
+  if (sk)
+    nl_socket_free (sk);
+
+  return error;
 }
 
 int
@@ -572,6 +588,7 @@ lcp_ns_switch_restore (lcp_ns_switch_t *sw, const char *where)
 static void
 lcp_itf_pair_delete_by_index (index_t lipi)
 {
+  vnet_sw_interface_t *si;
   u32 host_sw_if_index;
   lcp_itf_pair_t *lip;
   u8 *host_name, *ns;
@@ -584,7 +601,14 @@ lcp_itf_pair_delete_by_index (index_t lipi)
 
   lcp_itf_pair_del (lip->lip_phy_sw_if_index);
 
-  if (vnet_sw_interface_is_sub (vnet_get_main (), host_sw_if_index))
+  /*
+   * The host interface can already be gone, for example when it was
+   * cascaded away with the tap it is a sub-interface of. Both branches below
+   * delete interfaces, and vnet_sw_interface_is_sub() would resolve the freed
+   * index through pool_elt_at_index and abort. Do nothing then.
+   */
+  si = vnet_get_sw_interface_or_null (vnet_get_main (), host_sw_if_index);
+  if (si && si->sw_if_index != si->sup_sw_if_index)
     {
       lcp_ns_switch_t ns_switch;
 
@@ -597,7 +621,7 @@ lcp_itf_pair_delete_by_index (index_t lipi)
 
       vnet_delete_sub_interface (host_sw_if_index);
     }
-  else
+  else if (si)
     tap_delete_if (vlib_get_main (), host_sw_if_index);
 
   vec_free (host_name);
@@ -627,9 +651,34 @@ lcp_itf_pair_delete (u32 phy_sw_if_index)
 static clib_error_t *
 lcp_itf_interface_add_del (vnet_main_t *vnm, u32 sw_if_index, u32 is_add)
 {
-  if (!is_add)
-    /* remove any interface pair we have for this interface */
-    lcp_itf_pair_delete (sw_if_index);
+  lcp_itf_pair_t *lip;
+  index_t lipi;
+
+  if (is_add)
+    return (NULL);
+
+  /*
+   * Remove any interface pair we have for this interface. One sw_if_index can
+   * be the phy of one pair and the host of another, so both lookups run: the
+   * phy path deletes its pair and that pair's host link, and lcp_itf_pair_del()
+   * clears both index maps before it releases the pair, so a second lookup of
+   * the same pair returns INDEX_INVALID instead of deleting it twice.
+   */
+  lipi = lcp_itf_pair_find_by_phy (sw_if_index);
+  if (lipi != INDEX_INVALID)
+    lcp_itf_pair_delete_by_index (lipi);
+
+  /*
+   * The interface may also, or instead, be the host of a pair that outlives
+   * it, deleted on its own or as a sub-interface of a host that is being
+   * deleted. Remove the pair record only: the host link is already going
+   * away, and deleting it from here would re-enter this callback through
+   * vnet_delete_sw_interface(). A pair is never left pointing at an index
+   * that is about to be freed.
+   */
+  lip = lcp_itf_pair_get (lcp_itf_pair_find_by_host (sw_if_index));
+  if (lip)
+    lcp_itf_pair_del (lip->lip_phy_sw_if_index);
 
   return (NULL);
 }
