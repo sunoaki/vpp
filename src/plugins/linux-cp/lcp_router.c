@@ -296,7 +296,12 @@ lcp_router_link_addr (struct rtnl_link *rl, lcp_itf_pair_t *lip)
     return;
 
   hw = vnet_get_sup_hw_interface (vnm, lip->lip_phy_sw_if_index);
-  if (!vec_len (hw->hw_address))
+
+  /* vnet_hw_interface_change_mac_address() copies a six byte address:
+   * require the netlink address and the hardware address to be exactly
+   * that long before the compare and the copy. */
+  if ((nl_addr_get_len (mac_addr) != sizeof (mac_address_t)) ||
+      (vec_len (hw->hw_address) != sizeof (mac_address_t)))
     return;
 
   mac_addr_bytes = nl_addr_get_binary_addr (mac_addr);
@@ -330,7 +335,7 @@ lcp_router_link_add (struct rtnl_link *rl, void *ctx)
       u32 sw_if_up;
 
       lip = lcp_itf_pair_get (lipi);
-      if (!vnet_get_sw_interface (vnm, lip->lip_phy_sw_if_index))
+      if (NULL == vnet_get_sw_interface_or_null (vnm, lip->lip_phy_sw_if_index))
 	return;
 
       if (lcp_router_lip_ts_check ((nl_msg_info_t *) ctx, lip))
@@ -590,31 +595,54 @@ lcp_router_proto_k2f (uint32_t k)
     case AF_MPLS:
       return FIB_PROTOCOL_MPLS;
     default:
-      ASSERT (0);
+      /* Not a family this plugin can translate. Return the sentinel instead
+       * of aborting on a message the kernel can send; the callers either gate
+       * on the family or reject FIB_PROTOCOL_NONE. */
       return FIB_PROTOCOL_NONE;
     }
 }
 
-static void
+static int
 lcp_router_mk_addr (const struct nl_addr *rna, ip_address_t *ia)
 {
+  uint32_t family = nl_addr_get_family (rna);
   fib_protocol_t fproto;
 
   ip_address_reset (ia);
-  fproto = lcp_router_proto_k2f (nl_addr_get_family (rna));
-  ASSERT (FIB_PROTOCOL_MPLS != fproto);
+
+  /* A neighbor or address message can carry an address that has no IP
+   * meaning, AF_MPLS in particular. Reject the entry instead of aborting on
+   * the assert that used to sit here. */
+  if (AF_INET != family && AF_INET6 != family)
+    {
+      LCP_ROUTER_ERROR ("ignore address of family %u", family);
+      return -1;
+    }
+
+  fproto = lcp_router_proto_k2f (family);
 
   ip_address_set (ia, nl_addr_get_binary_addr (rna),
 		  FIB_PROTOCOL_IP4 == fproto ? AF_IP4 : AF_IP6);
+
+  return 0;
 }
 
 static fib_protocol_t
 lcp_router_mk_addr46 (const struct nl_addr *rna, ip46_address_t *ia)
 {
+  uint32_t family = nl_addr_get_family (rna);
   fib_protocol_t fproto;
 
-  fproto = lcp_router_proto_k2f (nl_addr_get_family (rna));
-  ASSERT (FIB_PROTOCOL_MPLS != fproto);
+  /* Same gate as lcp_router_mk_addr(): an address that is neither IPv4 nor
+   * IPv6 has no ip46_address_t representation, so the callers drop the path
+   * rather than copy a foreign buffer. */
+  if (AF_INET != family && AF_INET6 != family)
+    {
+      LCP_ROUTER_ERROR ("ignore address of family %u", family);
+      return FIB_PROTOCOL_NONE;
+    }
+
+  fproto = lcp_router_proto_k2f (family);
 
   ip46_address_reset (ia);
   if (FIB_PROTOCOL_IP4 == fproto)
@@ -659,7 +687,8 @@ lcp_router_link_addr_add_del (struct rtnl_addr *rla, int is_del)
     {
       ip_address_t nh;
 
-      lcp_router_mk_addr (rtnl_addr_get_local (rla), &nh);
+      if (lcp_router_mk_addr (rtnl_addr_get_local (rla), &nh))
+	return;
 
       if (AF_IP4 == ip_addr_version (&nh))
 	{
@@ -711,13 +740,17 @@ static walk_rc_t
 lcp_router_address_mark (index_t index, void *ctx)
 {
   vnet_main_t *vnm = vnet_get_main ();
+  vnet_sw_interface_t *sw;
 
   lcp_itf_pair_t *lip = lcp_itf_pair_get (index);
   if (!lip)
     return WALK_CONTINUE;
 
-  ip_interface_address_mark_one_interface (
-    vnm, vnet_get_sw_interface (vnm, lip->lip_phy_sw_if_index), 0);
+  sw = vnet_get_sw_interface_or_null (vnm, lip->lip_phy_sw_if_index);
+  if (NULL == sw)
+    return WALK_CONTINUE;
+
+  ip_interface_address_mark_one_interface (vnm, sw, 0);
 
   return WALK_CONTINUE;
 }
@@ -759,7 +792,8 @@ lcp_router_neigh_del (struct rtnl_neigh *rn)
 
       if ((rna = rtnl_neigh_get_dst (rn)) == NULL)
 	return;
-      lcp_router_mk_addr (rna, &nh);
+      if (lcp_router_mk_addr (rna, &nh))
+	return;
 
       if (ip46_address_is_multicast (&ip_addr_46 (&nh)))
 	{
@@ -814,7 +848,8 @@ lcp_router_neigh_add (struct rtnl_neigh *rn)
 
       if ((rna = rtnl_neigh_get_dst (rn)) == NULL)
 	return;
-      lcp_router_mk_addr (rna, &nh);
+      if (lcp_router_mk_addr (rna, &nh))
+	return;
 
       if (ip46_address_is_multicast (&ip_addr_46 (&nh)))
 	{
@@ -832,6 +867,13 @@ lcp_router_neigh_add (struct rtnl_neigh *rn)
 	  mac_address_t mac;
 	  ip_neighbor_flags_t flags;
 	  int rv;
+
+	  if (nl_addr_get_len (ll) != sizeof (mac_address_t))
+	    {
+	      LCP_ROUTER_ERROR ("ignore neighbor with a %u byte lladdr",
+				nl_addr_get_len (ll));
+	      return;
+	    }
 
 	  lcp_router_mk_mac_addr (ll, &mac);
 
@@ -1065,38 +1107,54 @@ lcp_router_table_state (u32 table_id, fib_protocol_t proto, lcp_router_table_sta
   return 1;
 }
 
-static void
+static int
 lcp_router_route_mk_prefix (struct rtnl_route *r, fib_prefix_t *p)
 {
   const struct nl_addr *addr = rtnl_route_get_dst (r);
+  uint32_t family = nl_addr_get_family (addr);
   u32 *baddr = nl_addr_get_binary_addr (addr);
   u32 blen = nl_addr_get_len (addr);
   ip46_address_t *paddr = &p->fp_addr;
   u32 entry;
 
   ip46_address_reset (paddr);
-  p->fp_proto = lcp_router_proto_k2f (nl_addr_get_family (addr));
+  p->fp_proto = lcp_router_proto_k2f (family);
 
   switch (p->fp_proto)
     {
     case FIB_PROTOCOL_MPLS:
+      /* The address is only as long as the netlink attribute that carried
+       * it; read the label only when all four bytes are present. */
+      if (blen < sizeof (entry))
+	{
+	  LCP_ROUTER_ERROR ("ignore mpls route with a %u byte dst address",
+			    blen);
+	  return -1;
+	}
       entry = ntohl (*baddr);
       p->fp_label = (entry & MPLS_LS_LABEL_MASK) >> MPLS_LS_LABEL_SHIFT;
       p->fp_len = 21;
       p->fp_eos = MPLS_NON_EOS;
-      return;
+      return 0;
     case FIB_PROTOCOL_IP4:
       memcpy (&paddr->ip4, baddr, blen);
       break;
     case FIB_PROTOCOL_IP6:
       memcpy (&paddr->ip6, baddr, blen);
       break;
+    default:
+      /* lcp_router_proto_k2f() reports FIB_PROTOCOL_NONE for a family with no
+       * FIB protocol; such a prefix has no table to live in. */
+      LCP_ROUTER_ERROR ("ignore route with a %u dst address family", family);
+      return -1;
     }
 
   p->fp_len = nl_addr_get_prefixlen (addr);
+
+  return 0;
 }
 
-static void
+static int
 lcp_router_route_mk_mprefix (struct rtnl_route *r, mfib_prefix_t *p)
 {
   const struct nl_addr *addr;
@@ -1105,10 +1163,18 @@ lcp_router_route_mk_mprefix (struct rtnl_route *r, mfib_prefix_t *p)
 
   p->fp_len = nl_addr_get_prefixlen (addr);
   p->fp_proto = lcp_router_mk_addr46 (addr, &p->fp_grp_addr);
+  if (FIB_PROTOCOL_NONE == p->fp_proto)
+    return -1;
 
   addr = rtnl_route_get_src (r);
   if (addr)
-    p->fp_proto = lcp_router_mk_addr46 (addr, &p->fp_src_addr);
+    {
+      p->fp_proto = lcp_router_mk_addr46 (addr, &p->fp_src_addr);
+      if (FIB_PROTOCOL_NONE == p->fp_proto)
+	return -1;
+    }
+
+  return 0;
 }
 
 static int
@@ -1201,7 +1267,16 @@ lcp_router_route_path_parse (struct rtnl_nexthop *rnh, void *arg)
 	addr = rtnl_route_nh_get_via (rnh);
 
       if (addr)
-	fproto = lcp_router_mk_addr46 (addr, &path->frp_addr);
+	{
+	  fproto = lcp_router_mk_addr46 (addr, &path->frp_addr);
+	  if (FIB_PROTOCOL_NONE == fproto)
+	    {
+	      /* lcp_router_mk_addr46() rejected the gateway address; drop the
+	       * path that was just added. */
+	      vec_del1 (ctx->paths, vec_len (ctx->paths) - 1);
+	      return;
+	    }
+	}
       else
 	fproto = ctx->route_proto;
 
@@ -1330,7 +1405,8 @@ lcp_router_route_del (struct rtnl_route *rr)
   if (!lcp_router_route_type_valid[rtype] || (table_id == 255))
     return;
 
-  lcp_router_route_mk_prefix (rr, &pfx);
+  if (lcp_router_route_mk_prefix (rr, &pfx))
+    return;
   entry_flags = lcp_router_route_mk_entry_flags (rtype, table_id, rproto);
 
   /* Skip any kernel routes and IPv6 LL or multicast routes */
@@ -1430,7 +1506,8 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
   if (!lcp_router_route_type_valid[rtype] || (table_id == 255))
     return;
 
-  lcp_router_route_mk_prefix (rr, &pfx);
+  if (lcp_router_route_mk_prefix (rr, &pfx))
+    return;
   entry_flags = lcp_router_route_mk_entry_flags (rtype, table_id, rproto);
 
   /* Skip any kernel routes and IPv6 LL or multicast routes */
@@ -1459,16 +1536,28 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
 
   if (0 != vec_len (np.paths))
     {
+      mfib_prefix_t mpfx = {};
+
+      /* Build the multicast prefix before the table is locked, so rejecting
+       * the route here leaves no reference behind. */
+      if (rtype == RTN_MULTICAST && lcp_router_route_mk_mprefix (rr, &mpfx))
+	{
+	  fib_route_path_t *rpath;
+
+	  /* The FIB takes ownership of a path's label stack, so the parsed
+	   * paths must release their own on a route that is not installed. */
+	  vec_foreach (rpath, np.paths)
+	    vec_free (rpath->frp_label_stack);
+	  vec_free (np.paths);
+	  return;
+	}
+
       nlt = lcp_router_table_add_or_lock (table_id, pfx.fp_proto);
 
       if (rtype == RTN_MULTICAST)
 	{
 	  /* it's not clear to me how linux expresses the RPF paramters
 	   * so we'll allow from all interfaces and hope for the best */
-	  mfib_prefix_t mpfx = {};
-
-	  lcp_router_route_mk_mprefix (rr, &mpfx);
-
 	  mfib_table_entry_update (nlt->nlt_mfib_index, &mpfx,
 				   MFIB_SOURCE_PLUGIN_LOW, MFIB_RPF_ID_NONE,
 				   MFIB_ENTRY_FLAG_ACCEPT_ALL_ITF);
