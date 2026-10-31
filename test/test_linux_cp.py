@@ -29,6 +29,7 @@ from asfframework import (
     get_testcase_dirname,
 )
 from vpp_ipip_tun_interface import VppIpIpTunInterface
+from vpp_papi_provider import CliFailedCommandError
 from template_ipsec import (
     TemplateIpsec,
     IpsecTun4,
@@ -2122,10 +2123,18 @@ for sequence in range(100, 130):
             "LCP pair must be gone with its host tap",
         )
 
-        # The phy outlived its host; deleting it again must not act on the
-        # freed host index
-        self.vapi.cli(f"lcp delete {pg.name}")
-        self.assertIsNone(self._find_lcp_pair(pg.sw_if_index))
+        # The pair record went away with its host tap, so this delete has
+        # nothing to act on: it must report the missing pair and leave the
+        # freed host index alone, not crash vpp like the unchecked path did.
+        # lcp_itf_pair_delete returns VNET_API_ERROR_INVALID_SW_IF_INDEX (-2)
+        # when lcp_itf_pair_find_by_phy finds no pair.
+        with self.assertRaises(CliFailedCommandError) as cm:
+            self.vapi.cli(f"lcp delete {pg.name}")
+        self.assertIn("deletion failed (-2)", str(cm.exception))
+        self.assertIsNone(
+            self._find_lcp_pair(pg.sw_if_index),
+            "LCP pair must stay gone after the failed delete",
+        )
 
     def test_tap_phy_and_host_delete_removes_both_pairs(self):
         """Deleting a tap that is both a host and a phy removes both pairs"""
