@@ -1561,7 +1561,7 @@ lcp_router_route_sync_end (void)
       nlt = pool_elt_at_index (lcp_router_table_pool, *index);
       nlt->nlt_refs++;
       u32 before = lcp_router_table_source_count (nlt, lcp_rt_fib_src) +
-	lcp_router_table_source_count (nlt, lcp_rt_fib_src_dynamic);
+		   lcp_router_table_source_count (nlt, lcp_rt_fib_src_dynamic);
       fib_table_sweep (nlt->nlt_fib_index, nlt->nlt_proto, lcp_rt_fib_src);
       fib_table_sweep (nlt->nlt_fib_index, nlt->nlt_proto,
 		       lcp_rt_fib_src_dynamic);
@@ -1570,7 +1570,7 @@ lcp_router_route_sync_end (void)
 		       format_fib_protocol, nlt->nlt_proto,
 		       nlt->nlt_fib_index);
       u32 after = lcp_router_table_source_count (nlt, lcp_rt_fib_src) +
-	lcp_router_table_source_count (nlt, lcp_rt_fib_src_dynamic);
+		  lcp_router_table_source_count (nlt, lcp_rt_fib_src_dynamic);
       ASSERT (before >= after && nlt->nlt_refs > before - after);
       nlt->nlt_refs -= before - after;
       lcp_router_table_unlock (nlt);
@@ -1686,27 +1686,20 @@ lcp_router_table_flush (lcp_router_table_t *nlt, u32 *sw_if_index_to_bool,
 __clib_export const nl_vft_t lcp_router_vft = {
   .nvl_rt_link_add = { .is_mp_safe = 0, .cb = lcp_router_link_add },
   .nvl_rt_link_del = { .is_mp_safe = 0, .cb = lcp_router_link_del },
-  .nvl_rt_link_sync_begin = { .is_mp_safe = 0,
-			      .cb = lcp_router_link_sync_begin },
+  .nvl_rt_link_sync_begin = { .is_mp_safe = 0, .cb = lcp_router_link_sync_begin },
   .nvl_rt_link_sync_end = { .is_mp_safe = 0, .cb = lcp_router_link_sync_end },
   .nvl_rt_addr_add = { .is_mp_safe = 0, .cb = lcp_router_link_addr_add },
   .nvl_rt_addr_del = { .is_mp_safe = 0, .cb = lcp_router_link_addr_del },
-  .nvl_rt_addr_sync_begin = { .is_mp_safe = 0,
-			      .cb = lcp_router_link_addr_sync_begin },
-  .nvl_rt_addr_sync_end = { .is_mp_safe = 0,
-			    .cb = lcp_router_link_addr_sync_end },
+  .nvl_rt_addr_sync_begin = { .is_mp_safe = 0, .cb = lcp_router_link_addr_sync_begin },
+  .nvl_rt_addr_sync_end = { .is_mp_safe = 0, .cb = lcp_router_link_addr_sync_end },
   .nvl_rt_neigh_add = { .is_mp_safe = 0, .cb = lcp_router_neigh_add },
   .nvl_rt_neigh_del = { .is_mp_safe = 0, .cb = lcp_router_neigh_del },
-  .nvl_rt_neigh_sync_begin = { .is_mp_safe = 0,
-			       .cb = lcp_router_neigh_sync_begin },
-  .nvl_rt_neigh_sync_end = { .is_mp_safe = 0,
-			     .cb = lcp_router_neigh_sync_end },
+  .nvl_rt_neigh_sync_begin = { .is_mp_safe = 0, .cb = lcp_router_neigh_sync_begin },
+  .nvl_rt_neigh_sync_end = { .is_mp_safe = 0, .cb = lcp_router_neigh_sync_end },
   .nvl_rt_route_add = { .is_mp_safe = 1, .cb = lcp_router_route_add },
   .nvl_rt_route_del = { .is_mp_safe = 1, .cb = lcp_router_route_del },
-  .nvl_rt_route_sync_begin = { .is_mp_safe = 0,
-			       .cb = lcp_router_route_sync_begin },
-  .nvl_rt_route_sync_end = { .is_mp_safe = 0,
-			     .cb = lcp_router_route_sync_end },
+  .nvl_rt_route_sync_begin = { .is_mp_safe = 0, .cb = lcp_router_route_sync_begin },
+  .nvl_rt_route_sync_end = { .is_mp_safe = 0, .cb = lcp_router_route_sync_end },
 };
 
 static void
@@ -1822,8 +1815,8 @@ lcp_router_init (vlib_main_t *vm)
   lcp_rt_fib_src_dynamic = fib_source_allocate (
     "lcp-rt-dynamic", FIB_SOURCE_PRIORITY_HI + 1, FIB_SOURCE_BH_API);
 
-  lcp_rt_fib_src_special = fib_source_allocate (
-    "lcp-rt-special", FIB_SOURCE_PRIORITY_HI, FIB_SOURCE_BH_API);
+  lcp_rt_fib_src_special =
+    fib_source_allocate ("lcp-rt-special", FIB_SOURCE_PRIORITY_HI, FIB_SOURCE_BH_API);
 
   return (NULL);
 }

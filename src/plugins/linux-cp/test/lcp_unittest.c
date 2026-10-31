@@ -184,8 +184,7 @@ lcp_router_test_refs (fib_node_index_t entry, void *arg)
 static void
 lcp_router_test_state (vlib_main_t *vm, fib_protocol_t proto, lcp_router_table_state_t *state)
 {
-  vlib_cli_output (vm, "refs:%u fib:%u mfib:%u", state->refs, state->fib_index,
-		   state->mfib_index);
+  vlib_cli_output (vm, "refs:%u fib:%u mfib:%u", state->refs, state->fib_index, state->mfib_index);
   state->refs = 0;
   fib_table_walk (state->fib_index, proto, lcp_router_test_refs, state);
   vlib_cli_output (vm, "invalid-source-refs:%u", state->refs);
@@ -197,8 +196,8 @@ lcp_router_test_state (vlib_main_t *vm, fib_protocol_t proto, lcp_router_table_s
 	.fp_addr.ip4.as_u32 = ~0,
       };
       u32 entry = fib_table_lookup_exact_match (state->fib_index, &broadcast);
-      fib_entry_src_t *source = entry == ~0 ? NULL :
-	fib_entry_src_find (fib_entry_get (entry), state->sources[2]);
+      fib_entry_src_t *source =
+	entry == ~0 ? NULL : fib_entry_src_find (fib_entry_get (entry), state->sources[2]);
       vlib_cli_output (vm, "broadcast refs:%u local:%u", source ? source->fes_ref_count : 0,
 		       source ? !!(source->fes_entry_flags & FIB_ENTRY_FLAG_LOCAL) : 0);
     }
@@ -231,8 +230,8 @@ lcp_router_test_entry (vlib_main_t *vm, unformat_input_t *input, fib_protocol_t 
   const char *names[] = { "static", "dynamic", "permanent" };
   for (u32 ii = 0; ii < ARRAY_LEN (state->sources); ii++)
     {
-      fib_entry_src_t *source = entry == ~0 ? NULL :
-	fib_entry_src_find (fib_entry_get (entry), state->sources[ii]);
+      fib_entry_src_t *source =
+	entry == ~0 ? NULL : fib_entry_src_find (fib_entry_get (entry), state->sources[ii]);
       vlib_cli_output (vm, "%s:%u refs:%u", names[ii], source != NULL,
 		       source ? source->fes_ref_count : 0);
     }
@@ -242,11 +241,11 @@ lcp_router_test_entry (vlib_main_t *vm, unformat_input_t *input, fib_protocol_t 
       if (entry != ~0)
 	{
 	  const dpo_id_t *dpo = fib_entry_contribute_ip_forwarding (entry);
-	  if (dpo->dpoi_type == DPO_LOAD_BALANCE &&
-	      load_balance_n_buckets (dpo->dpoi_index) == 1)
+	  if (dpo->dpoi_type == DPO_LOAD_BALANCE && load_balance_n_buckets (dpo->dpoi_index) == 1)
 	    dpo = load_balance_get_bucket (dpo->dpoi_index, 0);
 	  forwarding = dpo->dpoi_type == DPO_RECEIVE ? "receive" :
-		       dpo->dpoi_type == DPO_DROP ? "drop" : "other";
+		       dpo->dpoi_type == DPO_DROP    ? "drop" :
+						       "other";
 	}
       vlib_cli_output (vm, "forwarding:%s", forwarding);
     }

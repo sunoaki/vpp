@@ -14,6 +14,6 @@ typedef struct
 } lcp_router_table_state_t;
 
 __clib_export int lcp_router_table_state (u32 table_id, fib_protocol_t proto,
-					lcp_router_table_state_t *state);
+					  lcp_router_table_state_t *state);
 
 #endif
