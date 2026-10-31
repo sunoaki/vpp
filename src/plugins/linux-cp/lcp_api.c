@@ -190,6 +190,14 @@ send_lcp_itf_pair_details (index_t lipi, vl_api_registration_t *rp,
   vl_api_lcp_itf_pair_details_t *rmp;
   lcp_itf_pair_t *lcp_pair = lcp_itf_pair_get (lipi);
 
+  /*
+   * REPLY_MACRO_DETAILS4_END does not check rp, and vl_api_send_msg
+   * dereferences rp->registration_type. The client index in the request
+   * header can name a registration that has already been freed.
+   */
+  if (rp == 0)
+    return;
+
   REPLY_MACRO_DETAILS4_END (
     VL_API_LCP_ITF_PAIR_DETAILS, rp, context, ({
       rmp->phy_sw_if_index = lcp_pair->lip_phy_sw_if_index;
