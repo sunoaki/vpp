@@ -1,0 +1,1709 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Temporary DTLS cleanup controls
+
+on:
+  push:
+    branches: [feat/dtls-runtime-controls-ff49-october19]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dtls-controls-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dtls:
+    name: DTLS / ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fixed, restored]
+    container:
+      image: debian:trixie
+      options: >-
+        --shm-size=2g
+        --cap-add=SYS_ADMIN
+        --cap-add=NET_ADMIN
+        --security-opt=apparmor=unconfined
+        --device-cgroup-rule="c 10:200 rwm"
+        --device-cgroup-rule="c 10:238 rwm"
+    defaults:
+      run:
+        shell: bash
+    env:
+      CANDIDATE_SHA: 02e289cc8903acf2ed728fc40be5b443aac477bb
+      FROZEN_SHA: 630f876bc326eee05c23d517600b72e8d6a6ec83
+      WORKFLOW_SHA: ${{ github.sha }}
+      CONTROL_VARIANT: ${{ matrix.variant }}
+      CLANG_FORMAT_VER: "19"
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: ${{ github.workspace }}
+    steps:
+      - name: Install base tools
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          printf 'CONTROL_DIR=%s/dtls-tools\nEVIDENCE_DIR=%s/dtls-evidence\n' \
+            "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/dtls-tools" "$RUNNER_TEMP/dtls-evidence"
+          rm -f /etc/apt/apt.conf.d/docker-clean
+          apt-get update -qq
+          apt-get install -y -qq sudo make git bash iproute2 python3
+
+      - name: Check out immutable workflow
+        timeout-minutes: 3
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Prepare external observer and control tools
+        run: |
+          set -euo pipefail
+          cp .github/workflows/dtls-regression-control.yml "$EVIDENCE_DIR/workflow.yml"
+          cat > "$CONTROL_DIR/sitecustomize.py" <<'PY'
+          import json
+          import os
+          import sys
+          import threading
+          import traceback
+          import unittest
+          from pathlib import Path
+
+          destination = os.environ.get("DTLS_EVENTS")
+          if destination:
+              state = threading.local()
+              provider = os.environ["DTLS_PROVIDER"]
+
+              def emit(record):
+                  record["pid"] = os.getpid()
+                  data = (json.dumps(record, sort_keys=True) + "\n").encode()
+                  if len(data) > 256 * 1024:
+                      raise RuntimeError("DTLS observer record exceeds 256 KiB")
+                  fd = os.open(destination, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+                  try:
+                      if os.fstat(fd).st_size + len(data) > 4 * 1024 * 1024:
+                          raise RuntimeError("DTLS observer exceeds 4 MiB")
+                      if os.write(fd, data) != len(data):
+                          raise RuntimeError("Incomplete DTLS observer write")
+                  finally:
+                      os.close(fd)
+
+              def wrap(name):
+                  original = getattr(unittest.TestResult, name)
+
+                  def observed(self, test, *args):
+                      if name == "startTest":
+                          state.test = test.id()
+                      record = {"kind": name, "test": test.id()}
+                      if name == "startTest":
+                          record["workers"] = test.get_vpp_worker_count()
+                      if name in ("addFailure", "addError"):
+                          record["exception"] = args[0][0].__name__
+                          record["traceback"] = "".join(traceback.format_exception(*args[0]))
+                      if name == "addSkip":
+                          record["reason"] = str(args[0])
+                      emit(record)
+                      result = original(self, test, *args)
+                      if name == "stopTest":
+                          state.test = None
+                      return result
+
+                  setattr(unittest.TestResult, name, observed)
+
+              for method in ("startTest", "stopTest", "addSuccess", "addFailure", "addError",
+                             "addSkip", "addExpectedFailure", "addUnexpectedSuccess", "addSubTest"):
+                  wrap(method)
+
+              def profile(frame, event, response):
+                  if (event == "return" and frame.f_code.co_filename == provider
+                          and frame.f_code.co_name == "cli_return_response"
+                          and frame.f_locals.get("cli", "").strip() == "test session dtls-cleanup"):
+                      emit({"kind": "cli", "test": getattr(state, "test", None),
+                            "retval": getattr(response, "retval", None),
+                            "reply": getattr(response, "reply", None)})
+
+              if sys.getprofile() is not None:
+                  raise RuntimeError("DTLS observer requires an unused profile hook")
+              sys.setprofile(profile)
+              emit({"kind": "loaded"})
+          PY
+          cat > "$CONTROL_DIR/control.py" <<'PY'
+          import ctypes
+          import hashlib
+          import json
+          import os
+          import re
+          import selectors
+          import signal
+          import stat
+          import subprocess
+          import sys
+          import time
+          import traceback
+          from pathlib import Path
+
+          SOURCE = "src/vnet/tls/tls.c"
+          TESTS = ["src/plugins/tlsopenssl/tls_openssl.c", "src/plugins/unittest/session_test.c",
+                   "test/asf/test_tls.py", "test/vpp_papi_provider.py", "test/asf/asfframework.py",
+                   "test/Makefile", "test/requirements.txt", "test/requirements-3.txt"]
+          WORKFLOW = ".github/workflows/dtls-regression-control.yml"
+          WITNESS = ("DTLS immediate failure retained hostname/async ownership "
+                     "(named 1, async 0, iteration 0)")
+          BEFORE = (b"  cargs->sep_ext.transport_flags = TRANSPORT_CFG_F_CONNECTED;\n"
+                    b"  if ((rv = vnet_connect (cargs)))\n    {\n"
+                    b"      tls_ctx_free (ctx);\n      return rv;\n    }")
+          AFTER = BEFORE.replace(b"tls_ctx_free (ctx)", b"tls_ctx_half_open_free (ctx_handle)")
+
+          def require(condition, message):
+              if not condition:
+                  raise AssertionError(message)
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          def blob(ref, path):
+              return git("rev-parse", f"{ref}:{path}")
+
+          def restored(data):
+              require(data.count(BEFORE) == 1, "Restoration anchor is missing or ambiguous")
+              return data.replace(BEFORE, AFTER, 1)
+
+          FATAL_DIAGNOSTIC = (r"\bSIG(?:SEGV|ABRT|BUS|ILL|FPE|QUIT|INT|HUP)\b|"
+                              r"segmentation fault|\bAborted\b|\bBus error\b|"
+                              r"illegal instruction|floating point exception|core dumped|"
+                              r"Core was generated|AddressSanitizer|runtime error:|assertion.*fails")
+
+          def fatal_diagnostic(text):
+              return bool(re.search(FATAL_DIAGNOSTIC, text, re.I))
+
+          def validate(variant, cls, workers, rc, console, logs, stderr, events):
+              identity = f"test_tls.{cls}.test_dtls_cleanup"
+              loaded = [e["pid"] for e in events if e["kind"] == "loaded"]
+              records = [e for e in events if e["kind"] != "loaded"]
+              require(loaded and len(set(loaded)) == len(loaded), "Missing/duplicate observer load")
+              require(all(e["pid"] in loaded and e["test"] == identity for e in records),
+                      "Unexpected test or missing observer load")
+              expected = ["startTest", "cli", "addSuccess" if variant == "fixed" else "addFailure",
+                          "stopTest"]
+              require([e["kind"] for e in records] == expected,
+                      f"Unexpected observer lifecycle: {[e['kind'] for e in records]}")
+              require(len({e["pid"] for e in records}) == 1, "Lifecycle spans different processes")
+              require(records[0]["workers"] == workers, "Wrong actual worker configuration")
+              callbacks = re.findall(r"--- (add\w+)\(\) (\w+)\.(\w+)\(", logs)
+              require(callbacks == [(expected[2], cls, "test_dtls_cleanup")],
+                      f"Wrong framework callbacks: {callbacks}")
+              console = re.sub(r"\x1b\[[0-9;]*m", "", console)
+              require(len(re.findall(r"(?m)^Ran 1 tests? in [0-9.]+s\s*$", console)) == 1,
+                      "Missing normal single-test completion")
+              channels = "\n".join((console, logs, stderr))
+              require(not fatal_diagnostic(channels), "Fatal VPP diagnostic in test evidence")
+              require(not re.search(r"timed out|TimeoutError|VppTransportSocketIOError|"
+                                    r"Vpp\s+dead\b|VPP.*(?:died|crashed)|"
+                                    r"(?m:^)(?:ERROR|SKIP):|OK \(skipped=", channels, re.I),
+                      "Crash, caught transport failure, timeout, setup error, or skipped test")
+              reply = records[1]["reply"]
+              require(isinstance(reply, str), "Missing real CLI reply")
+              success = f"DTLS cleanup: 4 modes passed on thread {workers}"
+              if variant == "fixed":
+                  require(rc == 0 and records[1]["retval"] == 0, "Fixed run or CLI failed")
+                  require(re.search(r"(?m)^OK\s*$", console), "Missing successful unittest summary")
+                  require(reply.count(success) == 1 and "SUCCESS" in reply,
+                          "Missing four-mode/thread success in actual CLI reply")
+                  require(not re.search(r"FAIL:\d+:|DTLS .*retained|Session unit test failed", reply + stderr),
+                          "Fixed run contains a C failure")
+              else:
+                  require(rc == 2, f"Expected ordinary make failure rc=2, got {rc}")
+                  require(records[1]["retval"] == -1, "Wrong actual CLI failure status")
+                  require(re.search(r"(?m)^FAILED \(failures=1\)\s*$", console),
+                          "Missing assertion-only unittest completion")
+                  failure = records[2]
+                  require(failure["exception"] == "AssertionError", "Non-assertion failure")
+                  trace = failure["traceback"]
+                  require("self.assertEqual(response.retval, 0, response.reply)" in trace
+                          and "AssertionError: -1 != 0 :" in trace and WITNESS in trace,
+                          "Wrong ordinary assertion location or message")
+                  require(reply.count(WITNESS) == 1 and "Session unit test failed" in reply,
+                          "Missing exact retained-hostname CLI witness")
+                  require("Session unit test failed" in trace, "Missing CLI failure in actual assertion")
+                  require(not re.search(r"SIGSEGV|segmentation fault|Core was generated|"
+                                        r"AddressSanitizer|runtime error:|assertion.*fails", stderr, re.I),
+                          "Raw VPP stderr contains a crash or C assertion")
+                  require("DTLS cleanup: 4 modes passed" not in reply,
+                          "Restored cleanup unexpectedly reported success")
+                  require(not re.search(r"DTLS (?:expected immediate route failure|immediate failure retained "
+                                        r"connection state|failures grew heap|migration)", reply),
+                          "Unrelated DTLS failure")
+
+          def collect(destination):
+              destination.mkdir(parents=True, exist_ok=True)
+              report = ["24 MiB total, 2 MiB/file, 200 files; text tails; no symlinks or cores."]
+              candidates = []
+              for root in [*sorted(Path("/tmp").glob("vpp-unittest-*")), Path("build-root/test-logs")]:
+                  if root.is_symlink() or not root.is_dir():
+                      continue
+                  for directory, subdirs, names in os.walk(root, followlinks=False):
+                      subdirs[:] = sorted(n for n in subdirs if not (Path(directory) / n).is_symlink())
+                      for name in sorted(names):
+                          path = Path(directory) / name
+                          if path.suffix not in (".txt", ".log", ".pcap", ".pcapng"):
+                              continue
+                          if stat.S_ISREG(path.lstat().st_mode):
+                              priority = 0 if name in ("log.txt", "vpp_stderr.txt") else 1
+                              candidates.append((path.suffix in (".pcap", ".pcapng"), priority, path))
+              remaining, count = 24 * 1024 * 1024, 0
+              for binary, _, path in sorted(candidates):
+                  if count == 200:
+                      report.append("Stopped at 200 files")
+                      break
+                  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                  with os.fdopen(fd, "rb") as reader:
+                      info = os.fstat(reader.fileno())
+                      if not stat.S_ISREG(info.st_mode):
+                          continue
+                      size = info.st_size
+                      length = min(size, 2 * 1024 * 1024)
+                      if length > remaining or binary and size > length:
+                          if len(report) < 1000:
+                              report.append(f"SKIP {str(path)[:500]!r}: {size}")
+                          continue
+                      reader.seek(size - length)
+                      data = reader.read(length)
+                      target = destination / f"{count:04d}{path.suffix}"
+                      target.write_bytes(data)
+                  report.append(f"{str(path)[:500]!r} -> {target.name}: {len(data)}/{size}")
+                  remaining -= len(data)
+                  count += 1
+              (destination / "collection.txt").write_text("\n".join(report) + "\n")
+
+          def process_table(errors=None, tracked=None):
+              table = {}
+              paths = set(Path("/proc").glob("[0-9]*/stat"))
+              if tracked is not None:
+                  paths.update(Path(f"/proc/{pid}/stat") for pid in tracked)
+              for path in sorted(paths):
+                  pid = int(path.parent.name)
+                  try:
+                      fields = path.read_text().rsplit(")", 1)[1].split()
+                      table[pid] = (int(fields[1]), int(fields[19]))
+                  except (OSError, ValueError, IndexError) as error:
+                      if errors is not None and not isinstance(error, (FileNotFoundError, ProcessLookupError)):
+                          errors[pid] = {"type": type(error).__name__, "message": str(error)[:1000]}
+              return table
+
+          def descendants(tracked, baseline, discovery_errors=None):
+              table = process_table() if discovery_errors is None else process_table(discovery_errors, tracked)
+              changed = True
+              while changed:
+                  changed = False
+                  for pid, (parent, birth) in table.items():
+                      if tracked.get(pid) == birth or baseline.get(pid) == birth:
+                          continue
+                      valid_parent = (parent in tracked and parent in table
+                                      and table[parent][1] == tracked[parent])
+                      if parent == os.getpid() or valid_parent:
+                          tracked[pid] = birth
+                          changed = True
+              return {pid for pid, birth in tracked.items()
+                      if pid in table and table[pid][1] == birth}
+
+          def signal_process(pid, birth, sig, reap):
+              try:
+                  handle = os.pidfd_open(pid, 0)
+              except ProcessLookupError:
+                  return False, None
+              try:
+                  current = process_table().get(pid)
+                  if current is None or current[1] != birth:
+                      return False, None
+                  try:
+                      signal.pidfd_send_signal(handle, sig, None, 0)
+                  except ProcessLookupError:
+                      return False, None
+                  reaped = None
+                  if reap:
+                      try:
+                          reaped = os.waitid(os.P_PIDFD, handle, os.WEXITED | os.WNOHANG)
+                      except ChildProcessError:
+                          pass
+                  return True, reaped
+              finally:
+                  os.close(handle)
+
+          def completion_process(pid, birth):
+              path = Path(f"/proc/{pid}")
+              with (path / "stat").open("rb") as stream:
+                  raw = stream.read(4096)
+              fields = raw.rsplit(b")", 1)[1].split()
+              require(int(fields[19]) == birth, "Completion diagnostic process identity changed")
+              with (path / "cmdline").open("rb") as stream:
+                  cmdline = stream.read(4096)
+              require(process_table().get(pid, (None, None))[1] == birth,
+                      "Completion diagnostic identity changed while reading")
+              return {"pid": pid, "birth": birth, "parent": int(fields[1]),
+                      "state": fields[0].decode(errors="replace"),
+                      "comm": raw.split(b"(", 1)[1].rsplit(b")", 1)[0][:256].decode(errors="replace"),
+                      "cmdline": cmdline.replace(b"\0", b" ").decode(errors="replace")}
+
+          def completion_descendants(root_pid, tracked, baseline, report, stage):
+              errors = {}
+              live = descendants(tracked, baseline, errors) - {root_pid}
+              relevant = sorted(pid for pid in errors if pid in tracked and pid != root_pid)
+              require(len(relevant) <= 128, "Too many discovery errors for bounded completion evidence")
+              for pid in relevant:
+                  report["discovery_errors"].append(dict(pid=pid, birth=tracked[pid], stage=stage, error=errors[pid]))
+                  if pid not in report["unresolved"]:
+                      report["unresolved"].append(pid)
+              return live
+
+          def completion_deadline(report, deadline, stage):
+              if time.monotonic() >= deadline:
+                  report["deadline_exceeded"] = report["deadline_exceeded"] or stage
+              return not report["deadline_exceeded"]
+
+          def reap_completed_descendants(root_pid, tracked, baseline, deadline):
+              report = {"processes": [], "unresolved": [], "remaining": [],
+                        "discovery_errors": [], "deadline_exceeded": None}
+              if not completion_deadline(report, deadline, "entry"):
+                  return report
+              live = completion_descendants(root_pid, tracked, baseline, report, "initial")
+              identities = [(pid, tracked[pid]) for pid in sorted(live)]
+              require(len(identities) <= 128, "Too many descendants for bounded completion evidence")
+              for pid, birth in identities:
+                  if not completion_deadline(report, deadline, "before-inspection"):
+                      break
+                  record = {"pid": pid, "birth": birth, "waitid": None}
+                  report["processes"].append(record)
+                  handle = None
+                  try:
+                      handle = os.pidfd_open(pid, 0)
+                      require(process_table().get(pid, (None, None))[1] == birth,
+                              "Completion pidfd process identity changed")
+                      record.update(completion_process(pid, birth))
+                      if not completion_deadline(report, deadline, "after-inspection"):
+                          raise TimeoutError("Completion inspection deadline exceeded")
+                      reaped = os.waitid(os.P_PIDFD, handle, os.WEXITED | os.WNOHANG)
+                      if reaped is None:
+                          record["status"] = "live-or-unresolved"
+                          report["unresolved"].append(pid)
+                      else:
+                          record["waitid"] = {"pid": reaped.si_pid, "status": reaped.si_status,
+                                              "code": reaped.si_code}
+                          require(reaped.si_pid == pid, "Completion waitid returned a different process")
+                          record["status"] = "reaped"
+                  except (OSError, AssertionError, ValueError, IndexError) as error:
+                      record.update(status="unresolved", error={"type": type(error).__name__, "message": str(error)})
+                      if pid not in report["unresolved"]:
+                          report["unresolved"].append(pid)
+                  finally:
+                      if handle is not None:
+                          os.close(handle)
+                      completion_deadline(report, deadline, "after-wait")
+              report["remaining"] = sorted(completion_descendants(root_pid, tracked, baseline, report, "final"))
+              completion_deadline(report, deadline, "after-final-discovery")
+              return report
+
+          def cleanup(process, tracked, baseline):
+              result = {"signals": [], "reaped": [], "survivors": []}
+              deadline = time.monotonic() + 5
+              for sig, budget in ((signal.SIGTERM, 1), (signal.SIGKILL, 3)):
+                  stage_end = min(deadline, time.monotonic() + budget)
+                  while True:
+                      live = descendants(tracked, baseline)
+                      identities = [(pid, tracked[pid]) for pid in sorted(live)]
+                      if process is not None:
+                          process.poll()
+                      for pid, birth in identities:
+                          reap = process is None or pid != process.pid or process.returncode is not None
+                          sent, reaped = signal_process(pid, birth, sig, reap)
+                          if sent:
+                              result["signals"].append([pid, int(sig)])
+                          if reaped:
+                              result["reaped"].append([reaped.si_pid, reaped.si_status])
+                      if not descendants(tracked, baseline) or time.monotonic() >= stage_end:
+                          break
+                      time.sleep(0.02)
+              if process is not None:
+                  try:
+                      process.wait(timeout=max(0.01, deadline - time.monotonic()))
+                  except subprocess.TimeoutExpired:
+                      result["survivors"].append(process.pid)
+              result["survivors"] = sorted(set(result["survivors"]) | descendants(tracked, baseline))
+              return result
+
+          def publish_json(path, record, exclusive=False):
+              temporary = path.with_name(f".{path.name}.{os.urandom(16).hex()}.tmp")
+              try:
+                  temporary.write_text(json.dumps(record, indent=2) + "\n")
+                  if exclusive:
+                      os.link(temporary, path)
+                  else:
+                      os.replace(temporary, path)
+              finally:
+                  temporary.unlink(missing_ok=True)
+
+          def command_identity(record):
+              return (isinstance(record, dict) and isinstance(record.get("command_id"), str)
+                      and bool(record["command_id"]) and isinstance(record.get("ancestors"), list)
+                      and all(isinstance(item, dict) and isinstance(item.get("result"), str)
+                              and isinstance(item.get("command_id"), str)
+                              for item in record["ancestors"]))
+
+          def finite_timestamp(value):
+              return type(value) in (int, float) and -float("inf") < value < float("inf")
+
+          def command_exception(value):
+              return (isinstance(value, dict) and isinstance(value.get("type"), str)
+                      and isinstance(value.get("message"), str)
+                      and ("traceback" not in value or isinstance(value["traceback"], str)))
+
+          def command_cleanup(value):
+              if not isinstance(value, dict) or not isinstance(value.get("survivors"), list):
+                  return False
+              if not all(type(pid) is int and pid > 0 for pid in value["survivors"]):
+                  return False
+              if "exception" in value:
+                  return command_exception(value["exception"])
+              return all(isinstance(value.get(key), list)
+                         and all(isinstance(pair, list) and len(pair) == 2
+                                 and all(type(item) is int for item in pair) for pair in value[key])
+                         for key in ("signals", "reaped"))
+
+          def command_state(record):
+              require(command_identity(record), "Invalid command identity")
+              require(isinstance(record.get("command"), list) and bool(record["command"])
+                      and all(isinstance(item, str) for item in record["command"])
+                      and finite_timestamp(record.get("start")) and finite_timestamp(record.get("deadline")),
+                      "Invalid command inputs or timestamps")
+              require(all(key in record for key in ("rc", "exception", "cleanup"))
+                      and (record["rc"] is None or type(record["rc"]) is int)
+                      and (record["exception"] is None or command_exception(record["exception"]))
+                      and all(key not in record or type(record[key]) is bool
+                              for key in ("caught_transport", "fatal_diagnostic")), "Invalid command status types")
+              outcome = record.get("outcome")
+              require(isinstance(outcome, str) and outcome in (
+                  "running", "success", "nonzero", "timeout", "exception", "cleanup-failed",
+                  "transport-failure", "fatal-diagnostic"), "Invalid command outcome")
+              if outcome == "running":
+                  require("end" not in record and record["rc"] is None and record["exception"] is None
+                          and record["cleanup"] is None and not record.get("caught_transport")
+                          and not record.get("fatal_diagnostic"), "Inconsistent running command state")
+                  return
+              require(finite_timestamp(record.get("end")) and record["end"] >= record["start"]
+                      and command_cleanup(record["cleanup"]), "Invalid terminal command state")
+              cleanup_failed = bool(record["cleanup"].get("exception") or record["cleanup"]["survivors"])
+              require((not record.get("fatal_diagnostic") or outcome == "fatal-diagnostic")
+                      and (not record.get("caught_transport") or outcome in ("transport-failure", "fatal-diagnostic"))
+                      and (not cleanup_failed or outcome in ("cleanup-failed", "transport-failure", "fatal-diagnostic")),
+                      "Inconsistent terminal failure flags")
+              if outcome in ("success", "nonzero"):
+                  require(type(record["rc"]) is int and (record["rc"] == 0) == (outcome == "success")
+                          and record["exception"] is None and not cleanup_failed, "Inconsistent command exit status")
+              elif outcome in ("timeout", "exception"):
+                  require(record["exception"] is not None and not cleanup_failed
+                          and (record["exception"]["type"] in ("TimeoutError", "TimeoutExpired")) == (outcome == "timeout"),
+                          "Inconsistent command exception state")
+              else:
+                  require({"cleanup-failed": cleanup_failed, "transport-failure": record.get("caught_transport"),
+                           "fatal-diagnostic": record.get("fatal_diagnostic")}[outcome], "Missing terminal failure evidence")
+
+          def evidence_bytes(path):
+              require(not path.is_symlink() and stat.S_ISREG(path.stat().st_mode)
+                      and path.stat().st_size <= 1024 * 1024, "Invalid or oversized evidence record")
+              return path.read_bytes()
+
+          def interrupted_record(path, output):
+              evidence = {"raw_result": str(path.relative_to(output)), "raw_result_sha256": None,
+                          "raw_result_state": "missing", "ownership": None, "partial_results": []}
+              diagnostic = None
+              try:
+                  raw = evidence_bytes(path)
+                  evidence.update(raw_result_sha256=hashlib.sha256(raw).hexdigest(), raw_result_state="malformed")
+                  child = json.loads(raw)
+                  command_state(child)
+                  evidence["raw_result_state"] = child["outcome"]
+                  return child, evidence, None
+              except (OSError, ValueError, AssertionError) as error:
+                  diagnostic = {"result": evidence["raw_result"], "raw_sha256": evidence["raw_result_sha256"],
+                                "error": str(error), "ownership_recovered": False}
+              try:
+                  owner_path = path.parent / "ownership.json"
+                  owner_raw = evidence_bytes(owner_path)
+                  child = json.loads(owner_raw)
+                  require(command_identity(child) and child.get("result") == evidence["raw_result"],
+                          "Ownership record does not identify this result")
+                  evidence["ownership"] = {"path": str(owner_path.relative_to(output)),
+                                           "sha256": hashlib.sha256(owner_raw).hexdigest()}
+                  diagnostic["ownership_recovered"] = True
+              except (OSError, ValueError, AssertionError) as error:
+                  diagnostic["ownership_error"] = str(error)
+                  return None, evidence, diagnostic
+              return child, evidence, diagnostic
+
+          def partial_result_evidence(directory, output):
+              paths = sorted(directory.glob(".result.json.*.tmp"))
+              require(len(paths) <= 32, "Too many partial result records")
+              records, remaining = [], 1024 * 1024
+              for path in paths:
+                  record = {"path": str(path.relative_to(output))}
+                  try:
+                      require(path.stat().st_size <= remaining, "Partial result evidence exceeds 1 MiB")
+                      raw = evidence_bytes(path)
+                      remaining -= len(raw)
+                      record.update(size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                  except (OSError, AssertionError) as error:
+                      record["error"] = str(error)
+                  records.append(record)
+              return records
+
+          def record_interruptions(parent_status, parent_result):
+              if parent_result["cleanup"].get("exception") or parent_result["cleanup"]["survivors"]:
+                  return
+              output = Path(os.environ["EVIDENCE_DIR"])
+              reference = {"result": str(parent_status.relative_to(output)),
+                           "command_id": parent_result["command_id"]}
+              paths = sorted({path.parent / "result.json" for pattern in ("*/result.json", "*/ownership.json")
+                              for path in output.glob(pattern)})
+              require(len(paths) <= 1000, "Too many command records for interruption attribution")
+              errors = []
+              for path in paths:
+                  if path.is_symlink() or path.parent.is_symlink():
+                      continue
+                  child, evidence, diagnostic = interrupted_record(path, output)
+                  if diagnostic:
+                      errors.append(diagnostic)
+                  if (child is None or reference not in child["ancestors"]
+                          or (diagnostic is None and (child.get("outcome") != "running" or "end" in child))
+                          or (path.parent / "interruption.json").exists()):
+                      continue
+                  try:
+                      evidence["partial_results"] = partial_result_evidence(path.parent, output)
+                  except AssertionError as error:
+                      evidence["partial_results_error"] = str(error)
+                  interruption = dict(evidence, outcome="interrupted-by-parent", observed_at=time.time(),
+                                      parent=reference, parent_outcome=parent_result["outcome"],
+                                      command_id=child["command_id"], rc=None, cleanup=None, spawned=None,
+                                      unknowns="Child workload spawn, exit status and child supervisor cleanup are unknown; "
+                                               "parent cleanup is recorded only in the referenced parent result.")
+                  try:
+                      publish_json(path.parent / "interruption.json", interruption, exclusive=True)
+                  except FileExistsError:
+                      pass
+              if errors:
+                  publish_json(parent_status.parent / "attribution-errors.json", errors)
+
+          def initialize_command(directory, args, seconds, inherited):
+              now = time.time()
+              limit = min(now + seconds, float(os.environ.get("DTLS_WORK_DEADLINE", now + seconds)),
+                          float(os.environ.get("DTLS_PHASE_DEADLINE", now + seconds)))
+              ancestors = json.loads(inherited.get("DTLS_COMMAND_ANCESTORS", "[]"))
+              command_id = os.urandom(16).hex()
+              result = {"command": args, "start": now, "deadline": limit, "rc": None,
+                        "outcome": "running", "exception": None, "cleanup": None,
+                        "command_id": command_id, "ancestors": ancestors}
+              status = directory / "result.json"
+              publish_json(directory / "ownership.json",
+                           {"result": str(status.relative_to(Path(os.environ["EVIDENCE_DIR"]))),
+                            "command_id": command_id, "ancestors": ancestors}, exclusive=True)
+              publish_json(status, result)
+              return result, time.monotonic() + max(0, limit - time.time())
+
+          def update_command_output(stream, tail, window, chunk, result):
+              window = (window + chunk)[-131072:]
+              result["caught_transport"] = result.get("caught_transport", False) or bool(re.search(
+                  rb"VppTransportSocketIOError|Vpp\s+dead\b", window, re.I))
+              result["fatal_diagnostic"] = result.get("fatal_diagnostic", False) or fatal_diagnostic(
+                  window.decode(errors="replace"))
+              tail.extend(chunk)
+              del tail[:-8 * 1024 * 1024]
+              stream.seek(0)
+              stream.write(tail)
+              stream.truncate()
+              stream.flush()
+              return window
+
+          def publish_command_result(status, result, caught_transport):
+              if result["cleanup"]["survivors"]:
+                  result["outcome"] = "cleanup-failed"
+              result["caught_transport"] = caught_transport
+              if caught_transport:
+                  result["outcome"] = "transport-failure"
+              if result.get("fatal_diagnostic"):
+                  result["outcome"] = "fatal-diagnostic"
+              result["end"] = time.time()
+              publish_json(status, result)
+
+          def command(label, args, env=None, seconds=300):
+              directory = Path(os.environ["EVIDENCE_DIR"]) / label
+              directory.mkdir()
+              inherited = os.environ if env is None else env
+              result, deadline = initialize_command(directory, args, seconds, inherited)
+              status = directory / "result.json"
+              limit, command_id, ancestors = result["deadline"], result["command_id"], result["ancestors"]
+              tail, process, tracked = bytearray(), None, {}
+              diagnostic_window = b""
+              caught_transport = False
+              baseline = {pid: birth for pid, (_, birth) in process_table().items()}
+              poller = selectors.DefaultSelector()
+              try:
+                  require(ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0,
+                          "Cannot become child subreaper")
+                  if time.monotonic() >= deadline:
+                      raise TimeoutError("Command budget exhausted before spawn")
+                  reference = {"result": str(status.relative_to(Path(os.environ["EVIDENCE_DIR"]))),
+                               "command_id": command_id}
+                  environment = dict(inherited, DTLS_PHASE_DEADLINE=str(limit),
+                                     DTLS_COMMAND_ANCESTORS=json.dumps(ancestors + [reference]))
+                  process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                             env=environment, start_new_session=True)
+                  tracked[process.pid] = process_table().get(process.pid, (0, -1))[1]
+                  os.set_blocking(process.stdout.fileno(), False)
+                  poller.register(process.stdout, selectors.EVENT_READ)
+                  with (directory / "console.log").open("w+b") as stream:
+                      while poller.get_map() or process.poll() is None:
+                          descendants(tracked, baseline)
+                          remaining = deadline - time.monotonic()
+                          if remaining <= 0:
+                              raise TimeoutError("Absolute command deadline exceeded")
+                          for key, _ in poller.select(min(0.1, remaining)):
+                              chunk = os.read(key.fd, 65536)
+                              if not chunk:
+                                  poller.unregister(key.fileobj)
+                                  continue
+                              diagnostic_window = update_command_output(
+                                  stream, tail, diagnostic_window, chunk, result)
+                              caught_transport |= result.get("caught_transport", False)
+                  result["rc"] = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+                  result["completion"] = reap_completed_descendants(process.pid, tracked, baseline, deadline)
+                  if result["completion"]["deadline_exceeded"]:
+                      raise TimeoutError("Completion deadline exceeded: " + result["completion"]["deadline_exceeded"])
+                  require(not result["completion"]["unresolved"] and not result["completion"]["remaining"],
+                          "Command left live or unresolved descendant processes after completion")
+                  result["outcome"] = "success" if result["rc"] == 0 else "nonzero"
+              except BaseException as error:
+                  result["outcome"] = "timeout" if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)) else "exception"
+                  result["exception"] = {"type": type(error).__name__, "message": str(error),
+                                         "traceback": traceback.format_exc()}
+              finally:
+                  try:
+                      result["cleanup"] = cleanup(process, tracked, baseline)
+                  except BaseException as error:
+                      result["cleanup"] = {"survivors": sorted(descendants(tracked, baseline)),
+                                           "exception": {"type": type(error).__name__, "message": str(error)}}
+                      result["outcome"] = "cleanup-failed"
+                  finally:
+                      if process is not None:
+                          result["rc"] = process.returncode
+                          process.stdout.close()
+                      poller.close()
+                      publish_command_result(status, result, caught_transport)
+              record_interruptions(status, result)
+              if result["outcome"] not in ("success", "nonzero"):
+                  raise RuntimeError(f"{label}: {result['outcome']}; see {status}")
+              return directory, result["rc"], tail.decode(errors="replace")
+
+          def verify(variant):
+              candidate = os.environ["CANDIDATE_SHA"]
+              require(git("rev-parse", "HEAD") == candidate, "Candidate HEAD changed")
+              original = subprocess.check_output(["git", "show", f"{candidate}:{SOURCE}"])
+              expected = restored(original) if variant == "restored" else original
+              require(Path(SOURCE).read_bytes() == expected, "Unexpected TLS source bytes")
+              require(git("diff", "--name-only").splitlines() == ([SOURCE] if variant == "restored" else []),
+                      "Unexpected tracked tree changes")
+              require(not git("diff", "--cached", "--name-only"), "Unexpected staged changes")
+              for path in TESTS:
+                  require(git("hash-object", path) == blob(candidate, path), f"Changed test/tool: {path}")
+
+          def initialize():
+              output = Path(os.environ["EVIDENCE_DIR"])
+              phases = {name: {"outcome": "skipped", "reason": "not reached"} for name in
+                        ("fixtures", "prepare", "dependencies", "checks", "python", "select",
+                         "version", "build", "tests", "collect")}
+              (output / "phases.json").write_text(json.dumps(phases, indent=2))
+              candidate = os.environ["CANDIDATE_SHA"]
+              workflow_sha = os.environ["WORKFLOW_SHA"]
+              manifest = {"workflow_sha": workflow_sha, "workflow_blob": blob(workflow_sha, WORKFLOW),
+                          "source": {"path": SOURCE, "candidate_blob": blob(candidate, SOURCE)},
+                          "work_deadline": os.environ["DTLS_WORK_DEADLINE"],
+                          "candidate_sha": candidate, "candidate_tree": git("rev-parse", f"{candidate}^{{tree}}"),
+                          "frozen_sha": os.environ["FROZEN_SHA"], "variant": os.environ["CONTROL_VARIANT"],
+                          "tests": {p: blob(candidate, p) for p in TESTS},
+                          "tools_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                                           for p in sorted(Path(os.environ["CONTROL_DIR"]).glob("*.py"))},
+                          "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                          "job": os.environ["GITHUB_JOB"],
+                          "artifact_name": f"dtls-{os.environ['CONTROL_VARIANT']}-"
+                                           f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
+                          "run_url": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+                                     f"/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+                          "expected_negative_witness": WITNESS,
+                          "limits": {"successful_handshake": "unproven", "cross_worker_migration": "unproven",
+                                     "isolated_unnamed_async1_negative": "pending: named async0 returns first"}}
+              (output / "initial-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+              (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+          def phase(name, seconds, args):
+              path = Path(os.environ["EVIDENCE_DIR"]) / "phases.json"
+              phases = json.loads(path.read_text())
+              phases[name] = {"outcome": "running", "start": time.time(), "command": args}
+              path.write_text(json.dumps(phases, indent=2))
+              try:
+                  directory, rc, _ = command("phase-" + name, args, seconds=seconds)
+                  result = json.loads((directory / "result.json").read_text())
+                  phases[name].update(result)
+                  require(rc == 0, f"Phase {name} failed: {rc}")
+              except BaseException as error:
+                  phases[name].update(outcome="failed", exception={"type": type(error).__name__,
+                                                               "message": str(error)})
+                  raise
+              finally:
+                  phases[name]["end"] = time.time()
+                  path.write_text(json.dumps(phases, indent=2))
+
+          def prepare():
+              output = Path(os.environ["EVIDENCE_DIR"])
+              candidate = os.environ["CANDIDATE_SHA"]
+              require(git("rev-parse", "HEAD") == os.environ["WORKFLOW_SHA"], "Workflow checkout mismatch")
+              subprocess.run(["git", "checkout", "--detach", candidate], check=True)
+              require(not git("status", "--porcelain", "--untracked-files=all"), "Dirty candidate checkout")
+              for path in ("build-root/build-vpp_debug-native", "build-root/install-vpp_debug-native",
+                           "build-root/test/venv", "build-root/.ccache"):
+                  require(not Path(path).exists(), f"Build is not independent: {path}")
+              verify("fixed")
+              (output / "assessment.txt").write_text(
+                  "Fixed gates both original ASF classes and their four-mode OpenSSL loops.\n"
+                  "Restored source differs only at the immediate nested UDP error cleanup call.\n"
+                  "Migration flags, detach/attach code, and all product tests remain unchanged.\n"
+                  "Restored named async0 iteration0 returns before unnamed async1.\n"
+                  "Isolated unnamed async1 retained-pointer runtime witness remains pending.\n"
+                  "Successful DTLS handshake and actual cross-worker migration remain unproven.\n")
+
+          def select_variant():
+              verify("fixed")
+              if os.environ["CONTROL_VARIANT"] == "restored":
+                  Path(SOURCE).write_bytes(restored(Path(SOURCE).read_bytes()))
+              verify(os.environ["CONTROL_VARIANT"])
+              output = Path(os.environ["EVIDENCE_DIR"])
+              manifest_path = output / "manifest.json"
+              manifest = json.loads(manifest_path.read_text())
+              index = Path(os.environ["CONTROL_DIR"]) / "tree-index"
+              environment = dict(os.environ, GIT_INDEX_FILE=str(index))
+              subprocess.run(["git", "read-tree", os.environ["CANDIDATE_SHA"]], env=environment, check=True)
+              subprocess.run(["git", "add", SOURCE], env=environment, check=True)
+              manifest["built_tree"] = subprocess.check_output(
+                  ["git", "write-tree"], env=environment, text=True).strip()
+              manifest["source"] = {"path": SOURCE, "candidate_blob": blob(os.environ["CANDIDATE_SHA"], SOURCE),
+                                    "built_blob": git("hash-object", SOURCE)}
+              manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+              (output / "restoration.diff").write_text(git("diff", "--", SOURCE) + "\n")
+
+          def bounded_text(paths):
+              chunks = []
+              remaining = 8 * 1024 * 1024
+              for path in sorted(paths):
+                  if path.is_symlink() or not path.is_file():
+                      continue
+                  size = path.stat().st_size
+                  require(size <= remaining, "Classifier input exceeds 8 MiB; refusing partial evidence")
+                  chunks.append(path.read_text(errors="replace"))
+                  remaining -= size
+              return "\n".join(chunks)
+
+          def tests():
+              output = Path(os.environ["EVIDENCE_DIR"])
+              variant = os.environ["CONTROL_VARIANT"]
+              errors = []
+              for cls, workers in (("TestDTLSCleanup", 0), ("TestDTLSCleanupWorker", 1)):
+                  verify(variant)
+                  label = f"test-{cls}"
+                  events_path = output / f"{label}-events.jsonl"
+                  environment = dict(os.environ, DTLS_EVENTS=str(events_path),
+                                     DTLS_PROVIDER=str(Path("test/vpp_papi_provider.py").resolve()),
+                                     PYTHONPATH=os.environ["CONTROL_DIR"] + os.pathsep + os.environ.get("PYTHONPATH", ""))
+                  args = ["make", "UNATTENDED=yes", "UV=", "TEST_JOBS=1", "FORCE_FOREGROUND=1",
+                          "RETRIES=0", "FAILFAST=0", "SKIP_TESTS=", "VPP_EXCLUDED_PLUGINS=", "COREDUMP_SIZE=0",
+                          "COMPRESS_FAILED_TEST_LOGS=no", "DECODE_PCAPS=none", "RND_SEED=49",
+                          f"TEST=tls.{cls}.test_dtls_cleanup", "test-debug"]
+                  directory, rc, console = command(label, args, environment)
+                  collect(directory / "diagnostics")
+                  try:
+                      verify(variant)
+                      logs = bounded_text(Path("/tmp").glob("vpp-unittest-*/log.txt"))
+                      stderr = bounded_text(Path("/tmp").glob("vpp-unittest-*/vpp_stderr.txt"))
+                      events = [json.loads(line) for line in events_path.read_text().splitlines()]
+                      validate(variant, cls, workers, rc, console, logs, stderr, events)
+                  except (AssertionError, OSError, ValueError, KeyError, TypeError) as error:
+                      errors.append(f"{cls}: {error}")
+                      (directory / "validation.txt").write_text(f"FAIL: {error}\n")
+                  else:
+                      (directory / "validation.txt").write_text("PASS\n")
+              require(not errors, "\n".join(errors))
+
+          def fixtures():
+              for cls, workers in (("TestDTLSCleanup", 0), ("TestDTLSCleanupWorker", 1)):
+                  for variant in ("fixed", "restored"):
+                      identity = f"test_tls.{cls}.test_dtls_cleanup"
+                      reply = (f"DTLS cleanup: 4 modes passed on thread {workers}\nSUCCESS\n"
+                               if variant == "fixed" else WITNESS + "\nSession unit test failed")
+                      callback = "addSuccess" if variant == "fixed" else "addFailure"
+                      trace = ("self.assertEqual(response.retval, 0, response.reply)\n"
+                               "AssertionError: -1 != 0 : " + reply)
+                      events = [{"kind": "loaded", "pid": 1},
+                                {"kind": "startTest", "pid": 1, "test": identity, "workers": workers},
+                                {"kind": "cli", "pid": 1, "test": identity,
+                                 "retval": 0 if variant == "fixed" else -1, "reply": reply},
+                                {"kind": callback, "pid": 1, "test": identity,
+                                 "exception": "AssertionError", "traceback": trace},
+                                {"kind": "stopTest", "pid": 1, "test": identity}]
+                      rc = 0 if variant == "fixed" else 2
+                      console = "Ran 1 test in 0.1s\n" + ("OK\n" if variant == "fixed" else "FAILED (failures=1)\n")
+                      logs = f"--- {callback}() {cls}.test_dtls_cleanup(doc) called"
+                      stderr = "" if variant == "fixed" else "test session: Session unit test failed"
+                      validate(variant, cls, workers, rc, console, logs, stderr, events)
+                      mutations = [events[:-1], events + [events[3]], events[:2] + events[3:]]
+                      for index, key, value in ((1, "workers", 1 - workers),
+                                                (2, "reply", "unrelated error"),
+                                                (2, "retval", -156),
+                                                (3, "kind", "addError"),
+                                                (3, "kind", "addSkip"),
+                                                (3, "exception", "CliFailedCommandError"),
+                                                (3, "traceback", "AssertionError: unrelated")):
+                          if variant == "fixed" and key in ("exception", "traceback"):
+                              continue
+                          bad = [dict(event) for event in events]
+                          bad[index][key] = value
+                          mutations.append(bad)
+                      for bad in mutations:
+                          try:
+                              validate(variant, cls, workers, rc, console, logs, stderr, bad)
+                          except AssertionError:
+                              pass
+                          else:
+                              raise AssertionError("Accepted incomplete or duplicate lifecycle")
+                      for bad_console in ("", console + "SIGSEGV", console + "timed out"):
+                          try:
+                              validate(variant, cls, workers, rc, bad_console, logs, stderr, events)
+                          except AssertionError:
+                              pass
+                          else:
+                              raise AssertionError("Accepted invalid completion")
+                      for channel in range(3):
+                          orderly = [console, logs, stderr]
+                          orderly[channel] += "\nreceived signal SIGTERM, PC 0x1\nreceived SIGTERM from PID 1 UID 0, exiting..."
+                          validate(variant, cls, workers, rc, *orderly, events)
+                          for diagnostic in ("VppTransportSocketIOError: Vpp dead. Cannot log show commands.",
+                                             "Vpp dead", "caught VppTransportSocketIOError",
+                                             "received signal SIGABRT, PC 0x1", "received signal SIGBUS, PC 0x1",
+                                             "received signal SIGILL, PC 0x1", "received signal SIGFPE, PC 0x1",
+                                             "Aborted", "Bus error (core dumped)", "received signal SIGSEGV, PC 0x1",
+                                             "received signal SIGQUIT, PC 0x1", "received signal SIGINT, PC 0x1",
+                                             "received signal SIGHUP, PC 0x1"):
+                              channels = [console, logs, stderr]
+                              channels[channel] += "\n" + diagnostic
+                              try:
+                                  validate(variant, cls, workers, rc, *channels, events)
+                              except AssertionError:
+                                  pass
+                              else:
+                                  raise AssertionError("Accepted caught transport teardown failure")
+                      for bad_rc in (-11, 124, 137):
+                          try:
+                              validate(variant, cls, workers, bad_rc, console, logs, stderr, events)
+                          except AssertionError:
+                              pass
+                          else:
+                              raise AssertionError("Accepted signal or timeout status")
+              require(restored(BEFORE).count(AFTER) == 1, "Restoration fixture failed")
+              print("DTLS classifier lifecycle, status, crash, timeout, and restoration fixtures passed")
+
+          def observer_fixtures():
+              import io
+              import tempfile
+              import unittest
+              from types import SimpleNamespace
+
+              with tempfile.TemporaryDirectory(dir=os.environ["CONTROL_DIR"]) as directory:
+                  path = Path(directory) / "events.jsonl"
+                  provider = str(Path(directory) / "provider.py")
+                  environment = dict(os.environ, DTLS_EVENTS=str(path), DTLS_PROVIDER=provider)
+                  script = '''
+          import io
+          import unittest
+          from types import SimpleNamespace
+          provider = compile('def cli_return_response(cli):\\n return SimpleNamespace(retval=-1, reply="actual reply")\\n',
+                             __import__('os').environ['DTLS_PROVIDER'], 'exec')
+          namespace = {'SimpleNamespace': SimpleNamespace}
+          exec(provider, namespace)
+          class Example(unittest.TestCase):
+              def get_vpp_worker_count(self):
+                  return 1
+              def test_success(self):
+                  response = namespace['cli_return_response']('test session dtls-cleanup')
+                  self.assertEqual(response.retval, -1)
+                  self.assertEqual(response.reply, 'actual reply')
+              def test_failure(self):
+                  self.assertEqual(1, 0, 'original failure')
+              def test_error(self):
+                  raise ValueError('original error')
+          result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.defaultTestLoader.loadTestsFromTestCase(Example))
+          assert result.testsRun == 3
+          assert len(result.failures) == 1 and 'AssertionError: 1 != 0 : original failure' in result.failures[0][1]
+          assert len(result.errors) == 1 and 'ValueError: original error' in result.errors[0][1]
+          '''
+                  subprocess.run([sys.executable, "-c", script], env=dict(
+                      environment, PYTHONPATH=os.environ["CONTROL_DIR"]), check=True)
+                  events = [json.loads(line) for line in path.read_text().splitlines()]
+                  kinds = [event["kind"] for event in events]
+                  require(kinds.count("startTest") == kinds.count("stopTest") == 3,
+                          "Observer changed lifecycle")
+                  require(all(kinds.count(kind) == 1 for kind in ("addSuccess", "addFailure", "addError", "cli")),
+                          "Observer changed actual unittest outcomes")
+                  reply = next(event for event in events if event["kind"] == "cli")
+                  require(reply["retval"] == -1 and reply["reply"] == "actual reply",
+                          "Observer changed actual CLI response")
+              print("Delegated observer preserved actual success, failure, exception, and CLI reply")
+
+          def nested_deadline_fixtures():
+              output = Path(os.environ["EVIDENCE_DIR"])
+              control = str(Path(os.environ["CONTROL_DIR"]) / "control.py")
+              for number in range(2):
+                  name = f"deadline-proof-{number}"
+                  label = f"nested-proof-{number}"
+                  try:
+                      phase(name, 0.3, [sys.executable, control, label, sys.executable, "-c",
+                                       "import os,time;os.close(1);os.close(2);time.sleep(60)"])
+                  except RuntimeError:
+                      pass
+                  else:
+                      raise AssertionError("Nested deadline unexpectedly succeeded")
+                  parent_path = output / ("phase-" + name) / "result.json"
+                  parent = json.loads(parent_path.read_text())
+                  require(parent["outcome"] == "timeout" and not parent["cleanup"]["survivors"],
+                          "Nested deadline did not complete parent cleanup")
+                  child_path = output / label / "result.json"
+                  raw = child_path.read_bytes()
+                  child = json.loads(raw)
+                  if child["outcome"] == "running":
+                      interrupted = json.loads((child_path.parent / "interruption.json").read_text())
+                      require(interrupted["outcome"] == "interrupted-by-parent"
+                              and interrupted["parent"]["command_id"] == parent["command_id"]
+                              and interrupted["parent"]["result"] == str(parent_path.relative_to(output))
+                              and interrupted["observed_at"] >= parent["end"]
+                              and interrupted["raw_result_sha256"] == hashlib.sha256(raw).hexdigest()
+                              and interrupted["rc"] is None and interrupted["cleanup"] is None
+                              and interrupted["unknowns"] and child["rc"] is None
+                              and child["cleanup"] is None and "end" not in child,
+                              "Missing authoritative interruption evidence")
+                  else:
+                      require("end" in child and child["cleanup"] is not None,
+                              "Nested command has no terminal evidence")
+                  reference = {"result": str(parent_path.relative_to(output)),
+                               "command_id": parent["command_id"]}
+                  fixtures = {f"completed-proof-{number}": {"ancestors": [reference], "outcome": "success", "end": 1},
+                              f"unrelated-proof-{number}": {"ancestors": [], "outcome": "running"}}
+                  for fixture_name, record in fixtures.items():
+                      directory = output / fixture_name
+                      directory.mkdir()
+                      fixture_path = directory / "result.json"
+                      fixture_raw = (json.dumps(record) + "\n").encode()
+                      fixture_path.write_bytes(fixture_raw)
+                      record_interruptions(parent_path, parent)
+                      require(fixture_path.read_bytes() == fixture_raw
+                              and not (directory / "interruption.json").exists(),
+                              "Completed or unrelated evidence changed")
+                  record_interruptions(parent_path, parent)
+                  require(child_path.read_bytes() == raw, "Nested raw evidence was overwritten")
+              print("Actual nested deadlines preserve raw/unknown status with authoritative parent interruption")
+
+          def publication_script():
+              return (
+                  "import json,runpy,sys,time\nfrom pathlib import Path\n"
+                  "space=runpy.run_path(sys.argv[1],run_name='publication_fixture')\n"
+                  "original=Path.write_text\n"
+                  "def partial(path,data,*args,**kwargs):\n"
+                  " if path.name.startswith('.result.json.') and ('end' in json.loads(data)) == (sys.argv[3]=='terminal'):\n"
+                  "  with path.open('w') as stream:\n"
+                  "   stream.write('{');stream.flush()\n"
+                  "   (path.parent/'publication-ready').write_bytes(b'ready')\n"
+                  "   time.sleep(60)\n"
+                  " return original(path,data,*args,**kwargs)\n"
+                  "Path.write_text=partial\n"
+                  "space['command'](sys.argv[2],[sys.executable,'-c','pass'])\n")
+
+          def check_publication(parent_path, directory, mode):
+              output = Path(os.environ["EVIDENCE_DIR"])
+              parent = json.loads(parent_path.read_bytes())
+              interrupted = json.loads((directory / "interruption.json").read_bytes())
+              reference = {"result": str(parent_path.relative_to(output)), "command_id": parent["command_id"]}
+              require((directory / "publication-ready").read_bytes() == b"ready"
+                      and any(path.read_bytes() == b"{" for path in directory.glob(".result.json.*.tmp")),
+                      "Fixture missed partial publication window")
+              require(parent["outcome"] == "timeout" and not parent["cleanup"]["survivors"]
+                      and interrupted["parent"] == reference and interrupted["observed_at"] >= parent["end"]
+                      and interrupted["rc"] is None and interrupted["cleanup"] is None
+                      and interrupted["spawned"] is None, "Missing parent attribution or unknowns")
+              if mode == "terminal":
+                  raw = (directory / "result.json").read_bytes()
+                  child = json.loads(raw)
+                  require(child["outcome"] == "running" and "end" not in child and child["rc"] is None
+                          and child["cleanup"] is None and interrupted["raw_result_sha256"] == hashlib.sha256(raw).hexdigest(),
+                          "Atomic terminal publication lost complete running evidence")
+              else:
+                  owner_raw = (directory / "ownership.json").read_bytes()
+                  require(not (directory / "result.json").exists()
+                          and interrupted["raw_result_state"] == "missing" and interrupted["raw_result_sha256"] is None
+                          and interrupted["ownership"]["sha256"] == hashlib.sha256(owner_raw).hexdigest()
+                          and any(item.get("sha256") == hashlib.sha256(b"{").hexdigest()
+                                  for item in interrupted["partial_results"]), "Missing initial publication evidence")
+              return parent
+
+          def publication_deadline_fixtures():
+              output = Path(os.environ["EVIDENCE_DIR"])
+              control = str(Path(os.environ["CONTROL_DIR"]) / "control.py")
+              for mode in ("terminal", "initial"):
+                  for number in range(3):
+                      label = f"{mode}-publication-child-{number}"
+                      args = [sys.executable, "-c", publication_script(), control, label, mode]
+                      if number == 2:
+                          args = [sys.executable, control, f"{mode}-publication-middle", *args]
+                      parent_path = output / f"{mode}-publication-parent-{number}" / "result.json"
+                      try:
+                          command(parent_path.parent.name, args, seconds=0.5)
+                      except RuntimeError:
+                          pass
+                      else:
+                          raise AssertionError("Interrupted publication unexpectedly completed")
+                      parent = check_publication(parent_path, output / label, mode)
+                      owner = json.loads((output / label / "ownership.json").read_bytes())
+                      require(len(owner["ancestors"]) >= (2 if number == 2 else 1)
+                              and {"result": str(parent_path.relative_to(output)), "command_id": parent["command_id"]}
+                              in owner["ancestors"], "Missing explicit grandparent ancestry")
+              return parent_path
+
+          def malformed_publication_fixtures(parent_path):
+              output = Path(os.environ["EVIDENCE_DIR"])
+              parent = json.loads(parent_path.read_bytes())
+              reference = {"result": str(parent_path.relative_to(output)), "command_id": parent["command_id"]}
+              snapshots = {}
+              cases = {"a-damaged-owned": (b"{", [reference]),
+                       "b-damaged-unowned": (b"", None),
+                       "c-damaged-wrong-id": (b"{", [dict(reference, command_id="wrong")]),
+                       "d-damaged-wrong-path": (b"{", [dict(reference, result="wrong/result.json")]),
+                       "e-damaged-owner": (b"{", "malformed"),
+                       "f-completed": ({"outcome": "success", "end": 1}, [reference]),
+                       "g-unrelated": ({"outcome": "running"}, []),
+                       "z-valid-descendant": ({"outcome": "running"}, [reference])}
+              for name, (record, ancestors) in cases.items():
+                  directory = output / name
+                  directory.mkdir()
+                  identity = {"command_id": name, "ancestors": ancestors,
+                              "result": f"{name}/result.json"}
+                  if isinstance(record, bytes):
+                      raw = record
+                  else:
+                      valid = fixture_command(identity)
+                      if record["outcome"] == "success":
+                          valid.update(outcome="success", end=3, rc=0,
+                                       cleanup={"signals": [], "reaped": [], "survivors": []})
+                      raw = json.dumps(valid).encode()
+                  (directory / "result.json").write_bytes(raw)
+                  snapshots[name] = raw
+                  if ancestors is not None:
+                      (directory / "ownership.json").write_bytes(
+                          b"{" if ancestors == "malformed" else json.dumps(identity).encode())
+              for failed_cleanup in ({"survivors": [123]}, {"survivors": [], "exception": {"type": "fixture"}}):
+                  record_interruptions(parent_path, dict(parent, cleanup=failed_cleanup))
+                  require(not (output / "a-damaged-owned/interruption.json").exists(),
+                          "Failed parent cleanup authorized attribution")
+              record_interruptions(parent_path, parent)
+              for name, raw in snapshots.items():
+                  directory = output / name
+                  require((directory / "result.json").read_bytes() == raw, "Damaged/completed raw evidence changed")
+                  require((directory / "interruption.json").exists()
+                          == (name in ("a-damaged-owned", "z-valid-descendant")),
+                          "Malformed record suppressed later scan or guessed ownership")
+              interrupted_path = output / "a-damaged-owned/interruption.json"
+              raw_sidecar = interrupted_path.read_bytes()
+              interrupted = json.loads(raw_sidecar)
+              require(interrupted["raw_result_state"] == "malformed" and interrupted["ownership"]
+                      and interrupted["rc"] is None and interrupted["cleanup"] is None
+                      and interrupted["raw_result_sha256"] == hashlib.sha256(b"{").hexdigest(),
+                      "Damaged result attribution fabricated child completion")
+              record_interruptions(parent_path, parent)
+              require(interrupted_path.read_bytes() == raw_sidecar, "Existing interruption changed")
+              errors = json.loads((parent_path.parent / "attribution-errors.json").read_bytes())
+              require({f"{name}/result.json" for name in cases if name[:1] in "abcde"}
+                      <= {item["result"] for item in errors}
+                      and any(not item["ownership_recovered"] for item in errors),
+                      "Missing bounded malformed ownership diagnostics")
+              print("Atomic interrupted publication twice/grandparent, damaged raw isolation and ownership guards passed")
+
+          def missing_result_guards(parent_path):
+              output = Path(os.environ["EVIDENCE_DIR"])
+              parent = json.loads(parent_path.read_bytes())
+              reference = {"result": str(parent_path.relative_to(output)), "command_id": parent["command_id"]}
+              cases = {"missing-owned": [reference], "missing-wrong-id": [dict(reference, command_id="wrong")],
+                       "missing-wrong-path": [dict(reference, result="wrong/result.json")],
+                       "missing-unrelated": [], "missing-damaged": None,
+                       "missing-owner-result-mismatch": [reference]}
+              snapshots = {}
+              for name, ancestors in cases.items():
+                  directory = output / name
+                  directory.mkdir()
+                  result_path = "wrong/result.json" if name == "missing-owner-result-mismatch" else f"{name}/result.json"
+                  raw = b"{" if ancestors is None else json.dumps(
+                      {"result": result_path, "command_id": name, "ancestors": ancestors}).encode()
+                  (directory / "ownership.json").write_bytes(raw)
+                  snapshots[name] = raw
+              for cleanup_failure in ({"survivors": [123]}, {"survivors": [], "exception": {"type": "fixture"}}):
+                  record_interruptions(parent_path, dict(parent, cleanup=cleanup_failure))
+                  require(not (output / "missing-owned/interruption.json").exists(), "Cleanup failure authorized missing result")
+              record_interruptions(parent_path, parent)
+              for name, raw in snapshots.items():
+                  directory = output / name
+                  require((directory / "ownership.json").read_bytes() == raw and not (directory / "result.json").exists()
+                          and (directory / "interruption.json").exists() == (name == "missing-owned"),
+                          "Missing-result ownership guessed or raw changed")
+              sidecar = output / "missing-owned/interruption.json"
+              original = sidecar.read_bytes()
+              record_interruptions(parent_path, parent)
+              require(sidecar.read_bytes() == original, "Existing missing-result interruption changed")
+
+          def fatal_stream_fixtures():
+              output = Path(os.environ["EVIDENCE_DIR"])
+              script = "import sys;print('received signal SIGABRT, PC 0x1',flush=True);sys.stdout.write('x'*(9*1024*1024))"
+              try:
+                  command("early-fatal-proof", [sys.executable, "-c", script], seconds=5)
+              except RuntimeError:
+                  pass
+              else:
+                  raise AssertionError("Early fatal diagnostic accepted")
+              result = json.loads((output / "early-fatal-proof/result.json").read_bytes())
+              tail = (output / "early-fatal-proof/console.log").read_bytes()
+              require(result["outcome"] == "fatal-diagnostic" and result["fatal_diagnostic"]
+                      and not result["cleanup"]["survivors"] and len(tail) == 8 * 1024 * 1024
+                      and b"SIGABRT" not in tail, "Truncated fatal evidence lost failure")
+
+          def fixture_command(identity):
+              return dict(identity, command=[sys.executable, "-c", "pass"], start=1, deadline=2,
+                          outcome="running", rc=None, exception=None, cleanup=None)
+
+          def invalid_state_records(identity):
+              running = fixture_command(identity)
+              completed = dict(running, outcome="success", end=3, rc=0,
+                               cleanup={"signals": [], "reaped": [], "survivors": []})
+              cases = [{key: value for key, value in running.items() if key != "outcome"}]
+              cases += [dict(running, outcome=value) for value in ([], 42, None, {}, True, "unknown")]
+              cases += [dict(running, **change) for change in (
+                  {"end": 3}, {"rc": 0}, {"cleanup": {}}, {"exception": {"type": "Error", "message": "x"}},
+                  {"caught_transport": True}, {"fatal_diagnostic": True}, {"command": "python"},
+                  {"start": "1"}, {"deadline": None}, {"rc": False}, {"caught_transport": []})]
+              cases += [dict(completed, **change) for change in (
+                  {"end": None}, {"end": "3"}, {"end": 0}, {"end": float("nan")}, {"rc": None}, {"rc": 2},
+                  {"cleanup": None}, {"cleanup": []}, {"cleanup": {"survivors": "none"}},
+                  {"cleanup": {"survivors": [], "signals": [], "reaped": "none"}},
+                  {"exception": "Error"}, {"exception": {"type": 42, "message": "x"}},
+                  {"outcome": "timeout"}, {"outcome": "exception"}, {"outcome": "cleanup-failed"},
+                  {"outcome": "transport-failure"}, {"outcome": "fatal-diagnostic"})]
+              cases.append({key: value for key, value in completed.items() if key != "end"})
+              return cases
+
+          def state_schema_fixtures(parent_path):
+              output = Path(os.environ["EVIDENCE_DIR"])
+              parent = json.loads(parent_path.read_bytes())
+              reference = {"result": str(parent_path.relative_to(output)), "command_id": parent["command_id"]}
+              snapshots = {}
+              for number, record in enumerate(invalid_state_records({"command_id": "schema", "ancestors": [reference]})):
+                  directory = output / f"schema-invalid-{number:02d}"
+                  directory.mkdir()
+                  raw = json.dumps(record).encode()
+                  (directory / "result.json").write_bytes(raw)
+                  owner = dict(command_id=record["command_id"], ancestors=[reference],
+                               result=str((directory / "result.json").relative_to(output)))
+                  owner_raw = json.dumps(owner).encode()
+                  (directory / "ownership.json").write_bytes(owner_raw)
+                  snapshots[directory] = (raw, owner_raw)
+              record_interruptions(parent_path, parent)
+              errors = json.loads((parent_path.parent / "attribution-errors.json").read_bytes())
+              diagnostics = {item["result"]: item for item in errors}
+              for directory, (raw, owner_raw) in snapshots.items():
+                  interrupted = json.loads((directory / "interruption.json").read_bytes())
+                  require((directory / "result.json").read_bytes() == raw
+                          and interrupted["raw_result_sha256"] == hashlib.sha256(raw).hexdigest()
+                          and interrupted["ownership"]["sha256"] == hashlib.sha256(owner_raw).hexdigest()
+                          and interrupted["raw_result_state"] == "malformed" and interrupted["parent"] == reference
+                          and interrupted["spawned"] is None and interrupted["rc"] is None and interrupted["cleanup"] is None
+                          and diagnostics[str((directory / "result.json").relative_to(output))]["ownership_recovered"],
+                          "Invalid state omitted diagnostic, changed raw or fabricated child state")
+              state_schema_guards(parent_path)
+              valid_state_guards(parent_path)
+              print(f"{len(snapshots)} invalid command-state schemas recovered through immutable ownership; guards passed")
+
+          def valid_state_records(reference):
+              running = fixture_command({"command_id": "valid-state", "ancestors": [reference]})
+              completed = dict(running, end=3, rc=0, cleanup={"signals": [], "reaped": [], "survivors": []})
+              exception = {"type": "ValueError", "message": "fixture"}
+              return [dict(completed, outcome="success"), dict(completed, outcome="nonzero", rc=2),
+                      dict(completed, outcome="timeout", rc=-15, exception=dict(exception, type="TimeoutError")),
+                      dict(completed, outcome="exception", rc=None, exception=exception),
+                      dict(completed, outcome="cleanup-failed", cleanup={"survivors": [], "exception": exception}),
+                      dict(completed, outcome="transport-failure", caught_transport=True),
+                      dict(completed, outcome="fatal-diagnostic", fatal_diagnostic=True)]
+
+          def valid_state_guards(parent_path):
+              output = Path(os.environ["EVIDENCE_DIR"])
+              parent = json.loads(parent_path.read_bytes())
+              reference = {"result": str(parent_path.relative_to(output)), "command_id": parent["command_id"]}
+              snapshots = {}
+              for number, record in enumerate(valid_state_records(reference)):
+                  command_state(record)
+                  directory = output / f"schema-completed-{number}"
+                  directory.mkdir()
+                  raw = json.dumps(record).encode()
+                  (directory / "result.json").write_bytes(raw)
+                  snapshots[directory] = raw
+              directory = output / "schema-existing-sidecar"
+              directory.mkdir()
+              raw = json.dumps(dict(command_id="existing", ancestors=[reference], outcome=42)).encode()
+              (directory / "result.json").write_bytes(raw)
+              (directory / "ownership.json").write_text(json.dumps(
+                  dict(command_id="existing", ancestors=[reference], result="schema-existing-sidecar/result.json")))
+              sidecar = b'{"outcome":"existing-proof"}\n'
+              (directory / "interruption.json").write_bytes(sidecar)
+              record_interruptions(parent_path, parent)
+              require(all((path / "result.json").read_bytes() == data
+                          and not (path / "interruption.json").exists() for path, data in snapshots.items())
+                      and (directory / "result.json").read_bytes() == raw
+                      and (directory / "interruption.json").read_bytes() == sidecar,
+                      "Valid completed or existing interruption evidence changed")
+
+          def state_schema_guards(parent_path):
+              output = Path(os.environ["EVIDENCE_DIR"])
+              parent = json.loads(parent_path.read_bytes())
+              reference = {"result": str(parent_path.relative_to(output)), "command_id": parent["command_id"]}
+              cases = {"schema-no-owner": None, "schema-bad-owner": b"{",
+                       "schema-wrong-id": dict(reference, command_id="wrong"),
+                       "schema-wrong-path": dict(reference, result="wrong/result.json")}
+              for name, owner in cases.items():
+                  directory = output / name
+                  directory.mkdir()
+                  (directory / "result.json").write_text(json.dumps(dict(command_id=name, ancestors=[reference], outcome=42)))
+                  if owner is not None:
+                      (directory / "ownership.json").write_bytes(owner if isinstance(owner, bytes) else json.dumps(
+                          dict(command_id=name, ancestors=[owner], result=f"{name}/result.json")).encode())
+              completed = fixture_command({"command_id": "completed", "ancestors": [reference]})
+              completed.update(outcome="success", end=3, rc=0, cleanup={"signals": [], "reaped": [], "survivors": []})
+              for name, record in (("schema-valid-completed", completed), ("schema-valid-unrelated", fixture_command(
+                      {"command_id": "unrelated", "ancestors": []})), ("zz-schema-valid-later", fixture_command(
+                      {"command_id": "later", "ancestors": [reference]}))):
+                  directory = output / name
+                  directory.mkdir()
+                  (directory / "result.json").write_text(json.dumps(record))
+              record_interruptions(parent_path, parent)
+              require(all(not (output / name / "interruption.json").exists() for name in cases)
+                      and not (output / "schema-valid-completed/interruption.json").exists()
+                      and not (output / "schema-valid-unrelated/interruption.json").exists()
+                      and (output / "zz-schema-valid-later/interruption.json").exists(), "Schema recovery bypassed ownership or blocked later record")
+
+          def publication_fixtures():
+              parent_path = publication_deadline_fixtures()
+              malformed_publication_fixtures(parent_path)
+              missing_result_guards(parent_path)
+              state_schema_fixtures(parent_path)
+              fatal_stream_fixtures()
+              print("Initial/terminal/grandparent publication, missing-result guards and persistent fatal diagnostics passed")
+
+          def identity_fixtures():
+              from types import SimpleNamespace
+              from unittest import mock
+              module = sys.modules[__name__]
+              owner = os.getpid()
+              table = {201: (owner, 31), 202: (owner, 41), 203: (owner, 60)}
+              tracked = {202: 40}
+              baseline = {201: 30, 203: 60}
+              with mock.patch.object(module, "process_table", return_value=table):
+                  require(descendants(tracked, baseline) == {201, 202}, "Owned new identities excluded")
+                  require(tracked == {201: 31, 202: 41}, "Owned identity not rediscovered")
+              state = {300: (owner, 50)}
+              handles, sent = {}, []
+              def open_handle(pid, flags=0):
+                  handle = 900 + len(handles)
+                  handles[handle] = (pid, state[pid][1])
+                  return handle
+              def send(handle, sig, info=None, flags=0):
+                  sent.append((handles[handle], int(sig)))
+              def poll():
+                  state[300] = (999, 51)
+                  return 0
+              process = SimpleNamespace(pid=300, returncode=0, poll=poll, wait=lambda timeout: 0)
+              with mock.patch.object(module, "process_table", side_effect=lambda: dict(state)), \
+                   mock.patch.object(os, "pidfd_open", side_effect=open_handle), \
+                   mock.patch.object(signal, "pidfd_send_signal", side_effect=send), \
+                   mock.patch.object(os, "close"), \
+                   mock.patch.object(os, "kill", side_effect=AssertionError("Numeric kill forbidden")), \
+                   mock.patch.object(os, "killpg", side_effect=AssertionError("Group kill forbidden")):
+                  result = cleanup(process, {300: 50}, {})
+                  require(not sent and not result["survivors"], "Signalled post-reap replacement")
+                  state[300] = (owner, 50)
+                  def replace_after_open(pid, flags=0):
+                      handle = open_handle(pid, flags)
+                      state[pid] = (999, 51)
+                      return handle
+                  with mock.patch.object(os, "pidfd_open", side_effect=replace_after_open):
+                      require(signal_process(300, 50, signal.SIGTERM, False) == (False, None),
+                              "Accepted identity replacement during handle acquisition")
+                  require(not sent, "Replacement identity received a signal")
+                  state[300] = (owner, 50)
+                  def replace_before_send(handle, sig, info=None, flags=0):
+                      state[300] = (999, 51)
+                      send(handle, sig, info, flags)
+                  with mock.patch.object(signal, "pidfd_send_signal", side_effect=replace_before_send):
+                      require(signal_process(300, 50, signal.SIGTERM, False)[0], "Held identity not signalled")
+                  require(sent == [((300, 50), int(signal.SIGTERM))], "Signal escaped held identity")
+              print("Mock identity replacements: rediscovery and pidfd-only signaling passed; zero real signals")
+
+          def completion_identity_fixtures():
+              from unittest import mock
+              module = sys.modules[__name__]
+              identities = {701: 10}
+              table = {701: (os.getpid(), 10)}
+              with mock.patch.object(module, "descendants", return_value={701}), \
+                   mock.patch.object(module, "process_table", side_effect=lambda: dict(table)), \
+                   mock.patch.object(module, "completion_process", return_value={"state": "Z"}), \
+                   mock.patch.object(os, "pidfd_open", return_value=901), mock.patch.object(os, "close"), \
+                   mock.patch.object(signal, "pidfd_send_signal", side_effect=AssertionError("Completion must not signal")), \
+                   mock.patch.object(os, "waitid") as wait:
+                  table[701] = (999, 11)
+                  report = reap_completed_descendants(700, identities, {}, time.monotonic() + 1)
+                  require(report["unresolved"] == [701] and not wait.called, "Reaped replacement identity")
+                  table[701] = (os.getpid(), 10)
+                  wait.side_effect = ChildProcessError("not an adopted child")
+                  report = reap_completed_descendants(700, identities, {}, time.monotonic() + 1)
+                  require(report["unresolved"] == [701], "Ignored unresolved child ownership")
+                  wait.reset_mock()
+                  report = reap_completed_descendants(700, identities, {}, time.monotonic() - 1)
+                  require(report["deadline_exceeded"] == "entry" and not wait.called, "Completion exceeded deadline")
+              completion_discovery_fixtures()
+              completion_deadline_fixtures()
+              print("Completion identity replacement, nonchild and deadline guards passed without real signals")
+
+          def completion_discovery_fixtures():
+              from unittest import mock
+              module = sys.modules[__name__]
+              path = Path("/proc/701/stat")
+              for error in (PermissionError("stat denied"), ValueError("invalid stat"),
+                            FileNotFoundError("gone"), ProcessLookupError("gone")):
+                  with mock.patch.object(Path, "glob", side_effect=lambda *args: iter([path])), \
+                       mock.patch.object(Path, "read_text", side_effect=error), \
+                       mock.patch.object(os, "pidfd_open", side_effect=AssertionError("Cannot open unread identity")), \
+                       mock.patch.object(os, "waitid", side_effect=AssertionError("Cannot wait unread identity")):
+                      report = reap_completed_descendants(700, {701: 10}, {}, time.monotonic() + 1)
+                      uncertain = not isinstance(error, (FileNotFoundError, ProcessLookupError))
+                      require(bool(report["unresolved"]) == uncertain
+                              and bool(report["discovery_errors"]) == uncertain,
+                              "Discovery read uncertainty became verified absence")
+                      if uncertain:
+                          require(all(record["pid"] == 701 and record["birth"] == 10
+                                      and record["error"]["type"] == type(error).__name__
+                                      for record in report["discovery_errors"]), "Missing discovery error identity")
+                      unrelated = reap_completed_descendants(700, {}, {}, time.monotonic() + 1)
+                      require(not unrelated["unresolved"] and not unrelated["discovery_errors"],
+                              "Unrelated unread identity authorized completion ownership")
+              raw = "701 (fixture) " + " ".join(["Z", str(os.getpid())] + ["0"] * 17 + ["10"])
+              with mock.patch.object(Path, "glob", side_effect=lambda *args: iter([path])), \
+                   mock.patch.object(Path, "read_text", side_effect=[raw, PermissionError("final stat denied")]), \
+                   mock.patch.object(os, "pidfd_open", side_effect=ProcessLookupError("gone after capture")):
+                  report = reap_completed_descendants(700, {701: 10}, {}, time.monotonic() + 1)
+                  require(report["unresolved"] == [701] and report["discovery_errors"][0]["stage"] == "final",
+                          "Final discovery uncertainty or captured disappearance was lost")
+              for error in (PermissionError("omitted unread identity"), FileNotFoundError("omitted absent identity")):
+                  with mock.patch.object(Path, "glob", return_value=[]), \
+                       mock.patch.object(Path, "read_text", side_effect=error):
+                      report = reap_completed_descendants(700, {701: 10}, {}, time.monotonic() + 1)
+                      require(bool(report["discovery_errors"]) == isinstance(error, PermissionError),
+                              "Omitted tracked identity was not directly verified")
+              print("Completion tracked read/parse errors retained; verified absence and unrelated errors excluded")
+
+          def completion_deadline_fixtures():
+              from types import SimpleNamespace
+              from unittest import mock
+              module = sys.modules[__name__]
+              for stage in ("entry", "after-inspection", "after-wait", "after-final-discovery"):
+                  clock = [12 if stage == "entry" else 10]
+                  scans = [0]
+                  def discover(*args):
+                      scans[0] += 1
+                      if scans[0] == 2:
+                          if stage == "after-final-discovery":
+                              clock[0] = 12
+                          return set()
+                      return {701}
+                  def inspect(*args):
+                      if stage == "after-inspection":
+                          clock[0] = 12
+                      return {"state": "Z"}
+                  def wait(*args):
+                      if stage == "after-wait":
+                          clock[0] = 12
+                      return SimpleNamespace(si_pid=701, si_status=0, si_code=os.CLD_EXITED)
+                  with mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]), \
+                       mock.patch.object(module, "descendants", side_effect=discover), \
+                       mock.patch.object(module, "process_table", return_value={701: (os.getpid(), 10)}), \
+                       mock.patch.object(module, "completion_process", side_effect=inspect), \
+                       mock.patch.object(os, "pidfd_open", return_value=901) as opened, \
+                       mock.patch.object(os, "close") as closed, mock.patch.object(os, "waitid", side_effect=wait) as waited, \
+                       mock.patch.object(signal, "pidfd_send_signal", side_effect=AssertionError("Completion must not signal")), \
+                       mock.patch.object(os, "kill", side_effect=AssertionError("Numeric signal forbidden")), \
+                       mock.patch.object(os, "killpg", side_effect=AssertionError("Group signal forbidden")):
+                      report = reap_completed_descendants(700, {} if stage == "entry" else {701: 10}, {}, 11)
+                      require(report["deadline_exceeded"] == stage and opened.call_count == closed.call_count,
+                              "Completion expiry omitted terminal evidence or leaked handle")
+                      require(waited.call_count == (0 if stage in ("entry", "after-inspection") else 1),
+                              "Expired completion waited or lost actual wait evidence")
+              print("Completion absolute deadline rejects empty entry and inspection/wait/final-discovery overrun")
+
+          def completion_fixtures():
+              output = Path(os.environ["EVIDENCE_DIR"])
+              exited = ("import os,time;child=os.fork();os._exit(0) if child==0 else None;"
+                        "os.waitid(os.P_PID,child,os.WEXITED|os.WNOWAIT);print(child,flush=True);time.sleep(.2)")
+              for number in range(2):
+                  directory, rc, _ = command(f"completion-exited-{number}", [sys.executable, "-c", exited], seconds=3)
+                  result = json.loads((directory / "result.json").read_bytes())
+                  records = result["completion"]["processes"]
+                  require(rc == 0 and result["outcome"] == "success" and not result["cleanup"]["signals"]
+                          and len(records) == 1 and records[0]["state"] == "Z" and records[0]["status"] == "reaped"
+                          and records[0]["waitid"]["code"] == os.CLD_EXITED and records[0]["waitid"]["status"] == 0,
+                          "Exited owned child was not reaped without signaling")
+              live = ("import os,time;child=os.fork();"
+                      "os.close(1) if child==0 else None;os.close(2) if child==0 else None;"
+                      "time.sleep(60) if child==0 else time.sleep(.2)")
+              try:
+                  command("completion-live", [sys.executable, "-c", live], seconds=3)
+              except RuntimeError:
+                  pass
+              else:
+                  raise AssertionError("Accepted live child after root completion")
+              result = json.loads((output / "completion-live/result.json").read_bytes())
+              require(result["rc"] == 0 and result["outcome"] == "exception" and result["completion"]["unresolved"]
+                      and not result["cleanup"]["survivors"], "Cleanup masked live child failure")
+              for rc in (0, 7):
+                  _, observed, _ = command(f"completion-rc-{rc}", [sys.executable, "-c", f"raise SystemExit({rc})"], seconds=2)
+                  require(observed == rc, "Completion reaping changed root exit status")
+              completion_identity_fixtures()
+              print("Completed children reaped without signals; live descendants rejected; root rc0/7 preserved")
+
+          def runner_fixtures():
+              from unittest import mock
+              identity_fixtures()
+              prefix = "runner-fixture-"
+              command(prefix + "success", [sys.executable, "-c", "print('complete')"], seconds=2)
+              escaped = ("import os,signal,time; "
+                         "child=os.fork(); "
+                         "os.setsid() if child==0 else None; "
+                         "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+                         "print(os.getpid(),flush=True); time.sleep(60)")
+              orphan = ("import os,signal,time; child=os.fork(); "
+                        "os._exit(0) if child else None; os.setsid(); "
+                        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+                        "print(os.getpid(),flush=True); time.sleep(60)")
+              scenarios = [("timeout", [sys.executable, "-c", escaped], 0.3),
+                           ("orphan", [sys.executable, "-c", orphan], 0.3),
+                           ("spawn", ["/dtls-fixture-nonexistent"], 1)]
+              for name, args, seconds in scenarios:
+                  begin = time.monotonic()
+                  try:
+                      command(prefix + name, args, seconds=seconds)
+                  except RuntimeError:
+                      pass
+                  else:
+                      raise AssertionError(f"Accepted {name}")
+                  result = json.loads((Path(os.environ["EVIDENCE_DIR"]) / (prefix + name) / "result.json").read_text())
+                  require(result["exception"] and not result["cleanup"]["survivors"], "Incomplete exception cleanup")
+                  require(time.monotonic() - begin < 7, "Cleanup exceeded fixture budget")
+                  if name == "timeout":
+                      require(result["outcome"] == "timeout" and result["rc"] is not None,
+                              "Timeout did not reap command")
+                      require(len({pid for pid, _ in result["cleanup"]["signals"]}) >= 2,
+                              "Detached session descendant not signalled")
+                      require(result["cleanup"]["reaped"], "Detached descendant not reaped")
+              original_read = os.read
+              def failed_read(fd, count):
+                  if count == 65536:
+                      raise OSError("injected selector read failure")
+                  return original_read(fd, count)
+              with mock.patch.object(os, "read", side_effect=failed_read):
+                  try:
+                      command(prefix + "read", [sys.executable, "-c", "print('ready',flush=True); __import__('time').sleep(60)"], seconds=2)
+                  except RuntimeError:
+                      pass
+                  else:
+                      raise AssertionError("Accepted read exception")
+              result = json.loads((Path(os.environ["EVIDENCE_DIR"]) / (prefix + "read") / "result.json").read_text())
+              require(result["outcome"] == "exception" and result["rc"] is not None
+                      and not result["cleanup"]["survivors"], "Read exception leaked child")
+              phase_path = Path(os.environ["EVIDENCE_DIR"]) / "phases.json"
+              saved = phase_path.read_bytes()
+              try:
+                  try:
+                      phase("fixture-failure", 2, [sys.executable, "-c", "raise ValueError('fixture failure')"])
+                  except AssertionError:
+                      pass
+                  phases = json.loads(phase_path.read_text())
+                  require(phases["fixture-failure"]["exception"] and phases["prepare"]["outcome"] == "skipped",
+                          "Missing exception or skipped preparation status")
+                  require((phase_path.parent / "initial-manifest.json").is_file(), "Manifest missing before fixtures")
+              finally:
+                  phase_path.write_bytes(saved)
+              print("Runner deadlines, setsid descendant cleanup/reaping, spawn/read exceptions, phase evidence passed")
+
+          if __name__ == "__main__":
+              action = sys.argv[1]
+              if action == "initialize":
+                  initialize()
+              elif action == "phase":
+                  phase(sys.argv[2], int(sys.argv[3]), sys.argv[4:])
+              elif action == "prepare":
+                  prepare()
+              elif action == "select":
+                  select_variant()
+              elif action == "verify":
+                  verify(os.environ["CONTROL_VARIANT"])
+              elif action == "tests":
+                  tests()
+              elif action == "collect":
+                  collect(Path(os.environ["EVIDENCE_DIR"]) / "final-diagnostics")
+              elif action == "fixtures":
+                  fixtures()
+                  observer_fixtures()
+                  runner_fixtures()
+                  nested_deadline_fixtures()
+                  publication_fixtures()
+                  completion_fixtures()
+              else:
+                  _, rc, _ = command(action, sys.argv[2:])
+                  raise SystemExit(rc)
+          PY
+          export DTLS_WORK_DEADLINE=$(( $(date +%s) + 4200 ))
+          printf 'DTLS_WORK_DEADLINE=%s\n' "$DTLS_WORK_DEADLINE" >> "$GITHUB_ENV"
+          timeout --kill-after=5s 30s python3 "$CONTROL_DIR/control.py" initialize
+          python3 "$CONTROL_DIR/control.py" phase fixtures 90 python3 "$CONTROL_DIR/control.py" fixtures
+          python3 "$CONTROL_DIR/control.py" phase prepare 60 python3 "$CONTROL_DIR/control.py" prepare
+
+      - name: Install build and checkstyle dependencies on clean candidate
+        run: python3 "$CONTROL_DIR/control.py" phase dependencies 900 make UNATTENDED=yes install-dep
+
+      - name: Run source-clean C style and API checks
+        run: |
+          python3 "$CONTROL_DIR/control.py" phase checks 600 bash -s <<'SH'
+          set -euo pipefail
+          trap 'git checkout --quiet --detach "$CANDIDATE_SHA"' EXIT
+          for commit in $(git rev-list --reverse --no-merges "$FROZEN_SHA..$CANDIDATE_SHA"); do
+            git checkout --quiet --detach "$commit"
+            python3 "$CONTROL_DIR/control.py" "style-$commit" make checkstyle
+            python3 "$CONTROL_DIR/control.py" "api-$commit" make checkstyle-api
+            python3 "$CONTROL_DIR/control.py" "message-$commit" bash extras/scripts/check_commit_msg.sh
+            test -z "$(git status --porcelain --untracked-files=all)"
+          done
+          git checkout --quiet --detach "$CANDIDATE_SHA"
+          trap - EXIT
+          SH
+
+      - name: Run pinned Python checks before any source restoration
+        run: |
+          python3 "$CONTROL_DIR/control.py" phase python 600 bash -s <<'SH'
+          set -euo pipefail
+          touch test/requirements-3.txt
+          python3 "$CONTROL_DIR/control.py" python-style make UV= checkstyle-python
+          test -z "$(git status --porcelain --untracked-files=all)"
+          python3 "$CONTROL_DIR/control.py" python-tools \
+            build-root/test/venv/bin/python -m pip freeze --all
+          SH
+
+      - name: Select only the immediate error cleanup variant
+        run: python3 "$CONTROL_DIR/control.py" phase select 60 python3 "$CONTROL_DIR/control.py" select
+
+      - name: Supply and record build version
+        run: |
+          python3 "$CONTROL_DIR/control.py" phase version 60 bash -s <<'SH'
+          set -euo pipefail
+          if ! git describe --long --match 'v[0-9]*' 2>/dev/null; then
+            printf '0.0.0-release+%s.%s-g%s\n' "$(git log -1 --format=%ct)" \
+              "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)" > src/scripts/.version
+          fi
+          if [ -f src/scripts/.version ]; then
+            cp src/scripts/.version "$EVIDENCE_DIR/version.txt"
+          fi
+          python3 "$CONTROL_DIR/control.py" toolchain bash -c \
+            'uname -a; python3 --version; make --version; clang --version; git --version; dpkg-query -W'
+          SH
+
+      - name: Build debug variant independently
+        run: |
+          python3 "$CONTROL_DIR/control.py" phase build 2400 bash -s <<'SH'
+          set -euo pipefail
+          python3 "$CONTROL_DIR/control.py" verify
+          make UNATTENDED=yes build
+          python3 "$CONTROL_DIR/control.py" verify
+          SH
+
+      - name: Prepare test runtime
+        timeout-minutes: 2
+        uses: ./.github/actions/vpp-docker-runtime-setup
+        with:
+          WORKSPACE: ${{ github.workspace }}
+          SHM_SIZE: 2G
+          LOG_DIR: ${{ runner.temp }}/dtls-evidence/runtime
+
+      - name: Run unchanged main and worker regression methods
+        run: |
+          python3 "$CONTROL_DIR/control.py" phase tests 600 bash -s <<'SH'
+          set -euo pipefail
+          mountpoint /dev/shm
+          test "$(df -B1 --output=size /dev/shm | tail -n 1)" -ge 2147483648
+          python3 "$CONTROL_DIR/control.py" tests
+          SH
+
+      - name: Retain bounded diagnostics and tools on every outcome
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          if [ -d "$CONTROL_DIR" ]; then
+            for tool in "$CONTROL_DIR/"*.py; do
+              [ ! -f "$tool" ] || cp "$tool" "$EVIDENCE_DIR/"
+            done
+          fi
+          if [ -f "$CONTROL_DIR/control.py" ] && [ -f "$EVIDENCE_DIR/phases.json" ]; then
+            DTLS_WORK_DEADLINE=$(( $(date +%s) + 60 )) \
+              python3 "$CONTROL_DIR/control.py" phase collect 45 python3 "$CONTROL_DIR/control.py" collect || true
+          fi
+          timeout --kill-after=2s 5s git status --short > "$EVIDENCE_DIR/final-git-status.txt" || true
+          timeout --kill-after=2s 5s git diff -- src/vnet/tls/tls.c > "$EVIDENCE_DIR/final-restoration.diff" || true
+
+      - name: Upload immutable run evidence
+        id: evidence
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtls-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dtls-evidence/
+          include-hidden-files: true
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 6
+
+      - name: Record artifact identity and pending coverage
+        if: always()
+        env:
+          ARTIFACT_ID: ${{ steps.evidence.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.evidence.outputs.artifact-url }}
+        run: |
+          printf 'Artifact ID: %s\nArtifact URL: %s\n' "$ARTIFACT_ID" "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' 'Successful handshake, cross-worker migration, and isolated restored unnamed async1 pointer witness remain unproven.' >> "$GITHUB_STEP_SUMMARY"
