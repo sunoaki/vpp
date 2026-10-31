@@ -151,7 +151,11 @@ quic_connect_connection (transport_endpoint_cfg_t *tep)
     }
   error = quic_eng_crypto_context_acquire_connect (ctx);
   if (error)
-    return error;
+    {
+      vec_free (ctx->srv_hostname);
+      quic_ctx_free (qm, ctx);
+      return error;
+    }
 
   error = vnet_connect (cargs);
   if (error)
