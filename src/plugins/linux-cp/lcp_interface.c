@@ -588,6 +588,7 @@ lcp_ns_switch_restore (lcp_ns_switch_t *sw, const char *where)
 static void
 lcp_itf_pair_delete_by_index (index_t lipi)
 {
+  vnet_sw_interface_t *si;
   u32 host_sw_if_index;
   lcp_itf_pair_t *lip;
   u8 *host_name, *ns;
@@ -600,7 +601,14 @@ lcp_itf_pair_delete_by_index (index_t lipi)
 
   lcp_itf_pair_del (lip->lip_phy_sw_if_index);
 
-  if (vnet_sw_interface_is_sub (vnet_get_main (), host_sw_if_index))
+  /*
+   * The host interface can already be gone, for example when it was
+   * cascaded away with the tap it is a sub-interface of. Both branches below
+   * delete interfaces, and vnet_sw_interface_is_sub() would resolve the freed
+   * index through pool_elt_at_index and abort. Do nothing then.
+   */
+  si = vnet_get_sw_interface_or_null (vnet_get_main (), host_sw_if_index);
+  if (si && si->sw_if_index != si->sup_sw_if_index)
     {
       lcp_ns_switch_t ns_switch;
 
@@ -613,7 +621,7 @@ lcp_itf_pair_delete_by_index (index_t lipi)
 
       vnet_delete_sub_interface (host_sw_if_index);
     }
-  else
+  else if (si)
     tap_delete_if (vlib_get_main (), host_sw_if_index);
 
   vec_free (host_name);
