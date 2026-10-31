@@ -2127,6 +2127,34 @@ for sequence in range(100, 130):
         self.vapi.cli(f"lcp delete {pg.name}")
         self.assertIsNone(self._find_lcp_pair(pg.sw_if_index))
 
+    def test_tap_phy_and_host_delete_removes_both_pairs(self):
+        """Deleting a tap that is both a host and a phy removes both pairs"""
+        self.create_pg_interfaces(range(1))
+        pg = self.pg_interfaces[0]
+
+        self.vapi.cli(f"lcp create {pg.name} host-if hdual0 netns {self.ns_name}")
+        first = self._find_lcp_pair(pg.sw_if_index)
+        self.assertIsNotNone(first, "first pair should exist")
+        self.assertTrue(interface_exists(self.ns_name, "hdual0"))
+
+        # The host tap of the first pair becomes the phy of a second one
+        shared = first.host_sw_if_index
+        self.vapi.cli(f"lcp create {shared} host-if hdual1 netns {self.ns_name}")
+        second = self._find_lcp_pair(shared)
+        self.assertIsNotNone(second, "second pair should exist")
+        self.assertEqual(second.phy_sw_if_index, shared)
+
+        self.vapi.tap_delete_v2(sw_if_index=shared)
+
+        self.assertIsNone(
+            self._find_lcp_pair(pg.sw_if_index),
+            "pair hosted on the deleted tap must be gone",
+        )
+        self.assertIsNone(
+            self._find_lcp_pair(shared),
+            "pair using the deleted tap as phy must be gone",
+        )
+
     def test_pair_vlan_subinterface(self):
         """Create LCP pairs for VLAN sub-interfaces"""
         self.create_pg_interfaces(range(1))
