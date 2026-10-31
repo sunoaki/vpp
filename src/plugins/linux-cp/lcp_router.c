@@ -595,17 +595,29 @@ lcp_router_proto_k2f (uint32_t k)
     }
 }
 
-static void
+static int
 lcp_router_mk_addr (const struct nl_addr *rna, ip_address_t *ia)
 {
+  uint32_t family = nl_addr_get_family (rna);
   fib_protocol_t fproto;
 
   ip_address_reset (ia);
-  fproto = lcp_router_proto_k2f (nl_addr_get_family (rna));
-  ASSERT (FIB_PROTOCOL_MPLS != fproto);
+
+  /* A neighbor or address message can carry an address that has no IP
+   * meaning, AF_MPLS in particular. Reject the entry instead of aborting on
+   * the assert that used to sit here. */
+  if (AF_INET != family && AF_INET6 != family)
+    {
+      LCP_ROUTER_ERROR ("ignore address of family %u", family);
+      return -1;
+    }
+
+  fproto = lcp_router_proto_k2f (family);
 
   ip_address_set (ia, nl_addr_get_binary_addr (rna),
 		  FIB_PROTOCOL_IP4 == fproto ? AF_IP4 : AF_IP6);
+
+  return 0;
 }
 
 static fib_protocol_t
@@ -659,7 +671,8 @@ lcp_router_link_addr_add_del (struct rtnl_addr *rla, int is_del)
     {
       ip_address_t nh;
 
-      lcp_router_mk_addr (rtnl_addr_get_local (rla), &nh);
+      if (lcp_router_mk_addr (rtnl_addr_get_local (rla), &nh))
+	return;
 
       if (AF_IP4 == ip_addr_version (&nh))
 	{
@@ -759,7 +772,8 @@ lcp_router_neigh_del (struct rtnl_neigh *rn)
 
       if ((rna = rtnl_neigh_get_dst (rn)) == NULL)
 	return;
-      lcp_router_mk_addr (rna, &nh);
+      if (lcp_router_mk_addr (rna, &nh))
+	return;
 
       if (ip46_address_is_multicast (&ip_addr_46 (&nh)))
 	{
@@ -814,7 +828,8 @@ lcp_router_neigh_add (struct rtnl_neigh *rn)
 
       if ((rna = rtnl_neigh_get_dst (rn)) == NULL)
 	return;
-      lcp_router_mk_addr (rna, &nh);
+      if (lcp_router_mk_addr (rna, &nh))
+	return;
 
       if (ip46_address_is_multicast (&ip_addr_46 (&nh)))
 	{
