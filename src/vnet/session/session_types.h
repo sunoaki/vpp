@@ -289,7 +289,7 @@ typedef struct session_
   /** Listener instance identity for queued cut-through connects */
   u64 ct_listener_id;
 
-    CLIB_CACHE_LINE_ALIGN_MARK (pad);
+  CLIB_CACHE_LINE_ALIGN_MARK (pad);
 } session_t;
 
 always_inline session_type_t

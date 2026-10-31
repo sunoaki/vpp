@@ -7,7 +7,7 @@
 #include <vnet/session/session.h>
 
 #define CT_TEST_PENDING 16
-#define CT_TEST_FRESH CT_TEST_PENDING
+#define CT_TEST_FRESH	CT_TEST_PENDING
 
 typedef enum
 {
@@ -135,8 +135,8 @@ ct_test_attach (char *name, u8 local, u32 *app_index)
   int rv;
 
   options[APP_OPTIONS_FLAGS] = APP_OPTIONS_FLAGS_IS_BUILTIN;
-  options[APP_OPTIONS_FLAGS] |= local ? APP_OPTIONS_FLAGS_USE_LOCAL_SCOPE :
-					    APP_OPTIONS_FLAGS_USE_GLOBAL_SCOPE;
+  options[APP_OPTIONS_FLAGS] |=
+    local ? APP_OPTIONS_FLAGS_USE_LOCAL_SCOPE : APP_OPTIONS_FLAGS_USE_GLOBAL_SCOPE;
   options[APP_OPTIONS_ADD_SEGMENT_SIZE] = 16 << 20;
   rv = vnet_application_attach (&args);
   vec_free (args.name);
@@ -168,10 +168,10 @@ ct_test_fifo_count (app_worker_t *wrk)
   pool_foreach (fs, sm->segments)
     count += fifo_segment_num_fifos (fs);
   hash_foreach_pair (entry, wrk->listeners_table, ({
-    sm = segment_manager_get (entry->value[0]);
-    pool_foreach (fs, sm->segments)
-      count += fifo_segment_num_fifos (fs);
-  }));
+		       sm = segment_manager_get (entry->value[0]);
+		       pool_foreach (fs, sm->segments)
+			 count += fifo_segment_num_fifos (fs);
+		     }));
   return count;
 }
 
@@ -387,8 +387,7 @@ ct_test_cleanup (vlib_main_t *vm, ct_listener_test_t *state)
   clib_error_t *error;
   u32 role;
 
-  if ((error = ct_test_wait_requests (vm, state)) ||
-      (error = ct_test_close_client (state)))
+  if ((error = ct_test_wait_requests (vm, state)) || (error = ct_test_close_client (state)))
     return error;
   if (state->unlisten.handle != SESSION_INVALID_HANDLE)
     {
@@ -420,11 +419,10 @@ ct_test_run (vlib_main_t *vm, ct_listener_test_t *state, u8 same_endpoint, u8 sa
 
   if ((error = ct_test_queue_stale (state)) ||
       (error = ct_test_replace_listener (state, same_endpoint, same_app)) ||
-      (error = ct_test_wait_requests (vm, state)) ||
-      (error = ct_test_verify_completions (state)) ||
+      (error = ct_test_wait_requests (vm, state)) || (error = ct_test_verify_completions (state)) ||
       (error = ct_test_close_client (state)) ||
-      (error = ct_test_wait_baseline (vm, state->listening_sessions,
-				      state->listening_connections)) ||
+      (error =
+	 ct_test_wait_baseline (vm, state->listening_sessions, state->listening_connections)) ||
       (error = ct_test_verify_fifos (state)))
     return error;
   return ct_test_verify_completions (state);
@@ -452,12 +450,12 @@ ct_test_replacement (vlib_main_t *vm, u8 local, u8 same_endpoint, u8 same_app)
   if (cleanup_error)
     {
       error = clib_error_return (error, "%U; fixture retained until VPP process exit",
-				format_clib_error, cleanup_error);
+				 format_clib_error, cleanup_error);
       clib_error_free (cleanup_error);
     }
   if (error)
-    error = clib_error_return (error, "local %u endpoint %u app %u", local, same_endpoint,
-			      same_app);
+    error =
+      clib_error_return (error, "local %u endpoint %u app %u", local, same_endpoint, same_app);
   return error;
 }
 
