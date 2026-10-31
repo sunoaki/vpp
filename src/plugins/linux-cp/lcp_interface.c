@@ -366,8 +366,9 @@ lcp_itf_pair_add (u32 host_sw_if_index, u32 phy_sw_if_index, u8 *host_name,
 static clib_error_t *
 lcp_netlink_add_link_vlan (int parent, u32 vlan, u16 proto, const char *name)
 {
-  struct rtnl_link *link;
-  struct nl_sock *sk;
+  struct rtnl_link *link = NULL;
+  struct nl_sock *sk = NULL;
+  clib_error_t *error = NULL;
   int err;
 
   sk = nl_socket_alloc ();
@@ -375,7 +376,8 @@ lcp_netlink_add_link_vlan (int parent, u32 vlan, u16 proto, const char *name)
     {
       LCP_ITF_PAIR_ERR ("netlink_add_link_vlan: connect error: %s",
 			nl_geterror (err));
-      return clib_error_return (NULL, "Unable to connect socket: %d", err);
+      error = clib_error_return (NULL, "Unable to connect socket: %d", err);
+      goto done;
     }
 
   link = rtnl_link_vlan_alloc ();
@@ -389,36 +391,50 @@ lcp_netlink_add_link_vlan (int parent, u32 vlan, u16 proto, const char *name)
     {
       LCP_ITF_PAIR_ERR ("netlink_add_link_vlan: link add error: %s",
 			nl_geterror (err));
-      return clib_error_return (NULL, "Unable to add link %s: %d", name, err);
+      error = clib_error_return (NULL, "Unable to add link %s: %d", name, err);
     }
 
-  rtnl_link_put (link);
-  nl_close (sk);
+done:
+  if (link)
+    rtnl_link_put (link);
 
-  return NULL;
+  /* nl_close() only closes the descriptor, the socket handle would leak. */
+  if (sk)
+    nl_socket_free (sk);
+
+  return error;
 }
 
 static clib_error_t *
 lcp_netlink_del_link (const char *name)
 {
-  struct rtnl_link *link;
-  struct nl_sock *sk;
+  struct rtnl_link *link = NULL;
+  struct nl_sock *sk = NULL;
+  clib_error_t *error = NULL;
   int err;
 
   sk = nl_socket_alloc ();
   if ((err = nl_connect (sk, NETLINK_ROUTE)) < 0)
-    return clib_error_return (NULL, "Unable to connect socket: %d", err);
+    {
+      error = clib_error_return (NULL, "Unable to connect socket: %d", err);
+      goto done;
+    }
 
   link = rtnl_link_alloc ();
   rtnl_link_set_name (link, name);
 
   if ((err = rtnl_link_delete (sk, link)) < 0)
-    return clib_error_return (NULL, "Unable to del link %s: %d", name, err);
+    error = clib_error_return (NULL, "Unable to del link %s: %d", name, err);
 
-  rtnl_link_put (link);
-  nl_close (sk);
+done:
+  if (link)
+    rtnl_link_put (link);
 
-  return NULL;
+  /* nl_close() only closes the descriptor, the socket handle would leak. */
+  if (sk)
+    nl_socket_free (sk);
+
+  return error;
 }
 
 int
