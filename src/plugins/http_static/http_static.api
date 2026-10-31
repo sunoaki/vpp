@@ -109,8 +109,8 @@ define http_static_get_reply {
     u64 max_body_size;
     u32 rx_buff_thresh;
 
-    /* Root of the html path */
+    /* Live default root; empty for URL-only or absent default */
     string www_root[256];
-    /* The bind URI */
+    /* Live default URI normalized to http/https; empty without default */
     string uri[256];
 };

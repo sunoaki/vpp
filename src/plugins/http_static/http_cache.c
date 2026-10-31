@@ -230,13 +230,9 @@ hss_cache_do_evictions (hss_cache_t *hc)
     {
       /* pick the LRU */
       ce = pool_elt_at_index (hc->cache_pool, free_index);
-      /* Which could be in use... */
-      if (ce->inuse)
-	{
-	  if (hc->debug_level > 1)
-	    clib_warning ("index %d in use refcnt %d", free_index, ce->inuse);
-	}
       free_index = ce->prev_index;
+      if (ce->inuse)
+	continue;
       kv.key = (u64) (ce->filename);
       kv.value = ~0ULL;
       if (BV (clib_bihash_add_del) (&hc->name_to_data, &kv, 0 /* is_add */) <
@@ -286,6 +282,7 @@ hss_cache_add_and_attach (hss_cache_t *hc, u8 *path, u8 **data, u64 *data_len,
     {
       clib_warning ("Error reading '%s'", path);
       clib_error_report (error);
+      hss_cache_unlock (hc);
       return ~0;
     }
 
@@ -314,7 +311,7 @@ hss_cache_add_and_attach (hss_cache_t *hc, u8 *path, u8 **data, u64 *data_len,
 
   /* Add to the lookup table */
 
-  kv.key = (u64) vec_dup (path);
+  kv.key = (u64) ce->filename;
   kv.value = ce_index;
 
   if (hc->debug_level > 1)
@@ -349,7 +346,6 @@ hss_cache_clear (hss_cache_t *hc)
       if (ce->inuse)
 	{
 	  busy_items++;
-	  free_index = ce->next_index;
 	  continue;
 	}
       kv.key = (u64) (ce->filename);
@@ -369,7 +365,6 @@ hss_cache_clear (hss_cache_t *hc)
       if (hc->debug_level > 1)
 	clib_warning ("pool put index %d", ce - hc->cache_pool);
       pool_put (hc->cache_pool, ce);
-      free_index = hc->last_index;
     }
 
   hss_cache_unlock (hc);
@@ -393,7 +388,10 @@ hss_cache_init (hss_cache_t *hc, uword cache_size, u8 debug_level)
 void
 hss_cache_free (hss_cache_t *hc)
 {
-  hss_cache_clear (hc);
+  u32 busy_items = hss_cache_clear (hc);
+  ASSERT (busy_items == 0);
+  (void) busy_items;
+  pool_free (hc->cache_pool);
   BV (clib_bihash_free) (&hc->name_to_data);
   clib_spinlock_free (&hc->cache_lock);
 }
@@ -450,3 +448,288 @@ format_hss_cache (u8 *s, va_list *args)
 
   return s;
 }
+
+#if CLIB_DEBUG > 0
+static void
+hss_cache_test_free (hss_cache_t *hc)
+{
+  hss_cache_entry_t *ce;
+
+  pool_foreach (ce, hc->cache_pool)
+    ce->inuse = 0;
+  hss_cache_free (hc);
+}
+
+static clib_error_t *
+hss_cache_test_pressure (u8 **paths, uword limit)
+{
+  hss_cache_t hc = {};
+  hss_cache_entry_t *ce;
+  u8 *data, *modified, *saved_data[3], *saved_modified[3], *copies[3] = {};
+  u64 length, lengths[3];
+  u32 indices[3], index, i;
+  clib_error_t *error = 0;
+
+  hss_cache_init (&hc, limit, 0);
+  for (i = 0; i < 3; i++)
+    {
+      indices[i] = hss_cache_add_and_attach (&hc, paths[i], &data, &length, &modified);
+      if (indices[i] == ~0)
+	{
+	  error = clib_error_return (0, "pressure fixture could not read file %u", i);
+	  goto done;
+	}
+      if (length <= limit || !modified)
+	{
+	  error = clib_error_return (0, "pressure file %u must exceed limit %wu", i, limit);
+	  goto done;
+	}
+      saved_data[i] = data;
+      saved_modified[i] = modified;
+      lengths[i] = length;
+      copies[i] = vec_dup (data);
+      if (pool_elts (hc.cache_pool) != i + 1)
+	{
+	  error = clib_error_return (0, "busy owner recycled at limit %wu, add %u", limit, i);
+	  goto done;
+	}
+    }
+  for (i = 0; i < 3; i++)
+    {
+      ce = pool_elt_at_index (hc.cache_pool, indices[i]);
+      if (ce->inuse != 1 || ce->data != saved_data[i] || ce->last_modified != saved_modified[i] ||
+	  hss_cache_lookup (&hc, paths[i]) != indices[i] ||
+	  memcmp (ce->data, copies[i], lengths[i]))
+	{
+	  error = clib_error_return (0, "busy owner %u changed at limit %wu", i, limit);
+	  goto done;
+	}
+    }
+  hss_cache_detach_entry (&hc, indices[0]);
+  pool_elt_at_index (hc.cache_pool, indices[1])->inuse = -1;
+  index = hss_cache_add_and_attach (&hc, paths[3], &data, &length, &modified);
+  if (index == ~0)
+    {
+      error = clib_error_return (0, "pressure fixture could not read fourth file");
+      goto done;
+    }
+  if (hss_cache_lookup (&hc, paths[0]) != ~0 || pool_elts (hc.cache_pool) != 3)
+    {
+      error = clib_error_return (0, "idle owner was not reclaimed after finite busy traversal");
+      goto done;
+    }
+  for (i = 1; i < 3; i++)
+    {
+      ce = pool_elt_at_index (hc.cache_pool, indices[i]);
+      if (ce->inuse != (i == 1 ? -1 : 1) || ce->data != saved_data[i] ||
+	  memcmp (ce->data, copies[i], lengths[i]))
+	{
+	  error = clib_error_return (0, "retained owner %u changed after idle eviction", i);
+	  goto done;
+	}
+      if (i == 1)
+	ce->inuse = 1;
+      hss_cache_detach_entry (&hc, indices[i]);
+    }
+  hss_cache_detach_entry (&hc, index);
+  if (hss_cache_clear (&hc) != 0 || pool_elts (hc.cache_pool))
+    error = clib_error_return (0, "detached pressure owners did not clear");
+
+done:
+  for (i = 0; i < 3; i++)
+    vec_free (copies[i]);
+  hss_cache_test_free (&hc);
+  return error;
+}
+
+static clib_error_t *
+hss_cache_test_clear (u8 **paths)
+{
+  hss_cache_t hc;
+  hss_cache_entry_t *ce;
+  u8 *data, *modified;
+  u64 length;
+  u32 count, states, state, digits, i, index, busy, expected;
+  clib_error_t *error = 0;
+
+  for (count = 0, states = 1; count <= 4; count++, states *= 3)
+    for (state = 0; state < states; state++)
+      {
+	clib_memset (&hc, 0, sizeof (hc));
+	hss_cache_init (&hc, ~0ULL, 0);
+	busy = 0;
+	digits = state;
+	for (i = 0; i < count; i++, digits /= 3)
+	  {
+	    index = hss_cache_add_and_attach (&hc, paths[i], &data, &length, &modified);
+	    if (index == ~0)
+	      {
+		error = clib_error_return (0, "clear fixture could not read file %u", i);
+		goto failed;
+	      }
+	    ce = pool_elt_at_index (hc.cache_pool, index);
+	    ce->inuse = (int) (digits % 3) - 1;
+	    busy += ce->inuse != 0;
+	  }
+	if (hss_cache_clear (&hc) != busy || pool_elts (hc.cache_pool) != busy)
+	  {
+	    error = clib_error_return (0, "clear count/survivors differ: length %u state %u", count,
+				       state);
+	    goto failed;
+	  }
+	digits = state;
+	for (i = 0; i < count; i++, digits /= 3)
+	  {
+	    expected = digits % 3;
+	    index = hss_cache_lookup (&hc, paths[i]);
+	    if ((expected == 1) != (index == ~0))
+	      {
+		error = clib_error_return (0, "clear retained wrong file %u in state %u", i, state);
+		goto failed;
+	      }
+	    if (index != ~0 &&
+		pool_elt_at_index (hc.cache_pool, index)->inuse != (int) expected - 1)
+	      {
+		error = clib_error_return (0, "clear changed owner count in state %u", state);
+		goto failed;
+	      }
+	  }
+	hss_cache_test_free (&hc);
+      }
+  return 0;
+
+failed:
+  hss_cache_test_free (&hc);
+  return error;
+}
+
+static clib_error_t *
+hss_cache_test_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  u8 *paths[4] = {};
+  clib_error_t *error = 0;
+  u32 i;
+  u8 pressure;
+
+  if (unformat (input, "pressure"))
+    pressure = 1;
+  else if (unformat (input, "clear"))
+    pressure = 0;
+  else
+    return clib_error_return (0, "specify pressure or clear");
+  for (i = 0; i < 4; i++)
+    if (!unformat (input, "%s", &paths[i]))
+      {
+	error = clib_error_return (0, "four distinct nonempty files required");
+	goto done;
+      }
+  if (pressure)
+    {
+      error = hss_cache_test_pressure (paths, 0);
+      if (!error)
+	error = hss_cache_test_pressure (paths, 1);
+    }
+  else
+    error = hss_cache_test_clear (paths);
+  if (!error)
+    vlib_cli_output (vm, pressure ? "cache pressure: zero/finite owners passed" :
+				    "cache clear: 121 states passed");
+
+done:
+  for (i = 0; i < 4; i++)
+    vec_free (paths[i]);
+  return error;
+}
+
+VLIB_CLI_COMMAND (hss_cache_test_command, static) = {
+  .path = "test http static cache owners",
+  .short_help =
+    "test http static cache owners <pressure|clear> <file-a> <file-b> <file-c> <file-d>",
+  .function = hss_cache_test_command_fn,
+};
+
+static clib_error_t *
+hss_cache_test_read_error (u8 *invalid, u8 *valid)
+{
+  hss_cache_t hc = {};
+  u8 *data, *modified, *saved_data, *saved_modified;
+  u64 length, saved_length;
+  u32 index, reused;
+  clib_error_t *error = 0;
+
+  hss_cache_init (&hc, ~0ULL, 0);
+  index = hss_cache_add_and_attach (&hc, invalid, &data, &length, &modified);
+  if (!clib_spinlock_trylock (&hc.cache_lock))
+    {
+      /* Only this fresh, empty fixture owns the retained lock and hash. */
+      pool_free (hc.cache_pool);
+      BV (clib_bihash_free) (&hc.name_to_data);
+      clib_spinlock_free (&hc.cache_lock);
+      return clib_error_return (0, "cache read error retained lock");
+    }
+  hss_cache_unlock (&hc);
+  if (index != ~0)
+    {
+      hss_cache_detach_entry (&hc, index);
+      error = clib_error_return (0, "read-error fixture path must fail to read");
+      goto done;
+    }
+  if (pool_elts (hc.cache_pool) || hc.cache_size ||
+      hss_cache_lookup_and_attach (&hc, invalid, &data, &length, &modified) != ~0 ||
+      hss_cache_clear (&hc) != 0)
+    {
+      error = clib_error_return (0, "failed read changed empty cache");
+      goto done;
+    }
+  index = hss_cache_add_and_attach (&hc, valid, &data, &length, &modified);
+  if (index == ~0)
+    {
+      error = clib_error_return (0, "read-error fixture could not read valid file");
+      goto done;
+    }
+  saved_data = data;
+  saved_modified = modified;
+  saved_length = length;
+  hss_cache_detach_entry (&hc, index);
+  reused = hss_cache_lookup_and_attach (&hc, valid, &data, &length, &modified);
+  if (reused != index || !length || length != saved_length || data != saved_data ||
+      modified != saved_modified || pool_elts (hc.cache_pool) != 1)
+    {
+      error = clib_error_return (0, "valid owner could not be reused after failed read");
+      goto done;
+    }
+  hss_cache_detach_entry (&hc, reused);
+  if (hss_cache_clear (&hc) != 0 || pool_elts (hc.cache_pool) || hc.cache_size)
+    error = clib_error_return (0, "valid owner did not clear after failed read");
+
+done:
+  hss_cache_test_free (&hc);
+  return error;
+}
+
+static clib_error_t *
+hss_cache_test_read_error_command_fn (vlib_main_t *vm, unformat_input_t *input,
+				      vlib_cli_command_t *cmd)
+{
+  u8 *invalid = 0, *valid = 0;
+  clib_error_t *error;
+
+  if (!unformat (input, "%s %s", &invalid, &valid))
+    error = clib_error_return (0, "specify an unreadable path and a valid nonempty file");
+  else
+    {
+      error = hss_cache_test_read_error (invalid, valid);
+      if (!error)
+	vlib_cli_output (vm, "cache read error: lock released, valid owner reused and cleared");
+    }
+  vec_free (invalid);
+  vec_free (valid);
+  return error;
+}
+
+VLIB_CLI_COMMAND (hss_cache_test_read_error_command, static) = {
+  .path = "test http static cache read-error",
+  .short_help = "test http static cache read-error <unreadable-path> <valid-file>",
+  .function = hss_cache_test_read_error_command_fn,
+};
+#endif
