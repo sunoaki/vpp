@@ -965,6 +965,16 @@ def _prefix_tuple(prefix):
     return (str(iface.ip), iface.network.prefixlen)
 
 
+def _cleanup_failure(failure, logger, description, fn):
+    """Run a cleanup step without hiding the failure being propagated."""
+    try:
+        fn()
+    except Exception as exc:
+        if failure is None:
+            raise
+        logger.error("%s cleanup failed: %s", description, exc)
+
+
 @unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
 class TestLinuxCPSync(TestLinuxCPNetNSBase):
     """Linux CP VPP-to-Linux State Sync"""
@@ -2774,17 +2784,42 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
         """Permanent limited broadcast receive survives repeated real recovery"""
         self.create_pg_interfaces(range(1))
         phy = self.pg0
+        prefix = phy.local_ip4_prefix
         phy.admin_up()
-        phy.config_ip4()
-        self.vapi.cli(f"lcp create {phy.name} host-if hbcast netns {self.ns_name}")
-        host = HostInterface(self, self.ns_name, "hbcast")
-        packet = (
-            Ether(src=phy.remote_mac, dst="ff:ff:ff:ff:ff:ff")
-            / IP(src=phy.remote_ip4, dst="255.255.255.255")
-            / UDP(sport=18888, dport=18888)
-            / Raw(b"lcp broadcast ownership")
-        )
+
+        def pair_address():
+            vpp = any(
+                str(address.prefix) == prefix
+                for address in self.vapi.ip_address_dump(phy.sw_if_index, is_ipv6=False)
+            )
+            linux = _prefix_tuple(prefix) in get_interface_addresses(
+                self.ns_name, "hbcast", "inet"
+            )
+            return vpp, linux
+
+        host = None
+        address_added = False
+        failure = None
         try:
+            self.vapi.cli(f"lcp create {phy.name} host-if hbcast netns {self.ns_name}")
+            host = HostInterface(self, self.ns_name, "hbcast")
+            # Linux owns the pair address, LCP mirrors it into VPP, and the
+            # resync address sweep withdraws addresses Linux does not hold.
+            add_namespace_address(self.ns_name, "hbcast", prefix)
+            address_added = True
+            set_interface_up(self.ns_name, "hbcast")
+            self.poll_for(
+                f"{prefix} on phy and hbcast",
+                pair_address,
+                (True, True),
+                timeout=5,
+            )
+            packet = (
+                Ether(src=phy.remote_mac, dst="ff:ff:ff:ff:ff:ff")
+                / IP(src=phy.remote_ip4, dst="255.255.255.255")
+                / UDP(sport=18888, dport=18888)
+                / Raw(b"lcp broadcast ownership")
+            )
             for cycle in range(4):
                 self.assertIn(
                     "broadcast refs:1 local:1", self._router("ip4 table 0 state")
@@ -2810,8 +2845,29 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
                     self._netlink_count(stats, "synchronization completed"),
                     "broadcast receive ownership",
                 )
+                self.poll_for(
+                    f"{prefix} on phy and hbcast after recovery",
+                    pair_address,
+                    (True, True),
+                    timeout=5,
+                )
+        except BaseException as exc:
+            failure = exc
+            raise
         finally:
-            host.disable_capture()
-            self.vapi.cli(f"lcp delete {phy.name}")
-            phy.unconfig_ip4()
-            phy.admin_down()
+            if host is not None:
+                _cleanup_failure(failure, self.logger, "capture", host.disable_capture)
+            if address_added:
+                _cleanup_failure(
+                    failure,
+                    self.logger,
+                    "namespace address",
+                    lambda: del_namespace_address(self.ns_name, "hbcast", prefix),
+                )
+            _cleanup_failure(
+                failure,
+                self.logger,
+                "pair",
+                lambda: self.vapi.cli(f"lcp delete {phy.name}"),
+            )
+            _cleanup_failure(failure, self.logger, "admin state", phy.admin_down)
