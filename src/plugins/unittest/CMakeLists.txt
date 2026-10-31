@@ -52,6 +52,7 @@ add_vpp_plugin(unittest
   punt_test.c
   rbtree_test.c
   session_test.c
+  session_ct_test.c
   sparse_vec_test.c
   string_test.c
   svm_fifo_test.c

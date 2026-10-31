@@ -1693,5 +1693,37 @@ class VCLCutThruTestCaseBAPI(VCLTestCase):
         )
 
 
+@unittest.skipIf(
+    "unittest" in config.excluded_plugins, "Exclude tests requiring unittest plugin"
+)
+class CTListenerIdentityTestCase(VppAsfTestCase):
+    """Queued CT listener replacement without VPP workers"""
+
+    vpp_worker_count = 0
+
+    @classmethod
+    def setUpClass(cls):
+        if config.running_vpp or (config.debug and config.debug.lower() == "attach"):
+            raise unittest.SkipTest(
+                "CT listener fixture requires a dedicated VPP process"
+            )
+        cls.extra_vpp_config = ["session { poll-main }"]
+        super().setUpClass()
+
+    def test_ct_listener_replacement(self):
+        """Class teardown terminates VPP, including any retained callback state."""
+        self.vapi.session_enable_disable(is_enable=1)
+        self.assertIn(
+            "CT listener identity SUCCESS",
+            self.vapi.cli("test session ct-listener"),
+        )
+
+
+class CTListenerIdentityWorkersTestCase(CTListenerIdentityTestCase):
+    """Queued CT listener replacement with two VPP workers"""
+
+    vpp_worker_count = 2
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=VppTestRunner)

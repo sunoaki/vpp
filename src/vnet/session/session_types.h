@@ -274,6 +274,9 @@ typedef struct session_
   /** App listener index in app's listener pool if a listener */
   u32 al_index;
 
+  /** Opaque, for general use */
+  u32 opaque;
+
   union
   {
     /** Parent listener session index if the result of an accept */
@@ -283,10 +286,10 @@ typedef struct session_
     u32 ho_index;
   };
 
-  /** Opaque, for general use */
-  u32 opaque;
+  /** Listener instance identity for queued cut-through connects */
+  u64 ct_listener_id;
 
-    CLIB_CACHE_LINE_ALIGN_MARK (pad);
+  CLIB_CACHE_LINE_ALIGN_MARK (pad);
 } session_t;
 
 always_inline session_type_t
