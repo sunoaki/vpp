@@ -1364,7 +1364,7 @@ dtls_connect (transport_endpoint_cfg_t *tep)
   cargs->sep_ext.transport_flags = TRANSPORT_CFG_F_CONNECTED;
   if ((rv = vnet_connect (cargs)))
     {
-      tls_ctx_half_open_free (ctx_handle);
+      tls_ctx_free (ctx);
       return rv;
     }
 
