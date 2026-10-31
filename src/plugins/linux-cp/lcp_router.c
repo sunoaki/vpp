@@ -330,7 +330,7 @@ lcp_router_link_add (struct rtnl_link *rl, void *ctx)
       u32 sw_if_up;
 
       lip = lcp_itf_pair_get (lipi);
-      if (!vnet_get_sw_interface (vnm, lip->lip_phy_sw_if_index))
+      if (NULL == vnet_get_sw_interface_or_null (vnm, lip->lip_phy_sw_if_index))
 	return;
 
       if (lcp_router_lip_ts_check ((nl_msg_info_t *) ctx, lip))
