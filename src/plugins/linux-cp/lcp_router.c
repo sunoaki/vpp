@@ -296,7 +296,12 @@ lcp_router_link_addr (struct rtnl_link *rl, lcp_itf_pair_t *lip)
     return;
 
   hw = vnet_get_sup_hw_interface (vnm, lip->lip_phy_sw_if_index);
-  if (!vec_len (hw->hw_address))
+
+  /* vnet_hw_interface_change_mac_address() copies a six byte address:
+   * require the netlink address and the hardware address to be exactly
+   * that long before the compare and the copy. */
+  if ((nl_addr_get_len (mac_addr) != sizeof (mac_address_t)) ||
+      (vec_len (hw->hw_address) != sizeof (mac_address_t)))
     return;
 
   mac_addr_bytes = nl_addr_get_binary_addr (mac_addr);
@@ -724,13 +729,17 @@ static walk_rc_t
 lcp_router_address_mark (index_t index, void *ctx)
 {
   vnet_main_t *vnm = vnet_get_main ();
+  vnet_sw_interface_t *sw;
 
   lcp_itf_pair_t *lip = lcp_itf_pair_get (index);
   if (!lip)
     return WALK_CONTINUE;
 
-  ip_interface_address_mark_one_interface (
-    vnm, vnet_get_sw_interface (vnm, lip->lip_phy_sw_if_index), 0);
+  sw = vnet_get_sw_interface_or_null (vnm, lip->lip_phy_sw_if_index);
+  if (NULL == sw)
+    return WALK_CONTINUE;
+
+  ip_interface_address_mark_one_interface (vnm, sw, 0);
 
   return WALK_CONTINUE;
 }
