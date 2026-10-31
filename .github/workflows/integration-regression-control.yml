@@ -1,0 +1,2388 @@
+# SPDX-License-Identifier: Apache-2.0
+# Temporary branch-only evidence. Never merge this workflow into master.
+name: Temporary immutable integration controls
+
+on:
+  push:
+    branches: [feat/integration-runtime-controls-ff50-octobe]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-controls-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  control:
+    if: github.ref == 'refs/heads/feat/integration-runtime-controls-ff50-octobe'
+    name: integration / ${{ matrix.case }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        case:
+          - fixed-linux_cp
+          - fixed-linux_cp_lifecycle
+          - fixed-linux_cp_netlink
+          - fixed-ipsec_esp
+          - fixed-gre
+          - fixed-gre_teib
+          - fixed-ip_mcast
+          - router-add
+          - router-delete
+          - router-sweep
+          - router-permanent
+          - lifecycle-fd
+          - lifecycle-failure
+          - lifecycle-refresh
+          - lifecycle-flags
+          - lifecycle-vlan-add
+          - lifecycle-vlan-delete
+          - lifecycle-namespace
+          - netlink-pair
+          - netlink-dump
+          - tunnel-df
+          - gre-config
+          - gre-ingress
+    container:
+      image: debian:trixie
+      options: >-
+        --shm-size=2g
+        --cap-add=SYS_ADMIN
+        --cap-add=NET_ADMIN
+        --security-opt=apparmor=unconfined
+        --device-cgroup-rule="c 10:200 rwm"
+        --device-cgroup-rule="c 10:238 rwm"
+    defaults:
+      run:
+        shell: bash
+    env:
+      CASE: ${{ matrix.case }}
+      WORKFLOW_SHA: ${{ github.sha }}
+      CLANG_FORMAT_VER: "19"
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: ${{ github.workspace }}
+    steps:
+      - name: Bootstrap bounded tools and upload reserve
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/integration-tools"
+          evidence="$RUNNER_TEMP/integration-evidence"
+          mkdir -p "$tools" "$evidence"
+          printf 'TOOLS=%s\nEVIDENCE=%s\nWORK_DEADLINE=%s\n' \
+            "$tools" "$evidence" "$(( $(date +%s) + 6600 ))" >> "$GITHUB_ENV"
+          printf '{"workflow":"%s","case":"%s","run":"%s","attempt":"%s","job":"%s","status":"bootstrap","expected_tree":"86cfc49495ff83e2869aca5d80177a6b112228ec","scoped_files":22,"required_methods":24}\n' \
+            "$WORKFLOW_SHA" "$CASE" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_JOB" > "$evidence/bootstrap.json"
+          for phase in prepare dependencies feature-list c-style api-style c-formatter python-style python-pin mutate build binaries environment tests finalize; do
+            printf '{"action":"%s","status":"NOT_RUN","rc":null}\n' "$phase" > "$evidence/phase-$phase.json"
+          done
+          rm -f /etc/apt/apt.conf.d/docker-clean
+          rc=0
+          timeout --signal=TERM --kill-after=5s 300s bash -euo pipefail -c \
+            'apt-get update -qq; apt-get install -y -qq sudo make git bash iproute2 python3' \
+            > "$evidence/bootstrap.log" 2>&1 || rc=$?
+          tail -c 8388608 "$evidence/bootstrap.log" > "$evidence/bootstrap-tail.log"
+          mv "$evidence/bootstrap-tail.log" "$evidence/bootstrap.log"
+          printf '{"rc":%s}\n' "$rc" > "$evidence/bootstrap-result.json"
+          exit "$rc"
+
+      - name: Check out the exact workflow before reading style inputs
+        timeout-minutes: 5
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Materialize external immutable tools
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          export STEP_DEADLINE="$(( $(date +%s) + 240 ))"
+          cp .github/workflows/integration-regression-control.yml "$EVIDENCE/workflow.yml"
+          cat > "$TOOLS/sitecustomize.py" <<'PY'
+          import json
+          import os
+          import sys
+          import threading
+          import traceback
+          import unittest
+          from pathlib import Path
+
+          destination = os.environ.get("INTEGRATION_EVENTS")
+          if destination:
+              sequence = 0
+              state = threading.local()
+
+              def emit(kind, **values):
+                  global sequence
+                  sequence += 1
+                  record = dict(kind=kind, pid=os.getpid(), sequence=sequence, **values)
+                  data = (json.dumps(record, sort_keys=True) + "\n").encode()
+                  path = Path(destination + f".{os.getpid()}.jsonl")
+                  if len(data) > 256 * 1024 or (path.exists() and path.stat().st_size + len(data) > 32 * 1024 * 1024):
+                      raise RuntimeError("Integration observer capacity exceeded; refusing partial evidence")
+                  with path.open("ab") as stream:
+                      stream.write(data)
+
+              def wrap(name):
+                  original = getattr(unittest.TestResult, name)
+                  def observed(self, test, *args):
+                      if name == "startTest":
+                          state.test = test.id()
+                      record = dict(test=test.id())
+                      if name == "startTest":
+                          config = getattr(sys.modules.get("config"), "config", None)
+                          record.update(netns=getattr(config, "skip_netns_tests", None),
+                                        excluded=list(getattr(config, "excluded_plugins", [])),
+                                        workers=getattr(test.__class__, "vpp_worker_count", 0),
+                                        cmdline=list(getattr(test.__class__, "vpp_cmdline", [])))
+                      if name in ("addError", "addFailure", "addExpectedFailure", "addSubTest"):
+                          error = args[-1]
+                          if error:
+                              record.update(exception=error[0].__name__, traceback="".join(traceback.format_exception(*error)))
+                      if name == "addSubTest":
+                          subtest = args[0]
+                          record.update(parent_test=test.id(), subtest_id=subtest.id(),
+                                        subtest_description=str(subtest), params=dict(subtest.params))
+                      if name == "addSkip":
+                          record["reason"] = str(args[0])
+                      emit(name, **record)
+                      result = original(self, test, *args)
+                      if name == "stopTest":
+                          state.test = None
+                      return result
+                  setattr(unittest.TestResult, name, observed)
+
+              for name in ("startTest", "stopTest", "addSuccess", "addFailure", "addError", "addSkip",
+                           "addExpectedFailure", "addUnexpectedSuccess", "addSubTest"):
+                  wrap(name)
+              original_stop = unittest.TestResult.stopTestRun
+              def stop(self):
+                  emit("completed", tests=self.testsRun, errors=len(self.errors), failures=len(self.failures),
+                       skips=len(self.skipped), expected=len(self.expectedFailures), unexpected=len(self.unexpectedSuccesses))
+                  return original_stop(self)
+              unittest.TestResult.stopTestRun = stop
+
+              def profile(frame, event, value):
+                  if event != "return":
+                      return
+                  path, name = frame.f_code.co_filename, frame.f_code.co_name
+                  if path.endswith("/run_tests.py") and name == "__call__":
+                      owner = frame.f_locals.get("self")
+                      case = frame.f_locals.get("test_method")
+                      if owner.__class__.__name__ == "SplitToSuitesCallback" and case is not None:
+                          suite = owner.suites.get(owner.suite_name)
+                          if suite is not None and any(item is case for item in suite):
+                              emit("selected", test=case.id())
+                      return
+                  if not getattr(state, "test", None):
+                      return
+                  record = dict(test=state.test, file=path, function=name, line=frame.f_code.co_firstlineno)
+                  if path.endswith("/vpp_papi_provider.py") and name in ("cli", "cli_return_response"):
+                      record.update(command=frame.f_locals.get("cli"), value=str(value))
+                  elif path.endswith("/vpp_papi_provider.py") and name == "api":
+                      record.update(api=getattr(frame.f_locals.get("api_fn"), "__name__", None),
+                                    arguments=repr(frame.f_locals.get("api_args")), retval=frame.f_locals.get("retval"),
+                                    value=repr(value))
+                  elif path.endswith(("/test_linux_cp.py", "/test_linux_cp_netlink.py", "/test_linux_cp_lifecycle.py")) and name in (
+                          "_stats", "_netlink_stats", "_router", "poll_for", "_namespace_fd_count", "_fd_count", "_pairs"):
+                      record.update(value=str(value), description=frame.f_locals.get("description"),
+                                    actual=repr(frame.f_locals.get("actual")), expected=repr(frame.f_locals.get("expected")),
+                                    namespace=frame.f_locals.get("namespace"))
+                  elif path.endswith("/test_gre_teib.py") and name == "assert_ingress":
+                      owner = frame.f_locals["owner"]
+                      record.update(owner=owner.sw_if_index, before=frame.f_locals.get("before"),
+                                    packets=len(frame.f_locals.get("packets", [])), received=len(frame.f_locals.get("received", [])))
+                  else:
+                      return
+                  if len(str(record).encode()) > 128 * 1024:
+                      raise RuntimeError("Integration helper record exceeds capacity")
+                  emit("helper", **record)
+              if sys.getprofile() is not None:
+                  raise RuntimeError("Integration observer profile slot already occupied")
+              sys.setprofile(profile)
+              threading.setprofile(profile)
+              emit("loaded")
+          PY
+          cat > "$TOOLS/control.py" <<'PY'
+          import ast
+          import collections
+          import ctypes
+          import difflib
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import selectors
+          import signal
+          import stat
+          import subprocess
+          import sys
+          import time
+
+          BASE = "630f876bc326eee05c23d517600b72e8d6a6ec83"
+          INTEGRATION = "646bccb9f3f601c25e828f0155c97e910e7ac0be"
+          TREE = "86cfc49495ff83e2869aca5d80177a6b112228ec"
+          WORKFLOW = ".github/workflows/integration-regression-control.yml"
+          INPUTS = [
+              ("M33", "d15bb141b659828bf2118bc9c1345fed2b3f3d36", {
+                  "src/plugins/linux-cp/lcp.rst": "0eafbd92ebf35abe6ab78f5cda9612c586e01aa9",
+                  "src/plugins/linux-cp/lcp_router.c": "1b765aaf37148dd1d3de70063e42e37c5c478998",
+                  "src/plugins/linux-cp/lcp_router.h": "4ee3acd50e268747b70dc736d4f3d4effa49eb7a",
+                  "src/plugins/linux-cp/test/lcp_unittest.c": "114d6c27565468da8e828fcbffc95869a94819cb",
+                  "test/test_linux_cp.py": "33620a1d8541bb1207871b750cd878b17bdc934e"}),
+              ("M36", "5888791b2eeb6b0cb624ef579c5fe8945e9408d0", {
+                  "src/plugins/linux-cp/lcp.api": "82135513fac65e72c10d53e9e0f8cb4daf3b0eb3",
+                  "src/plugins/linux-cp/lcp.c": "90daafd78ca6229891a750faca0f660342991e1e",
+                  "src/plugins/linux-cp/lcp_interface.c": "6d770e525c84345248e294a01d63ab937c00034a",
+                  "src/plugins/linux-cp/lcp_interface.h": "5324731ebf68a3f78813b0a3143448041fb7672c",
+                  "test/test_linux_cp_lifecycle.py": "cfcb2b404c8b64d7c06a869909c6f602feff8c9d"}),
+              ("M37", "a3027e2d53b2cd0def6cb88065ac23b492abad23", {
+                  "src/plugins/linux-cp/lcp_nl.c": "0d418e1d8733b0b66638f24fb2b0dc6ca404b28c",
+                  "src/plugins/linux-cp/lcp_nl.h": "1e963053474c6f11d451c49a7d3c572c6b86e991",
+                  "test/test_linux_cp_netlink.py": "1c03f2dd5e27de79e91c5f6fcc104979124b103d"}),
+              ("M40", "815eaa339772c4c715ac0890fe2c2b136f694fe9", {
+                  "src/vnet/tunnel/tunnel_dp.h": "468c628236393f184ab64736441fe1b7bbd40e36",
+                  "test/test_ipsec_esp.py": "093794c2074bbdf66f9350308439e833a03dccc6"}),
+              ("M42", "245e223eb0130571ca953079f5a1631a5345b363", {
+                  "src/plugins/gre/gre.h": "7ed347d0ff765c2eee2785838e855a3ad7703834",
+                  "src/plugins/gre/interface.c": "f515e68b509f98f343a40a5d433a5ef8aaaf68ef",
+                  "test/test_gre_teib.py": "fe80bb2566a62be3ba443a2995ba544bf4be1063"}),
+              ("M43", "694e5bca5e74d8594334c53e36459f88bcf5c2b1", {
+                  "src/plugins/unittest/mfib_test.c": "1609d5e9d62736799e3e57802a0a2483b7089903",
+                  "src/vnet/mfib/mfib_entry.c": "66f8faf3543beae2666aad39f4961de4a1496f91",
+                  "test/test_ip_mcast.py": "61e55c0622b90c560956507f278d9538175a8195"}),
+              ("M39", "2e8b1e68964c8473ec13149d111be12ffa20dfba", {
+                  ".github/workflows/pr-verify.yml": "1c42770dbfa97b62dcf66d10af7b94c3e0e782eb"})]
+          READY = {
+              "linux_cp": {"TestLinuxCPNetlinkRecovery": ["netlink_poll_error_recovery", "netlink_poll_error_invalid_fd",
+                  "router_source_ownership", "router_partial_delete_ownership", "router_mpls_ownership",
+                  "router_linux_replace_replay", "router_bound_table_sweep", "router_broadcast_recovery"]},
+              "linux_cp_lifecycle": {"TestLinuxCPLifecycle": ["default_namespace_resources", "default_namespace_failure",
+                  "pair_replace_resend", "pair_flags_pool_reuse", "vlan_resources"],
+                  "TestLinuxCPNamespaceOwnership": ["equal_ifindex_namespace_delete"]},
+              "linux_cp_netlink": {"TestLinuxCPNetlinkSocketOwnership": ["pair_add_during_netlink_recovery"],
+                  "TestLinuxCPNetlinkDumpCompletion": ["dump_completion_errors", "dump_completion_success"]},
+              "ipsec_esp": {"TestIpsecEspTun": ["tun_df44"]},
+              "gre_teib": {"TestGreTeib": ["gre_teib_ipv4", "gre_teib_ipv6", "gre_teib_cross_mp"]},
+              "ip_mcast": {"TestIPMcast": ["mfib_zero_flags_ip4", "mfib_zero_flags_ip6"], "TestMFIB": ["mfib"]}}
+          GAPS = [
+              "M44 final two ip4 methods and fib INTERPOSE regression pending M35 scope release; intermediate24 is not final26 acceptance",
+              "M33 MPLS invalid-index unlock guard lacks ordinary failure witness; permanent-source negative stops before recovery/packet send",
+              "M36 heap vectors, socket/link owners, direct-add refresh, startup failure, allocation/connect failures, getter alias/fd0 and invalid length lack independent existing runtime oracles",
+              "M36 fd counts do not prove heap cleanup; VLAN negative checks <0, not exact -73",
+              "M37 restored parser first-case witness does not establish each DONE scenario or exact libnl error mapping",
+              "M43 private global extension pool is not measured directly",
+              "M43 negative mechanism unverified/on hold after provider refusal; no crash reproduction is implemented"]
+          CASE = os.environ.get("CASE", "fixed-linux_cp")
+          OUT = Path(os.environ.get("EVIDENCE", "."))
+          TOOLS = Path(os.environ.get("TOOLS", "."))
+          CALLBACK = re.compile(r"--- (add\w+)\(\) (\w+)\.(\w+)\(")
+          INFRA = re.compile(r"VppTransportSocketIOError|VppDiedError|Vpp dead|VPP subprocess died unexpectedly|"
+                             r"VPP died shortly after startup|Exception connecting to (?:vapi|VPP)|PUMP THREAD TIMEOUT|"
+                             r"\bSIG(?:SEGV|ABRT|BUS|ILL|FPE)\b|\bAborted\b|\bBus error\b|"
+                             r"\bIllegal instruction\b|\bFloating point exception\b|"
+                             r"segmentation fault|Core was generated|Core file present,|AddressSanitizer|"
+                             r"timed out|TimeoutError|not enough cpus|Skipping tests due to setup failure|"
+                             r"(?:^|\n)SKIP:|OK \(skipped=", re.I)
+
+          def require(value, message):
+              if not value:
+                  raise AssertionError(message)
+
+          def git(*args, env=None, data=None):
+              return subprocess.check_output(["git", *args], env=env, input=data)
+
+          def textgit(*args, **kwargs):
+              return git(*args, **kwargs).decode().strip()
+
+          def content(ref, path):
+              return git("show", f"{ref}:{path}")
+
+          def oid(data):
+              return hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+
+          def sha(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def publish(target, value):
+              temporary = target.with_name(target.name + f".{os.getpid()}.pending")
+              temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+              os.replace(temporary, target)
+
+          def save(name, value):
+              publish(OUT / name, value)
+
+          def function(data, name):
+              token = b"\n" + name.encode() + b" ("
+              require(data.count(token) == 1, f"Ambiguous function {name}")
+              point = data.index(token) + 1
+              start = data.rfind(b"\n", 0, point - 1) + 1
+              return data[start:data.index(b"\n}\n", point) + 3]
+
+          def ready(suite=None):
+              return [f"test_{module}.{cls}.test_{method}" for module, classes in READY.items()
+                      if suite is None or suite == module for cls, methods in classes.items() for method in methods]
+
+          def initial_manifest():
+              OUT.mkdir(parents=True, exist_ok=True)
+              value = dict(workflow_sha=os.environ["WORKFLOW_SHA"], workflow_blob=textgit("hash-object", WORKFLOW),
+                           patchbase=BASE, integration_base=INTEGRATION, expected_tree=TREE, inputs=INPUTS,
+                           case=CASE, required24=ready(), pending=GAPS, status="preparation_pending",
+                           run_id=os.environ["GITHUB_RUN_ID"], attempt=os.environ["GITHUB_RUN_ATTEMPT"],
+                           job=os.environ["GITHUB_JOB"], repository=os.environ["GITHUB_REPOSITORY"],
+                           run_url=f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+                           tools={p.name: sha(p.read_bytes()) for p in TOOLS.glob("*.py")})
+              save("manifest.json", value)
+              # Resolve every pin before checkout or fixtures so failed fetchability has provenance.
+              value["resolved"] = {}
+              for ref in [BASE, INTEGRATION, *(tip for _, tip, _ in INPUTS)]:
+                  value["resolved"][ref] = dict(commit=textgit("rev-parse", f"{ref}^{{commit}}"),
+                                                 tree=textgit("rev-parse", f"{ref}^{{tree}}"))
+                  save("manifest.json", value)
+              return value
+
+          def prepare():
+              manifest = initial_manifest()
+              require(textgit("rev-parse", "HEAD") == os.environ["WORKFLOW_SHA"], "Wrong workflow commit")
+              require(not textgit("status", "--porcelain"), "Dirty workflow checkout")
+              for path in ("build-root/build-vpp_debug-native", "build-root/install-vpp_debug-native", "build-root/.ccache", "build-root/test/venv"):
+                  require(not Path(path).exists(), f"Build not independent: {path}")
+              subprocess.run(["git", "checkout", "--detach", INTEGRATION], check=True)
+              seen, patches = set(), []
+              for mission, tip, files in INPUTS:
+                  actual = textgit("diff", "--name-only", BASE, tip).splitlines()
+                  require(set(actual) == set(files) and not seen.intersection(files), f"Unexpected {mission} scope")
+                  seen.update(files)
+                  for path, blob in files.items():
+                      require(textgit("rev-parse", f"{tip}:{path}") == blob, f"Changed reviewed blob {path}")
+                  patch = git("diff", "--binary", "--full-index", BASE, tip, "--", *files)
+                  subprocess.run(["git", "apply", "--index", "--check", "-"], input=patch, check=True)
+                  subprocess.run(["git", "apply", "--index", "-"], input=patch, check=True)
+                  (OUT / f"{mission}.patch").write_bytes(patch)
+                  patches.append(dict(mission=mission, tip=tip, sha256=sha(patch)))
+              require(textgit("write-tree") == TREE, "Composition tree mismatch; owner resolution required")
+              for _, _, files in INPUTS:
+                  for path, blob in files.items():
+                      require(textgit("hash-object", path) == blob, f"Integrated blob mismatch: {path}")
+              require(set(textgit("diff", "--cached", "--name-only", INTEGRATION).splitlines()) == seen, "Unexpected integrated paths")
+              identity = dict(os.environ, GIT_AUTHOR_NAME="Integration CI", GIT_AUTHOR_EMAIL="ci@example.invalid",
+                              GIT_COMMITTER_NAME="Integration CI", GIT_COMMITTER_EMAIL="ci@example.invalid",
+                              GIT_AUTHOR_DATE="2026-10-19T00:00:00Z", GIT_COMMITTER_DATE="2026-10-19T00:00:00Z")
+              commit = textgit("commit-tree", TREE, "-p", INTEGRATION, env=identity,
+                               data=b"ci: construct immutable integration\n\nType: ci\n")
+              subprocess.run(["git", "checkout", "--detach", commit], check=True)
+              require(not textgit("status", "--porcelain"), "Integrated checkout not clean")
+              manifest.update(integration_head=commit, integration_tree=TREE, patches=patches, status="prepared")
+              manifest["tracked"] = tracked()
+              save("manifest.json", manifest)
+              fixtures()
+
+          def tracked():
+              result = {}
+              for entry in git("ls-files", "-s", "-z").split(b"\0"):
+                  if not entry:
+                      continue
+                  metadata, path = entry.split(b"\t", 1)
+                  mode = metadata.decode().split()[0]
+                  name = path.decode()
+                  target = Path(name)
+                  data = os.readlink(target).encode() if target.is_symlink() else target.read_bytes()
+                  actual_mode = "120000" if target.is_symlink() else "100755" if target.stat().st_mode & 0o111 else "100644"
+                  require(actual_mode == mode, f"Tracked file mode changed: {name}")
+                  result[name] = dict(mode=actual_mode, blob=oid(data), symlink=target.is_symlink())
+              return result
+
+          def verify(variant=True):
+              manifest = json.loads((OUT / "manifest.json").read_text())
+              require(textgit("rev-parse", "HEAD") == manifest["integration_head"], "Integration HEAD moved")
+              expected = dict(manifest["tracked"])
+              if variant and manifest.get("restoration"):
+                  recipe = manifest["restoration"]
+                  expected[recipe["path"]] = dict(expected[recipe["path"]], blob=recipe["after_blob"])
+              require(tracked() == expected, "Tracked bytes/modes/symlinks changed outside selected recipe")
+              return manifest
+
+          def recipe(name):
+              router = "src/plugins/linux-cp/lcp_router.c"
+              interface = "src/plugins/linux-cp/lcp_interface.c"
+              setter = "src/plugins/linux-cp/lcp.c"
+              nl = "src/plugins/linux-cp/lcp_nl.c"
+              gre = "src/plugins/gre/interface.c"
+              records = {
+                  "router-add": (router, "lcp_router_route_add", "5b05177dfd04cbf5f018a968b1b9ebe8e902de9c", "linux_cp.TestLinuxCPNetlinkRecovery.test_router_linux_replace_replay"),
+                  "router-delete": (router, "lcp_router_route_del", "573e14db071e9bcae115347532e16dbcad3c4648", "linux_cp.TestLinuxCPNetlinkRecovery.test_router_partial_delete_ownership"),
+                  "router-sweep": (router, "lcp_router_route_sync_end", "0b4a54b5ce18858b7e1846f9be6b11fc0fd2c608", "linux_cp.TestLinuxCPNetlinkRecovery.test_router_bound_table_sweep"),
+                  "router-permanent": (router, "lcp_router_table_add_del_special_routes", "86e3f8e628efe0ceaeec4a97be0d9f025eb0cc74", "linux_cp.TestLinuxCPNetlinkRecovery.test_router_broadcast_recovery"),
+                  "lifecycle-failure": (setter, "lcp_set_default_ns", "016dadeb32d35e1ee8cf52d5ae30d69a8f088379", "linux_cp_lifecycle.TestLinuxCPLifecycle.test_default_namespace_failure"),
+                  "lifecycle-vlan-add": (interface, "lcp_netlink_add_link_vlan", "29bf90b6df1003c871bb4db8369ce7c761a5b09b", "linux_cp_lifecycle.TestLinuxCPLifecycle.test_vlan_resources"),
+                  "lifecycle-vlan-delete": (interface, "lcp_netlink_del_link", "257216236be34803b2ce75963f13698d955d3767", "linux_cp_lifecycle.TestLinuxCPLifecycle.test_vlan_resources"),
+                  "gre-config": (gre, "gre_tunnel_db_find", "97c0d115972105645cf124b5ff8ea7fe0a1df0cc", "gre_teib.TestGreTeib.test_gre_teib_ipv4"),
+                  "gre-ingress": (gre, "gre_tunnel_db_add", "54c02ccad20ffd3d0102721c431a308041551bf5", "gre_teib.TestGreTeib.test_gre_teib_ipv4")}
+              if name in records:
+                  path, fn, after, selector = records[name]
+                  before = content(TREE, path)
+                  steps = [(function(before, fn), function(content(BASE, path), fn))]
+                  kind = "literal-base-function"
+              else:
+                  kind = "literal-base-block"
+                  if name == "lifecycle-fd":
+                      path, after, selector = setter, "ee82bbcb7e2098546faa5cebb08bffe0ee27a2eb", "linux_cp_lifecycle.TestLinuxCPLifecycle.test_default_namespace_resources"
+                      steps = [(b"  if (lcpm->default_ns_fd >= 0)\n    close (lcpm->default_ns_fd);\n  vec_free (lcpm->default_namespace);", b"  vec_free (lcpm->default_namespace);")]
+                      kind = "isolated-owner-regression"
+                  elif name == "lifecycle-flags":
+                      path, after, selector = interface, "08875ad819d268aae7817eeda9c6b6bc33633895", "linux_cp_lifecycle.TestLinuxCPLifecycle.test_pair_flags_pool_reuse"
+                      steps = [(b"  pool_get (lcp_itf_pair_pool, lip);\n  lip->lip_flags = 0;", b"  pool_get (lcp_itf_pair_pool, lip);")]
+                  elif name == "lifecycle-refresh":
+                      path, after, selector = interface, "13a10a5b6a6dfbeff556bfc497d32d4658166bda", "linux_cp_lifecycle.TestLinuxCPLifecycle.test_pair_replace_resend"
+                      steps = []
+                      for ref in (TREE, BASE):
+                          body = function(content(ref, path), "lcp_itf_pair_create")
+                          start = body.index(b"  if (lipi != INDEX_INVALID)\n")
+                          steps.append(body[start:body.index(b"\n    }", start) + 6])
+                      steps = [tuple(steps)]
+                  elif name == "lifecycle-namespace":
+                      path, after, selector = interface, "8f3d5970c8fb502eef25e011f83f974504749c2f", "linux_cp_lifecycle.TestLinuxCPNamespaceOwnership.test_equal_ifindex_namespace_delete"
+                      steps = [(b"  if (lcp_itf_pair_find_by_vif (lip->lip_vif_index) == lipi)\n    hash_unset (lip_db_by_vif, lip->lip_vif_index);", b"  hash_unset (lip_db_by_vif, lip->lip_vif_index);")]
+                  elif name == "netlink-pair":
+                      path, after, selector = nl, "11a05311ea57b2989bdb40f495a31d7fe4280561", "linux_cp_netlink.TestLinuxCPNetlinkSocketOwnership.test_pair_add_during_netlink_recovery"
+                      steps = [(b"lcp_nl_pair_add_cb (lcp_itf_pair_t *pair)\n{\n  nl_main_t *nm = &nl_main;\n\n  if (nm->nl_status == NL_STATUS_SYNC)\n    return;\n\n  if (!nm->sk_route)", b"lcp_nl_pair_add_cb (lcp_itf_pair_t *pair)\n{\n  nl_main_t *nm = &nl_main;\n\n  if (!nm->sk_route)")]
+                  elif name == "netlink-dump":
+                      path, after, selector = nl, "2877ceb3d2c2cf57d06fc08270d99a0af18b5906", "linux_cp_netlink.TestLinuxCPNetlinkDumpCompletion.test_dump_completion_errors"
+                      steps = [(b"  while (nlmsg_ok (hdr, n_bytes))\n    {\n      if (hdr->nlmsg_flags & NLM_F_DUMP_INTR)\n\t{\n\t  err = -NLE_DUMP_INTR;\n\t  goto out;\n\t}\n\n      nlmsg_free (msg);", b"  while (nlmsg_ok (hdr, n_bytes))\n    {\n      nlmsg_free (msg);")]
+                      original = content(TREE, path)
+                      start = original.index(b"      if (hdr->nlmsg_type == NLMSG_DONE)\n")
+                      end = original.index(b"\n\t}", start) + 3
+                      steps.append((original[start:end], b"      if (hdr->nlmsg_type == NLMSG_DONE)\n\t{\n\t  done = 1;\n\t  goto out;\n\t}"))
+                  elif name == "tunnel-df":
+                      path, after, selector = "src/vnet/tunnel/tunnel_dp.h", "fd0d60c0a1a3021b22dad1d52fc3e54049bade46", "ipsec_esp.TestIpsecEspTun.test_tun_df44"
+                      steps = [(b"      u16 old_flags = outer->flags_and_fragment_offset;\n\n      ip4_header_set_df (outer);\n\n      sum = ip_csum_update (outer->checksum, old_flags, outer->flags_and_fragment_offset,\n\t\t\t    ip4_header_t, flags_and_fragment_offset);\n", b"      u16 tos = outer->flags_and_fragment_offset;\n\n      ip4_header_set_df (outer);\n\n      sum =\n\tip_csum_update (outer->checksum, tos, outer->tos, ip4_header_t,\n\t\t\tflags_and_fragment_offset);\n")]
+                  else:
+                      raise AssertionError(f"Unknown finite control {name}")
+                  before = content(TREE, path)
+              result = before
+              for old, new in steps:
+                  require(old != new and result.count(old) == 1, f"Ambiguous owner recipe {name}")
+                  result = result.replace(old, new, 1)
+              require(oid(result) == after, f"Owner output blob differs: {name}: {oid(result)}")
+              reverse = result
+              for old, new in reversed(steps):
+                  require(reverse.count(new) == 1, f"Ambiguous inverse {name}")
+                  reverse = reverse.replace(new, old, 1)
+              require(reverse == before, "Recipe is not byte reversible")
+              return dict(name=name, path=path, kind=kind, before_blob=oid(before), after_blob=after,
+                          selector=selector), result
+
+          def mutate():
+              manifest = verify(False)
+              if not CASE.startswith("fixed-"):
+                  entry, data = recipe(CASE)
+                  require(Path(entry["path"]).read_bytes() == content(TREE, entry["path"]), "Owner input bytes differ")
+                  Path(entry["path"]).write_bytes(data)
+                  manifest["restoration"] = entry
+                  (OUT / "restoration.patch").write_bytes(git("diff", "--binary", "--full-index"))
+              index = TOOLS / "variant-index"
+              environment = dict(os.environ, GIT_INDEX_FILE=str(index))
+              subprocess.run(["git", "read-tree", TREE], env=environment, check=True)
+              if manifest.get("restoration"):
+                  subprocess.run(["git", "add", manifest["restoration"]["path"]], env=environment, check=True)
+              manifest["built_tree"] = textgit("write-tree", env=environment)
+              save("manifest.json", manifest)
+              verify()
+
+          def processes():
+              result = {}
+              for directory in Path("/proc").iterdir():
+                  if not directory.name.isdigit():
+                      continue
+                  try:
+                      data = (directory / "stat").read_text()
+                      fields = data[data.rfind(")") + 2:].split()
+                      result[int(directory.name)] = (int(fields[1]), fields[19], fields[0])
+                  except (OSError, ValueError, IndexError):
+                      continue
+              return result
+
+          class OwnedProcesses:
+              def __init__(self):
+                  self.handles = {}
+                  self.observed = []
+                  self.unresolved = set()
+                  self.acquisitions = {}
+                  self.cleanup_errors = []
+                  self.self_birth = self.fresh_self_birth()
+
+              @staticmethod
+              def fresh_self_birth():
+                  return Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]
+
+              def candidate(self, pid, identity, table):
+                  key = (pid, identity[1])
+                  if key not in self.acquisitions:
+                      require(len(self.acquisitions) < 20000, "Acquisition evidence capacity exceeded")
+                      self.acquisitions[key] = dict(pid=pid, birth=identity[1], parent=identity[0],
+                          parent_birth=self.self_birth if identity[0] == os.getpid() else table[identity[0]][1],
+                          state=identity[2], status="pending", bind_attempts=0, absence_checks=0,
+                          reused=False, first_seen=time.monotonic())
+                  self.unresolved.add(key)
+
+              def acquisition(self, key, **values):
+                  if key in self.acquisitions:
+                      self.acquisitions[key].update(values, updated=time.monotonic())
+
+              def blocked(self, key):
+                  return self.acquisitions.get(key, {}).get("reused", False)
+
+              def resolve(self, key, status):
+                  if self.blocked(key):
+                      self.unresolved.add(key)
+                      return False
+                  self.acquisition(key, status=status)
+                  self.unresolved.discard(key)
+                  return True
+
+              def observe(self, key, value, label):
+                  self.acquisition(key, last_identity=value, state=value[2])
+                  if value[1] != key[1]:
+                      record = self.acquisitions[key]
+                      record.setdefault("birth_mismatch", dict(stage=label, expected=key[1], actual=value))
+                      self.acquisition(key, reused=True, reason="birth_changed", status="pending")
+                      self.unresolved.add(key)
+                      return False
+                  return not self.blocked(key)
+
+              def acquisition_deadline(self):
+                  deadline = work_deadline() if "WORK_DEADLINE" in os.environ else float("inf")
+                  if hasattr(self, "deadline"):
+                      deadline = min(deadline, time.time() + self.deadline - time.monotonic())
+                  if time.time() >= deadline:
+                      raise TimeoutError("Acquisition deadline exhausted")
+
+              def reconcile(self, table):
+                  for key in list(self.unresolved):
+                      pid, birth = key
+                      record = self.acquisitions[key]
+                      if record["reused"]:
+                          continue
+                      current = table.get(pid)
+                      if current is not None:
+                          record["absence_checks"] = 0
+                          self.acquisition(key, reason="snapshot_present")
+                          self.observe(key, current, "reconcile_snapshot")
+                          continue
+                      directory = None
+                      try:
+                          directory = os.open(f"/proc/{pid}", os.O_RDONLY | os.O_DIRECTORY)
+                          current = self.identity(directory)
+                          self.acquisition(key, absence_checks=0, reason="direct_probe_present")
+                          self.observe(key, current, "reconcile_direct")
+                      except (FileNotFoundError, ProcessLookupError) as error:
+                          record["absence_checks"] += 1
+                          self.acquisition(key, reason="direct_probe_absent", absence_errno=error.errno,
+                                           absence_time=time.monotonic())
+                          if record["absence_checks"] >= 2:
+                              self.resolve(key, "vanished")
+                      except (OSError, ValueError, IndexError, UnicodeError) as error:
+                          self.acquisition(key, reason="direct_probe_uncertain", absence_checks=0,
+                                           probe_error=type(error).__name__, probe_errno=getattr(error, "errno", None))
+                      finally:
+                          if directory is not None:
+                              os.close(directory)
+
+              @staticmethod
+              def identity(directory):
+                  descriptor = os.open("stat", os.O_RDONLY, dir_fd=directory)
+                  try:
+                      data = os.read(descriptor, 8192).decode()
+                  finally:
+                      os.close(descriptor)
+                  fields = data[data.rfind(")") + 2:].split()
+                  return int(fields[1]), fields[19], fields[0]
+
+              @staticmethod
+              def exited(handle):
+                  with selectors.DefaultSelector() as poller:
+                      poller.register(handle[1], selectors.EVENT_READ)
+                      return bool(poller.select(0))
+
+              def parent_proof(self, parent, observation):
+                  if parent == os.getpid():
+                      value = self.fresh_self_birth()
+                      observation.update(kind="self", parent=parent, parent_birth=value)
+                      return (None, None) if value == self.self_birth else None
+                  for key, handle in self.handles.items():
+                      if key[0] != parent or self.blocked(key):
+                          continue
+                      observation.update(kind="owned", parent=parent, parent_birth=key[1],
+                                         parent_handle=list(handle))
+                      observation["exited"] = self.exited(handle)
+                      observation["identity"] = self.identity(handle[0])
+                      valid = self.observe(key, observation["identity"], "parent_before")
+                      if valid and not observation["exited"]:
+                          return key, handle
+                  observation.setdefault("kind", "unverified")
+                  return None
+
+              def parent_still_owned(self, proof, observation):
+                  key, handle = proof
+                  if key is None:
+                      value = self.fresh_self_birth()
+                      observation.update(kind="self", parent_birth=value)
+                      return value == self.self_birth
+                  observation.update(kind="owned", parent_birth=key[1], parent_handle=list(handle),
+                                     same_handle=self.handles.get(key) is handle)
+                  observation["exited"] = self.exited(handle)
+                  observation["identity"] = self.identity(handle[0])
+                  valid = self.observe(key, observation["identity"], "parent_after")
+                  return observation["same_handle"] and valid and not observation["exited"]
+
+              def ownership_rounds(self, key, handle, attempt):
+                  directory, _ = handle
+                  for number in range(3):
+                      self.acquisition_deadline()
+                      observation = dict(number=number + 1, parent_before={}, parent_after={})
+                      attempt["rounds"].append(observation)
+                      first = self.identity(directory)
+                      observation["before"] = first
+                      if not self.observe(key, first, "round_before"):
+                          return False
+                      proof = self.parent_proof(first[0], observation["parent_before"])
+                      final = self.identity(directory)
+                      observation["final"] = final
+                      if not self.observe(key, final, "round_final"):
+                          return False
+                      observation["parent_changed"] = first[0] != final[0]
+                      if observation["parent_changed"]:
+                          self.acquisition(key, reason="parent_changed")
+                          continue
+                      if proof is None or not self.parent_still_owned(proof, observation["parent_after"]):
+                          self.acquisition(key, reason="ancestor_unverified")
+                          return False
+                      self.acquisition_deadline()
+                      if self.blocked(key):
+                          return False
+                      attempt["proof"] = observation
+                      return True
+                  self.acquisition(key, reason="parent_rounds_exhausted")
+                  return False
+
+              def bind(self, pid, expected):
+                  key = (pid, expected[1])
+                  if self.blocked(key):
+                      self.unresolved.add(key)
+                      return False
+                  if key in self.handles:
+                      return self.resolve(key, "bound")
+                  if key not in self.acquisitions:
+                      table = processes()
+                      if not self.attributable(expected, table):
+                          return False
+                      self.candidate(pid, expected, table)
+                  record = self.acquisitions[key]
+                  record["bind_attempts"] += 1
+                  attempt = dict(generation=record["bind_attempts"], expected=expected, rounds=[])
+                  record["last_attempt"] = attempt
+                  directory = descriptor = handle = None
+                  stage = "open_proc"
+                  try:
+                      self.acquisition_deadline()
+                      directory = os.open(f"/proc/{pid}", os.O_RDONLY | os.O_DIRECTORY)
+                      before = self.identity(directory)
+                      attempt["before"] = before
+                      if not self.observe(key, before, "before_pidfd"):
+                          return False
+                      stage = "open_pidfd"
+                      descriptor = os.pidfd_open(pid)
+                      attempt["handles"] = dict(directory=directory, pidfd=descriptor)
+                      stage = "verify_identity"
+                      after = self.identity(directory)
+                      attempt["after"] = after
+                      if not self.observe(key, after, "after_pidfd"):
+                          return False
+                      stage = "verify_ancestor"
+                      handle = (directory, descriptor)
+                      if not self.ownership_rounds(key, handle, attempt) or self.blocked(key):
+                          return False
+                      self.observed.append(dict(pid=pid, birth=key[1], parent=attempt["proof"]["final"][0],
+                                                generation=attempt["generation"]))
+                      self.acquisition(key, reason="pidfd_bound", pidfd_bound=True)
+                      if not self.resolve(key, "bound") or self.blocked(key):
+                          return False
+                      self.handles[key] = handle
+                      return True
+                  except TimeoutError:
+                      self.acquisition(key, reason="acquisition_deadline", bind_stage=stage)
+                      raise
+                  except (OSError, ValueError, IndexError, UnicodeError) as error:
+                      self.acquisition(key, reason="bind_uncertain", bind_stage=stage,
+                                       bind_error=type(error).__name__, bind_errno=getattr(error, "errno", None))
+                      return False
+                  finally:
+                      try:
+                          if handle is None or self.handles.get(key) is not handle:
+                              self.unresolved.add(key)
+                              self.acquisition(key, status="pending", pidfd_bound=False)
+                          self.acquisition(key, bind_reason=record.get("reason"), bind_stage=stage)
+                      finally:
+                          if handle is None or self.handles.get(key) is not handle:
+                              try:
+                                  if directory is not None:
+                                      os.close(directory)
+                              finally:
+                                  if descriptor is not None:
+                                      os.close(descriptor)
+
+              def attributable(self, identity, table):
+                  parent = identity[0]
+                  if parent == os.getpid():
+                      return True
+                  for key, handle in self.handles.items():
+                      if key[0] != parent or self.blocked(key):
+                          continue
+                      snapshot = table.get(parent)
+                      if snapshot is None or not self.observe(key, snapshot, "attributable_snapshot"):
+                          continue
+                      try:
+                          exited = self.exited(handle)
+                          value = self.identity(handle[0])
+                          if self.observe(key, value, "attributable_direct") and not exited:
+                              return True
+                      except (ProcessLookupError, FileNotFoundError):
+                          pass
+                  return False
+
+              def discover(self):
+                  for _ in range(8):
+                      count = len(self.handles)
+                      table = processes()
+                      for owned_key in self.handles:
+                          snapshot = table.get(owned_key[0])
+                          if snapshot is not None:
+                              self.observe(owned_key, snapshot, "discover_snapshot")
+                      for pid, identity in table.items():
+                          key = (pid, identity[1])
+                          if self.blocked(key):
+                              self.unresolved.add(key)
+                              continue
+                          if key in self.handles:
+                              self.resolve(key, "bound")
+                              continue
+                          if self.attributable(identity, table):
+                              self.candidate(pid, identity, table)
+                          if key in self.acquisitions and self.bind(pid, identity):
+                              self.resolve(key, "bound")
+                      self.reconcile(table)
+                      if len(self.handles) == count:
+                          break
+
+              def signal(self, sig):
+                  for key, handle in self.handles.items():
+                      try:
+                          signal.pidfd_send_signal(handle[1], sig)
+                          self.acquisition(key, last_signal=int(sig), signal_result="sent")
+                      except ProcessLookupError:
+                          self.acquisition(key, last_signal=int(sig), signal_result="already_exited")
+
+              def cleanup(self, root):
+                  try:
+                      for sig in (signal.SIGTERM, signal.SIGKILL):
+                          stop = time.monotonic() + 2
+                          self.deadline = stop
+                          self.signal(sig)
+                          try:
+                              while time.monotonic() < stop:
+                                  self.discover()
+                                  self.signal(sig)
+                                  for key, handle in self.handles.items():
+                                      if key[0] == root:
+                                          continue
+                                      try:
+                                          reaped = os.waitid(os.P_PIDFD, handle[1], os.WEXITED | os.WNOHANG)
+                                          self.acquisition(key, reap_result="reaped" if reaped else "not_ready",
+                                                           reap_status=reaped.si_status if reaped else None)
+                                      except ChildProcessError:
+                                          self.acquisition(key, reap_result="not_child_or_already_reaped")
+                                  if all(self.exited(handle) for handle in self.handles.values()):
+                                      self.discover()
+                                      if (all(self.exited(handle) for handle in self.handles.values()) and
+                                              not self.unresolved and not self.cleanup_errors):
+                                          return True
+                                  time.sleep(0.03)
+                          except TimeoutError as error:
+                              self.cleanup_errors.append(dict(signal=int(sig), deadline=stop,
+                                  observed=time.monotonic(), error=str(error), exception=type(error).__name__))
+                      return False
+                  finally:
+                      for key, handle in self.handles.items():
+                          try:
+                              self.acquisition(key, pidfd_exited=self.exited(handle))
+                          finally:
+                              for fd in handle:
+                                  os.close(fd)
+
+          def work_deadline():
+              return min(float(os.environ["WORK_DEADLINE"]),
+                         float(os.environ.get("STEP_DEADLINE", os.environ["WORK_DEADLINE"])))
+
+          def command(label, args, environment=None, limit=1200):
+              directory = OUT / label
+              directory.mkdir(exist_ok=True)
+              start = time.time()
+              seconds = min(limit, max(0, work_deadline() - start - 10))
+              result = dict(command=args, cwd=str(Path.cwd()), start=start, rc=None, status="running",
+                            deadline=work_deadline(), allowed_seconds=seconds)
+              target = directory / "result.json"
+              target.write_text(json.dumps(result, indent=2))
+              tail, records, owned = bytearray(), [], OwnedProcesses()
+              process = None
+              require(ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0, "Cannot become child subreaper")
+              try:
+                  require(seconds > 0, "Shared work deadline exhausted")
+                  process = subprocess.Popen(args, env=environment, stdout=subprocess.PIPE,
+                                             stderr=subprocess.STDOUT, start_new_session=True)
+                  result["pid"] = process.pid
+                  deadline = time.monotonic() + seconds
+                  owned.deadline = deadline
+                  table = processes()
+                  owned.candidate(process.pid, table[process.pid], table)
+                  require(owned.bind(process.pid, table[process.pid]), "Root identity unavailable")
+                  require(owned.resolve((process.pid, table[process.pid][1]), "bound"), "Root birth mismatch")
+                  root = next(handle for key, handle in owned.handles.items() if key[0] == process.pid)
+                  os.set_blocking(process.stdout.fileno(), False)
+                  buffer = b""
+                  with selectors.DefaultSelector() as poller, (directory / "console.log").open("w+b") as stream:
+                      poller.register(process.stdout, selectors.EVENT_READ)
+                      while poller.get_map() or not owned.exited(root):
+                          require(time.monotonic() < deadline, "Command deadline exhausted")
+                          owned.discover()
+                          for key, _ in poller.select(min(0.2, max(0, deadline - time.monotonic()))):
+                              try:
+                                  chunk = os.read(key.fd, 65536)
+                              except BlockingIOError:
+                                  continue
+                              if not chunk:
+                                  poller.unregister(key.fd)
+                                  continue
+                              tail.extend(chunk)
+                              del tail[:-8 * 1024 * 1024]
+                              stream.seek(0)
+                              stream.write(tail)
+                              stream.truncate()
+                              buffer += chunk
+                              lines = buffer.split(b"\n")
+                              buffer = lines.pop()
+                              require(len(buffer) < 256 * 1024, "Console line exceeds evidence capacity")
+                              for line in lines:
+                                  value = line.decode(errors="replace")
+                                  if INFRA.search(value):
+                                      records.append(value)
+                                      require(sum(len(x) for x in records) <= 1024 * 1024, "Infrastructure evidence overflow")
+                      result.update(rc=process.wait(), status="completed")
+                      if buffer and INFRA.search(buffer.decode(errors="replace")):
+                          records.append(buffer.decode(errors="replace"))
+                          require(sum(len(x) for x in records) <= 1024 * 1024, "Infrastructure evidence overflow")
+              except BaseException as error:
+                  result.update(status="execution_error", error=str(error))
+                  raise
+              finally:
+                  if process is not None:
+                      try:
+                          result["cleanup_complete"] = owned.cleanup(process.pid)
+                          if process.returncode is None:
+                              try:
+                                  result["cleanup_rc"] = process.wait(timeout=0.1)
+                              except subprocess.TimeoutExpired:
+                                  result["cleanup_complete"] = False
+                      except BaseException as error:
+                          result.update(cleanup_complete=False, cleanup_error=str(error))
+                      finally:
+                          process.stdout.close()
+                      if not result["cleanup_complete"]:
+                          result.update(status="cleanup_incomplete", supervisor_rc=125)
+                  result.update(end=time.time(), console_bytes=len(tail), infrastructure=records,
+                                observed_processes=owned.observed, unresolved_processes=sorted(owned.unresolved),
+                                acquisition_evidence=list(owned.acquisitions.values()), cleanup_errors=owned.cleanup_errors)
+                  publish(target, result)
+                  if result.get("cleanup_complete") is False:
+                      raise SystemExit(125)
+              require(result["status"] == "completed" and result["cleanup_complete"], "Incomplete command/cleanup")
+              print(f"{label}: rc={result['rc']}; {directory}", flush=True)
+              return result["rc"], tail.decode(errors="replace")
+
+          def evidence(directory):
+              sources, callbacks, suspicious, combined = [], [], [], []
+              total = 0
+              roots = sorted(Path("/tmp").glob("vpp-unittest-*"))
+              for root in roots:
+                  if root.is_symlink() or not root.is_dir():
+                      continue
+                  for path in (root / "log.txt", root / "vpp_stderr.txt"):
+                      if not path.exists():
+                          continue
+                      require(path.is_file() and not path.is_symlink(), "Unsafe classifier log")
+                      data = path.read_bytes()
+                      total += len(data)
+                      require(total <= 256 * 1024 * 1024, "Classifier input limit exceeded; refusing partial evidence")
+                      text = data.decode(errors="replace")
+                      combined.append(text)
+                      sources.append(dict(path=str(path), bytes=len(data), sha256=sha(data)))
+                      for number, line in enumerate(text.splitlines(), 1):
+                          if CALLBACK.search(line) or INFRA.search(line):
+                              require(len(line.encode()) <= 256 * 1024, "Classifier line too large")
+                              record = dict(source=str(path), line=number, text=line)
+                              if CALLBACK.search(line):
+                                  callbacks.append(record)
+                              if INFRA.search(line):
+                                  suspicious.append(record)
+              require(len(callbacks) <= 20000 and len(suspicious) <= 20000, "Classifier record capacity exceeded")
+              events, event_sources = [], []
+              for path in sorted(directory.glob("events.*.jsonl")):
+                  data = path.read_bytes()
+                  require(len(data) <= 32 * 1024 * 1024, "Observer file exceeded bound")
+                  event_sources.append(dict(path=path.name, bytes=len(data), sha256=sha(data)))
+                  events.extend(json.loads(line) for line in data.splitlines())
+              require(events, "Missing complete observer events")
+              record = dict(complete=True, sources=sources, callbacks=callbacks, infrastructure=suspicious,
+                            event_sources=event_sources,
+                            provenance={name: dict(bytes=(OUT / name).stat().st_size, sha256=sha((OUT / name).read_bytes()))
+                                        for name in ("manifest.json", f"{directory.name}/result.json")})
+              data = (json.dumps(record, indent=2) + "\n").encode()
+              require(len(data) <= 16 * 1024 * 1024, "Complete callback evidence exceeds bound")
+              (directory / "callbacks.json").write_bytes(data)
+              diagnostics(directory / "diagnostics")
+              return events, "\n".join(combined), record
+
+          def diagnostics(destination):
+              destination.mkdir(parents=True, exist_ok=True)
+              remaining, count, report = 32 * 1024 * 1024, 0, []
+              for root in [*sorted(Path("/tmp").glob("vpp-unittest-*")), Path("build-root/test-logs")]:
+                  if root.is_symlink() or not root.is_dir():
+                      continue
+                  for directory, subdirs, names in os.walk(root, followlinks=False):
+                      subdirs[:] = sorted(name for name in subdirs if not (Path(directory) / name).is_symlink())
+                      for name in sorted(names):
+                          source = Path(directory) / name
+                          if source.suffix not in (".txt", ".log", ".pcap", ".pcapng"):
+                              continue
+                          require(time.time() < float(os.environ["WORK_DEADLINE"]) + 30, "Diagnostics deadline exhausted")
+                          if not stat.S_ISREG(source.lstat().st_mode):
+                              continue
+                          size = source.stat().st_size
+                          length = min(size, 2 * 1024 * 1024)
+                          binary = source.suffix in (".pcap", ".pcapng")
+                          if count >= 300 or length > remaining or binary and size > length:
+                              if len(report) < 1000:
+                                  report.append(dict(path=str(source), status="omitted", bytes=size))
+                              continue
+                          with source.open("rb") as stream:
+                              stream.seek(size - length)
+                              data = stream.read(length)
+                          target = destination / f"{count:04d}{source.suffix}"
+                          target.write_bytes(data)
+                          report.append(dict(path=str(source), target=target.name, retained=len(data), bytes=size))
+                          remaining -= len(data)
+                          count += 1
+              (destination / "index.json").write_text(json.dumps(report, indent=2) + "\n")
+
+          def worker_contract():
+              source = content(TREE, "test/test_ipsec_esp.py")
+              classes = {node.name: node for node in ast.parse(source).body if isinstance(node, ast.ClassDef)}
+              def count(name):
+                  node = classes.get(name)
+                  if node is None:
+                      return 0
+                  for item in node.body:
+                      if isinstance(item, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "vpp_worker_count" for target in item.targets):
+                          return ast.literal_eval(item.value)
+                  if any(isinstance(base, ast.Name) and base.id == "RunTestIpsecEspAll" for base in node.bases) and (ast.get_docstring(node) or "").split()[0] == "async":
+                      return 2
+                  return max((count(base.id) for base in node.bases if isinstance(base, ast.Name)), default=0)
+              return {"test_ipsec_esp." + name: count(name) for name in classes}
+
+          RunEvidence = collections.namedtuple("RunEvidence", "events console rc logs callbacks")
+
+          def common(evidence):
+              events, console, rc, logs, callbacks = evidence
+              traces = "\n".join(e.get("traceback", "") for e in events)
+              require(not any(INFRA.search(channel) for channel in (console, logs, traces)),
+                      "Caught dead-VPP, infrastructure, timeout, crash or skip evidence")
+              require(rc in (0, 2), f"Unexpected command exit {rc}")
+              loaded = [event["pid"] for event in events if event["kind"] == "loaded"]
+              require(loaded and len(loaded) == len(set(loaded)), "Observer load provenance missing/duplicate")
+              require(all(event["pid"] in loaded for event in events), "Unattributed observer process")
+              starts = [event for event in events if event["kind"] == "startTest"]
+              stops = [event for event in events if event["kind"] == "stopTest"]
+              selected = [event["test"] for event in events if event["kind"] == "selected"]
+              require(selected and collections.Counter(selected) == collections.Counter(e["test"] for e in starts), "Discovered full suite differs from executed methods")
+              require(starts and collections.Counter(e["test"] for e in starts) == collections.Counter(e["test"] for e in stops), "Incomplete test lifecycle")
+              require(len({e["test"] for e in starts}) == len(starts), "Duplicate tests/retries")
+              require(not any(e["kind"] in ("addSkip", "addExpectedFailure", "addUnexpectedSuccess") for e in events), "Skipped/substituted result")
+              workers = worker_contract()
+              for event in starts:
+                  cls = event["test"].rsplit(".", 1)[0]
+                  require(event["netns"] is False and event["workers"] == workers.get(cls, 0) and not event["excluded"], "Required namespace/plugin/worker configuration changed")
+                  require(event["cmdline"], "Missing real VPP command line")
+              completed = [event for event in events if event["kind"] == "completed" and event["tests"]]
+              require(sum(e["tests"] for e in completed) == len(starts), "Missing ordinary runner completion")
+              require(all(not any(e[key] for key in ("skips", "expected", "unexpected")) for e in completed), "Invalid runner completion")
+              require(re.search(r"Ran [1-9][0-9]* tests? in ", console), "Missing completed console summary")
+              actual_callbacks = CALLBACK.findall("\n".join(record["text"] for record in callbacks))
+              return starts, completed, actual_callbacks
+
+          def positive(suite, evidence):
+              events, console, rc, logs, callbacks = evidence
+              starts, completed, actual = common(evidence)
+              require(rc == 0 and all(not e["errors"] and not e["failures"] for e in completed), "Fixed test command failed")
+              successes = [e["test"] for e in events if e["kind"] == "addSuccess"]
+              expected = collections.Counter(e["test"] for e in starts)
+              require(collections.Counter(successes) == expected, "Not every started test actually succeeded")
+              require(not any(e["kind"] in ("addError", "addFailure") or e["kind"] == "addSubTest" and e.get("exception") for e in events), "Fixed error or subtest failure")
+              require(all(kind == "addSuccess" for kind, _, _ in actual), "Raw framework callback failure")
+              require(collections.Counter((cls, method) for _, cls, method in actual) == collections.Counter(tuple(e["test"].split(".")[-2:]) for e in starts), "Incomplete framework success callbacks")
+              require(set(ready(suite)) <= set(successes), f"Missing named ready methods for {suite}")
+              require(not re.search(r"\bFAIL:[0-9]+:", logs), "C unit test assertion failed")
+              return successes
+
+          def failure_witnesses():
+              return {
+                  "router-add": ('self.assertRegex(lines[0], rf"^refs:{expected} fib:[0-9]+ mfib:[0-9]+$", output)', "refs:1", "refs:2"),
+                  "router-delete": ('self.assertRegex(lines[0], rf"^refs:{expected} fib:[0-9]+ mfib:[0-9]+$", output)', "refs:1", "absent fib:"),
+                  "router-sweep": ('self.assertRegex(lines[0], rf"^refs:{expected} fib:[0-9]+ mfib:[0-9]+$", output)', "refs:1", "refs:2"),
+                  "router-permanent": ('self.assertIn("broadcast refs:1 local:1"', "broadcast refs:1 local:1", "broadcast refs:0 local:0"),
+                  "lifecycle-fd": ("test_linux_cp_lifecycle.py\", line 100", "AssertionError"),
+                  "lifecycle-failure": ("lcp_default_ns_set", "got 0", "assert_known_api_retval"),
+                  "lifecycle-refresh": ("test_linux_cp_lifecycle.py\", line 144", "-81", "instead of"),
+                  "lifecycle-flags": ("self.assertEqual(set(self._pairs()), {new})", "AssertionError"),
+                  "lifecycle-vlan-add": ("self.assertEqual(self._fd_count(), baseline)", "line 239"),
+                  "lifecycle-vlan-delete": ("self.assertEqual(self._fd_count(), baseline)", "line 253"),
+                  "lifecycle-namespace": ("self.assertEqual(actual, expected, description)", "False != True", "owner receives 198.18.11.1/24"),
+                  "netlink-pair": ('self.assertEqual(paused_after["Socket"], "-1", paused_after)', "-1"),
+                  "netlink-dump": ("self.assertEqual(actual, expected, description)", "False != True", "injected dump attempt finished"),
+                  "tunnel-df": ("self.assertEqual(checksum(header[:header_len]), 0)", "49151 != 0"),
+                  "gre-config": ("test_gre_teib.py\", line 147", "self.make_tunnel(is_ip6, key)", "-79"),
+                  "gre-ingress": ("self.assertEqual(owner.get_rx_stats() - before, len(packets))", "0 != 3")}
+
+          def negative(name, evidence):
+              events, console, rc, logs, callbacks = evidence
+              starts, completed, actual = common(evidence)
+              entry, _ = recipe(name)
+              identity = "test_" + entry["selector"]
+              require([e["test"] for e in starts] == [identity], "Wrong negative selector")
+              require(rc == 2 and sum(e["errors"] + e["failures"] for e in completed) >= 1, "Missing ordinary negative completion")
+              failures = [e for e in events if e["kind"] in ("addFailure", "addError", "addSubTest") and e.get("exception")]
+              require(failures and not any(e["kind"] == "addSuccess" for e in events), "Restored source unexpectedly passed")
+              require(all(e["test"] == identity for e in failures), "Failure belongs to another test")
+              first = failures[0]
+              trace = first.get("traceback", "")
+              helpers = [e for e in events if e["kind"] == "helper"]
+              joined = "\n".join(str(e) for e in helpers)
+              require(actual and all(kind in ("addFailure", "addError") for kind, _, _ in actual) or first["kind"] == "addSubTest", "Missing negative raw result callback")
+              expected_type = "UnexpectedApiReturnValueError" if name in ("lifecycle-failure", "lifecycle-refresh", "gre-config") else "AssertionError"
+              require(all(e["exception"] == expected_type for e in failures), "Unexpected secondary exception or teardown error")
+              witnesses = failure_witnesses()
+              require(sum(e["errors"] for e in completed) == sum(e["exception"] != "AssertionError" for e in failures) and
+                      sum(e["failures"] for e in completed) == sum(e["exception"] == "AssertionError" for e in failures), "Observer/runner failure counts differ")
+              repeated = name in ("lifecycle-refresh", "tunnel-df", "gre-config", "gre-ingress")
+              require(repeated or len(failures) == 1, "Unexpected additional ordinary failure")
+              if name in ("tunnel-df", "lifecycle-refresh"):
+                  require(len(failures) == 1, "First-failure negative execution continued unexpectedly")
+              if name == "lifecycle-refresh":
+                  require(first.get("params") == dict(version=1, host_type=0), "Wrong first retained-pair refresh case")
+              seen_subtests = set()
+              for failure in failures:
+                  failure_trace = failure.get("traceback", "")
+                  require(all(token in failure_trace for token in witnesses[name]), f"Wrong intended failure witness for {name}: {failure_trace}")
+                  require(not re.search(r"in (?:tearDown|tearDownClass|doCleanups|doClassCleanups)\b", failure_trace), "Cleanup failed after intended failure")
+                  if repeated:
+                      require(failure["kind"] == "addSubTest" and failure.get("parent_test") == identity and failure.get("subtest_id", "").startswith(identity + " "), "Missing actual subtest identity")
+                      require(failure["subtest_id"] not in seen_subtests, "Duplicate failing subtest")
+                      seen_subtests.add(failure["subtest_id"])
+                      params = failure.get("params", {})
+                      if name == "lifecycle-refresh":
+                          require(set(params) == {"version", "host_type"} and params["version"] in (1, 2, 3) and params["host_type"] in (0, 1), "Unknown lifecycle refresh case")
+                      elif name.startswith("gre-"):
+                          require(set(params) == {"key", "p2p_first"} and params["key"] in (0, 0x12345678) and type(params["p2p_first"]) is bool and
+                                  (name != "gre-config" or params["p2p_first"] is False), "Unknown GRE failure case")
+                      else:
+                          require(set(params) == {"tun_flags", "inner_df", "inner_tos", "payload_size"} and params["inner_df"] == 1 and
+                                  (params["tun_flags"], params["inner_tos"]) in ((1, 0), (1, 0xAB), (13, 0xAB)) and
+                                  params["payload_size"] in (0, 1, 54, 511), "Unknown checksum failure case")
+                  if name in ("lifecycle-fd", "lifecycle-vlan-add", "lifecycle-vlan-delete"):
+                      values = re.search(r"AssertionError: ([0-9]+) != ([0-9]+)", failure_trace)
+                      require(values and int(values[1]) == int(values[2]) + 1, "FD witness is not exactly one retained descriptor")
+              ordinary = [e for e in failures if e["kind"] != "addSubTest"]
+              require(collections.Counter(actual) == collections.Counter(
+                  (e["kind"], *identity.split(".")[-2:]) for e in ordinary), "Raw framework failure callbacks differ")
+              if name.startswith("router-"):
+                  require("test lcp router" in joined, "No real router CLI state")
+                  if name == "router-add":
+                      require(any(e.get("function") == "poll_for" and "preference 100 in VPP" in str(e.get("description")) and e.get("actual") == e.get("expected") for e in helpers), "No changed Linux gateway observed in VPP")
+              if name == "netlink-dump":
+                  states = []
+                  for event in helpers:
+                      if event.get("function") == "_stats":
+                          states.append(ast.literal_eval(event["value"]))
+                  require(states, "No actual netlink state observations")
+                  before = states[0]
+                  require(any(s.get("Test dump injected") == "1" and int(s.get("Test dump result", "0")) > 0 and
+                              s.get("State") == "notification" and s.get("Test dump sync ends") == "4" and
+                              int(s["Synchronization completed"]) == int(before["Synchronization completed"]) + 1 and
+                              s["Synchronization failed"] == before["Synchronization failed"] for s in states), "No source-attributable false-success state")
+              if name == "netlink-pair":
+                  require("synchronizing" in joined and "lcp create loop1" in joined, "Missing actual recovery/pair sequence")
+              if name == "lifecycle-namespace":
+                  require(any(e.get("function") == "poll_for" and e.get("description") == "owner receives 198.18.10.1/24" and e.get("actual") == e.get("expected") for e in helpers), "No real prior address synchronization")
+              if name == "tunnel-df":
+                  require(first.get("params", {}).get("tun_flags") == 1 and first.get("params", {}).get("inner_df") == 1 and first.get("params", {}).get("payload_size") == 0 and first.get("params", {}).get("inner_tos") == 0, "Wrong first checksum subtest")
+              if name.startswith("gre-"):
+                  require(first.get("params", {}).get("key") == 0 and first.get("params", {}).get("p2p_first") == (name == "gre-ingress"), "Wrong first GRE ownership subtest")
+                  require(any(e.get("function") == "assert_ingress" and e.get("packets") == e.get("received") == 3 for e in helpers), "Missing preceding real GRE packet delivery")
+              if name in ("lifecycle-refresh", "gre-config", "lifecycle-failure"):
+                  api = "gre_tunnel_add_del" if name == "gre-config" else "lcp_default_ns_set" if name == "lifecycle-failure" else "lcp_itf_pair_add_del"
+                  value = -79 if name == "gre-config" else 0 if name == "lifecycle-failure" else -81
+                  require(any(str(e.get("api", "")).startswith(api) and e.get("retval") == value for e in helpers), "Missing intended real API return value")
+              return identity
+
+          def tests():
+              manifest = verify()
+              suite = CASE.removeprefix("fixed-") if CASE.startswith("fixed-") else None
+              selector = suite if suite else manifest["restoration"]["selector"]
+              directory = OUT / "runtime"
+              directory.mkdir(exist_ok=True)
+              environment = dict(os.environ, INTEGRATION_EVENTS=str(directory / "events"),
+                                 PYTHONPATH=str(TOOLS) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+              failfast = CASE in ("tunnel-df", "lifecycle-refresh")
+              args = ["make", "UNATTENDED=yes", "UV=", "TEST_JOBS=1", "FORCE_FOREGROUND=1", "VPP_WORKER_COUNT=0",
+                      "RETRIES=0", f"FAILFAST={int(failfast)}", "SKIP_TESTS=", "VPP_EXCLUDED_PLUGINS=", "V=2", "TIMEOUT=300",
+                      "COREDUMP_SIZE=0", "COMPRESS_FAILED_TEST_LOGS=no", "DECODE_PCAPS=none", "RND_SEED=50", f"TEST={selector}", "test-debug"]
+              rc, console = command("runtime", args, environment, limit=3000)
+              events, logs, records = evidence(directory)
+              verify()
+              result = json.loads((directory / "result.json").read_text())
+              require(not result["infrastructure"], "Caught infrastructure exception in full console")
+              if suite:
+                  successes = positive(suite, RunEvidence(events, console, rc, logs, records["callbacks"]))
+                  acceptance = dict(status="PASS", case=CASE, suite=suite, successes=successes, required=ready(suite))
+              else:
+                  identity = negative(CASE, RunEvidence(events, console, rc, logs, records["callbacks"]))
+                  acceptance = dict(status="PASS", case=CASE, intended_failure=identity, paired_fixed=identity.split(".")[0].removeprefix("test_"))
+              acceptance.update(integration_tree=TREE, built_tree=manifest["built_tree"], workflow_sha=os.environ["WORKFLOW_SHA"],
+                                run=os.environ["GITHUB_RUN_ID"], attempt=os.environ["GITHUB_RUN_ATTEMPT"], pending=GAPS)
+              save("acceptance.json", acceptance)
+
+          def binaries():
+              verify()
+              root = Path("build-root/install-vpp_debug-native")
+              files = {}
+              for name in ("vpp", "linux_cp_plugin.so", "linux_cp_unittest_plugin.so", "gre_plugin.so", "unittest_plugin.so"):
+                  paths = [p for p in root.rglob(name) if p.is_file()]
+                  require(paths, f"Required installed binary missing: {name}")
+                  files.update({str(path): sha(path.read_bytes()) for path in paths})
+              save("binaries.json", files)
+              caches = list(Path("build-root/build-vpp_debug-native").rglob("CMakeCache.txt"))
+              require(caches, "Missing debug CMake cache")
+              (OUT / "CMakeCache.txt").write_text("\n".join(path.read_text() for path in caches))
+              require("cmake_build_type:string=debug" in (OUT / "CMakeCache.txt").read_text().lower(), "Not a debug build")
+              plugin = next(path for path in files if path.endswith("linux_cp_plugin.so"))
+              symbols = subprocess.check_output(["nm", "-D", "--defined-only", plugin], text=True)
+              for name in ("lcp_router_vft", "lcp_nl_test_set_sync_pause", "lcp_nl_test_inject_dump"):
+                  require(re.search(r"\b" + name + "$", symbols, re.M), f"Missing exported hook {name}")
+              (OUT / "linux-cp-symbols.txt").write_text(symbols)
+
+          def fixtures():
+              import copy
+              require(len(ready()) == len(set(ready())) == 24, "Invalid ready inventory")
+              cases = ["router-add", "router-delete", "router-sweep", "router-permanent", "lifecycle-fd", "lifecycle-failure", "lifecycle-refresh", "lifecycle-flags", "lifecycle-vlan-add", "lifecycle-vlan-delete", "lifecycle-namespace", "netlink-pair", "netlink-dump", "tunnel-df", "gre-config", "gre-ingress"]
+              records = []
+              for name in cases:
+                  entry, data = recipe(name)
+                  require(entry["before_blob"] != entry["after_blob"], "Ineffective recipe")
+                  records.append(entry)
+              save("recipe-fixtures.json", dict(status="PASS", recipes=records, runtime="not executed by fixtures"))
+              identity = "test_gre.TestGRE.test_example"
+              events = [dict(kind="loaded", pid=1), dict(kind="selected", pid=1, test=identity),
+                        dict(kind="startTest", pid=1, test=identity, netns=False, workers=0, excluded=[], cmdline=["vpp"]),
+                        dict(kind="addSuccess", pid=1, test=identity), dict(kind="stopTest", pid=1, test=identity),
+                        dict(kind="completed", pid=1, tests=1, errors=0, failures=0, skips=0, expected=0, unexpected=0)]
+              callbacks = [dict(text="--- addSuccess() TestGRE.test_example(doc) called")]
+              console = "Ran 1 test in 0.1s\nOK\n"
+              positive("gre", RunEvidence(events, console, 0, "", callbacks))
+              bad_events = [events[:-1], events + [events[3]], events[:3] + events[4:]]
+              for index, key, value in ((2, "netns", True), (2, "excluded", ["gre"]),
+                                         (3, "kind", "addSkip"), (3, "kind", "addError"),
+                                         (1, "test", "test_gre.Wrong.test_example")):
+                  bad = copy.deepcopy(events)
+                  bad[index][key] = value
+                  bad_events.append(bad)
+              for bad in bad_events:
+                  try:
+                      positive("gre", RunEvidence(bad, console, 0, "", callbacks))
+                  except AssertionError:
+                      pass
+                  else:
+                      raise AssertionError("Classifier accepted missing, duplicate, skipped or wrong-class result")
+              for marker in ("VppTransportSocketIOError", "VppDiedError", "Vpp dead", "VPP subprocess died unexpectedly", "timed out", "SIGSEGV", "not enough cpus"):
+                  require(INFRA.search(marker), f"Infrastructure filter misses {marker}")
+                  try:
+                      positive("gre", RunEvidence(events, console, 0, marker, callbacks))
+                  except AssertionError:
+                      pass
+                  else:
+                      raise AssertionError("Classifier accepted caught infrastructure")
+              witness_map = failure_witnesses()
+              for name in cases:
+                  entry, _ = recipe(name)
+                  identity = "test_" + entry["selector"]
+                  error_type = "UnexpectedApiReturnValueError" if name in ("lifecycle-failure", "lifecycle-refresh", "gre-config") else "AssertionError"
+                  trace = "\n".join(witness_map[name])
+                  if name in ("lifecycle-fd", "lifecycle-vlan-add", "lifecycle-vlan-delete"):
+                      trace += "\nAssertionError: 7 != 6"
+                  params = (dict(key=0, p2p_first=name == "gre-ingress") if name.startswith("gre-") else
+                            dict(version=1, host_type=0) if name == "lifecycle-refresh" else
+                            dict(tun_flags=1, inner_df=1, inner_tos=0, payload_size=0))
+                  helpers = [dict(function="cli", command="test lcp router", value="synchronizing lcp create loop1"),
+                             dict(function="poll_for", description="changed gateway preference 100 in VPP", actual="True", expected="True"),
+                             dict(function="poll_for", description="owner receives 198.18.10.1/24", actual="True", expected="True"),
+                             dict(function="assert_ingress", packets=3, received=3),
+                             dict(function="api", api="gre_tunnel_add_del", retval=-79),
+                             dict(function="api", api="lcp_itf_pair_add_del_v3", retval=-81),
+                             dict(function="api", api="lcp_default_ns_set", retval=0)]
+                  before = {"Synchronization completed": "2", "Synchronization failed": "1"}
+                  after = dict(before, **{"Synchronization completed": "3", "Test dump injected": "1", "Test dump result": "1", "Test dump sync ends": "4", "State": "notification"})
+                  helpers += [dict(function="_stats", value=str(value)) for value in (before, after)]
+                  sample = [dict(kind="loaded", pid=1), dict(kind="selected", pid=1, test=identity),
+                            dict(kind="startTest", pid=1, test=identity, netns=False, workers=0, excluded=[], cmdline=["vpp"]),
+                            *[dict(kind="helper", pid=1, test=identity, **value) for value in helpers],
+                            dict(kind="addSubTest", pid=1, test=identity, parent_test=identity,
+                                 subtest_id=identity + " (fixture)", subtest_description=identity + " (fixture)",
+                                 exception=error_type, traceback=trace, params=params),
+                            dict(kind="stopTest", pid=1, test=identity),
+                            dict(kind="completed", pid=1, tests=1, errors=int(error_type != "AssertionError"), failures=int(error_type == "AssertionError"), skips=0, expected=0, unexpected=0)]
+                  console_negative = "Ran 1 test in 0.1s\nFAILED (failures=1)\n"
+                  negative(name, RunEvidence(sample, console_negative, 2, "", []))
+                  failure_index = next(i for i, event in enumerate(sample) if event["kind"] == "addSubTest")
+                  bad = copy.deepcopy(sample)
+                  extra = dict(bad[failure_index], kind="addFailure", traceback="in tearDown\nAssertionError: unrelated teardown")
+                  bad.insert(-2, extra)
+                  bad[-1]["failures"] += 1
+                  try:
+                      negative(name, RunEvidence(bad, console_negative, 2, "", []))
+                  except AssertionError:
+                      pass
+                  else:
+                      raise AssertionError(f"Accepted secondary teardown failure {name}")
+                  for key, value in (("exception", "VppTransportSocketIOError"), ("traceback", "unrelated assertion")):
+                      bad = copy.deepcopy(sample)
+                      bad[failure_index][key] = value
+                      try:
+                          negative(name, RunEvidence(bad, console_negative, 2, "", []))
+                      except AssertionError:
+                          pass
+                      else:
+                          raise AssertionError(f"Accepted unrelated negative {name}")
+              infrastructure_fixtures()
+              observer_fixtures()
+              process_fixtures()
+              scheduling_fixtures()
+              acquisition_fixtures()
+              ownership_fixtures()
+              cleanup_boundary_fixtures()
+              parent_identity_fixtures()
+              first_failure_fixtures()
+              observation_fixtures()
+              deadline_fixtures()
+              save("classifier-fixtures.json", dict(status="PASS", runtime="synthetic unittest/processes only"))
+              print("Pure recipe/blob/roundtrip, classifier, observer and descendant fixtures passed")
+
+          def infrastructure_fixtures():
+              import copy
+              from unittest.mock import patch
+              identity = "test_gre.TestGRE.test_example"
+              events = [dict(kind="loaded", pid=1), dict(kind="selected", pid=1, test=identity),
+                        dict(kind="startTest", pid=1, test=identity, netns=False, workers=0, excluded=[], cmdline=["vpp"]),
+                        dict(kind="addSuccess", pid=1, test=identity), dict(kind="stopTest", pid=1, test=identity),
+                        dict(kind="completed", pid=1, tests=1, errors=0, failures=0, skips=0, expected=0, unexpected=0)]
+              callbacks = [dict(text="--- addSuccess() TestGRE.test_example(doc) called")]
+              console = "Ran 1 test in 0.1s\nOK"
+              entry, _ = recipe("lifecycle-flags")
+              identity = "test_" + entry["selector"]
+              failures = copy.deepcopy(events)
+              for event in failures:
+                  if "test" in event:
+                      event["test"] = identity
+              failures[3].update(kind="addFailure", exception="AssertionError",
+                                 traceback="\n".join(failure_witnesses()["lifecycle-flags"]))
+              failures[-1]["failures"] = 1
+              cls, method = identity.split(".")[-2:]
+              failed_callbacks = [dict(text=f"--- addFailure() {cls}.{method}(doc) called")]
+              def classify(sample, summary, rc, logs, raw):
+                  value = RunEvidence(sample, summary, rc, logs, raw)
+                  return positive("gre", value) if rc == 0 else negative("lifecycle-flags", value)
+              markers = ("SIGABRT", "SIGBUS", "SIGILL", "SIGFPE", "Aborted", "Bus error",
+                         "Illegal instruction", "Floating point exception", "SKIP: infrastructure substituted")
+              for source, summary, rc, raw in ((events, console, 0, callbacks),
+                                             (failures, "Ran 1 test in 0.1s\nFAILED (failures=1)", 2, failed_callbacks)):
+                  classify(source, summary, rc, "SIGTERM: normal shutdown", raw)
+                  for marker in markers:
+                      for channel in range(3):
+                          sample = copy.deepcopy(source)
+                          text, logs = summary, ""
+                          if channel == 0:
+                              text += "\n" + marker
+                          elif channel == 1:
+                              logs = marker
+                          else:
+                              sample[3]["traceback"] = marker + "\n" + sample[3].get("traceback", "")
+                          try:
+                              classify(sample, text, rc, logs, raw)
+                          except AssertionError:
+                              pass
+                          else:
+                              raise AssertionError(f"Accepted infrastructure {marker} in channel {channel}, rc {rc}")
+              rc, tail = command("fixture-fatal-tail", [sys.executable, "-c",
+                  "import sys; print('SIGABRT: Aborted', file=sys.stderr, flush=True); "
+                  "sys.stdout.write(('x'*8191+'\\n')*1153)"], limit=30)
+              result = json.loads((OUT / "fixture-fatal-tail/result.json").read_text())
+              require(rc == 0 and result["cleanup_complete"] and "SIGABRT" not in tail and
+                      result["console_bytes"] == 8 * 1024 * 1024 and result["infrastructure"] == ["SIGABRT: Aborted"],
+                      "Early fatal evidence lost after console tail eviction")
+              fixture_root = OUT / "fixture-fatal-gate"
+              directory = fixture_root / "runtime"
+              directory.mkdir(parents=True, exist_ok=True)
+              publish(directory / "result.json", result)
+              with patch.dict(globals(), CASE="fixed-gre", OUT=fixture_root, verify=lambda: {},
+                              command=lambda *args, **kwargs: (rc, tail + "\n" + console),
+                              evidence=lambda path: (events, "", dict(callbacks=callbacks))):
+                  try:
+                      tests()
+                  except AssertionError as error:
+                      require("full console" in str(error), "Sticky evidence rejected for an unrelated reason")
+                  else:
+                      raise AssertionError("Runtime accepted fatal evidence outside retained console")
+
+          def observer_fixtures():
+              import tempfile
+              with tempfile.TemporaryDirectory(dir=TOOLS) as temporary:
+                  path = Path(temporary)
+                  observer = path / "sitecustomize.py"
+                  observer.write_bytes((TOOLS / "sitecustomize.py").read_bytes())
+                  environment = dict(os.environ, PYTHONPATH=str(path), INTEGRATION_EVENTS=str(path / "events"))
+                  code = '''
+          import io, unittest
+          class Example(unittest.TestCase):
+              def test_success(self): pass
+              def test_failure(self): self.assertEqual(1, 0, "real failure")
+              def test_error(self): raise ValueError("real error")
+              def test_subtest(self):
+                  for label in ("first label", "second label"):
+                      with self.subTest(label, value=3): self.assertEqual(3, 4)
+                  with self.subTest("outer label", outer=7):
+                      with self.subTest("nested label", value=3): self.assertEqual(3, 4)
+          result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.defaultTestLoader.loadTestsFromTestCase(Example))
+          assert result.testsRun == 4 and len(result.failures) == 4 and len(result.errors) == 1
+          '''
+                  subprocess.run([sys.executable, "-c", code], env=environment, check=True, timeout=10)
+                  events = [json.loads(line) for item in path.glob("events.*.jsonl") for line in item.read_text().splitlines()]
+                  counts = collections.Counter(e["kind"] for e in events)
+                  require(counts["startTest"] == counts["stopTest"] == 4 and counts["addSuccess"] == counts["addFailure"] == counts["addError"] == 1 and counts["addSubTest"] == 3, "Observer changed real callbacks")
+                  subtests = [e for e in events if e["kind"] == "addSubTest"]
+                  require(len({e["subtest_id"] for e in subtests}) == 3 and subtests[0]["params"] == subtests[1]["params"] and
+                          "first label" in subtests[0]["subtest_id"] and "second label" in subtests[1]["subtest_id"] and
+                          subtests[2]["params"] == dict(outer=7, value=3) and "nested label" in subtests[2]["subtest_description"] and
+                          all(e["parent_test"] == e["test"] for e in subtests), "Observer lost subtest identity/labels/nesting")
+                  require(any("ValueError: real error" in e.get("traceback", "") for e in events), "Observer lost real exception")
+
+          def process_fixtures():
+              old = os.environ.get("WORK_DEADLINE")
+              os.environ["WORK_DEADLINE"] = str(time.time() + 30)
+              code = 'import os,time; child=os.fork(); (os.setsid(),time.sleep(20)) if child == 0 else None'
+              try:
+                  rc, _ = command("fixture-normal", [sys.executable, "-c", "print('normal completion')"], limit=2)
+                  require(rc == 0, "Normal command failed")
+                  identity_fixtures()
+                  rc, _ = command("fixture-setsid", [sys.executable, "-c", code], limit=0.5)
+              except AssertionError:
+                  result = json.loads((OUT / "fixture-setsid/result.json").read_text())
+                  require(result["status"] == "execution_error" and result["cleanup_complete"] and len(result["observed_processes"]) >= 2, "setsid descendant not cleaned after inherited pipe timeout")
+              else:
+                  raise AssertionError("Inherited setsid pipe unexpectedly escaped deadline")
+              finally:
+                  if old is None:
+                      os.environ.pop("WORK_DEADLINE", None)
+                  else:
+                      os.environ["WORK_DEADLINE"] = old
+
+          def deadline_fixtures():
+              from unittest.mock import patch
+              previous = os.environ["WORK_DEADLINE"]
+              phase_path = OUT / "phase-binaries.json"
+              prior_phase = phase_path.read_bytes() if phase_path.exists() else None
+              timer = signal.getitimer(signal.ITIMER_REAL)
+              started = time.monotonic()
+              path = OUT / "fixture-publication.json"
+              original = dict(status="running", rc=None)
+              publish(path, original)
+              with patch.object(Path, "write_text", side_effect=TimeoutError("interrupted publication")):
+                  try:
+                      publish(path, dict(status="completed", rc=0))
+                  except TimeoutError:
+                      pass
+              require(json.loads(path.read_text()) == original, "Interrupted publication damaged prior result")
+              try:
+                  with patch.dict(os.environ, WORK_DEADLINE="500", STEP_DEADLINE="130"), \
+                       patch.object(time, "time", return_value=100) as clock:
+                      command("fixture-step-first", [sys.executable, "-c", "pass"], limit=30)
+                      clock.return_value = 119.9
+                      try:
+                          command("fixture-step-second", [sys.executable, "-c", "import time; time.sleep(20)"], limit=30)
+                      except AssertionError as error:
+                          require(str(error) == "Command deadline exhausted", "Unrelated command fixture failure")
+                          result = json.loads((OUT / "fixture-step-second/result.json").read_text())
+                          require(result["cleanup_complete"] and result["rc"] is None and
+                                  0 < result["allowed_seconds"] < 0.11 and result["deadline"] == 130,
+                                  "Second command reset step budget or lost cleanup/raw exit")
+                      else:
+                          raise AssertionError("Sequential command exceeded shared step deadline")
+                  for limiting in ("WORK_DEADLINE", "STEP_DEADLINE"):
+                      for expired_before_arm in (True, False):
+                          environment = dict(WORK_DEADLINE="500", STEP_DEADLINE="500")
+                          environment[limiting] = "99" if expired_before_arm else "105"
+                          entered = []
+                          def body():
+                              entered.append(True)
+                              signal.raise_signal(signal.SIGALRM)
+                          with patch.dict(os.environ, **environment), patch.object(time, "time", return_value=100), \
+                               patch.object(signal, "setitimer") as arm, patch.dict(globals(), binaries=body):
+                              try:
+                                  phase("binaries", [])
+                              except (AssertionError, TimeoutError) as error:
+                                  expected = "Shared phase deadline exhausted" if expired_before_arm else "Phase work deadline exhausted, including postprocessing"
+                                  require(type(error) is (AssertionError if expired_before_arm else TimeoutError) and
+                                          str(error) == expected, "Wrong deterministic expiration branch")
+                              else:
+                                  raise AssertionError("Phase accepted deterministic expiration")
+                              require(entered == ([] if expired_before_arm else [True]), "Wrong phase body entry")
+                              require(arm.call_args_list == ([((signal.ITIMER_REAL, 0),)] if expired_before_arm else
+                                      [((signal.ITIMER_REAL, 5.0),), ((signal.ITIMER_REAL, 0),)]), "Wrong phase timer budget")
+                          value = json.loads(phase_path.read_text())
+                          require(value["status"] == "FAIL" and value["rc"] is None and value["error"] == expected,
+                                  "Deadline invented successful phase/exit status")
+              finally:
+                  os.environ["WORK_DEADLINE"] = previous
+                  if prior_phase is None:
+                      phase_path.unlink(missing_ok=True)
+                  else:
+                      phase_path.write_bytes(prior_phase)
+                  if timer[0]:
+                      signal.setitimer(signal.ITIMER_REAL, max(0.001, timer[0] - time.monotonic() + started), timer[1])
+
+          def identity_fixtures():
+              from unittest.mock import patch
+              owned = OwnedProcesses()
+              owned.candidate(300, (os.getpid(), "old", "S"), {})
+              owned.handles[(300, "old")] = (30, 31)
+              owned.resolve((300, "old"), "bound")
+              sent = []
+              with patch.object(signal, "pidfd_send_signal", side_effect=lambda fd, sig: sent.append((fd, sig))), \
+                   patch.object(os, "kill", side_effect=AssertionError("Numeric signal forbidden")), \
+                   patch.object(os, "killpg", side_effect=AssertionError("Group signal forbidden")):
+                  owned.signal(signal.SIGTERM)
+                  owned.signal(signal.SIGKILL)
+              require(sent == [(31, signal.SIGTERM), (31, signal.SIGKILL)], "PID replacement redirected original identity signal")
+              tables = [{300: (1, "replacement", "S"), 201: (os.getpid(), "new-birth", "S")}]
+              owned.candidate(201, (os.getpid(), "old-birth", "S"), {})
+              owned.handles[(201, "old-birth")] = (20, 21)
+              owned.resolve((201, "old-birth"), "bound")
+              acquired = []
+              def bind(pid, identity):
+                  acquired.append((pid, identity[1]))
+                  return False
+              with patch.dict(globals(), processes=lambda: tables[0]), patch.object(owned, "bind", side_effect=bind):
+                  owned.discover()
+              require((201, "new-birth") in acquired and (300, "replacement") not in acquired, "New owned birth hidden or unrelated replacement acquired")
+              for identities in (((os.getpid(), "old", "S"), (os.getpid(), "new", "S")),):
+                  candidate = OwnedProcesses()
+                  candidate.candidate(400, identities[0], {})
+                  with patch.object(os, "open", return_value=40), patch.object(os, "pidfd_open", return_value=41), \
+                       patch.object(os, "close"), patch.object(candidate, "identity", side_effect=identities):
+                      require(not candidate.bind(400, identities[0]) and not candidate.handles, "Open-time replacement acquired wrong identity")
+              candidate = OwnedProcesses()
+              candidate.candidate(500, (os.getpid(), "old-parent", "S"), {})
+              candidate.handles[(500, "old-parent")] = (50, 51)
+              candidate.resolve((500, "old-parent"), "bound")
+              candidate.candidate(600, (500, "child", "S"), {500: (1, "old-parent", "S")})
+              with patch.object(os, "open", return_value=60), patch.object(os, "pidfd_open", return_value=61), \
+                   patch.object(os, "close"), patch.object(candidate, "identity", side_effect=[(500, "child", "S")] * 2 + [(1, "new-parent", "S")]), \
+                   patch.object(candidate, "exited", return_value=False):
+                  require(not candidate.bind(600, (500, "child", "S")), "Replaced ancestor established false ownership")
+
+          def first_failure_fixtures():
+              import io
+              import types
+              import unittest
+              makefile = content(TREE, "test/Makefile").decode()
+              require("ifneq ($(findstring $(FAILFAST),1 y yes),)\nARG1=--failfast\nendif" in makefile, "Harness lost FAILFAST argument propagation")
+              runner = ast.parse(content(TREE, "test/run_tests.py"))
+              require(any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "VppTestRunner" and
+                          any(arg.arg == "failfast" and isinstance(arg.value, ast.Attribute) and arg.value.attr == "failfast" for arg in node.keywords)
+                          for node in ast.walk(runner)), "Harness lost failfast runner setting")
+              for module, cls, method in (("test_ipsec_esp", "TestIpsecEspTun", "test_tun_df44"),
+                                          ("test_linux_cp_lifecycle", "TestLinuxCPLifecycle", "test_pair_replace_resend")):
+                  source = content(TREE, f"test/{module}.py").decode()
+                  tree = ast.parse(source)
+                  node = next(item for item in ast.walk(tree) if isinstance(item, ast.FunctionDef) and item.name == method)
+                  namespace = dict(VppEnum=types.SimpleNamespace(vl_api_tunnel_encap_decap_flags_t=types.SimpleNamespace(
+                      TUNNEL_API_ENCAP_DECAP_FLAG_ENCAP_COPY_DF=1, TUNNEL_API_ENCAP_DECAP_FLAG_ENCAP_COPY_DSCP=4,
+                      TUNNEL_API_ENCAP_DECAP_FLAG_ENCAP_COPY_ECN=8)), socket=types.SimpleNamespace(AF_INET=2))
+                  exec(compile(ast.Module(body=[node], type_ignores=[]), f"test/{module}.py", "exec"), namespace)
+                  visits, pairs = [], set()
+                  def verify(self, *args, **kwargs):
+                      visits.append((self.inner_df, kwargs["payload_size"]))
+                      if self.inner_df and self.params[2].tun_flags & 1:
+                          self.fail("49151 != 0")
+                  def add_pair(self, *args, **kwargs):
+                      visits.append(args)
+                      if len(args) == 5 or len(args) == 3 and args[0] in pairs:
+                          raise ValueError("retained pair -81")
+                      if len(args) == 3:
+                          pairs.add(args[0])
+                  expected_error = type("ExpectedError", (), {
+                      "__enter__": lambda self: None,
+                      "__exit__": lambda self, kind, value, trace: kind is ValueError})
+                  attributes = {method: namespace[method], "params": {2: types.SimpleNamespace()},
+                                "unconfig_network": lambda self: None, "config_network": lambda *args: None,
+                                "verify_tun_44": verify, "create_pg_interfaces": lambda self, values: setattr(self, "pg_interfaces", [types.SimpleNamespace(sw_if_index=i) for i in values]),
+                                "_add_pair": add_pair, "_pairs": lambda self: {0: types.SimpleNamespace()},
+                                "vapi": types.SimpleNamespace(assert_known_api_retval=lambda values: expected_error(), lcp_itf_pair_replace_begin=lambda: None),
+                                "ns_name": "owner", "other_ns": "other"}
+                  for failfast in (False, True):
+                      visits.clear()
+                      pairs.clear()
+                      case = type(cls, (unittest.TestCase,), attributes)
+                      result = unittest.TextTestRunner(stream=io.StringIO(), failfast=failfast).run(case(method))
+                      count = len(result.failures) + len(result.errors)
+                      require(count == (1 if failfast else 12 if module == "test_ipsec_esp" else 6), "Pinned negative method did not stop only at first failure")
+                      if module == "test_linux_cp_lifecycle":
+                          traces = [trace for _, trace in result.errors]
+                          require("line 144" in traces[0] and all("line 131" in trace for trace in traces[1:]), "Retained-pair model lost original failure causality")
+                      if failfast:
+                          require(len(visits) == (5 if module == "test_ipsec_esp" else 7), "Unexpected first-failure execution boundary")
+
+          def observation_fixtures():
+              import tempfile
+              from unittest.mock import patch
+              with tempfile.TemporaryDirectory(dir=TOOLS) as temporary:
+                  root = Path(temporary)
+                  raw = {"phase-a.json": "{}", "phase-b.json": "null", "phase-c.json": "[]",
+                         "phase-d.json": "{", "phase-e.json": '{"status":[]}',
+                         "phase-z.json": '{"status":"running"}'}
+                  for name, data in raw.items():
+                      (root / name).write_text(data)
+                  with patch.dict(globals(), OUT=root, finalize=lambda: None):
+                      try:
+                          phase("finalize", [])
+                      except AssertionError:
+                          pass
+                      else:
+                          raise AssertionError("Malformed observations published successful finalization")
+                  values = json.loads((root / "phase-observations.json").read_text())
+                  require(sum(value["status"] == "UNKNOWN" for value in values) == 5 and
+                          any(value["path"] == "phase-z.json" and value["status"] == "running" for value in values), "Malformed shape aborted later phase observations")
+                  require(json.loads((root / "phase-finalize.json").read_text())["status"] == "FAIL" and
+                          all((root / name).read_text() == data for name, data in raw.items()), "Finalization invented PASS or altered malformed raw records")
+                  def indexed():
+                      index = json.loads((root / "evidence-index.json").read_text())
+                      require("evidence-index.json" not in index, "Index includes stale self snapshot")
+                      for name in ("phase-finalize.json", "phase-observations.json"):
+                          data = (root / name).read_bytes()
+                          require(index[name] == dict(bytes=len(data), sha256=sha(data)), "Index does not bind terminal evidence")
+                  indexed()
+                  for name in raw:
+                      (root / name).unlink()
+                  with patch.dict(globals(), OUT=root, finalize=lambda: None):
+                      phase("finalize", [])
+                  indexed()
+                  require(json.loads((root / "phase-finalize.json").read_text())["status"] == "PASS", "Valid finalization failed")
+                  with patch.dict(globals(), OUT=root, finalize=lambda: None,
+                                  evidence_index=lambda: (_ for _ in ()).throw(OSError("index publication failed"))):
+                      try:
+                          phase("finalize", [])
+                      except OSError as error:
+                          require(str(error) == "index publication failed", "Unexpected publication failure")
+                      else:
+                          raise AssertionError("Index failure published finalization success")
+                  require(not (root / "evidence-index.json").exists() and
+                          json.loads((root / "phase-finalize.json").read_text())["status"] == "FAIL", "Stale index survived failed finalization")
+
+          def scheduling_fixtures():
+              from unittest.mock import patch
+              owner = OwnedProcesses()
+              original = {9: (os.getpid(), "90", "S"), 8: (os.getpid(), "80", "S"), 7: (8, "11", "S")}
+              for pid, identity in original.items():
+                  owner.candidate(pid, identity, original)
+                  owner.resolve((pid, identity[1]), "bound")
+              owner.handles = {(9, "90"): (90, 91), (8, "80"): (80, 81), (7, "11"): (10, 11)}
+              table = {8: (os.getpid(), "80", "S"), 7: (8, "22", "S")}
+              exited, signals = {91, 11}, []
+              def identity(directory):
+                  if directory == 80:
+                      return os.getpid(), "80", "R"
+                  return table[7][:2] + ("R",)
+              def send(descriptor, sig):
+                  signals.append((descriptor, sig))
+                  exited.add(descriptor)
+                  if descriptor == 81:
+                      table.pop(8, None)
+                      table[7] = (os.getpid(), "22", "S")
+                  if descriptor == 71:
+                      table.pop(7, None)
+              with patch.dict(globals(), processes=lambda: dict(table)), patch.object(os, "open", return_value=70), \
+                   patch.object(os, "pidfd_open", return_value=71), patch.object(os, "close"), patch.object(os, "waitid"), \
+                   patch.object(owner, "identity", side_effect=identity), patch.object(owner, "exited", side_effect=lambda handle: handle[1] in exited), \
+                   patch.object(signal, "pidfd_send_signal", side_effect=send), \
+                   patch.object(os, "kill", side_effect=AssertionError("Numeric signal forbidden")), \
+                   patch.object(os, "killpg", side_effect=AssertionError("Group signal forbidden")):
+                  require(not owner.cleanup(9) and not table and (7, "22") in owner.handles and
+                          any(fd == 71 for fd, _ in signals), "S/R transition lost separately owned new birth")
+                  record = owner.acquisitions[(7, "11")]
+                  require(record["reused"] and (7, "11") in owner.unresolved and
+                          record["birth_mismatch"]["stage"] == "discover_snapshot",
+                          "Signalled replacement erased observed old-birth mismatch")
+              owner = OwnedProcesses()
+              owner.handles[(9, "90")] = (90, 91)
+              with patch.dict(globals(), processes=lambda: {7: (os.getpid(), "22", "S")}), \
+                   patch.object(owner, "bind", return_value=False), patch.object(owner, "exited", return_value=True), \
+                   patch.object(owner, "signal"), patch.object(os, "close"), patch.object(os, "waitid"):
+                  require(not owner.cleanup(9) and (7, "22") in owner.unresolved, "Unbound owned child falsely cleaned")
+
+          def acquisition_fixtures():
+              from unittest.mock import patch
+              owner = OwnedProcesses()
+              owner.handles[(9, "root-birth")] = (90, 91)
+              table = {7: (os.getpid(), "short-child", "S")}
+              def vanished(*args, **kwargs):
+                  table.clear()
+                  raise FileNotFoundError(2, "descendant vanished")
+              with patch.dict(globals(), processes=lambda: dict(table)), \
+                   patch.object(os, "open", side_effect=vanished), patch.object(os, "close"), \
+                   patch.object(os, "waitid"), patch.object(owner, "exited", return_value=True), \
+                   patch.object(signal, "pidfd_send_signal"), \
+                   patch.object(os, "kill", side_effect=AssertionError("Numeric signal forbidden")), \
+                   patch.object(os, "killpg", side_effect=AssertionError("Group signal forbidden")):
+                  owner.discover()
+                  require((7, "short-child") in owner.unresolved, "Single snapshot cleared candidate")
+                  require(owner.cleanup(9) and not owner.unresolved, "Verified disappearance stayed unresolved")
+              record = owner.acquisitions[(7, "short-child")]
+              require(record["status"] == "vanished" and record["absence_checks"] >= 2 and
+                      record["bind_error"] == "FileNotFoundError" and record["parent_birth"] == owner.self_birth,
+                      "Disappearance lacks acquisition/parent/absence evidence")
+              for mode in ("live", "uncertain", "reuse"):
+                  owner = OwnedProcesses()
+                  identity = (os.getpid(), "candidate", "S")
+                  owner.candidate(7, identity, {7: identity})
+                  if mode == "live":
+                      table = {7: identity}
+                  elif mode == "reuse":
+                      table = {7: (os.getpid(), "replacement", "R")}
+                  else:
+                      table = {}
+                  with patch.object(os, "open", side_effect=PermissionError(13, "uncertain")):
+                      owner.reconcile(table)
+                  with patch.object(os, "open", side_effect=FileNotFoundError(2, "later absent")):
+                      if mode == "reuse":
+                          owner.reconcile({})
+                          owner.reconcile({})
+                  owner.handles[(9, "root-birth")] = (90, 91)
+                  with patch.dict(globals(), processes=lambda: dict(table)), \
+                       patch.object(os, "open", side_effect=PermissionError(13, "uncertain")), \
+                       patch.object(owner, "bind", return_value=False), patch.object(owner, "signal"), \
+                       patch.object(owner, "exited", return_value=True), patch.object(os, "close"), \
+                       patch.object(os, "waitid"), patch.object(time, "sleep"), \
+                       patch.object(time, "monotonic", side_effect=iter(range(30))):
+                      require(not owner.cleanup(9), f"Unsafe acquisition cleanup accepted: {mode}")
+                  require((7, "candidate") in owner.unresolved and
+                          owner.acquisitions[(7, "candidate")]["status"] == "pending",
+                          f"Unsafe acquisition accepted: {mode}")
+              for error in (ValueError("malformed stat"), IndexError("short stat")):
+                  owner = OwnedProcesses()
+                  identity = (os.getpid(), "candidate", "S")
+                  owner.candidate(7, identity, {7: identity})
+                  with patch.object(os, "open", return_value=70), patch.object(os, "close"), \
+                       patch.object(owner, "identity", side_effect=error):
+                      owner.reconcile({})
+                  require((7, "candidate") in owner.unresolved and
+                          owner.acquisitions[(7, "candidate")]["reason"] == "direct_probe_uncertain",
+                          "Malformed identity became verified disappearance")
+              save("acquisition-fixtures.json", dict(status="PASS", vanished=True,
+                   rejected=["live", "uncertain", "reuse", "malformed"], signals="mocked pidfd only"))
+
+          def cleanup_boundary_fixtures():
+              from unittest.mock import patch
+              for boundary in ("discovery", "quiescence", "work", "step"):
+                  owner = OwnedProcesses()
+                  owner.handles[(900, "root")] = (90, 91)
+                  child = (os.getpid(), "child", "S")
+                  owner.candidate(600, child, {})
+                  clock, sent, closed, windows = [0.0], [], [], []
+                  def table():
+                      windows.append(owner.deadline)
+                      if boundary == "quiescence" and len(windows) == 1:
+                          return {}
+                      return {600: child}
+                  def identity(fd):
+                      clock[0] = owner.deadline + 0.01
+                      return child
+                  def sleep(seconds):
+                      clock[0] += seconds
+                  environment = dict(WORK_DEADLINE="1000", STEP_DEADLINE="1000")
+                  if boundary in ("work", "step"):
+                      environment["WORK_DEADLINE" if boundary == "work" else "STEP_DEADLINE"] = "0"
+                  with patch.dict(os.environ, environment), patch.dict(globals(), processes=table), \
+                       patch.object(time, "monotonic", side_effect=lambda: clock[0]), \
+                       patch.object(time, "time", return_value=1), patch.object(time, "sleep", side_effect=sleep), \
+                       patch.object(owner, "reconcile"), patch.object(owner, "identity", side_effect=identity), \
+                       patch.object(owner, "exited", return_value=boundary == "quiescence"), \
+                       patch.object(signal, "pidfd_send_signal", side_effect=lambda fd, sig: sent.append((fd, sig))), \
+                       patch.object(os, "open", return_value=60), patch.object(os, "pidfd_open", return_value=61), \
+                       patch.object(os, "close", side_effect=lambda fd: closed.append((fd, tuple(sent)))), \
+                       patch.object(os, "waitid", return_value=None), \
+                       patch.object(os, "kill", side_effect=AssertionError("Numeric signal forbidden")), \
+                       patch.object(os, "killpg", side_effect=AssertionError("Group signal forbidden")):
+                      require(not owner.cleanup(900), "Cleanup timeout became success")
+                  require((91, signal.SIGTERM) in sent and (91, signal.SIGKILL) in sent and
+                          all(fd == 91 for fd, _ in sent), "Deadline skipped KILL or signalled tentative child")
+                  require(all((91, signal.SIGKILL) in signals for fd, signals in closed if fd in (90, 91)),
+                          "Proven handle closed before KILL")
+                  require([fd for fd, _ in closed].count(90) == [fd for fd, _ in closed].count(91) == 1 and
+                          [fd for fd, _ in closed].count(60) == [fd for fd, _ in closed].count(61) ==
+                          (0 if boundary in ("work", "step") else 2), "Cleanup descriptors lost or double closed")
+                  require(len(owner.cleanup_errors) == 2 and
+                          [value["signal"] for value in owner.cleanup_errors] == [15, 9] and
+                          all(value["error"] == "Acquisition deadline exhausted" for value in owner.cleanup_errors) and
+                          owner.cleanup_errors[0]["deadline"] == 2 and
+                          owner.cleanup_errors[1]["deadline"] == owner.cleanup_errors[0]["observed"] + 2 and
+                          (600, "child") in owner.unresolved, "Cleanup lost fixed windows or timeout evidence")
+              cleanup = OwnedProcesses.cleanup
+              def expired_cleanup(owner, root):
+                  with patch.object(owner, "discover", side_effect=TimeoutError("Acquisition deadline exhausted")), \
+                       patch.object(signal, "pidfd_send_signal"):
+                      return cleanup(owner, root)
+              with patch.object(OwnedProcesses, "cleanup", expired_cleanup):
+                  try:
+                      command("fixture-cleanup-deadline", [sys.executable, "-c", "pass"], limit=5)
+                  except SystemExit as error:
+                      require(error.code == 125, "Cleanup deadline changed supervisor status")
+                  else:
+                      raise AssertionError("Cleanup deadline published command success")
+              result = json.loads((OUT / "fixture-cleanup-deadline/result.json").read_text())
+              require(result["rc"] == 0 and result["supervisor_rc"] == 125 and not result["cleanup_complete"] and
+                      len(result["cleanup_errors"]) == 2 and
+                      [value["signal"] for value in result["cleanup_errors"]] == [15, 9],
+                      "Command discarded raw exit or cleanup deadline evidence")
+              save("cleanup-boundary-fixtures.json", dict(status="PASS", boundaries=4,
+                   signals="proven pidfd only", cleanup_complete=False, raw_rc=0, supervisor_rc=125))
+
+          def parent_identity_fixtures():
+              from unittest.mock import patch
+              for boundary in ("before", "after", "attributable", "snapshot"):
+                  owner = OwnedProcesses()
+                  key = (500, "parent")
+                  parent = (os.getpid(), "parent", "S")
+                  child = (500, "child", "S")
+                  owner.candidate(500, parent, {})
+                  owner.handles[key] = (50, 51)
+                  owner.resolve(key, "bound")
+                  owner.candidate(600, child, {500: parent})
+                  replacement = (os.getpid(), "replacement", "R")
+                  parents = iter([parent, replacement] if boundary == "after" else [replacement])
+                  def identity(fd):
+                      return child if fd == 60 else next(parents)
+                  with patch.object(os, "open", return_value=60), patch.object(os, "pidfd_open", return_value=61), \
+                       patch.object(os, "close"), patch.object(owner, "identity", side_effect=identity), \
+                       patch.object(owner, "exited", return_value=False), patch.object(signal, "pidfd_send_signal") as sent:
+                      result = (owner.attributable(child, {500: replacement if boundary == "snapshot" else parent})
+                                if boundary in ("attributable", "snapshot") else owner.bind(600, child))
+                      require(not result and not sent.called, "Changed parent established child authority")
+                  record = owner.acquisitions[key]
+                  witness = dict(record["birth_mismatch"])
+                  require(record["reused"] and key in owner.unresolved and record["status"] == "pending" and
+                          witness["stage"] == {"before": "parent_before", "after": "parent_after",
+                              "attributable": "attributable_direct", "snapshot": "attributable_snapshot"}[boundary],
+                          "Parent mismatch lacks sticky first witness")
+                  owner.observe(key, (os.getpid(), "another", "Z"), "later_parent")
+                  owner.observe(key, parent, "later_original")
+                  with patch.object(os, "open", side_effect=FileNotFoundError(2, "later absent")):
+                      owner.reconcile({})
+                      owner.reconcile({})
+                  require(not owner.resolve(key, "bound") and not owner.resolve(key, "vanished") and
+                          not owner.bind(500, parent), "Parent mismatch bypassed sticky guards")
+                  clock = [0.0]
+                  with patch.dict(globals(), processes=lambda: {500: parent}), \
+                       patch.object(owner, "exited", return_value=True), patch.object(os, "close"), \
+                       patch.object(os, "waitid"), patch.object(signal, "pidfd_send_signal"), \
+                       patch.object(os, "open", side_effect=FileNotFoundError(2, "child absent")), \
+                       patch.object(time, "monotonic", side_effect=lambda: clock[0]), \
+                       patch.object(time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+                      require(not owner.cleanup(500), "Forgotten parent mismatch produced false cleanup")
+                  require(key in owner.unresolved and record["birth_mismatch"] == witness and record["reused"],
+                          "Discovery or absence replaced first parent mismatch")
+              with patch.object(OwnedProcesses, "fresh_self_birth", side_effect=["initial", "before", "after"]) as fresh:
+                  owner = OwnedProcesses()
+                  require(owner.parent_proof(os.getpid(), {}) is None and
+                          not owner.parent_still_owned((None, None), {}) and fresh.call_count == 3,
+                          "Fresh self reads were cached")
+              save("parent-identity-fixtures.json", dict(status="PASS", boundaries=4,
+                   sticky_paths=["observe", "resolve", "bind", "discover", "absence", "cleanup"], fresh_self_reads=3))
+              discovery_snapshot_fixtures()
+
+          def discovery_snapshot_fixtures():
+              from unittest.mock import patch
+              for boundary in ("discover", "cleanup", "distinct_birth"):
+                  owner = OwnedProcesses()
+                  key = (500, "old-parent")
+                  original = (os.getpid(), key[1], "S")
+                  replacement = (os.getpid() if boundary == "distinct_birth" else 1, "replacement", "S")
+                  owner.candidate(500, original, {})
+                  owner.handles[key] = (50, 51)
+                  owner.resolve(key, "bound")
+                  clock, sent, closed = [0.0], [], []
+                  with patch.dict(globals(), processes=lambda: {500: replacement}), \
+                       patch.object(owner, "exited", return_value=True), \
+                       patch.object(owner, "identity", return_value=replacement), \
+                       patch.object(os, "open", return_value=60), patch.object(os, "pidfd_open", return_value=61), \
+                       patch.object(os, "close", side_effect=closed.append), patch.object(os, "waitid", return_value=None), \
+                       patch.object(signal, "pidfd_send_signal", side_effect=lambda fd, sig: sent.append((fd, sig))), \
+                       patch.object(os, "kill", side_effect=AssertionError("Numeric signal forbidden")), \
+                       patch.object(os, "killpg", side_effect=AssertionError("Group signal forbidden")), \
+                       patch.object(time, "monotonic", side_effect=lambda: clock[0]), \
+                       patch.object(time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+                      if boundary == "cleanup":
+                          require(not owner.cleanup(500), "Standalone snapshot mismatch produced false cleanup")
+                      else:
+                          owner.discover()
+                          require(not sent and not closed, "Discovery signalled or closed published handles")
+                      record = owner.acquisitions[key]
+                      witness = dict(record.get("birth_mismatch", {}))
+                      require(record["reused"] and key in owner.unresolved and record["status"] == "pending" and
+                              witness == dict(stage="discover_snapshot", expected=key[1], actual=replacement),
+                              "Standalone discovery lost bound identity mismatch")
+                      if boundary == "distinct_birth":
+                          new_key = (500, replacement[1])
+                          require(owner.handles.get(new_key) == (60, 61) and new_key not in owner.unresolved and
+                                  owner.acquisitions[new_key]["status"] == "bound",
+                                  "Sticky old birth blocked separately proven new birth")
+                      else:
+                          require(set(owner.acquisitions) == {key} and set(owner.handles) == {key},
+                                  "Unattributable replacement acquired authority")
+                      owner.observe(key, (1, "later", "R"), "later_snapshot")
+                      owner.observe(key, original, "later_original")
+                      with patch.object(os, "open", side_effect=FileNotFoundError(2, "later absent")):
+                          owner.reconcile({})
+                          owner.reconcile({})
+                      require(not owner.resolve(key, "bound") and not owner.resolve(key, "vanished") and
+                              not owner.bind(500, original), "Snapshot mismatch bypassed sticky guards")
+                      owner.discover()
+                      if boundary != "cleanup":
+                          require(not owner.cleanup(500), "Sticky discovery mismatch produced false cleanup")
+                      require(record["birth_mismatch"] == witness and record["reused"] and key in owner.unresolved,
+                              "Later discovery or cleanup replaced first snapshot witness")
+                  descriptors = [50, 51, 60, 61] if boundary == "distinct_birth" else [50, 51]
+                  require(sorted(closed) == descriptors and (51, signal.SIGKILL) in sent and
+                          all(fd in ({51, 61} if boundary == "distinct_birth" else {51}) for fd, _ in sent),
+                          "Snapshot cleanup changed proven pidfd signalling or descriptor ownership")
+              save("discovery-snapshot-fixtures.json", dict(status="PASS", boundaries=3,
+                   first_witness="discover_snapshot", distinct_birth_bound=True, cleanup_complete=False))
+
+          def ownership_fixtures():
+              from unittest.mock import patch
+              baseline = (500, "child", "S")
+              adopted = (os.getpid(), "child", "Z")
+              def scenario(values, accepted, parent_exit=False, changes=None):
+                  owner = OwnedProcesses()
+                  for pid, handle in ((500, (50, 51)), (501, (52, 53))):
+                      owner.candidate(pid, (os.getpid(), "parent", "S"), {})
+                      owner.handles[(pid, "parent")] = handle
+                      owner.resolve((pid, "parent"), "bound")
+                  owner.candidate(600, baseline, {500: (1, "parent", "S")})
+                  children = iter(values)
+                  changes = changes or {}
+                  parents = iter(changes.get("identities", [(1, "parent", "R")] * 6))
+                  reads, closed = [], []
+                  def identity(fd):
+                      reads.append(fd)
+                      if fd == 60:
+                          return next(children)
+                      if changes.get("replace"):
+                          owner.handles[(500, "parent")] = (52, 53)
+                      return next(parents)
+                  if changes.get("self_birth"):
+                      owner.self_birth = "different"
+                  with patch.object(os, "open", return_value=60) as opened, \
+                       patch.object(os, "pidfd_open", return_value=61) as pidfd, \
+                       patch.object(os, "close", side_effect=closed.append), \
+                       patch.object(owner, "identity", side_effect=identity), \
+                       patch.object(owner, "exited", side_effect=parent_exit if isinstance(parent_exit, list) else None,
+                                    return_value=parent_exit), \
+                       patch.object(signal, "pidfd_send_signal") as sent:
+                      result = owner.bind(600, baseline)
+                      require(result is accepted and not sent.called, "Tentative authority or wrong acquisition verdict")
+                      require(opened.call_count == 1 and pidfd.call_count <= 1 and set(reads) <= {50, 52, 60}, "Acquisition replaced handle generation")
+                      expected_closed = [] if accepted else [60, 61] if pidfd.called else [60]
+                      require(closed == expected_closed, "Tentative descriptors closed incorrectly")
+                  return owner
+              for boundary in range(4):
+                  values = [baseline] * boundary + [adopted] * (6 - boundary)
+                  owner = scenario(values, True)
+                  attempt = owner.acquisitions[(600, "child")]["last_attempt"]
+                  require(attempt["expected"] == baseline and "before" in attempt and "after" in attempt and
+                          attempt["proof"]["final"] == adopted and owner.handles[(600, "child")] == (60, 61), "Adoption proof lost observations/handle")
+                  changed = (500, "replacement", "S")
+                  owner = scenario([baseline] * boundary + [changed] * (6 - boundary), False)
+                  record = owner.acquisitions[(600, "child")]
+                  require(record["reused"] and record["birth_mismatch"]["actual"][1] == "replacement", "Birth mismatch lacks immutable witness")
+                  with patch.object(os, "open", side_effect=AssertionError("Sticky key reopened")):
+                      require(not owner.bind(600, baseline) and not owner.resolve((600, "child"), "bound") and
+                              not owner.resolve((600, "child"), "vanished"), "Sticky key bypassed resolution")
+                  owner.handles[(600, "child")] = (60, 61)
+                  with patch.dict(globals(), processes=lambda: {600: baseline}):
+                      owner.discover()
+                      owner.reconcile({})
+                  require((600, "child") in owner.unresolved, "Already-bound shortcut cleared sticky key")
+              scenario([baseline] * 4, False, parent_exit=True)
+              scenario([baseline] * 4, False, parent_exit=[False, True])
+              scenario([baseline] * 4, False, changes={"replace": True})
+              scenario([baseline] * 4, False, changes={"identities": [(1, "parent", "S"), (1, "different", "S")]})
+              scenario([adopted] * 4, False, changes={"self_birth": True})
+              owner = scenario([baseline] * 4, True)
+              require(owner.acquisitions[(600, "child")]["last_attempt"]["proof"]["parent_after"]["same_handle"], "Parent pidfd not bracketed")
+              transferred = (501, "child", "R")
+              owner = scenario([baseline] * 3 + [transferred] * 3, True)
+              proof = owner.acquisitions[(600, "child")]["last_attempt"]["proof"]
+              require(proof["final"] == transferred and proof["parent_after"]["parent_handle"] == [52, 53],
+                      "New owned parent lacked fresh exact-handle proof")
+              scenario([baseline] * 2 + [(777, "child", "S")] * 2, False)
+              unstable = [baseline, baseline, baseline, adopted, adopted, baseline, baseline, adopted]
+              owner = scenario(unstable, False)
+              require(len(owner.acquisitions[(600, "child")]["last_attempt"]["rounds"]) == 3, "Ownership rounds unbounded")
+              for boundary in range(4):
+                  for failure in (PermissionError(13, "unreadable"), ValueError("malformed"), TimeoutError("deadline")):
+                      owner = OwnedProcesses()
+                      owner.candidate(600, adopted, {})
+                      closed = []
+                      with patch.object(os, "open", return_value=60), patch.object(os, "pidfd_open", return_value=61), \
+                           patch.object(os, "close", side_effect=closed.append), \
+                           patch.object(owner, "identity", side_effect=[adopted] * boundary + [failure]):
+                          try:
+                              result = owner.bind(600, adopted)
+                          except TimeoutError:
+                              require(isinstance(failure, TimeoutError), "Wrong deadline exception")
+                          else:
+                              require(result is False, "Uncertain acquisition accepted")
+                      require(closed == ([60] if boundary == 0 else [60, 61]) and
+                              not owner.handles and (600, "child") in owner.unresolved,
+                              "Exception lost descriptor/unresolved truth")
+              for point in ("resolve", "publication", "sticky"):
+                  owner = OwnedProcesses()
+                  owner.candidate(600, adopted, {})
+                  closed = []
+                  resolve = owner.resolve
+                  class Publication(dict):
+                      def __setitem__(self, key, value):
+                          super().__setitem__(key, value)
+                          raise TimeoutError("publication boundary")
+                  if point == "publication":
+                      owner.handles = Publication()
+                  def interrupt(key, status):
+                      result = resolve(key, status)
+                      if point == "sticky":
+                          owner.observe(key, (os.getpid(), "replacement", "S"), "publication_fixture")
+                          return result
+                      if point == "resolve":
+                          raise TimeoutError("resolution boundary")
+                      return result
+                  with patch.object(os, "open", return_value=60), patch.object(os, "pidfd_open", return_value=61), \
+                       patch.object(os, "close", side_effect=closed.append), \
+                       patch.object(owner, "identity", return_value=adopted), \
+                       patch.object(owner, "resolve", side_effect=interrupt):
+                      try:
+                          require(owner.bind(600, adopted) is False and point == "sticky", "Sticky publication accepted")
+                      except TimeoutError:
+                          require(point != "sticky", "Sticky publication raised wrong exception")
+                  require(closed == ([] if point == "publication" else [60, 61]), "Publication double-closed or leaked handles")
+                  require((600, "child") in owner.handles if point == "publication" else
+                          (600, "child") in owner.unresolved, "Publication lost descriptor ownership")
+              for opening in ("open", "pidfd_open"):
+                  owner = OwnedProcesses()
+                  owner.candidate(600, adopted, {})
+                  closed = []
+                  with patch.object(os, "open", return_value=60), patch.object(os, "pidfd_open", return_value=61), \
+                       patch.object(owner, "identity", return_value=adopted), \
+                       patch.object(os, "close", side_effect=closed.append), \
+                       patch.object(os, opening, side_effect=PermissionError(13, "opening")):
+                      require(not owner.bind(600, adopted), "Descriptor opening failure accepted")
+                  require(closed == ([] if opening == "open" else [60]), "Opening failure closed wrong handles")
+              owner = OwnedProcesses()
+              owner.candidate(600, adopted, {})
+              with patch.object(owner, "acquisition_deadline", side_effect=TimeoutError("deadline")), \
+                   patch.object(os, "open") as opened:
+                  try:
+                      owner.bind(600, adopted)
+                  except TimeoutError:
+                      pass
+                  else:
+                      raise AssertionError("Acquisition ignored deadline")
+                  require(not opened.called, "Expired acquisition opened descriptor")
+              owner.acquisitions = dict.fromkeys(range(20000))
+              try:
+                  owner.candidate(601, adopted, {})
+              except AssertionError as error:
+                  require(str(error) == "Acquisition evidence capacity exceeded", "Wrong acquisition capacity failure")
+              else:
+                  raise AssertionError("Acquisition capacity ignored")
+              owner = OwnedProcesses()
+              owner.candidate(600, adopted, {})
+              owner.observe((600, "child"), (os.getpid(), "replacement", "S"), "old_key_fixture")
+              replacement = (os.getpid(), "replacement", "R")
+              owner.candidate(600, replacement, {})
+              with patch.object(os, "open", return_value=60), patch.object(os, "pidfd_open", return_value=61), \
+                   patch.object(os, "close"), patch.object(owner, "identity", return_value=replacement):
+                  require(owner.bind(600, replacement) and (600, "child") in owner.unresolved,
+                          "New incarnation resolved sticky old key")
+              from unittest.mock import Mock
+              root = OwnedProcesses()
+              process = Mock(pid=600, returncode=0)
+              def sticky_root(pid, identity):
+                  root.observe((pid, identity[1]), (os.getpid(), "replacement", "S"), "root_fixture")
+                  return True
+              with patch.dict(globals(), processes=lambda: {600: adopted}), \
+                   patch.dict(globals(), OwnedProcesses=lambda: root), \
+                   patch.object(subprocess, "Popen", return_value=process), \
+                   patch.object(root, "bind", side_effect=sticky_root), \
+                   patch.object(root, "cleanup", return_value=False):
+                  try:
+                      command("fixture-root-sticky", ["fixture"], limit=5)
+                  except SystemExit as error:
+                      require(error.code == 125, "Root sticky changed supervisor status")
+                  else:
+                      raise AssertionError("Root sticky bypassed command guard")
+              result = json.loads((OUT / "fixture-root-sticky/result.json").read_text())
+              require(result["error"] == "Root birth mismatch" and result["unresolved_processes"] == [[600, "child"]],
+                      "Root sticky guard lost failure evidence")
+              save("ownership-fixtures.json", dict(status="PASS", rounds=3, boundary_parent_and_birth=8,
+                   child_read_errors=12, parent_rejections=6, publication_boundaries=3,
+                   sticky_paths=["bind", "bound", "discover", "vanished", "root", "new_birth"], tentative_signals=0))
+
+          def finalize():
+              diagnostics(OUT / "final-diagnostics")
+              for path in TOOLS.glob("*.py"):
+                  (OUT / path.name).write_bytes(path.read_bytes())
+
+          def evidence_index():
+              save("evidence-index.json", {str(p.relative_to(OUT)): dict(bytes=p.stat().st_size, sha256=sha(p.read_bytes()))
+                                          for p in OUT.rglob("*") if p.is_file() and not p.is_symlink() and
+                                          p.name != "evidence-index.json" and not p.name.endswith(".pending")})
+
+          def phase_observations():
+              observations = []
+              for path in sorted(OUT.glob("phase-*.json")):
+                  if path.name in ("phase-finalize.json", "phase-observations.json"):
+                      continue
+                  try:
+                      value = json.loads(path.read_text())
+                      require(isinstance(value, dict), "Phase record is not an object")
+                      require(isinstance(value.get("status"), str) and value["status"] in
+                              ("NOT_RUN", "running", "PASS", "FAIL"), "Missing or unknown phase status")
+                  except (OSError, ValueError, AssertionError) as error:
+                      observations.append(dict(path=path.name, status="UNKNOWN", rc=None, error=str(error)))
+                      continue
+                  if value["status"] != "PASS":
+                      observations.append(dict(path=path.name, status=value["status"], rc=None,
+                                               reason="Earlier phase failed or job interrupted; raw record retained"))
+              save("phase-observations.json", observations)
+              require(not any(value["status"] == "UNKNOWN" for value in observations), "Phase observations contain malformed or unreadable records")
+
+          def phase(action, arguments):
+              status = dict(action=action, start=time.time(), status="running", rc=None)
+              save(f"phase-{action}.json", status)
+              def expired(signum, frame):
+                  raise TimeoutError("Phase work deadline exhausted, including postprocessing")
+              previous = signal.signal(signal.SIGALRM, expired)
+              caps = dict(prepare=240, mutate=240, binaries=60, environment=240, tests=3060, build=2460)
+              budget = 75 if action == "finalize" else min(caps.get(action, 1500), work_deadline() - time.time())
+              try:
+                  require(budget > 0, "Shared phase deadline exhausted")
+                  signal.setitimer(signal.ITIMER_REAL, budget)
+                  if action == "prepare": prepare()
+                  elif action == "mutate": mutate()
+                  elif action == "tests": tests()
+                  elif action == "binaries": binaries()
+                  elif action == "finalize":
+                      finalize()
+                      phase_observations()
+                  elif action == "fixtures": fixtures()
+                  else:
+                      rc, _ = command(action, arguments, limit=2400 if action == "build" else 1500)
+                      status["rc"] = rc
+                      require(rc == 0, f"{action} command failed: {rc}")
+                  status["status"] = "PASS"
+              except BaseException as error:
+                  status.update(status="FAIL", error=str(error))
+                  raise
+              finally:
+                  try:
+                      status["end"] = time.time()
+                      save(f"phase-{action}.json", status)
+                      if action == "finalize":
+                          evidence_index()
+                  except BaseException as error:
+                      if action == "finalize":
+                          (OUT / "evidence-index.json").unlink(missing_ok=True)
+                          status.update(status="FAIL", error=str(error), end=time.time())
+                          save("phase-finalize.json", status)
+                      raise
+                  finally:
+                      signal.setitimer(signal.ITIMER_REAL, 0)
+                      signal.signal(signal.SIGALRM, previous)
+
+          if __name__ == "__main__":
+              phase(sys.argv[1], sys.argv[2:])
+          PY
+          python3 "$TOOLS/control.py" prepare
+
+      - name: Install dependencies on the exact clean integrated checkout
+        timeout-minutes: 27
+        run: |
+          export STEP_DEADLINE="$(( $(date +%s) + 1560 ))"
+          python3 "$TOOLS/control.py" dependencies make UNATTENDED=yes install-dep
+
+      - name: Execute clean integrated C API feature and pinned formatter checks
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          export STEP_DEADLINE="$(( $(date +%s) + 1740 ))"
+          test -z "$(git status --porcelain -uno)"
+          python3 "$TOOLS/control.py" feature-list make checkfeaturelist
+          python3 "$TOOLS/control.py" c-style make checkstyle
+          python3 "$TOOLS/control.py" api-style make checkstyle-api
+          python3 "$TOOLS/control.py" c-formatter clang-format-19 --version
+          touch test/requirements-3.txt
+          python3 "$TOOLS/control.py" python-style make UV= checkstyle-python
+          python3 "$TOOLS/control.py" python-pin build-root/test/venv/bin/python -c \
+            'import black; assert black.__version__ == "26.5.1", black.__version__; print(black.__version__)'
+          test -z "$(git status --porcelain -uno)"
+
+      - name: Select only the immutable owner restoration
+        timeout-minutes: 5
+        run: |
+          export STEP_DEADLINE="$(( $(date +%s) + 240 ))"
+          python3 "$TOOLS/control.py" mutate
+
+      - name: Record version and build an independent debug image
+        timeout-minutes: 42
+        run: |
+          set -euo pipefail
+          export STEP_DEADLINE="$(( $(date +%s) + 2460 ))"
+          if ! git describe --long --match 'v[0-9]*' 2>/dev/null; then
+            printf '0.0.0-release+%s.%s-g%s\n' "$(git log -1 --format=%ct)" \
+              "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)" > src/scripts/.version
+          fi
+          if [ -f src/scripts/.version ]; then cp src/scripts/.version "$EVIDENCE/version.txt"; fi
+          python3 "$TOOLS/control.py" build make UNATTENDED=yes VPP_EXCLUDED_PLUGINS= build
+          python3 "$TOOLS/control.py" binaries
+
+      - name: Prepare real test runtime
+        timeout-minutes: 3
+        uses: ./.github/actions/vpp-docker-runtime-setup
+        with:
+          WORKSPACE: ${{ github.workspace }}
+          SHM_SIZE: 2G
+          LOG_DIR: ${{ runner.temp }}/integration-evidence/runtime-setup
+
+      - name: Require CPUs namespaces and TAP devices
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          export STEP_DEADLINE="$(( $(date +%s) + 240 ))"
+          python3 "$TOOLS/control.py" environment bash -euo pipefail -c '
+            python3 -c "import os,pathlib; cpus=sorted(os.sched_getaffinity(0)); roots=[pathlib.Path(f\"/sys/devices/system/cpu/cpu{cpu}/topology\") for cpu in cpus]; cores={(p.joinpath(\"physical_package_id\").read_text().strip(),p.joinpath(\"core_id\").read_text().strip()) for p in roots}; required=3 if os.environ[\"CASE\"] == \"fixed-ipsec_esp\" else 2; print(dict(cpus=cpus,physical_cores=sorted(cores),required=required)); assert len(cores) >= required"
+            mountpoint /dev/shm
+            test "$(df -B1 --output=size /dev/shm | tail -n 1)" -ge 2147483648
+            ns="integration-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            trap '\''ip netns del "$ns"'\'' EXIT
+            ip netns add "$ns"
+            ip netns exec "$ns" ip link set lo up
+            ip netns exec "$ns" ip tuntap add dev probe mode tap
+            ip netns exec "$ns" ip link del probe
+            test -c /dev/net/tun
+            test -c /dev/vhost-net
+            (: <> /dev/net/tun)
+            (: <> /dev/vhost-net)
+            uname -a
+            dpkg-query -W clang-format-19 python3
+          '
+
+      - name: Execute complete fixed suite or precise intended failure
+        timeout-minutes: 52
+        run: python3 "$TOOLS/control.py" tests
+
+      - name: Retain bounded diagnostics and complete provenance
+        if: always()
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/integration-evidence"
+          if [ -f "$RUNNER_TEMP/integration-tools/control.py" ]; then
+            python3 "$RUNNER_TEMP/integration-tools/control.py" finalize
+          fi
+
+      - name: Upload every outcome with complete callbacks and events
+        id: evidence
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-${{ matrix.case }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/integration-evidence/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 6
+
+      - name: Record artifact and pending final acceptance
+        if: always()
+        timeout-minutes: 1
+        env:
+          ARTIFACT_ID: ${{ steps.evidence.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.evidence.outputs.artifact-url }}
+          ARTIFACT_DIGEST: ${{ steps.evidence.outputs.artifact-digest }}
+        run: |
+          printf 'Artifact ID: %s\nArtifact URL: %s\nArtifact digest: %s\n' \
+            "$ARTIFACT_ID" "$ARTIFACT_URL" "$ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' 'Intermediate required24 only. Final26 and M44 INTERPOSE remain pending. Coverage gaps are in manifest.json.' >> "$GITHUB_STEP_SUMMARY"
+
+  acceptance:
+    needs: control
+    if: always() && github.ref == 'refs/heads/feat/integration-runtime-controls-ff50-octobe'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download all independent variant evidence
+        timeout-minutes: 5
+        uses: actions/download-artifact@v4
+        with:
+          pattern: integration-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/integration-results
+
+      - name: Require ready24 and each precise paired source control
+        timeout-minutes: 2
+        env:
+          RESULT_ROOT: ${{ runner.temp }}/integration-results
+          MATRIX_RESULT: ${{ needs.control.result }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import collections
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          root = Path(os.environ['RESULT_ROOT'])
+          expected_tree = '86cfc49495ff83e2869aca5d80177a6b112228ec'
+          fixed = ['linux_cp', 'linux_cp_lifecycle', 'linux_cp_netlink', 'ipsec_esp', 'gre', 'gre_teib', 'ip_mcast']
+          negatives = ['router-add', 'router-delete', 'router-sweep', 'router-permanent', 'lifecycle-fd',
+                       'lifecycle-failure', 'lifecycle-refresh', 'lifecycle-flags', 'lifecycle-vlan-add',
+                       'lifecycle-vlan-delete', 'lifecycle-namespace', 'netlink-pair', 'netlink-dump',
+                       'tunnel-df', 'gre-config', 'gre-ingress']
+          expected = {'fixed-' + suite for suite in fixed} | set(negatives)
+          records, errors, hashes = {}, [], {}
+          for directory in sorted(root.glob('integration-*')):
+              try:
+                  manifest = json.loads((directory / 'manifest.json').read_text())
+                  result = json.loads((directory / 'acceptance.json').read_text())
+                  name = result['case']
+                  assert name in expected and name not in records, 'Unknown or duplicate variant'
+                  assert result['status'] == 'PASS', 'Variant did not pass strict classifier'
+                  assert result['integration_tree'] == manifest['integration_tree'] == expected_tree
+                  assert result['workflow_sha'] == manifest['workflow_sha'] == os.environ['WORKFLOW_SHA']
+                  assert result['run'] == manifest['run_id'] == os.environ['GITHUB_RUN_ID']
+                  assert result['attempt'] == manifest['attempt'] == os.environ['GITHUB_RUN_ATTEMPT']
+                  assert manifest['case'] == name
+                  for phase in ['prepare', 'dependencies', 'feature-list', 'c-style', 'api-style', 'c-formatter',
+                                'python-style', 'python-pin', 'mutate', 'build', 'binaries', 'environment', 'tests', 'finalize']:
+                      assert json.loads((directory / f'phase-{phase}.json').read_text())['status'] == 'PASS', phase
+                  callback = json.loads((directory / 'runtime/callbacks.json').read_text())
+                  assert callback['complete'] and callback['sources'] and callback['event_sources']
+                  index = json.loads((directory / 'evidence-index.json').read_text())
+                  for path in ['manifest.json', 'acceptance.json', 'runtime/callbacks.json', 'runtime/result.json',
+                               'phase-finalize.json', 'phase-observations.json']:
+                      data = (directory / path).read_bytes()
+                      assert index[path] == dict(bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
+                  for source in callback['event_sources']:
+                      data = (directory / 'runtime' / source['path']).read_bytes()
+                      assert len(data) == source['bytes'] and hashlib.sha256(data).hexdigest() == source['sha256']
+                  runtime = json.loads((directory / 'runtime/result.json').read_text())
+                  assert runtime['status'] == 'completed' and runtime['cleanup_complete'] and not runtime['infrastructure']
+                  assert not runtime.get('unresolved_processes') and not runtime.get('supervisor_rc')
+                  expected_failfast = 'FAILFAST=1' if name in ('tunnel-df', 'lifecycle-refresh') else 'FAILFAST=0'
+                  assert [arg for arg in runtime['command'] if arg.startswith('FAILFAST=')] == [expected_failfast]
+                  if name.startswith('fixed-'):
+                      assert result['built_tree'] == expected_tree and 'restoration' not in manifest
+                      assert not (collections.Counter(result['required']) - collections.Counter(result['successes']))
+                  else:
+                      assert manifest['restoration']['name'] == name and result['built_tree'] != expected_tree
+                  records[name] = (result, manifest)
+                  hashes[name] = {path: hashlib.sha256((directory / path).read_bytes()).hexdigest()
+                                  for path in ['manifest.json', 'acceptance.json', 'runtime/callbacks.json']}
+              except (OSError, ValueError, KeyError, AssertionError) as error:
+                  errors.append(f'{directory.name}: {error}')
+          if set(records) != expected:
+              errors.append(f'Missing variants: {sorted(expected - set(records))}')
+          if os.environ['MATRIX_RESULT'] != 'success':
+              errors.append('One or more independent jobs failed')
+          required = []
+          for suite in fixed:
+              if 'fixed-' + suite in records:
+                  required.extend(records['fixed-' + suite][0]['required'])
+          if len(required) != 24 or len(set(required)) != 24:
+              errors.append('Required24 inventory incomplete or duplicated')
+          for name in negatives:
+              if name not in records:
+                  continue
+              result, manifest = records[name]
+              paired = records.get('fixed-' + result['paired_fixed'])
+              if paired is None or collections.Counter(paired[0]['successes'])[result['intended_failure']] != 1:
+                  errors.append(f'{name}: no corresponding actual fixed success')
+          assessment = dict(status='FAIL' if errors else 'PASS', errors=errors, expected_variants=sorted(expected),
+                            required24=required, evidence_sha256=hashes, integration_tree=expected_tree,
+                            workflow_sha=os.environ['WORKFLOW_SHA'], run=os.environ['GITHUB_RUN_ID'],
+                            attempt=os.environ['GITHUB_RUN_ATTEMPT'],
+                            final26='PENDING: M44 final two ip4 methods plus C INTERPOSE regression',
+                            m43_negative='UNVERIFIED / ON HOLD; fixed full ip_mcast and three actual successes required',
+                            claim='Intermediate required24 and enabled functional controls only; not final audit acceptance')
+          (root / 'aggregate.json').write_text(json.dumps(assessment, indent=2) + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+              stream.write(assessment['claim'] + '\n\nStatus: ' + assessment['status'] + '\n')
+              stream.write('\n'.join(errors) + '\n')
+          if errors:
+              sys.exit(1)
+          PY
+
+      - name: Upload task-mapped intermediate acceptance
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-aggregate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/integration-results/aggregate.json
+          retention-days: 7
+          if-no-files-found: error
