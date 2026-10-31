@@ -1,0 +1,1418 @@
+# SPDX-License-Identifier: Apache-2.0
+# Temporary evidence only. Never merge this workflow into master.
+name: Temporary M44 exact source validation
+
+on:
+  push:
+    branches: [feat/fib-export-remote-validation-ff57-octobe]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m44-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  source-gates:
+    if: github.ref == 'refs/heads/feat/fib-export-remote-validation-ff57-octobe'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container: &container
+      image: debian:trixie
+      options: >-
+        --shm-size=2g
+        --cap-add=SYS_ADMIN
+        --cap-add=NET_ADMIN
+        --security-opt=apparmor=unconfined
+        --device-cgroup-rule="c 10:200 rwm"
+        --device-cgroup-rule="c 10:238 rwm"
+    defaults: &defaults
+      run:
+        shell: bash
+    env: &environment
+      CASE: ${{ matrix.case || 'source' }}
+      WORKFLOW_SHA: ${{ github.sha }}
+      CLANG_FORMAT_VER: '19'
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: ${{ github.workspace }}
+    steps:
+      - &bootstrap
+        name: Bootstrap tools with upload reserve
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/m44-tools"
+          mkdir "$RUNNER_TEMP/m44-evidence"
+          mkdir "$RUNNER_TEMP/m44-evidence/raw-acquisition"
+          printf '{"bytes":0,"files":0}\n' > "$RUNNER_TEMP/m44-evidence/raw-acquisition/budget"
+          printf 'TOOLS=%s\nEVIDENCE=%s\nWORK_DEADLINE=%s\n' \
+            "$RUNNER_TEMP/m44-tools" "$RUNNER_TEMP/m44-evidence" "$(( $(date +%s) + 6600 ))" >> "$GITHUB_ENV"
+          printf '{"workflow":"%s","case":"%s","run":"%s","attempt":"%s","job":"%s"}\n' \
+            "$WORKFLOW_SHA" "$CASE" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_JOB" > "$RUNNER_TEMP/m44-evidence/bootstrap.json"
+          for phase in prepare dependencies gates mutate build binaries environment tests finalize; do
+            printf '{"status":"UNRUN","rc":null}\n' > "$RUNNER_TEMP/m44-evidence/phase-$phase.json"
+          done
+          rc=0
+          timeout --signal=TERM --kill-after=5s 300s bash -euo pipefail -c \
+            'apt-get update -qq; apt-get install -y -qq sudo make git bash iproute2 python3' \
+            > "$RUNNER_TEMP/m44-evidence/bootstrap.log" 2>&1 || rc=$?
+          tail -c 8388608 "$RUNNER_TEMP/m44-evidence/bootstrap.log" > "$RUNNER_TEMP/m44-evidence/bootstrap-tail.log"
+          mv "$RUNNER_TEMP/m44-evidence/bootstrap-tail.log" "$RUNNER_TEMP/m44-evidence/bootstrap.log"
+          printf '{"rc":%s}\n' "$rc" > "$RUNNER_TEMP/m44-evidence/bootstrap-result.json"
+          exit "$rc"
+      - &checkout
+        name: Check out workflow carrier independently
+        timeout-minutes: 5
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - &tools
+        name: Materialize immutable external observer and controller
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cp .github/workflows/m44-remote-validation.yml "$EVIDENCE/workflow.yml"
+          cat > "$TOOLS/sitecustomize.py" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          import threading
+          import traceback
+          import unittest
+
+          destination = os.environ.get('M44_EVENTS')
+          if destination:
+              sequence = 0
+              process_id = os.getpid()
+              state = threading.local()
+
+              def emit(kind, **values):
+                  global sequence, process_id
+                  if process_id != os.getpid():
+                      process_id, sequence = os.getpid(), 0
+                      emit('loaded')
+                  sequence += 1
+                  record = dict(kind=kind, pid=os.getpid(), sequence=sequence, **values)
+                  data = (json.dumps(record, sort_keys=True) + '\n').encode()
+                  target = Path(destination + f'.{os.getpid()}.jsonl')
+                  if len(data) > 256 * 1024 or (target.exists() and target.stat().st_size + len(data) > 32 * 1024 * 1024):
+                      raise RuntimeError('M44 observer capacity exceeded')
+                  with target.open('ab') as stream:
+                      stream.write(data)
+
+              def live(test):
+                  process = getattr(test.__class__, 'vpp', None)
+                  if process is None:
+                      return dict(live=False)
+                  pid = process.pid
+                  try:
+                      directory = Path(f'/proc/{pid}')
+                      first = (directory / 'stat').read_text().rsplit(')', 1)[1].split()
+                      executable = str((directory / 'exe').resolve(strict=True))
+                      maps = (directory / 'maps').read_text()
+                      loaded = sorted({line.split()[-1] for line in maps.splitlines()
+                                       if len(line.split()) >= 6 and line.split()[-1].startswith('/')})
+                      files = {}
+                      for path in loaded:
+                          if Path(path).name == 'vpp' or Path(path).name.startswith('libvnet.so') or Path(path).name == 'unittest_plugin.so':
+                              files[path] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                      final = (directory / 'stat').read_text().rsplit(')', 1)[1].split()
+                      return dict(live=process.poll() is None and first[19] == final[19] and final[0] not in ('Z', 'X'),
+                                  vpp_pid=pid, birth=first[19], executable=executable, loaded=files)
+                  except (OSError, ValueError, IndexError) as error:
+                      return dict(live=False, vpp_pid=pid, error=str(error))
+
+              def wrap(name):
+                  original = getattr(unittest.TestResult, name)
+                  def observed(self, test, *args):
+                      if name == 'startTest':
+                          state.test = test
+                      record = dict(test=test.id())
+                      if name == 'startTest':
+                          config = getattr(sys.modules.get('config'), 'config', None)
+                          record.update(workers=test.__class__.get_vpp_worker_count(),
+                                        excluded=list(getattr(config, 'excluded_plugins', [])),
+                                        netns=getattr(config, 'skip_netns_tests', None),
+                                        tempdir=str(getattr(test.__class__, 'tempdir', '')),
+                                        cmdline=list(getattr(test.__class__, 'vpp_cmdline', [])), **live(test))
+                      if name in ('addFailure', 'addError', 'addExpectedFailure', 'addSubTest') and args[-1]:
+                          error = args[-1]
+                          record.update(exception=error[0].__name__, traceback=''.join(traceback.format_exception(*error)), **live(test))
+                      if name == 'addSkip':
+                          record['reason'] = str(args[0])
+                      emit(name, **record)
+                      result = original(self, test, *args)
+                      if name == 'stopTest':
+                          state.test = None
+                      return result
+                  setattr(unittest.TestResult, name, observed)
+
+              for name in ('startTest', 'stopTest', 'addSuccess', 'addFailure', 'addError', 'addSkip',
+                           'addExpectedFailure', 'addUnexpectedSuccess', 'addSubTest'):
+                  wrap(name)
+              original_stop = unittest.TestResult.stopTestRun
+              def stop(self):
+                  emit('completed', tests=self.testsRun, errors=len(self.errors), failures=len(self.failures),
+                       skips=len(self.skipped), expected=len(self.expectedFailures), unexpected=len(self.unexpectedSuccesses))
+                  return original_stop(self)
+              unittest.TestResult.stopTestRun = stop
+
+              def profile(frame, event, value):
+                  if event != 'return':
+                      return
+                  path, name = frame.f_code.co_filename, frame.f_code.co_name
+                  if path.endswith('/run_tests.py') and name == '__call__':
+                      owner, case = frame.f_locals.get('self'), frame.f_locals.get('test_method')
+                      if owner.__class__.__name__ == 'SplitToSuitesCallback' and case is not None:
+                          suite = owner.suites.get(owner.suite_name)
+                          if suite is not None and any(item is case for item in suite):
+                              emit('selected', test=case.id())
+                  test = getattr(state, 'test', None)
+                  if test is not None and path.endswith('/vpp_papi_provider.py') and name == 'cli_return_response' and frame.f_locals.get('cli', '').strip() == 'test fib':
+                      emit('cli_reply', test=test.id(), command=frame.f_locals.get('cli'),
+                           retval=getattr(value, 'retval', None), reply=getattr(value, 'reply', None), **live(test))
+              if sys.getprofile() is not None:
+                  raise RuntimeError('M44 profile slot occupied')
+              sys.setprofile(profile)
+              threading.setprofile(profile)
+              emit('loaded')
+          PY
+          cat > "$TOOLS/control.py" <<'PY'
+          import ast
+          import collections
+          import ctypes
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import selectors
+          import signal
+          import stat
+          import subprocess
+          import sys
+          import time
+
+          BASE = '9ad393ec1cca66d600932ad69d128634a845e4f4'
+          TIP = 'be9629d88fa4a97cc1e6e30e5e297dbdfce3cc84'
+          TREE = '1359b93e9f4435a642e90d89bf9d87fd64839fed'
+          OLD = '6d5b381bf06ad3b0a839f864bf307b2aa08553eb'
+          HISTORY = ['88b305a361fb6b5182156ea90c3714287861a391', '0f903d2c5967eddf811bf02d0a83d32868895eee',
+                     OLD, 'e84552bf087fb1e902b6b977d25c5958f6c7afc6', '9cb95d6b4b67cf461ae314ac6dbffddfdfaef3ca', TIP]
+          WORKFLOW = '.github/workflows/m44-remote-validation.yml'
+          FIB = 'src/plugins/unittest/fib_test.c'
+          IP4 = 'test/test_ip4.py'
+          INTERFACE = 'src/vnet/fib/fib_entry_src_interface.c'
+          EXPORT = 'src/vnet/fib/fib_attached_export.c'
+          INTERPOSE = 'src/vnet/fib/fib_entry_src_interpose.c'
+          PINS = {FIB: '6a642ffd52c9b1eb606e249cd2f0ef85d8e7fe32', IP4: '48b37a4e3fd1151eac4fc537f0314e527a8c8de7',
+                  INTERFACE: '6921f857bd3debf39e44140427a1aaddfc878d1a', EXPORT: '211f7e1d79840d457fae40828e04e7f0e84daa0a',
+                  INTERPOSE: '51f80ed7789af867513ec9bed5b4b72e0be9f331',
+                  'src/vnet/fib/fib_entry.c': 'c6739caf0e4583c68a477a05b5a0f2ef03c3c345',
+                  'src/vnet/fib/fib_entry.h': '83ba7b1e1710f78021458dfd192463ea4b1465e3',
+                  'src/vnet/fib/fib_node.h': '2828c429739f7bdedc1a69b56bd696968567ef78',
+                  'src/vnet/fib/fib_entry_src.c': '4997d3104745e7fa2f005af6ef9da2e33706f3e1',
+                  'src/vnet/fib/fib_entry_src.h': '468e86483580e55159dc14ee581fc7d5d45ebc97',
+                  'test/requirements.txt': 'c0527dd70258d993915bd7fd360ce05837e8872d',
+                  'test/requirements-3.txt': 'e488be05264392f60948bf376d81889b1e57c76f'}
+          RECIPES = {'A': (BASE, {INTERFACE: '1943b38a9514d660277901f21d24e4336ddde454'}),
+                     'B': (BASE, {EXPORT: '480f0e34f8dffaff6d245ce5877a79d1e24f6616'}),
+                     'C': (OLD, {INTERFACE: '0453fff55cdab9da7ac5de279a6620e4733cb8a2',
+                                 INTERPOSE: 'e4716bb07b4c8a66b08f6b4aa63a5eefc9daa973'})}
+          REQUIRED = {'ip4': ['test_ip4.TestIPv4IfAddrRoute.test_ipv4_local_export_withdraw_glean',
+                              'test_ip4.TestIPv4IfAddrRoute.test_ipv4_local_export_withdraw_non_glean'],
+                      'fib': ['test_fib.TestFIB.test_fib']}
+          GAPS = ['Deterministic entry relocation UNFULFILLED', 'Restored old P2 actual failure UNFULFILLED',
+                  'M43 negative HOLD and excluded; no allocator consultation', 'Runtime acceptance requires actual remote evidence']
+          CASE = os.environ.get('CASE', 'source')
+          OUT = Path(os.environ.get('EVIDENCE', '.'))
+          TOOLS = Path(os.environ.get('TOOLS', '.'))
+          CALLBACK = re.compile(r'--- (add\w+)\(\) (\w+)\.(\w+)\(')
+          INFRA = re.compile(r'VppTransportSocketIOError|VppDiedError|Vpp dead|VPP subprocess died unexpectedly|'
+                             r'VPP died shortly after startup|Exception connecting to (?:vapi|VPP)|PUMP THREAD TIMEOUT|'
+                             r'\bSIG(?:SEGV|ABRT|BUS|ILL|FPE)\b|\bAborted\b|\bBus error\b|Illegal instruction|'
+                             r'Floating point exception|segmentation fault|Core was generated|Core file present,|'
+                             r'AddressSanitizer|timed out|TimeoutError|not enough cpus|Skipping tests due to setup failure', re.I)
+
+          def require(value, message):
+              if not value:
+                  raise AssertionError(message)
+
+          def sha(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def oid(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+
+          def save(name, value):
+              target = OUT / name
+              target.parent.mkdir(parents=True, exist_ok=True)
+              temporary = target.with_name(target.name + '.pending')
+              temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+              os.replace(temporary, target)
+
+          def git(*args):
+              return subprocess.check_output(['git', *args])
+
+          def textgit(*args):
+              return git(*args).decode().strip()
+
+          def content(ref, path):
+              return git('show', f'{ref}:{path}')
+
+          def deadline():
+              return min(float(os.environ['WORK_DEADLINE']), float(os.environ.get('STEP_DEADLINE', os.environ['WORK_DEADLINE'])))
+
+          def identity(pid):
+              fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+              return int(fields[1]), fields[19], fields[0]
+
+          class OwnedProcesses:
+              class PhaseExpired(Exception):
+                  pass
+
+              capacity, history_count, history_bytes = 20000, 1024, 1024 * 1024
+              error_count, error_bytes = 64, 64 * 1024
+
+              def __init__(self):
+                  self.birth = identity(os.getpid())[1]
+                  self.handles, self.pending = {}, {}
+                  self.history, self.errors = collections.deque(), collections.deque()
+                  self.totals = collections.Counter()
+                  self.sample_bytes = collections.Counter()
+                  self.sequence = self.peak_handles = self.peak_pending = 0
+                  self.incomplete = False
+                  self.root = None
+                  self.root_bound = self.intervened = False
+                  self.natural_rc = None
+                  self.final_live = self.final_pending = None
+                  self.final_active = None
+                  self.limit = float('inf')
+                  self.cleanup_deadline = None
+
+              def check(self):
+                  now = time.monotonic()
+                  if now >= self.limit and self.cleanup_deadline is not None and self.limit < self.cleanup_deadline:
+                      require(now < self.cleanup_deadline, 'Process acquisition deadline')
+                      raise self.PhaseExpired()
+                  require(now < self.limit, 'Process acquisition deadline')
+
+              def sample(self, section, record):
+                  self.sequence += 1
+                  self.totals[section] += 1
+                  encoded = json.dumps(dict(sequence=self.sequence, **record), sort_keys=True)
+                  if len(encoded.encode()) > 8192:
+                      encoded = json.dumps(dict(sequence=self.sequence, detail=encoded[:1024], truncated=True))
+                  entries = getattr(self, section)
+                  entries.append(encoded)
+                  self.sample_bytes[section] += len(encoded.encode())
+                  count = self.error_count if section == 'errors' else self.history_count
+                  size = self.error_bytes if section == 'errors' else self.history_bytes
+                  while len(entries) > count or self.sample_bytes[section] + 2 * len(entries) + 2 > size:
+                      self.sample_bytes[section] -= len(entries.popleft().encode())
+
+              def error(self, reason, **values):
+                  self.incomplete = True
+                  self.sample('errors', dict(reason=str(reason)[:2048], **values))
+
+              def poll_root(self):
+                  if self.root is not None:
+                      value = self.root.poll()
+                      if value is not None and not self.intervened:
+                          self.natural_rc = value
+                      return value
+
+              def table(self):
+                  result = {}
+                  for path in Path('/proc').iterdir():
+                      self.check()
+                      if path.name.isdigit():
+                          try:
+                              result[int(path.name)] = identity(int(path.name))
+                          except (FileNotFoundError, ProcessLookupError):
+                              pass
+                  return result
+
+              def exited(self, handle):
+                  with selectors.DefaultSelector() as poller:
+                      poller.register(handle[1], selectors.EVENT_READ)
+                      return bool(poller.select(0))
+
+              def anchored(self, directory):
+                  descriptor = os.open('stat', os.O_RDONLY, dir_fd=directory)
+                  try:
+                      fields = os.read(descriptor, 8192).decode().rsplit(')', 1)[1].split()
+                      return int(fields[1]), fields[19], fields[0]
+                  finally:
+                      os.close(descriptor)
+
+              def close(self, handle):
+                  for descriptor in handle:
+                      try:
+                          os.close(descriptor)
+                      except OSError as error:
+                          self.error(error, operation='close')
+
+              def retire(self):
+                  self.poll_root()
+                  progress = False
+                  for key, handle in list(self.handles.items()):
+                      self.check()
+                      if not self.exited(handle):
+                          continue
+                      if self.root is None or key[0] != self.root.pid:
+                          try:
+                              os.waitid(os.P_PIDFD, handle[1], os.WEXITED | os.WNOHANG)
+                          except ChildProcessError:
+                              pass
+                          except OSError as error:
+                              self.error(error, operation='reap', pid=key[0])
+                      self.sample('history', dict(pid=key[0], birth=key[1], status='exited'))
+                      self.totals['retired'] += 1
+                      self.close(self.handles.pop(key))
+                      progress = True
+                  return progress
+
+              def parent(self, pid, table):
+                  self.check()
+                  if pid == os.getpid():
+                      value = identity(pid)
+                      if value[1] != self.birth:
+                          self.error('controller birth mismatch', pid=pid, expected=self.birth, actual=value)
+                          return False
+                      return True
+                  for key, handle in self.handles.items():
+                      self.check()
+                      if key[0] != pid or self.exited(handle):
+                          continue
+                      value = table.get(pid)
+                      if value and value[1] != key[1]:
+                          self.error('parent birth mismatch', pid=pid, expected=key[1], actual=value)
+                          return False
+                      try:
+                          anchored = self.anchored(handle[0])
+                          if anchored[1] != key[1]:
+                              self.error('anchored parent birth mismatch', pid=pid, expected=key[1], actual=anchored)
+                              return False
+                          return not self.exited(handle)
+                      except (FileNotFoundError, ProcessLookupError):
+                          return False
+                  return False
+
+              def settle(self):
+                  progress = False
+                  for key, record in list(self.pending.items()):
+                      self.check()
+                      try:
+                          value = identity(key[0])
+                          record['absence'] = 0
+                          if value[1] != key[1]:
+                              self.error('pending birth mismatch', pid=key[0], expected=key[1], actual=value)
+                              del self.pending[key]
+                              progress = True
+                          elif value[2] in ('Z', 'X', 'x'):
+                              self.sample('history', dict(pid=key[0], birth=key[1], status='terminal_unbound'))
+                              self.totals['terminal_unbound'] += 1
+                              del self.pending[key]
+                              progress = True
+                      except (FileNotFoundError, ProcessLookupError):
+                          record['absence'] += 1
+                          if record['absence'] >= 2:
+                              self.sample('history', dict(pid=key[0], birth=key[1], status='vanished'))
+                              self.totals['vanished'] += 1
+                              del self.pending[key]
+                              progress = True
+                  return progress
+
+              def discover(self, cleaning=False):
+                  for _ in range(8):
+                      self.check()
+                      progress = self.retire()
+                      progress = self.settle() or progress
+                      table = self.table()
+                      held_pids = set()
+                      for key in self.handles:
+                          self.check()
+                          held_pids.add(key[0])
+                          value = table.get(key[0])
+                          if value and value[1] != key[1]:
+                              self.error('snapshot birth mismatch', pid=key[0], expected=key[1], actual=value)
+                      for pid, value in table.items():
+                          self.check()
+                          key = pid, value[1]
+                          if value[2] in ('Z', 'X', 'x') or key in self.handles or pid in held_pids:
+                              continue
+                          if not self.parent(value[0], table):
+                              continue
+                          if key not in self.pending:
+                              if len(self.handles) + len(self.pending) >= self.capacity:
+                                  self.error('Process evidence capacity', pid=pid, birth=value[1])
+                                  self.totals['overflow'] += 1
+                                  if not cleaning:
+                                      raise AssertionError('Process evidence capacity')
+                                  continue
+                              self.pending[key] = dict(pid=pid, birth=value[1], absence=0)
+                              self.peak_pending = max(self.peak_pending, len(self.pending))
+                              self.totals['admitted'] += 1
+                              progress = True
+                          if self.pending[key].get('identity_error'):
+                              continue
+                          directory = descriptor = None
+                          try:
+                              directory = os.open(f'/proc/{pid}', os.O_RDONLY | os.O_DIRECTORY)
+                              first = self.anchored(directory)
+                              require(first[1] == key[1], 'Child birth changed before pidfd')
+                              descriptor = os.pidfd_open(pid)
+                              self.check()
+                              final = self.anchored(directory)
+                              require(final[1] == key[1], 'Child birth changed after pidfd')
+                              require(first[0] == final[0] and self.parent(final[0], self.table()), 'Child ownership changed')
+                              require(self.anchored(directory)[:2] == final[:2], 'Child birth/parent changed after parent proof')
+                              require(final[2] not in ('Z', 'X', 'x'), 'Child exited during acquisition')
+                              self.handles[key] = (directory, descriptor)
+                              directory = descriptor = None
+                              self.sample('history', dict(pid=pid, birth=key[1], status='bound'))
+                              self.totals['acquired'] += 1
+                              self.peak_handles = max(self.peak_handles, len(self.handles))
+                              if self.root is not None and pid == self.root.pid:
+                                  self.root_bound = True
+                              del self.pending[key]
+                              progress = True
+                          except (FileNotFoundError, ProcessLookupError):
+                              pass
+                          except (OSError, AssertionError) as error:
+                              self.sample('history', dict(pid=pid, birth=key[1], status='uncertain', error=str(error)[:2048]))
+                              if 'birth' in str(error).lower():
+                                  self.pending[key]['identity_error'] = True
+                              if isinstance(error, OSError) or 'birth' in str(error).lower() or 'deadline' in str(error).lower():
+                                  self.error(error, pid=pid)
+                          finally:
+                              self.close(tuple(fd for fd in (directory, descriptor) if fd is not None))
+                      self.poll_root()
+                      if not progress:
+                          break
+                  if self.incomplete and not cleaning:
+                      raise AssertionError('Process ownership incomplete')
+
+              def summary(self):
+                  def section(records, total, size):
+                      retained, used = [], 2
+                      for record in records:
+                          encoded = json.dumps(record, sort_keys=True)
+                          extra = len(encoded.encode()) + (2 if retained else 0)
+                          if len(retained) == 1024 or used + extra > size - 1024:
+                              break
+                          retained.append(record)
+                          used += extra
+                      return dict(records=retained, total=total, dropped=total - len(retained), bytes=used,
+                           first_sequence=retained[0].get('sequence') if retained else None,
+                           last_sequence=retained[-1].get('sequence') if retained else None)
+                  history = [json.loads(value) for value in self.history]
+                  errors = [json.loads(value) for value in self.errors]
+                  return dict(ownership_incomplete=self.incomplete, totals=dict(self.totals), sequence=self.sequence,
+                       peak_handles=self.peak_handles, peak_pending=self.peak_pending,
+                       live=len(self.handles) if self.final_live is None else self.final_live,
+                       unresolved=len(self.pending) if self.final_pending is None else self.final_pending,
+                       root_bound=self.root_bound, natural_rc=self.natural_rc,
+                       history=section(history, self.totals['history'], self.history_bytes),
+                       errors=section(errors, self.totals['errors'], self.error_bytes),
+                       active=self.final_active if self.final_active is not None else section(
+                           (dict(pid=key[0], birth=key[1]) for key in self.handles), len(self.handles), self.history_bytes),
+                       pending=section(self.pending.values(), len(self.pending), self.history_bytes))
+
+              def cleanup(self, process):
+                  self.root = process
+                  started = time.monotonic()
+                  self.cleanup_deadline = started + 6
+                  try:
+                      for sig, seconds in ((signal.SIGTERM, 3), (signal.SIGKILL, 6)):
+                          self.limit = started + seconds
+                          while time.monotonic() < self.limit:
+                              try:
+                                  self.discover(cleaning=True)
+                                  self.poll_root()
+                                  for key, handle in list(self.handles.items()):
+                                      self.check()
+                                      if self.exited(handle):
+                                          continue
+                                      if key[0] == process.pid:
+                                          self.intervened = True
+                                      try:
+                                          signal.pidfd_send_signal(handle[1], sig)
+                                      except ProcessLookupError:
+                                          pass
+                                  self.retire()
+                              except self.PhaseExpired:
+                                  break
+                              except (OSError, AssertionError) as error:
+                                  self.error(error, operation='cleanup')
+                              if not self.handles and not self.pending and process.poll() is not None and not self.incomplete:
+                                  return True
+                              time.sleep(min(0.03, max(0, self.limit - time.monotonic())))
+                      self.error('Process cleanup deadline', live=len(self.handles), unresolved=len(self.pending))
+                      return False
+                  finally:
+                      self.final_live, self.final_pending = len(self.handles), len(self.pending)
+                      self.final_active = self.summary()['active']
+                      for key in list(self.handles):
+                          self.close(self.handles.pop(key))
+                      self.cleanup_deadline = None
+
+          def command(label, args, environment=None, limit=1200):
+              directory = OUT / label
+              directory.mkdir(parents=True, exist_ok=True)
+              allowed = min(limit, deadline() - time.time() - 12)
+              result = dict(command=args, start=time.time(), rc=None, status='running', deadline=deadline(), allowed=allowed)
+              save(f'{label}/result.json', result)
+              process, owned, tail, suspicious = None, None, bytearray(), []
+              try:
+                  owned = OwnedProcesses()
+                  require(ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0, 'Child subreaper unavailable')
+                  require(allowed > 0, 'Work deadline exhausted')
+                  process = subprocess.Popen(args, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+                  result['pid'] = process.pid
+                  stop = time.monotonic() + allowed
+                  owned.limit = stop
+                  owned.root = process
+                  owned.discover()
+                  require(owned.root_bound or owned.natural_rc is not None, 'Root process identity unavailable')
+                  os.set_blocking(process.stdout.fileno(), False)
+                  buffer = b''
+                  with selectors.DefaultSelector() as poller, (directory / 'console.log').open('w+b') as stream:
+                      poller.register(process.stdout, selectors.EVENT_READ)
+                      while poller.get_map() or process.poll() is None:
+                          require(time.monotonic() < stop, 'Command deadline exhausted')
+                          owned.discover()
+                          for key, _ in poller.select(min(0.2, max(0, stop - time.monotonic()))):
+                              try:
+                                  chunk = os.read(key.fd, 65536)
+                              except BlockingIOError:
+                                  continue
+                              if not chunk:
+                                  poller.unregister(key.fd)
+                                  continue
+                              tail.extend(chunk)
+                              result['total_console_bytes'] = result.get('total_console_bytes', 0) + len(chunk)
+                              del tail[:-8 * 1024 * 1024]
+                              stream.seek(0)
+                              stream.write(tail)
+                              stream.truncate()
+                              buffer += chunk
+                              lines = buffer.split(b'\n')
+                              buffer = lines.pop()
+                              require(len(buffer) < 256 * 1024, 'Oversized console line')
+                              for line in lines:
+                                  value = line.decode(errors='replace')
+                                  if INFRA.search(value):
+                                      suspicious.append(value)
+                                      require(sum(len(item) for item in suspicious) < 1024 * 1024, 'Fatal evidence overflow')
+                      result.update(rc=process.wait(), status='completed')
+                      if buffer and INFRA.search(buffer.decode(errors='replace')):
+                          suspicious.append(buffer.decode(errors='replace'))
+              except BaseException as error:
+                  result.update(status='execution_error', error=str(error)[:4096])
+                  raise
+              finally:
+                  alarm_started = time.monotonic()
+                  phase_alarm = signal.setitimer(signal.ITIMER_REAL, 0)
+                  try:
+                      if process is not None:
+                          try:
+                              owned.poll_root()
+                              if result['rc'] is None:
+                                  result['rc'] = owned.natural_rc
+                              result['cleanup_complete'] = owned.cleanup(process) and not owned.incomplete
+                              result['cleanup_rc'] = process.returncode
+                              if not result['cleanup_complete']:
+                                  result['status'] = 'execution_error'
+                          except BaseException as error:
+                              result.update(status='execution_error', cleanup_complete=False, cleanup_error=str(error)[:4096])
+                          finally:
+                              if result['rc'] is None:
+                                  result['rc'] = owned.natural_rc
+                              process.stdout.close()
+                      result.update(end=time.time(), retained_console_bytes=len(tail), infrastructure=suspicious,
+                                    ownership=owned.summary() if owned else None)
+                      require(len(json.dumps(result).encode()) < 8 * 1024 * 1024, 'Command result capacity')
+                      save(f'{label}/result.json', result)
+                  finally:
+                      elapsed = time.monotonic() - alarm_started
+                      if phase_alarm[0]:
+                          signal.setitimer(signal.ITIMER_REAL, max(0.001, phase_alarm[0] - elapsed), phase_alarm[1])
+              require(result['status'] == 'completed' and result.get('cleanup_complete'), 'Command or cleanup incomplete')
+              return result['rc'], tail.decode(errors='replace')
+
+          def zero(label, args, limit=1200):
+              rc, output = command(label, args, limit=limit)
+              require(rc == 0, f'{label}: exit {rc}')
+              return output
+
+          def expected_pins():
+              result = dict(PINS)
+              if CASE in RECIPES:
+                  result.update(RECIPES[CASE][1])
+              return result
+
+          def verify(label):
+              require(textgit('rev-parse', 'HEAD') == TIP, 'Wrong source commit')
+              pins = {path: oid(Path(path).read_bytes()) for path in PINS}
+              save(f'{label}-pins.json', pins)
+              require(pins == expected_pins(), 'Source/test/lock/pointer blob mismatch')
+              changed = textgit('diff', '--name-only').splitlines()
+              require(set(changed) == set(RECIPES[CASE][1] if CASE in RECIPES else []), 'Unexpected tracked mutation')
+              require(not textgit('diff', '--cached', '--name-only'), 'Unexpected index mutation')
+              return pins
+
+          def prepare():
+              save('manifest.json', dict(workflow_sha=os.environ['WORKFLOW_SHA'], workflow_blob=textgit('hash-object', WORKFLOW),
+                   source=TIP, base=BASE, tree=TREE, parent=HISTORY[-2], case=CASE, gaps=GAPS,
+                   run=os.environ['GITHUB_RUN_ID'], attempt=os.environ['GITHUB_RUN_ATTEMPT'], job=os.environ['GITHUB_JOB'],
+                   run_url=f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+                   tools={path.name: sha(path.read_bytes()) for path in TOOLS.glob('*.py')}))
+              require(textgit('rev-parse', 'HEAD') == os.environ['WORKFLOW_SHA'], 'Wrong carrier')
+              require(not textgit('status', '--porcelain'), 'Dirty carrier')
+              for path in ('build-root/build-vpp_debug-native', 'build-root/install-vpp_debug-native', 'build-root/test/venv', 'build-root/.ccache'):
+                  require(not Path(path).exists(), f'Non-fresh build tree {path}')
+              require(textgit('rev-parse', TIP + '^{tree}') == TREE, 'Wrong reviewed tree')
+              require(textgit('rev-parse', TIP + '^') == HISTORY[-2], 'Wrong parent')
+              require(textgit('rev-list', '--reverse', '--no-merges', BASE + '..' + TIP).splitlines() == HISTORY, 'Wrong history')
+              git('checkout', '--detach', TIP)
+              require(not textgit('status', '--porcelain'), 'Dirty exact source checkout')
+              for path, pin in PINS.items():
+                  require(oid(Path(path).read_bytes()) == pin, f'Initial pin mismatch {path}')
+              save('source-tree.json', dict(head=textgit('rev-parse', 'HEAD'), tree=textgit('write-tree'),
+                   blobs=textgit('ls-tree', '-r', 'HEAD'), diffstat=textgit('diff', '--stat', BASE, TIP),
+                   changed=textgit('diff', '--name-status', BASE, TIP)))
+              fixtures()
+
+          def gates():
+              zero('feature-list', ['make', 'checkfeaturelist'])
+              zero('patch-whitespace', ['git', 'diff', BASE, TIP, '--check'])
+              require(not textgit('diff', '--name-only', BASE, TIP, '--', '*.api'), 'Unexpected API change')
+              try:
+                  for commit in HISTORY:
+                      git('checkout', '--detach', commit)
+                      require(not textgit('status', '--porcelain', '-uno'), 'Dirty history gate')
+                      for label, argv in [('style', ['bash', 'extras/scripts/checkstyle.sh']),
+                                          ('message', ['bash', 'extras/scripts/check_commit_msg.sh']),
+                                          ('api', ['python3', 'extras/scripts/crcchecker.py', '--check-patchset'])]:
+                          zero(commit + '-' + label, argv)
+              finally:
+                  git('checkout', '--detach', TIP)
+              zero('full-c-diff', ['bash', '-euo', 'pipefail', '-c',
+                   'command -v clang-format-diff-19; clang-format-19 --version; '
+                   'git diff -U0 --no-color --relative "$1" "$2" -- ":!*.patch" ":(exclude)*src/vppinfra/dlmalloc.*" '
+                   '| clang-format-diff-19 -style file -p1 > "$3"; test ! -s "$3"',
+                   'm44-format', BASE, TIP, str(OUT / 'full-c-format.diff')])
+              require(not textgit('status', '--porcelain', '-uno'), 'Dirty before Python checks')
+              Path('test/requirements-3.txt').touch()
+              zero('python-style', ['make', 'UV=', 'checkstyle-python'], limit=1500)
+              zero('python-pin', ['build-root/test/venv/bin/python', '-c',
+                   'import ast,black,importlib.metadata as m; from pathlib import Path; '
+                   'assert black.__version__ == "26.5.1", black.__version__; '
+                   'ast.parse(Path("test/test_ip4.py").read_text()); '
+                   'print(black.__version__); print(sorted((d.metadata["Name"],d.version) for d in m.distributions()))'])
+              zero('python-target', ['build-root/test/venv/bin/python', '-m', 'black', '--check', '--target-version', 'py39', IP4])
+              verify('after-gates')
+
+          def mutate():
+              if CASE in RECIPES:
+                  ref, pins = RECIPES[CASE]
+                  for path, pin in pins.items():
+                      require(oid(content(ref, path)) == pin, 'Restoration provenance mismatch')
+                  git('restore', '--source=' + ref, '--worktree', '--', *pins)
+              verify('before-build')
+              save('variant.json', dict(case=CASE, recipe=RECIPES.get(CASE), blobs=expected_pins(),
+                   changed=textgit('diff', '--name-status'), patch=textgit('diff', '--binary')))
+
+          def binaries():
+              verify('after-build')
+              root = Path('build-root/install-vpp_debug-native/vpp').resolve()
+              files = {}
+              for pattern in ('vpp', 'libvnet.so*', 'unittest_plugin.so'):
+                  matches = sorted({path.resolve() for path in root.rglob(pattern) if path.is_file()})
+                  require(matches, f'Missing binary {pattern}')
+                  for path in matches:
+                      files[str(path)] = dict(sha256=sha(path.read_bytes()), build_id=subprocess.check_output(['readelf', '-n', str(path)], text=True))
+              save('binaries.json', files)
+              Path('test/requirements-3.txt').touch()
+              caches = list(Path('build-root/build-vpp_debug-native').rglob('CMakeCache.txt'))
+              require(caches, 'No debug configuration')
+              data = '\n'.join(path.read_text() for path in caches)
+              (OUT / 'CMakeCache.txt').write_text(data)
+              require('cmake_build_type:string=debug' in data.lower(), 'Wrong build type')
+              zero('tool-versions', ['bash', '-euo', 'pipefail', '-c', 'cat /etc/os-release; cc --version; cmake --version; python3 --version'])
+
+          def events_from(directory):
+              events, total = [], 0
+              paths = sorted(directory.glob('events.*.jsonl'))
+              require(len(paths) <= 2000, 'Too many observer files')
+              for path in paths:
+                  total += path.stat().st_size
+                  require(total <= 64 * 1024 * 1024, 'Observer total capacity exceeded')
+                  require(not path.is_symlink() and path.stat().st_size <= 32 * 1024 * 1024, 'Unsafe event file')
+                  rows = [json.loads(line) for line in path.read_text().splitlines()]
+                  require(rows and all(isinstance(row, dict) for row in rows), 'Malformed observer record')
+                  require([row.get('sequence') for row in rows] == list(range(1, len(rows) + 1)), 'Incomplete observer sequence')
+                  require(rows[0].get('kind') == 'loaded' and all(row.get('pid') == rows[0]['pid'] for row in rows), 'Event process identity mismatch')
+                  events.extend(rows)
+                  require(len(events) <= 100000, 'Observer record capacity exceeded')
+              require(events, 'Observer missing')
+              return events
+
+          class RawAcquisition:
+              def __enter__(self):
+                  import fcntl
+                  self.directory = os.open(OUT / 'raw-acquisition', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                  self.descriptor = None
+                  try:
+                      self.descriptor = os.open('budget', os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.directory)
+                      metadata = os.fstat(self.descriptor)
+                      require(stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 128, 'Unsafe acquisition state')
+                      fcntl.flock(self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                      try:
+                          os.stat('pending', dir_fd=self.directory, follow_symlinks=False)
+                      except FileNotFoundError:
+                          pass
+                      else:
+                          raise AssertionError('Interrupted acquisition reservation')
+                      self.used = json.loads(os.read(self.descriptor, 129))
+                      require(isinstance(self.used, dict) and set(self.used) == {'bytes', 'files'} and
+                              all(type(value) is int for value in self.used.values()) and
+                              0 <= self.used['bytes'] <= 256 * 1024 * 1024 and 0 <= self.used['files'] <= 2000,
+                              'Invalid acquisition state')
+                      self.ready = True
+                      return self
+                  except BaseException:
+                      if self.descriptor is not None:
+                          os.close(self.descriptor)
+                      os.close(self.directory)
+                      raise
+
+              def __exit__(self, *exception):
+                  os.close(self.descriptor)
+                  os.close(self.directory)
+
+              def reserve(self, length):
+                  require(self.ready, 'Acquisition reservation previously failed')
+                  require(0 <= length <= 32 * 1024 * 1024 and self.used['files'] < 2000 and
+                          self.used['bytes'] + length <= 256 * 1024 * 1024, 'Raw acquisition capacity exhausted')
+                  self.ready = False
+                  marker = os.open('pending', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.directory)
+                  os.close(marker)
+                  os.fsync(self.directory)
+                  self.used['bytes'] += length
+                  self.used['files'] += 1
+                  data = json.dumps(self.used, sort_keys=True).encode()
+                  os.lseek(self.descriptor, 0, os.SEEK_SET)
+                  require(os.write(self.descriptor, data) == len(data), 'Short acquisition reservation write')
+                  os.ftruncate(self.descriptor, len(data))
+                  os.fsync(self.descriptor)
+                  os.unlink('pending', dir_fd=self.directory)
+                  os.fsync(self.directory)
+                  self.ready = True
+
+          def raw_identity(metadata):
+              return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+          def raw_source(path):
+              directory = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+              try:
+                  parts = path.absolute().parts[1:]
+                  require(parts and '..' not in parts, 'Unsafe raw source path')
+                  for part in parts[:-1]:
+                      child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                      os.close(directory)
+                      directory = child
+                  return os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+              finally:
+                  os.close(directory)
+
+          def acquire_raw(path, target, acquisition):
+              before = path.lstat()
+              require(stat.S_ISREG(before.st_mode), 'Raw source is not a regular file')
+              descriptor = raw_source(path)
+              with os.fdopen(descriptor, 'rb', buffering=0) as source:
+                  metadata = os.fstat(source.fileno())
+                  require(stat.S_ISREG(metadata.st_mode) and raw_identity(before) == raw_identity(metadata), 'Raw source changed before open')
+                  acquisition.reserve(metadata.st_size)
+                  digest, length, text = hashlib.sha256(), 0, bytearray()
+                  with target.open('xb', buffering=0) as destination:
+                      while length < metadata.st_size:
+                          data = source.read(min(1024 * 1024, metadata.st_size - length))
+                          require(data, 'Raw source truncated')
+                          require(destination.write(data) == len(data), 'Short raw evidence write')
+                          length += len(data)
+                          digest.update(data)
+                          if path.name in ('log.txt', 'vpp_stderr.txt', 'vpp_stdout.txt'):
+                              text.extend(data)
+                      require(raw_identity(os.fstat(source.fileno())) == raw_identity(metadata) and
+                              raw_identity(path.lstat()) == raw_identity(metadata), 'Raw source changed during acquisition')
+                  return dict(bytes=length, sha256=digest.hexdigest()), text.decode(errors='replace')
+
+          def collect(directory, roots=None, strict=True):
+              directory.mkdir(parents=True, exist_ok=False)
+              records, combined, problems, incomplete = [], [], [], []
+              roots = roots if roots is not None else [*sorted(Path('/tmp').glob('vpp-unittest-*')), Path('build-root/test-logs')]
+              try:
+                  with RawAcquisition() as acquisition:
+                      require(acquisition.used['files'] < 2000, 'Raw acquisition file capacity exhausted')
+                      candidates = []
+                      for root in roots:
+                          if root.is_symlink() or not root.is_dir():
+                              problems.append(f'Missing or unsafe root: {root}')
+                              continue
+                          if strict:
+                              for name in ('log.txt', 'vpp_stdout.txt', 'vpp_stderr.txt'):
+                                  if not (root / name).is_file() or (root / name).is_symlink():
+                                      problems.append(f'Missing critical log: {root / name}')
+                          discovery_full = False
+                          for folder, subdirs, names in os.walk(root, followlinks=False):
+                              subdirs[:] = sorted(name for name in subdirs if not (Path(folder) / name).is_symlink())
+                              for name in sorted(names, key=lambda value: (value not in ('log.txt', 'vpp_stderr.txt', 'vpp_stdout.txt'), value)):
+                                  path = Path(folder) / name
+                                  if name.startswith('core'):
+                                      problems.append(f'Core evidence: {path}')
+                                      continue
+                                  if path.suffix in ('.txt', '.log', '.pcap', '.pcapng') or name.startswith('api_post_mortem.'):
+                                      if len(candidates) == 2000:
+                                          problems.append(f'Raw discovery capacity exhausted at: {path}')
+                                          incomplete.append(str(path))
+                                          discovery_full = True
+                                          break
+                                      critical = name in ('log.txt', 'vpp_stderr.txt', 'vpp_stdout.txt')
+                                      candidates.append((not critical, str(path), path, critical))
+                              if discovery_full:
+                                  break
+                          if discovery_full:
+                              break
+                      for _, _, path, critical in sorted(candidates):
+                          target = f'{len(records):04d}{path.suffix or ".bin"}'
+                          record = dict(path=str(path), target=target, critical=critical)
+                          try:
+                              values, text = acquire_raw(path, directory / target, acquisition)
+                              record.update(values)
+                              if critical:
+                                  combined.append('\n'.join(line for line in text.splitlines() if CALLBACK.search(line) or INFRA.search(line))
+                                                  if path.name == 'log.txt' else text)
+                          except BaseException as error:
+                              record.update(status='OMITTED', error=str(error))
+                              incomplete.append(str(path))
+                              records.append(record)
+                              if not isinstance(error, (OSError, AssertionError, ValueError)):
+                                  raise
+                              if critical:
+                                  problems.append(f'Critical evidence omitted: {path}')
+                              continue
+                          records.append(record)
+              except BaseException as error:
+                  problems.append(f'Raw acquisition incomplete: {error}')
+                  if not isinstance(error, (OSError, AssertionError, ValueError)):
+                      raise
+              finally:
+                  save(str(directory.relative_to(OUT) / 'index.json'), dict(schema=1, strict=strict,
+                       status='COMPLETE' if not problems and not incomplete else 'INCOMPLETE', roots=list(map(str, roots)),
+                       result_sha256=collection_json(directory.parent / 'result.json')[1] if strict else None,
+                       files=records, incomplete=incomplete, problems=problems,
+                       limits=dict(total=256 * 1024 * 1024, file=32 * 1024 * 1024, count=2000)))
+              require(not strict or not (problems or incomplete), '; '.join(problems + incomplete))
+              return '\n'.join(combined)
+
+          def collection_json(path):
+              descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+              with os.fdopen(descriptor, 'rb') as stream:
+                  metadata = os.fstat(stream.fileno())
+                  require(stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 8 * 1024 * 1024, 'Unsafe collection metadata')
+                  data = stream.read(8 * 1024 * 1024 + 1)
+                  require(len(data) == metadata.st_size, 'Collection metadata changed or exceeded capacity')
+              return json.loads(data), sha(data)
+
+          def collection_roots(suite, budget):
+              directory = suite / 'diagnostics'
+              require(not suite.is_symlink() and not directory.is_symlink(), 'Unsafe collection directory')
+              value, _ = collection_json(directory / 'index.json')
+              require(isinstance(value, dict) and set(value) == {'schema', 'strict', 'status', 'roots', 'result_sha256',
+                      'files', 'incomplete', 'problems', 'limits'}, 'Malformed collection schema')
+              require(type(value['schema']) is int and value['schema'] == 1 and value['strict'] is True and
+                      value['status'] == 'COMPLETE', 'Collection not strictly complete')
+              require(value['limits'] == dict(total=256 * 1024 * 1024, file=32 * 1024 * 1024, count=2000) and
+                      all(type(item) is int for item in value['limits'].values()), 'Wrong collection limits')
+              require(value['problems'] == [] and value['incomplete'] == [], 'Collection reports missing evidence')
+              require(isinstance(value['files'], list) and 0 < len(value['files']) <= 2000 and
+                      isinstance(value['roots'], list) and all(isinstance(root, str) for root in value['roots']), 'Malformed collection records')
+              roots = {Path(event['tempdir']) for event in events_from(suite) if event.get('kind') == 'startTest'}
+              require(roots and all(root.parent == Path('/tmp') and root.name.startswith('vpp-unittest-') for root in roots),
+                      'Invalid observed collection roots')
+              require(len(value['roots']) == len(roots) and set(value['roots']) == set(map(str, roots)), 'Collection roots differ from observer')
+              result, result_sha256 = collection_json(suite / 'result.json')
+              require(isinstance(result, dict) and result.get('status') == 'completed' and type(result.get('rc')) is int and
+                      result.get('cleanup_complete') is True and value['result_sha256'] == result_sha256, 'Stale or unfinished collection result')
+              paths, targets, critical = set(), set(), set()
+              for entry in value['files']:
+                  require(isinstance(entry, dict) and set(entry) == {'path', 'target', 'bytes', 'sha256', 'critical'}, 'Malformed retained record')
+                  require(isinstance(entry['path'], str) and isinstance(entry['target'], str), 'Malformed retained path')
+                  path, target = Path(entry['path']), entry['target']
+                  require(path.is_absolute() and '..' not in path.parts and any(root in path.parents for root in roots), 'Unobserved retained source')
+                  require(path.suffix in ('.txt', '.log', '.pcap', '.pcapng') or path.name.startswith('api_post_mortem.'), 'Unexpected retained source')
+                  require(not path.name.startswith('core') and type(entry['critical']) is bool and
+                          entry['critical'] == (path.name in ('log.txt', 'vpp_stderr.txt', 'vpp_stdout.txt')), 'Wrong critical record')
+                  require(target == f'{len(targets):04d}{path.suffix or ".bin"}' and path not in paths and target not in targets, 'Unsafe or duplicate retained target')
+                  require(type(entry['bytes']) is int and 0 <= entry['bytes'] <= 32 * 1024 * 1024 and
+                          isinstance(entry['sha256'], str) and re.fullmatch(r'[0-9a-f]{64}', entry['sha256']), 'Invalid retained size/hash')
+                  paths.add(path)
+                  targets.add(target)
+                  if entry['critical']:
+                      critical.add(path)
+              require(all(root / name in critical for root in roots for name in ('log.txt', 'vpp_stdout.txt', 'vpp_stderr.txt')),
+                      'Missing retained critical logs')
+              for entry in value['files']:
+                  require(budget['files'] > 0 and entry['bytes'] <= budget['bytes'], 'Collection verification capacity')
+                  budget['files'] -= 1
+                  descriptor = os.open(directory / entry['target'], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                  with os.fdopen(descriptor, 'rb') as stream:
+                      metadata = os.fstat(stream.fileno())
+                      require(stat.S_ISREG(metadata.st_mode) and metadata.st_size == entry['bytes'], 'Retained file type/size mismatch')
+                      digest, length = hashlib.sha256(), 0
+                      while length < entry['bytes']:
+                          data = stream.read(min(1024 * 1024, entry['bytes'] - length))
+                          require(data, 'Truncated retained file')
+                          length += len(data)
+                          budget['bytes'] -= len(data)
+                          digest.update(data)
+                      require(os.fstat(stream.fileno()).st_size == length and digest.hexdigest() == entry['sha256'], 'Retained file hash/size mismatch')
+              return roots
+
+          def loaded(event, binaries):
+              require(event.get('live') is True and type(event.get('vpp_pid')) is int and str(event.get('birth', '')).isdigit(), 'VPP was not live')
+              actual = event.get('loaded', {})
+              require(actual and all(path in binaries and value == binaries[path]['sha256'] for path, value in actual.items()), 'Loaded file differs from fresh image')
+              for token in ('vpp', 'unittest_plugin.so'):
+                  require(any(Path(path).name == token for path in actual), f'Missing loaded {token}')
+              require(any(Path(path).name.startswith('libvnet.so') for path in actual), 'Missing loaded libvnet')
+              require(event.get('executable') in binaries, 'Wrong executable')
+
+          def classify(suite, events, console, logs, rc, binaries, negative=False, supplemental=False):
+              traces = '\n'.join(event.get('traceback', '') for event in events)
+              require(not any(INFRA.search(channel) for channel in (console, logs, traces)), 'Fatal/timeout/infrastructure evidence')
+              starts = [event for event in events if event['kind'] == 'startTest']
+              stops = [event for event in events if event['kind'] == 'stopTest']
+              selected = [event['test'] for event in events if event['kind'] == 'selected']
+              require(starts and collections.Counter(selected) == collections.Counter(event['test'] for event in starts), 'Full discovery/execution mismatch')
+              require(len(starts) == len({event['test'] for event in starts}), 'Retry or duplicate execution')
+              require(collections.Counter(event['test'] for event in starts) == collections.Counter(event['test'] for event in stops), 'Incomplete lifecycle')
+              completed = [event for event in events if event['kind'] == 'completed' and event.get('tests')]
+              require(sum(event['tests'] for event in completed) == len(starts), 'Missing normal completion')
+              require(all(not any(event[key] for key in ('skips', 'expected', 'unexpected')) for event in completed), 'Skipped/alternative completion')
+              require(not any(event['kind'] in ('addSkip', 'addExpectedFailure', 'addUnexpectedSuccess') for event in events), 'Skipped result')
+              clean_console = re.sub(r'\x1b\[[0-9;]*m', '', console)
+              scheduled = re.findall(r'Scheduled tests:\s*([0-9]+)', clean_console)
+              executed = re.findall(r'Executed tests:\s*([0-9]+)', clean_console)
+              require('TEST RESULTS:' in clean_console and scheduled == executed == [str(len(starts))], 'Missing complete normal harness summary')
+              require(set(REQUIRED[suite]) <= {event['test'] for event in starts}, 'Named tests absent')
+              for event in starts:
+                  workers = 2 if event['test'].startswith('test_ip4.TestIPPuntHandoff.') else 0
+                  require(event.get('workers') == workers and event.get('netns') is False and event.get('excluded') == [], 'Wrong worker/plugin/namespace configuration')
+                  require(event.get('cmdline'), 'Missing startup command')
+                  loaded(event, binaries)
+              failures = [event for event in events if event['kind'] in ('addFailure', 'addError') or event['kind'] == 'addSubTest' and event.get('exception')]
+              outcomes = [event for event in events if event['kind'] in ('addSuccess', 'addFailure', 'addError')]
+              require(collections.Counter(event['test'] for event in outcomes) == collections.Counter(event['test'] for event in starts), 'Incomplete terminal outcomes')
+              actual = CALLBACK.findall(logs)
+              expected = [(event['kind'], *event['test'].split('.')[-2:]) for event in outcomes]
+              require(collections.Counter(actual) == collections.Counter(expected), 'Raw callback/observer mismatch')
+              require(sum(event['errors'] for event in completed) == sum(event['kind'] == 'addError' for event in failures), 'Error total mismatch')
+              require(sum(event['failures'] for event in completed) == sum(event['kind'] == 'addFailure' for event in failures), 'Failure total mismatch')
+              if supplemental:
+                  require(suite == 'ip4' and rc == (2 if failures else 0), 'Supplemental abnormal exit')
+                  witnesses = []
+                  for failure in failures:
+                      trace = failure.get('traceback', '')
+                      require(failure['test'] in REQUIRED['ip4'] and failure['kind'] == 'addFailure' and failure.get('exception') == 'AssertionError' and
+                              'test_ip4.py", line 487' in trace and 'find_route(self, removed.addr, 32, table_id=11)' in trace,
+                              'Unrelated supplemental failure')
+                      loaded(failure, binaries)
+                      witnesses.append(failure)
+                  return dict(status='OBSERVED_ONLY', rc=rc, named_outcomes=[event for event in outcomes if event['test'] in REQUIRED['ip4']],
+                              predicted_line487=witnesses, runtime_acceptance=False)
+              if not negative:
+                  require(rc == 0 and not failures and all(event['kind'] == 'addSuccess' for event in outcomes), 'Positive suite did not fully succeed')
+                  require(not re.search(r'\bFAIL:[0-9]+:|FIB Unit Test Failed', logs), 'Positive C failure')
+                  growth = []
+                  if suite == 'fib':
+                      growth = re.findall(r'first-export entry pool: length ([0-9]+) -> ([0-9]+), moved ([01])', logs)
+                      require(len(growth) == 1 and int(growth[0][1]) > int(growth[0][0]), 'Missing actual first-export capacity growth')
+                      replies = [event for event in events if event['kind'] == 'cli_reply' and event.get('command', '').strip() == 'test fib']
+                      require(len(replies) == 1 and replies[0]['retval'] == 0, 'FIB CLI did not complete normally')
+                      loaded(replies[0], binaries)
+                  return dict(status='PASS', suite=suite, tests=len(starts), growth=growth)
+              require(suite == 'fib' and rc == 2, 'Expected ordinary make failure exit 2')
+              require(len(failures) == 1 and failures[0]['kind'] == 'addError' and failures[0]['test'] == REQUIRED['fib'][0], 'Wrong negative failure identity/count')
+              failure = failures[0]
+              trace = failure.get('traceback', '')
+              require(failure.get('exception') == 'CliFailedCommandError' and 'FIB Unit Test Failed' in trace and
+                      'test_fib.py", line 22' in trace and 'vpp_papi_provider.py", line 484' in trace, 'Wrong normal CLI exception')
+              require(not re.search(r'in (?:tearDown|tearDownClass|doCleanups|doClassCleanups)\b', trace), 'Cleanup exception')
+              loaded(failure, binaries)
+              line, message = (5818, 'local remains imported after losing source add cycle 0') if CASE == 'C' else (5761, 'import uses installed interposed forwarding cycle 0')
+              markers = re.findall(r'\bFAIL:([0-9]+):([^\r\n]*)', logs)
+              require(len(markers) == 1 and int(markers[0][0]) == line and markers[0][1].strip() == message, 'Wrong source-derived C failure')
+              replies = [event for event in events if event['kind'] == 'cli_reply' and event.get('test') == REQUIRED['fib'][0] and event.get('command', '').strip() == 'test fib']
+              require(len(replies) == 1 and replies[0].get('retval') == -1 and isinstance(replies[0].get('reply'), str) and 'FIB Unit Test Failed' in replies[0]['reply'], 'Missing original normal CLI reply')
+              loaded(replies[0], binaries)
+              require((replies[0]['vpp_pid'], replies[0]['birth']) == (failure['vpp_pid'], failure['birth']), 'VPP identity changed after CLI')
+              return dict(status='EXPECTED_NORMAL_FAIL', suite=suite, line=line, message=message, test=failure['test'], raw_reply=replies[0]['reply'])
+
+          def run_suite(suite, negative=False, supplemental=False):
+              verify('before-' + suite)
+              directory = OUT / ('runtime-' + suite)
+              directory.mkdir(exist_ok=True)
+              environment = dict(os.environ, M44_EVENTS=str(directory / 'events'),
+                   PYTHONPATH=str(TOOLS) + os.pathsep + os.environ.get('PYTHONPATH', ''))
+              args = ['make', 'UNATTENDED=yes', 'UV=', 'TEST_JOBS=auto', 'VPP_WORKER_COUNT=0', 'RETRIES=0',
+                      'FAILFAST=0', 'SKIP_TESTS=', 'VPP_EXCLUDED_PLUGINS=', 'V=2', 'TIMEOUT=300', 'COREDUMP_SIZE=0',
+                      'COMPRESS_FAILED_TEST_LOGS=no', 'DECODE_PCAPS=none', 'RND_SEED=57', f'TEST={suite}', 'test-debug']
+              rc, console = command('runtime-' + suite, args, environment, limit=2400)
+              events = events_from(directory)
+              roots = sorted({Path(event['tempdir']) for event in events if event['kind'] == 'startTest'})
+              require(roots and all(root.parent == Path('/tmp') and root.name.startswith('vpp-unittest-') for root in roots), 'Invalid test log roots')
+              logs = collect(directory / 'diagnostics', roots)
+              verify('after-' + suite)
+              binaries = json.loads((OUT / 'binaries.json').read_text())
+              after = {path: sha(Path(path).read_bytes()) for path in binaries}
+              save('after-' + suite + '-binaries.json', after)
+              require(all(after[path] == binaries[path]['sha256'] for path in after), 'Test-debug replaced built binary identity')
+              result = json.loads((directory / 'result.json').read_text())
+              require(not result['infrastructure'], 'Fatal full console evidence')
+              assessment = classify(suite, events, console, logs, rc, binaries, negative, supplemental)
+              assessment.update(source=TIP, case=CASE, workflow=os.environ['WORKFLOW_SHA'], gaps=GAPS)
+              save('assessment-' + suite + '.json', assessment)
+
+          def tests():
+              errors = []
+              suites = ['ip4', 'fib'] if CASE == 'A' else [CASE.removeprefix('positive-')] if CASE.startswith('positive-') else ['fib']
+              for suite in suites:
+                  try:
+                      run_suite(suite, negative=CASE in RECIPES, supplemental=CASE == 'A' and suite == 'ip4')
+                  except (AssertionError, OSError, ValueError) as error:
+                      save('assessment-' + suite + '.json', dict(status='UNEXPECTED_FAIL', error=str(error), source=TIP, case=CASE, gaps=GAPS))
+                      errors.append(str(error))
+              require(not errors, '; '.join(errors))
+
+          def fixtures():
+              require(textgit('rev-list', '--reverse', '--no-merges', BASE + '..' + TIP).splitlines() == HISTORY, 'History fixture')
+              for path, pin in PINS.items():
+                  require(oid(content(TIP, path)) == pin, f'Pin fixture {path}')
+              for name, (ref, pins) in RECIPES.items():
+                  files = {path: content(TIP, path) for path in PINS}
+                  for path, pin in pins.items():
+                      require(oid(content(ref, path)) == pin, f'Recipe fixture {name}')
+                      files[path] = content(ref, path)
+                  require({path for path in files if files[path] != content(TIP, path)} == set(pins), 'Restoration scope fixture')
+                  for path in pins:
+                      files[path] = content(TIP, path)
+                  require(all(oid(data) == PINS[path] for path, data in files.items()), 'Restoration inverse fixture')
+              lines = content(TIP, FIB).decode().splitlines()
+              require('FIB_TEST((0 == dpo_cmp(local_bucket, import_bucket)),' in lines[5760] and
+                      'import uses installed interposed forwarding cycle %u' in lines[5761] and
+                      'FIB_TEST((FIB_NODE_INDEX_INVALID != fei),' in lines[5817] and
+                      'local remains imported after %s cycle %u' in lines[5818], 'C witness source positions')
+              require('self.assertFalse' in content(TIP, IP4).decode().splitlines()[486], 'Python witness source position')
+              ast.parse(content(TIP, IP4))
+              classifier_fixtures()
+              print('Pure blob, recipe, inverse, witness, AST and classifier checks passed; runtime remains UNRUN')
+
+          def classifier_fixtures():
+              import copy
+              global CASE
+              previous = CASE
+              binaries = {f'/fresh/{name}': dict(sha256=name) for name in ('vpp', 'libvnet.so', 'unittest_plugin.so')}
+              live = dict(live=True, vpp_pid=123, birth='456', executable='/fresh/vpp',
+                          loaded={path: value['sha256'] for path, value in binaries.items()})
+              console = 'TEST RESULTS:\nScheduled tests: 1\nExecuted tests: 1'
+              def sample(suite, failed=False):
+                  events, logs = [], []
+                  for test in REQUIRED[suite]:
+                      events.extend([dict(kind='selected', test=test), dict(kind='startTest', test=test, workers=0,
+                           excluded=[], netns=False, cmdline=['/fresh/vpp'], **live)])
+                      kind = 'addError' if failed else 'addSuccess'
+                      record = dict(kind=kind, test=test)
+                      if failed:
+                          record.update(exception='CliFailedCommandError',
+                               traceback='File "test_fib.py", line 22\nFile "vpp_papi_provider.py", line 484\nCliFailedCommandError: FIB Unit Test Failed', **live)
+                      events.extend([record, dict(kind='stopTest', test=test)])
+                      logs.append('--- ' + kind + '() ' + '.'.join(test.split('.')[-2:]) + '(')
+                  events.append(dict(kind='completed', tests=len(REQUIRED[suite]), errors=int(failed), failures=0, skips=0, expected=0, unexpected=0))
+                  if suite == 'fib':
+                      events.append(dict(kind='cli_reply', test=REQUIRED['fib'][0], command='test fib\n',
+                           retval=-1 if failed else 0, reply='FIB Unit Test Failed' if failed else '', **live))
+                      logs.append('FAIL:5761: import uses installed interposed forwarding cycle 0' if failed else
+                                  'first-export entry pool: length 8 -> 16, moved 0')
+                  return events, '\n'.join(logs)
+              def rejected(events, logs, rc=2, suite='fib', negative=True, output=console):
+                  try:
+                      classify(suite, events, output, logs, rc, binaries, negative)
+                  except (AssertionError, KeyError, TypeError, ValueError):
+                      return
+                  raise AssertionError('Malformed fixture was accepted')
+              try:
+                  CASE = 'A'
+                  events, logs = sample('fib', True)
+                  require(classify('fib', events, console, logs, 2, binaries, True)['status'] == 'EXPECTED_NORMAL_FAIL', 'A fixture')
+                  CASE = 'B'
+                  classify('fib', events, console, logs, 2, binaries, True)
+                  CASE = 'C'
+                  classify('fib', events, console, logs.replace('5761: import uses installed interposed forwarding', '5818: local remains imported after losing source add'), 2, binaries, True)
+                  CASE = 'A'
+                  for kind in ('selected', 'stopTest', 'completed', 'cli_reply'):
+                      rejected([event for event in events if event['kind'] != kind], logs)
+                  for field, value in [('exception', 'ValueError'), ('live', False), ('test', 'test_fib.TestFIB.other'), ('birth', '999')]:
+                      altered = copy.deepcopy(events)
+                      next(event for event in altered if event['kind'] == 'addError')[field] = value
+                      rejected(altered, logs)
+                  rejected(events, logs.replace('5761', '5818'))
+                  rejected(events, logs + '\nFAIL:1: unrelated')
+                  rejected(events, logs + '\nSIGSEGV')
+                  rejected(events, logs, rc=124)
+                  rejected(events, logs, output='')
+                  good, raw = sample('fib')
+                  classify('fib', good, console, raw, 0, binaries)
+                  rejected(good, raw.replace('8 -> 16', '16 -> 8'), rc=0, negative=False)
+                  good, raw = sample('ip4')
+                  classify('ip4', good, 'TEST RESULTS:\nScheduled tests: 2\nExecuted tests: 2', raw, 0, binaries)
+                  missing = REQUIRED['ip4'][1]
+                  rejected([event for event in good if event.get('test') != missing], raw, rc=0, suite='ip4', negative=False)
+              finally:
+                  CASE = previous
+
+          def finalize():
+              for path in TOOLS.glob('*.py'):
+                  (OUT / path.name).write_bytes(path.read_bytes())
+              try:
+                  suites = sorted(path for path in OUT.glob('runtime-*') if path.is_dir())
+                  retained, collected = set(), set()
+                  budget = dict(bytes=256 * 1024 * 1024, files=2000)
+                  for suite in suites:
+                      try:
+                          roots = collection_roots(suite, budget)
+                          retained.update(roots)
+                          collected.add(suite)
+                      except (OSError, ValueError, TypeError, KeyError, AttributeError, AssertionError) as error:
+                          save(str(suite.relative_to(OUT) / 'collection-invalid.json'), dict(error=str(error)))
+                  for suite in suites:
+                      if suite in collected:
+                          continue
+                      roots = set()
+                      try:
+                          for event in events_from(suite):
+                              if event.get('kind') == 'startTest':
+                                  root = Path(event['tempdir'])
+                                  if root.parent == Path('/tmp') and root.name.startswith('vpp-unittest-'):
+                                      roots.add(root)
+                      except (OSError, ValueError, AssertionError, TypeError, KeyError):
+                          pass
+                      if not roots:
+                          roots = set(Path('/tmp').glob('vpp-unittest-*')) - retained
+                      for attempt in range(2000):
+                          name = 'fallback-diagnostics' + (f'-{attempt}' if attempt else '')
+                          destination = suite / name
+                          if not destination.exists() and not destination.is_symlink():
+                              break
+                      else:
+                          raise AssertionError('Fallback collection capacity')
+                      save(str(suite.relative_to(OUT) / (name + '.json')),
+                           dict(reason='Missing suite collection', roots=sorted(map(str, roots))))
+                      collect(destination, sorted(roots), strict=False)
+                  if not suites:
+                      collect(OUT / 'final-diagnostics', strict=False)
+              finally:
+                  observations = []
+                  for path in sorted(OUT.glob('phase-*.json')):
+                      if path.name in ('phase-finalize.json', 'phase-observations.json'):
+                          continue
+                      try:
+                          value = json.loads(path.read_text())
+                          require(isinstance(value, dict) and value.get('status') in ('UNRUN', 'running', 'PASS', 'FAIL'), 'Malformed phase record')
+                          observations.append(dict(path=path.name, **value))
+                      except (OSError, ValueError, AssertionError) as error:
+                          observations.append(dict(path=path.name, status='UNKNOWN', error=str(error)))
+                  save('phase-observations.json', observations)
+                  require(not any(value['status'] == 'UNKNOWN' for value in observations), 'Malformed phase evidence')
+
+          def phase(action, arguments):
+              record = dict(action=action, status='running', rc=None, start=time.time())
+              save('phase-' + action + '.json', record)
+              def expired(signum, frame):
+                  raise TimeoutError('Phase deadline exhausted')
+              previous = signal.signal(signal.SIGALRM, expired)
+              budget = 75 if action == 'finalize' else min(dict(gates=3000, tests=4920, build=2460).get(action, 1500), deadline() - time.time())
+              try:
+                  require(budget > 0, 'Phase budget exhausted')
+                  signal.setitimer(signal.ITIMER_REAL, budget)
+                  actions = dict(prepare=prepare, gates=gates, mutate=mutate, binaries=binaries, tests=tests, finalize=finalize, fixtures=fixtures)
+                  if action in actions:
+                      actions[action]()
+                  else:
+                      record['rc'], _ = command(action, arguments, limit=2400 if action == 'build' else 1440)
+                      require(record['rc'] == 0, 'Phase command failed')
+                  record.update(status='PASS', rc=0)
+              except BaseException as error:
+                  record.update(status='FAIL', error=str(error))
+                  raise
+              finally:
+                  try:
+                      record['end'] = time.time()
+                      save('phase-' + action + '.json', record)
+                      if action == 'finalize':
+                          try:
+                              save('evidence-index.json', {str(path.relative_to(OUT)): dict(bytes=path.stat().st_size, sha256=sha(path.read_bytes()))
+                                   for path in OUT.rglob('*') if path.is_file() and not path.is_symlink() and path.name != 'evidence-index.json' and not path.name.endswith('.pending')})
+                          except BaseException as error:
+                              record.update(status='FAIL', rc=None, index_error=str(error), end=time.time())
+                              try:
+                                  (OUT / 'evidence-index.json').unlink(missing_ok=True)
+                              finally:
+                                  save('phase-' + action + '.json', record)
+                              raise
+                  finally:
+                      signal.setitimer(signal.ITIMER_REAL, 0)
+                      signal.signal(signal.SIGALRM, previous)
+
+          if __name__ == '__main__':
+              phase(sys.argv[1], sys.argv[2:])
+          PY
+          export STEP_DEADLINE="$(( $(date +%s) + 240 ))"
+          python3 "$TOOLS/control.py" prepare
+      - &dependencies
+        name: Install dependencies on exact source
+        timeout-minutes: 26
+        run: |
+          export STEP_DEADLINE="$(( $(date +%s) + 1500 ))"
+          python3 "$TOOLS/control.py" dependencies make UNATTENDED=yes install-dep
+      - name: Require all six history gates and pinned Python
+        timeout-minutes: 52
+        run: |
+          export STEP_DEADLINE="$(( $(date +%s) + 3060 ))"
+          python3 "$TOOLS/control.py" gates
+      - &finalize
+        name: Retain bounded evidence regardless of outcome
+        if: always()
+        timeout-minutes: 2
+        run: |
+          if [ -f "$TOOLS/control.py" ]; then
+            python3 "$TOOLS/control.py" finalize
+          else
+            printf '{"status":"UNRUN","reason":"tool materialization failed"}\n' > "$RUNNER_TEMP/m44-evidence/finalize-unrun.json"
+          fi
+      - &upload
+        name: Upload original results and identities
+        if: always()
+        timeout-minutes: 3
+        uses: actions/upload-artifact@v4
+        with:
+          name: m44-${{ github.job }}-${{ matrix.case || 'source' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/m44-evidence/
+          retention-days: 7
+          if-no-files-found: error
+
+  positive:
+    needs: source-gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container: *container
+    defaults: *defaults
+    env: *environment
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [positive-ip4, positive-fib]
+    steps:
+      - *bootstrap
+      - *checkout
+      - *tools
+      - *dependencies
+      - &mutate
+        name: Verify exact ordinary source restoration
+        timeout-minutes: 5
+        run: |
+          export STEP_DEADLINE="$(( $(date +%s) + 240 ))"
+          python3 "$TOOLS/control.py" mutate
+      - &build
+        name: Build independent debug image and record binary identities
+        timeout-minutes: 43
+        run: |
+          set -euo pipefail
+          export STEP_DEADLINE="$(( $(date +%s) + 2520 ))"
+          if ! git describe --long --match 'v[0-9]*' 2>/dev/null; then
+            printf '0.0.0-release+%s.%s-g%s\n' "$(git log -1 --format=%ct)" \
+              "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)" > src/scripts/.version
+          fi
+          if [ -f src/scripts/.version ]; then cp src/scripts/.version "$EVIDENCE/version.txt"; fi
+          python3 "$TOOLS/control.py" build make UNATTENDED=yes VPP_EXCLUDED_PLUGINS= build
+          python3 "$TOOLS/control.py" binaries
+      - &runtime
+        name: Prepare remote runtime
+        timeout-minutes: 3
+        uses: ./.github/actions/vpp-docker-runtime-setup
+        with:
+          WORKSPACE: ${{ github.workspace }}
+          SHM_SIZE: 2G
+          LOG_DIR: ${{ runner.temp }}/m44-evidence/runtime-setup
+      - &preflight
+        name: Require actual namespace capabilities and shared memory
+        timeout-minutes: 5
+        run: |
+          export STEP_DEADLINE="$(( $(date +%s) + 240 ))"
+          python3 "$TOOLS/control.py" environment bash -euo pipefail -c '
+            test "$(df -B1 --output=size /dev/shm | tail -n 1)" -ge 2147483648
+            python3 -c "import os; assert len(os.sched_getaffinity(0)) >= 2"
+            namespace="m44-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            trap '\''ip netns del "$namespace"'\'' EXIT
+            ip netns add "$namespace"
+            ip netns exec "$namespace" ip link set lo up
+            ip netns exec "$namespace" ip link show lo
+            mkdir -p /dev/net
+            if [ ! -e /dev/net/tun ]; then mknod /dev/net/tun c 10 200; fi
+            if [ ! -e /dev/vhost-net ]; then mknod /dev/vhost-net c 10 238; fi
+            for device in /dev/net/tun /dev/vhost-net; do test -c "$device"; (: <> "$device"); done
+            ip netns exec "$namespace" ip tuntap add dev m44-tap mode tap
+            ip netns exec "$namespace" ip link del m44-tap
+          '
+      - &tests
+        name: Run full suites without retries and classify normal completion
+        timeout-minutes: 83
+        run: |
+          export STEP_DEADLINE="$(( $(date +%s) + 4920 ))"
+          python3 "$TOOLS/control.py" tests
+      - *finalize
+      - *upload
+
+  ordinary-restores:
+    needs: positive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container: *container
+    defaults: *defaults
+    env: *environment
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [A, B, C]
+    steps:
+      - *bootstrap
+      - *checkout
+      - *tools
+      - *dependencies
+      - *mutate
+      - *build
+      - *runtime
+      - *preflight
+      - *tests
+      - *finalize
+      - *upload
