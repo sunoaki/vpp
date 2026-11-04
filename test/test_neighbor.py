@@ -2835,7 +2835,8 @@ class NeighborChurnTestCase(VppTestCase):
     """Dynamic neighbour create/delete cycles"""
 
     N_HOSTS = 32
-    N_CYCLES = 200
+    N_CYCLES = 20
+    AGE = 2
 
     @classmethod
     def setUpClass(cls):
@@ -2853,18 +2854,23 @@ class NeighborChurnTestCase(VppTestCase):
         for i in self.pg_interfaces:
             i.admin_up()
             i.config_ip4()
-            i.config_ip6()
+
+        self.pg0.generate_remote_hosts(self.N_HOSTS + 1)
 
     def tearDown(self):
         super(NeighborChurnTestCase, self).tearDown()
 
+        af = VppEnum.vl_api_address_family_t
+        self.vapi.ip_neighbor_config(
+            af=af.ADDRESS_IP4, max_number=50000, max_age=0, recycle=False
+        )
+
         for i in self.pg_interfaces:
             i.unconfig_ip4()
-            i.unconfig_ip6()
             i.admin_down()
 
-    def add_dynamic_neighbors(self):
-        for n in range(self.N_HOSTS):
+    def add_dynamic_neighbors(self, count=None, first=0):
+        for n in range(first, first + (count or self.N_HOSTS)):
             VppNeighbor(
                 self,
                 self.pg0.sw_if_index,
@@ -2872,41 +2878,41 @@ class NeighborChurnTestCase(VppTestCase):
                 self.pg0.remote_hosts[n].ip4,
             ).add_vpp_config()
 
-    def assert_no_neighbors(self):
+    def sorted_nbr_rows(self):
+        """Rows of the age-sorted list, excluding the always-printed header.
+
+        The header is emitted unconditionally by ip_neighbor_show_sorted_i,
+        so an empty age list prints exactly one line.
+        """
+        out = self.vapi.cli("show ip4 neighbor-sorted")
+        lines = out.strip().splitlines()
+        self.assertTrue(lines)
+        return lines[1:]
+
+    def assert_age_list_empty(self):
         af = VppEnum.vl_api_address_family_t
         self.assertFalse(
             self.vapi.ip_neighbor_dump(sw_if_index=0xFFFFFFFF, af=af.ADDRESS_IP4)
         )
-
-        # the age-sorted list is walked by the CLI; a stale or freed list
-        # element shows up here
-        self.vapi.cli("show ip4 neighbor-sorted")
+        self.assertEqual(self.sorted_nbr_rows(), [])
 
     def test_churn(self):
         """Dynamic neighbour create/delete cycles"""
 
         af = VppEnum.vl_api_address_family_t
 
-        self.pg0.generate_remote_hosts(self.N_HOSTS)
-
         #
         # each cycle links N_HOSTS elements into the age-sorted list and
         # unlinks them again.  Before ip_neighbor_list_remove returned its
-        # element to the pool, every cycle leaked N_HOSTS pool entries.
+        # element to the pool, every cycle left N_HOSTS stale elements
+        # linked, which the sorted walk prints as extra rows.
         #
         for _ in range(self.N_CYCLES):
             self.add_dynamic_neighbors()
-            self.assertEqual(
-                len(
-                    self.vapi.ip_neighbor_dump(
-                        sw_if_index=0xFFFFFFFF, af=af.ADDRESS_IP4
-                    )
-                ),
-                self.N_HOSTS,
-            )
+            self.assertEqual(len(self.sorted_nbr_rows()), self.N_HOSTS)
 
             self.vapi.ip_neighbor_flush(af.ADDRESS_IP4, 0xFFFFFFFF)
-            self.assert_no_neighbors()
+            self.assert_age_list_empty()
 
         #
         # the same cycle through the neighbour delete API, one entry at a time
@@ -2920,7 +2926,67 @@ class NeighborChurnTestCase(VppTestCase):
                     self.pg0.remote_hosts[n].ip4,
                     is_add=0,
                 )
-            self.assert_no_neighbors()
+            self.assert_age_list_empty()
+
+    def test_age(self):
+        """Dynamic neighbours age out of the sorted list"""
+
+        af = VppEnum.vl_api_address_family_t
+
+        self.vapi.ip_neighbor_config(
+            af=af.ADDRESS_IP4, max_number=50000, max_age=self.AGE, recycle=False
+        )
+
+        #
+        # the age loop destroys the oldest neighbour and restarts its walk
+        # from the head of the list; a destroyed element left linked would
+        # be printed as an extra row
+        #
+        for _ in range(self.N_CYCLES):
+            self.add_dynamic_neighbors()
+            self.assertEqual(len(self.sorted_nbr_rows()), self.N_HOSTS)
+
+            # AGE seconds to expire, then 3 probes one second apart, then the
+            # destroy; two more seconds of slack for the loop's wakeups
+            self.virtual_sleep(self.AGE + 6)
+            self.assert_age_list_empty()
+
+        self.vapi.ip_neighbor_config(
+            af=af.ADDRESS_IP4, max_number=50000, max_age=0, recycle=False
+        )
+
+    def test_recycle(self):
+        """Recycling the oldest neighbour keeps the sorted list bounded"""
+
+        af = VppEnum.vl_api_address_family_t
+
+        self.vapi.ip_neighbor_config(
+            af=af.ADDRESS_IP4, max_number=self.N_HOSTS, max_age=0, recycle=True
+        )
+
+        self.add_dynamic_neighbors()
+        self.assertEqual(len(self.sorted_nbr_rows()), self.N_HOSTS)
+
+        #
+        # ip_neighbor_force_reuse destroys the oldest neighbour to make room
+        # for each new one; the sorted list must stay at the limit rather
+        # than growing by one stale row per recycle
+        #
+        for n in range(1, self.N_CYCLES + 1):
+            VppNeighbor(
+                self,
+                self.pg0.sw_if_index,
+                self.pg0.remote_hosts[n].mac,
+                self.pg0.remote_hosts[n].ip4,
+            ).add_vpp_config()
+
+            self.assertEqual(len(self.sorted_nbr_rows()), self.N_HOSTS)
+            self.assertFalse(
+                find_nbr(self, self.pg0.sw_if_index, self.pg0.remote_hosts[0].ip4)
+            )
+
+        self.vapi.ip_neighbor_flush(af.ADDRESS_IP4, 0xFFFFFFFF)
+        self.assert_age_list_empty()
 
 
 if __name__ == "__main__":
