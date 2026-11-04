@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# Temporary validation workflow: exclude this file from master integration.
+# Manual validation workflow on master: runs only when dispatched by hand.
 name: QUIC credential rollback control
 
 on:
-  push:
-    branches: [feat/validate-quic-credential-failure-rollbac]
+  workflow_dispatch:
 
 permissions:
   contents: read
