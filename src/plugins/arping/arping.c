@@ -99,6 +99,15 @@ format_arping6_trace (u8 *s, va_list *args)
   return s;
 }
 
+static arping_intf_t *
+arping_intf_get (arping_main_t *am, u32 sw_if_index)
+{
+  if (sw_if_index >= vec_len (am->arping_interfaces))
+    return 0;
+
+  return &am->arping_interfaces[sw_if_index];
+}
+
 VLIB_NODE_FN (arping_input_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 {
@@ -526,15 +535,6 @@ arping_vec_validate (vlib_main_t *vm, u32 sw_if_index)
       vec_validate (am->arping_interfaces, sw_if_index);
       vlib_worker_thread_barrier_release (vm);
     }
-}
-
-static arping_intf_t *
-arping_intf_get (arping_main_t *am, u32 sw_if_index)
-{
-  if (sw_if_index >= vec_len (am->arping_interfaces))
-    return 0;
-
-  return &am->arping_interfaces[sw_if_index];
 }
 
 static arping_intf_t *
