@@ -147,9 +147,8 @@ VLIB_NODE_FN (arping_input_node)
 	  if (PREDICT_TRUE (arp0->opcode ==
 			    clib_host_to_net_u16 (ETHERNET_ARP_OPCODE_reply)))
 	    {
-	      aif0 = am->interfaces[sw_if_index0];
-	      if (PREDICT_TRUE (aif0->address.ip.ip4.as_u32 ==
-				arp0->ip4_over_ethernet[0].ip4.as_u32))
+	      aif0 = arping_intf_get (am, sw_if_index0);
+	      if (aif0 && (aif0->address.ip.ip4.as_u32 == arp0->ip4_over_ethernet[0].ip4.as_u32))
 		{
 		  aif0->recv.from4.ip4.as_u32 =
 		    arp0->ip4_over_ethernet[0].ip4.as_u32;
@@ -161,9 +160,8 @@ VLIB_NODE_FN (arping_input_node)
 	  if (PREDICT_TRUE (arp1->opcode ==
 			    clib_host_to_net_u16 (ETHERNET_ARP_OPCODE_reply)))
 	    {
-	      aif1 = am->interfaces[sw_if_index1];
-	      if (PREDICT_TRUE (aif1->address.ip.ip4.as_u32 ==
-				arp1->ip4_over_ethernet[0].ip4.as_u32))
+	      aif1 = arping_intf_get (am, sw_if_index1);
+	      if (aif1 && (aif1->address.ip.ip4.as_u32 == arp1->ip4_over_ethernet[0].ip4.as_u32))
 		{
 		  aif1->recv.from4.ip4.as_u32 =
 		    arp1->ip4_over_ethernet[0].ip4.as_u32;
@@ -223,9 +221,8 @@ VLIB_NODE_FN (arping_input_node)
 	  if (PREDICT_TRUE (arp0->opcode ==
 			    clib_host_to_net_u16 (ETHERNET_ARP_OPCODE_reply)))
 	    {
-	      aif0 = am->interfaces[sw_if_index0];
-	      if (PREDICT_TRUE (aif0->address.ip.ip4.as_u32 ==
-				arp0->ip4_over_ethernet[0].ip4.as_u32))
+	      aif0 = arping_intf_get (am, sw_if_index0);
+	      if (aif0 && (aif0->address.ip.ip4.as_u32 == arp0->ip4_over_ethernet[0].ip4.as_u32))
 		{
 		  aif0->recv.from4.ip4.as_u32 =
 		    arp0->ip4_over_ethernet[0].ip4.as_u32;
@@ -329,11 +326,9 @@ VLIB_NODE_FN (arping6_input_node)
 	  if (PREDICT_TRUE (sol_adv0->icmp.type ==
 			    ICMP6_neighbor_advertisement))
 	    {
-	      aif0 = am->interfaces[sw_if_index0];
-	      if (PREDICT_TRUE (clib_memcmp (&aif0->address.ip.ip6,
-					     &sol_adv0->target_address,
-					     sizeof (aif0->address.ip.ip6)) ==
-				0))
+	      aif0 = arping_intf_get (am, sw_if_index0);
+	      if (aif0 && (clib_memcmp (&aif0->address.ip.ip6, &sol_adv0->target_address,
+					sizeof (aif0->address.ip.ip6)) == 0))
 		{
 		  clib_memcpy_fast (&aif0->recv.from6.ip6,
 				    &sol_adv0->target_address,
@@ -352,11 +347,9 @@ VLIB_NODE_FN (arping6_input_node)
 	  if (PREDICT_TRUE (sol_adv1->icmp.type ==
 			    ICMP6_neighbor_advertisement))
 	    {
-	      aif1 = am->interfaces[sw_if_index1];
-	      if (PREDICT_TRUE (clib_memcmp (&aif1->address.ip.ip6,
-					     &sol_adv1->target_address,
-					     sizeof (aif1->address.ip.ip6)) ==
-				0))
+	      aif1 = arping_intf_get (am, sw_if_index1);
+	      if (aif1 && (clib_memcmp (&aif1->address.ip.ip6, &sol_adv1->target_address,
+					sizeof (aif1->address.ip.ip6)) == 0))
 		{
 		  clib_memcpy_fast (&aif1->recv.from6.ip6,
 				    &sol_adv1->target_address,
@@ -424,11 +417,9 @@ VLIB_NODE_FN (arping6_input_node)
 	  if (PREDICT_TRUE (sol_adv0->icmp.type ==
 			    ICMP6_neighbor_advertisement))
 	    {
-	      aif0 = am->interfaces[sw_if_index0];
-	      if (PREDICT_TRUE (clib_memcmp (&aif0->address.ip.ip6,
-					     &sol_adv0->target_address,
-					     sizeof (aif0->address.ip.ip6)) ==
-				0))
+	      aif0 = arping_intf_get (am, sw_if_index0);
+	      if (aif0 && (clib_memcmp (&aif0->address.ip.ip6, &sol_adv0->target_address,
+					sizeof (aif0->address.ip.ip6)) == 0))
 		{
 		  clib_memcpy_fast (&aif0->recv.from6.ip6,
 				    &sol_adv0->target_address,
@@ -529,12 +520,37 @@ arping_vec_validate (vlib_main_t *vm, u32 sw_if_index)
 {
   arping_main_t *am = &arping_main;
 
-  if (sw_if_index >= vec_len (am->interfaces))
+  if (sw_if_index >= vec_len (am->arping_interfaces))
     {
       vlib_worker_thread_barrier_sync (vm);
-      vec_validate (am->interfaces, sw_if_index);
+      vec_validate (am->arping_interfaces, sw_if_index);
       vlib_worker_thread_barrier_release (vm);
     }
+}
+
+static arping_intf_t *
+arping_intf_get (arping_main_t *am, u32 sw_if_index)
+{
+  if (sw_if_index >= vec_len (am->arping_interfaces))
+    return 0;
+
+  return &am->arping_interfaces[sw_if_index];
+}
+
+static arping_intf_t *
+arping_intf_alloc (vlib_main_t *vm, u32 sw_if_index, arping_args_t *args)
+{
+  arping_intf_t *aif;
+
+  arping_vec_validate (vm, sw_if_index);
+  aif = &arping_main.arping_interfaces[sw_if_index];
+  clib_memset (aif, 0, sizeof (*aif));
+  aif->interval = args->interval;
+  aif->repeat = args->repeat;
+  aif->in_progress = 1;
+  clib_memcpy (&aif->address, &args->address, sizeof (aif->address));
+
+  return aif;
 }
 
 static clib_error_t *
@@ -543,11 +559,11 @@ arping_neighbor_probe_dst (vlib_main_t *vm, arping_args_t *args)
   arping_main_t *am = &arping_main;
   u32 send_count = 0;
   clib_error_t *error;
-  arping_intf_t aif;
+  arping_intf_t *aif;
 
   /* Disallow multiple sends on the same interface for now. Who needs it? */
-  if ((vec_len (am->interfaces) > args->sw_if_index) &&
-      (am->interfaces[args->sw_if_index] != 0))
+  aif = arping_intf_get (am, args->sw_if_index);
+  if (aif && aif->in_progress)
     {
       error = clib_error_return (
 	0, "arping command is in progress for the same interface. "
@@ -556,14 +572,8 @@ arping_neighbor_probe_dst (vlib_main_t *vm, arping_args_t *args)
       return error;
     }
 
-  arping_vec_validate (vm, args->sw_if_index);
-  clib_memset (&aif, 0, sizeof (aif));
-  aif.interval = args->interval;
-  aif.repeat = args->repeat;
-  aif.reply_count = 0;
-  am->interfaces[args->sw_if_index] = &aif;
+  aif = arping_intf_alloc (vm, args->sw_if_index, args);
 
-  clib_memcpy (&aif.address, &args->address, sizeof (aif.address));
   if (args->address.version == AF_IP4)
     arping_vnet_feature_enable_disable (vm, "arp", "arping-input",
 					args->sw_if_index, 1, 0, 0);
@@ -598,7 +608,7 @@ arping_neighbor_probe_dst (vlib_main_t *vm, arping_args_t *args)
 
   /* wait for a second on the reply */
   u32 wait_count = 0;
-  while ((aif.reply_count < send_count) && (wait_count < 10))
+  while ((aif->reply_count < send_count) && (wait_count < 10))
     {
       vlib_process_suspend (vm, 0.1);
       wait_count++;
@@ -606,21 +616,19 @@ arping_neighbor_probe_dst (vlib_main_t *vm, arping_args_t *args)
 
   if (args->address.version == AF_IP4)
     {
-      clib_memcpy (&args->recv.from4, &aif.recv.from4,
-		   sizeof (args->recv.from4));
+      clib_memcpy (&args->recv.from4, &aif->recv.from4, sizeof (args->recv.from4));
       arping_vnet_feature_enable_disable (vm, "arp", "arping-input",
 					  args->sw_if_index, 0, 0, 0);
     }
   else
     {
-      clib_memcpy (&args->recv.from6, &aif.recv.from6,
-		   sizeof (args->recv.from6));
+      clib_memcpy (&args->recv.from6, &aif->recv.from6, sizeof (args->recv.from6));
       arping_vnet_feature_enable_disable (vm, "ip6-local", "arping6-input",
 					  args->sw_if_index, 0, 0, 0);
     }
-  args->reply_count = aif.reply_count;
+  args->reply_count = aif->reply_count;
 
-  am->interfaces[args->sw_if_index] = 0;
+  clib_memset (aif, 0, sizeof (*aif));
 
   return 0;
 }
