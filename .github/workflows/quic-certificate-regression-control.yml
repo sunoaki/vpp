@@ -1,0 +1,264 @@
+# SPDX-License-Identifier: Apache-2.0
+# Temporary validation workflow: exclude this file from master integration.
+name: QUIC credential rollback control
+
+on:
+  push:
+    branches: [feat/validate-quic-credential-failure-rollbac]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quic-credential-control-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # The four matrix jobs run concurrently on one runner host inside sibling
+  # containers. They share the kernel, so /dev/shm (remounted below), the
+  # network namespace configuration, loopback state and the host /tmp are not
+  # private to a job. Each job therefore keeps its own evidence root under
+  # runner.temp and passes TMP_DIR and FAILED_DIR into the harness; artifacts
+  # are named per matrix job and carry run-context.json. A run whose evidence
+  # shows cross-job interference is not valid evidence.
+  control:
+    name: ${{ matrix.source }} workers-${{ matrix.workers }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [fixed, original]
+        workers: [0, 1]
+    container:
+      image: debian:trixie
+      options: >-
+        --shm-size=2g
+        --cap-add=SYS_ADMIN
+        --cap-add=NET_ADMIN
+        --security-opt=apparmor=unconfined
+    defaults:
+      run:
+        shell: bash
+    env:
+      FIXED: 40b52275db082d350158684cdb117e9f43450418
+      ORIGINAL: b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c
+      QUIC_CRYPTO_EXPECT: ${{ matrix.source }}
+      # Evidence lives outside both the frozen checkout and the source clone, so
+      # harness temporary directories and failure links created under it cannot
+      # be mistaken for, or written into, product source.
+      EVIDENCE: ${{ runner.temp }}/evidence
+      QUIC_CRYPTO_ARTIFACTS: ${{ runner.temp }}/evidence/runtime
+      SOURCE_KIND: ${{ matrix.source }}
+      WORKERS: ${{ matrix.workers }}
+      MATRIX_JOB: ${{ matrix.source }}-workers-${{ matrix.workers }}
+    steps:
+      - name: Install base tools
+        run: |
+          timeout -k 30s 5m apt-get update -qq
+          timeout -k 30s 5m apt-get install -y -qq sudo make git bash openssl
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          path: frozen
+
+      - name: Freeze identical regression inputs and exact product source
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$EVIDENCE"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/frozen"
+          git -C frozen rev-parse HEAD HEAD^{tree} > "$EVIDENCE/regression-commit-tree.txt"
+          test "$(git -C frozen rev-parse HEAD)" = "$GITHUB_SHA"
+          if [ "$SOURCE_KIND" = fixed ]; then target=$FIXED; else target=$ORIGINAL; fi
+          git clone --no-hardlinks --no-checkout frozen source
+          git -C source checkout --detach "$target"
+          test "$(git -C source rev-parse HEAD)" = "$target"
+          git -C source rev-parse HEAD HEAD^{tree} > "$EVIDENCE/source-commit-tree.txt"
+          git -C source show --format=fuller --stat HEAD > "$EVIDENCE/source-commit.txt"
+          for file in test/asf/test_quic_crypto.py test/asf/quic_crypto_client.py; do
+            git -C frozen rev-parse "HEAD:$file" >> "$EVIDENCE/regression-blobs.txt"
+            mkdir -p "source/$(dirname "$file")"
+            cp "frozen/$file" "source/$file"
+            cmp "frozen/$file" "source/$file"
+            sha256sum "frozen/$file" "source/$file" >> "$EVIDENCE/regression-sha256.txt"
+          done
+          git -C source diff --binary > "$EVIDENCE/overlay.diff"
+          git -C source status --porcelain=v1 --untracked-files=all > "$EVIDENCE/overlay-status.txt"
+          cp frozen/test/asf/{test_quic_crypto.py,quic_crypto_client.py} "$EVIDENCE/"
+          cp frozen/.github/workflows/quic-certificate-regression-control.yml "$EVIDENCE/"
+          git -C source ls-tree -r HEAD src/plugins/quic src/plugins/quic_quicly \
+            > "$EVIDENCE/product-blobs.txt"
+          git -C source archive HEAD src/plugins/quic src/plugins/quic_quicly \
+            > "$EVIDENCE/product-source.tar"
+          git -C source config --local commit.template ''
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          def git(*args):
+              return subprocess.run(
+                  ["git", "-C", "source", *args], check=True, capture_output=True, text=True
+              ).stdout.strip()
+
+          context = {
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "job": os.environ["GITHUB_JOB"],
+              "matrix_job": os.environ["MATRIX_JOB"],
+              "source_kind": os.environ["SOURCE_KIND"],
+              "workers": int(os.environ["WORKERS"]),
+              "github_sha": os.environ["GITHUB_SHA"],
+              "github_ref": os.environ["GITHUB_REF"],
+              "github_workflow_ref": os.environ.get("GITHUB_WORKFLOW_REF"),
+              "runner_name": os.environ.get("RUNNER_NAME"),
+              "runner_temp": os.environ["RUNNER_TEMP"],
+              "evidence_root": str(Path(os.environ["EVIDENCE"]).resolve()),
+              "source_commit": git("rev-parse", "HEAD"),
+              "source_tree": git("rev-parse", "HEAD^{tree}"),
+          }
+          Path(os.environ["EVIDENCE"], "run-context.json").write_text(
+              json.dumps(context, indent=2) + "\n"
+          )
+          PY
+
+      - name: Install dependencies remotely
+        working-directory: source
+        run: |
+          set -Eeuo pipefail
+          timeout -k 30s 20m make UNATTENDED=yes install-dep 2>&1 | tee "$EVIDENCE/dependencies.log"
+          if ! git describe --long --match 'v[0-9]*' >/dev/null 2>&1; then
+            printf '0.0.0-release+%s.%s-g%s\n' "$(git log -1 --format=%ct)" \
+              "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)" > src/scripts/.version
+          fi
+          git diff --binary > "$EVIDENCE/pre-build.diff"
+          git status --porcelain=v1 --untracked-files=all > "$EVIDENCE/pre-build-status.txt"
+
+      - name: Build exact debug product remotely
+        working-directory: source
+        run: |
+          set -Eeuo pipefail
+          timeout -k 30s 45m make UNATTENDED=yes build 2>&1 | tee "$EVIDENCE/build.log"
+
+      - name: Run 100 attempts with strict witnesses
+        working-directory: source
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$QUIC_CRYPTO_ARTIFACTS" "$EVIDENCE/tmp" "$EVIDENCE/failed"
+          timeout -k 10s 30s mount -o remount,size=2G /dev/shm
+          # test-debug runs vpp-install first, and install_package removes the
+          # install directory before reinstalling, so the binary is hashed here,
+          # after that install, and is the one the harness launches.
+          vpp_binary=build-root/install-vpp_debug-native/vpp/bin/vpp
+          test -x "$vpp_binary"
+          sha256sum "$vpp_binary" > "$EVIDENCE/vpp-sha256.txt"
+          python3 - "$EVIDENCE/run-context.json" "$EVIDENCE/vpp-sha256.txt" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          context_path, digest_path = map(Path, sys.argv[1:])
+          context = json.loads(context_path.read_text())
+          context["vpp_sha256"] = digest_path.read_text().split()[0]
+          context_path.write_text(json.dumps(context, indent=2) + "\n")
+          PY
+          testclass=QUICCredentialFailure
+          if [ "$WORKERS" = 1 ]; then testclass=QUICCredentialFailureWorker; fi
+          # Budget: each attempt polls the non-blocking connect for at most 5 s,
+          # then takes one snapshot and one memory trace; 100 attempts stay far
+          # below the 900 s harness TIMEOUT and the 20 min step limit below.
+          command=(make UNATTENDED=yes TEST_JOBS=1 FORCE_FOREGROUND=1
+            RETRIES=0 FAILFAST=0 SKIP_TESTS=
+            VPP_EXCLUDED_PLUGINS= V=2 COREDUMP_SIZE=0 DECODE_PCAPS=none
+            RND_SEED=48 TIMEOUT=900
+            TMP_DIR="$EVIDENCE/tmp" FAILED_DIR="$EVIDENCE/failed"
+            TEST="quic_crypto.$testclass.test_credential_failure_rollback" test-debug)
+          printf '%q ' "${command[@]}" > "$EVIDENCE/test-command.txt"
+          printf '\n' >> "$EVIDENCE/test-command.txt"
+          set +e
+          timeout -k 30s 20m "${command[@]}" 2>&1 | tee "$EVIDENCE/test.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "$status" > "$EVIDENCE/test-exit.txt"
+          test "$status" = 0
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          root = Path(os.environ['QUIC_CRYPTO_ARTIFACTS']) / ('workers-' + os.environ['WORKERS'])
+          result = json.loads((root / 'result.json').read_text())
+          assert result['mode'] == os.environ['SOURCE_KIND']
+          assert result['workers'] == int(os.environ['WORKERS'])
+          assert result['completed'] == 100
+          assert result['failure_diagnostics'] == 100
+          assert result['cleanup'] == 'passed'
+          assert len(list(root.glob('attempt-*-result.json'))) == 100
+          assert len(list(root.glob('attempt-*-stderr.txt'))) == 100
+          assert len(list(root.glob('attempt-[0-9][0-9][0-9].json'))) == 100
+          thread = result['thread']
+          if not result['leaks']:
+              assert result['preapp'] == result['final']
+              assert result['hostname'] == [0, 0]
+          else:
+              assert result['final']['used'][thread] - result['preapp']['used'][thread] == 100
+              assert result['hostname'][0] == 100 and result['hostname'][1] > 0
+          PY
+
+      - name: Preserve logs and cleanup outcomes
+        if: always()
+        run: |
+          set +e
+          mkdir -p "$EVIDENCE/harness"
+          # The harness writes under TMP_DIR and FAILED_DIR, both inside the
+          # evidence root; /tmp is still scanned because test/Makefile hardcodes
+          # expand_ppp.py --basedir=/tmp and reset still touches it. Those /tmp
+          # entries are shared with the other matrix jobs on this host, so they
+          # are copied under a per-job path and labelled in run-context.json.
+          for directory in "$EVIDENCE"/tmp/vpp-unittest-* "$EVIDENCE"/failed; do
+            [ -d "$directory" ] || continue
+            cp -a "$directory" "$EVIDENCE/harness/"
+          done
+          host_tmp="$EVIDENCE/harness/host-tmp/$MATRIX_JOB"
+          mkdir -p "$host_tmp"
+          for directory in /tmp/vpp-unittest-* /tmp/vpp-failed-unittests; do
+            [ -d "$directory" ] || continue
+            cp -a "$directory" "$host_tmp/"
+          done
+          ps -ef > "$EVIDENCE/processes.txt"
+          git -C source diff --binary > "$EVIDENCE/post-run.diff"
+          git -C source status --porcelain=v1 --untracked-files=all > "$EVIDENCE/post-run-status.txt"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          root = Path(os.environ["EVIDENCE"])
+          manifest = {}
+          for path in root.rglob('*'):
+              if path.is_file() and not path.is_symlink():
+                  manifest[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
+          (root / 'artifact-sha256.json').write_text(json.dumps(manifest, indent=2))
+          context_path = root / 'run-context.json'
+          context = json.loads(context_path.read_text())
+          context["host_tmp_copy"] = {
+              "path": f"harness/host-tmp/{os.environ['MATRIX_JOB']}",
+              "source": "/tmp",
+              "shared_with_matrix_jobs": True,
+              "note": (
+                  "Copied from the host /tmp shared by all matrix jobs; entries "
+                  "may have been produced by another job and are not evidence "
+                  "this job produced."
+              ),
+          }
+          context_path.write_text(json.dumps(context, indent=2) + "\n")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quic-credential-${{ matrix.source }}-workers-${{ matrix.workers }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
+          retention-days: 14
