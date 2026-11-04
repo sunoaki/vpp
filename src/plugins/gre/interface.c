@@ -888,6 +888,9 @@ show_gre_tunnel_command_fn (vlib_main_t *vm, unformat_input_t *input,
     }
   else
     {
+      if (pool_is_free_index (gm->tunnels, ti))
+	return clib_error_return (0, "GRE tunnel index %d out of range", ti);
+
       t = pool_elt_at_index (gm->tunnels, ti);
 
       vlib_cli_output (vm, "%U", format_gre_tunnel, t);
