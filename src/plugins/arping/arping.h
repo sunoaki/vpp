@@ -32,12 +32,12 @@ typedef struct arping_intf_t
 
   arping46_reply_t recv;
   u32 reply_count;
+  u8 in_progress;
 } arping_intf_t;
 
 typedef struct arping_main_t
 {
   arping_intf_t *arping_interfaces;
-  arping_intf_t **interfaces;
   u16 msg_id_base;
 } arping_main_t;
 

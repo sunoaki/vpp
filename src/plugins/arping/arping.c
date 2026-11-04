@@ -547,6 +547,7 @@ arping_intf_alloc (vlib_main_t *vm, u32 sw_if_index, arping_args_t *args)
   clib_memset (aif, 0, sizeof (*aif));
   aif->interval = args->interval;
   aif->repeat = args->repeat;
+  aif->in_progress = 1;
   clib_memcpy (&aif->address, &args->address, sizeof (aif->address));
 
   return aif;
@@ -562,7 +563,7 @@ arping_neighbor_probe_dst (vlib_main_t *vm, arping_args_t *args)
 
   /* Disallow multiple sends on the same interface for now. Who needs it? */
   aif = arping_intf_get (am, args->sw_if_index);
-  if (aif && (aif->repeat > 0))
+  if (aif && aif->in_progress)
     {
       error = clib_error_return (
 	0, "arping command is in progress for the same interface. "
