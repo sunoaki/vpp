@@ -100,6 +100,35 @@ span_add_delete_entry (vlib_main_t * vm,
   return 0;
 }
 
+static clib_error_t *
+span_sw_interface_add_del (vnet_main_t *vnm, u32 sw_if_index, u32 is_add)
+{
+  span_main_t *sm = &span_main;
+  span_interface_t *si;
+  u32 sf, rxtx;
+
+  if (is_add || sw_if_index >= vec_len (sm->interfaces))
+    return 0;
+
+  vec_foreach (si, sm->interfaces)
+    {
+      for (sf = 0; sf < SPAN_FEAT_N; sf++)
+	for (rxtx = 0; rxtx < VLIB_N_RX_TX; rxtx++)
+	  {
+	    span_mirror_t *sm0 = &si->mirror_rxtx[sf][rxtx];
+
+	    if (sm0->num_mirror_ports == 0)
+	      continue;
+
+	    span_dst_set (sm0, sw_if_index, 0);
+	  }
+    }
+
+  return 0;
+}
+
+VNET_SW_INTERFACE_ADD_DEL_FUNCTION (span_sw_interface_add_del);
+
 static uword
 unformat_span_state (unformat_input_t * input, va_list * args)
 {
