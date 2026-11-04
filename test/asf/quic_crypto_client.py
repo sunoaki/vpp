@@ -113,16 +113,15 @@ class Client:
         )
         return handle
 
-    def connect(self, success):
+    def connect(self):
         handle = self.session()
         result = self.call("session_connect", handle, ct.byref(self.endpoint))
         error = self.call("session_get_error", handle)
-        if success:
-            self.require_zero(result, "session_connect")
+        if result == 0:
             self.connection = handle
-            return {"handle": handle, "connect": result, "error": error}
-        closed = self.call("session_close", handle)
-        return {"handle": handle, "connect": result, "error": error, "close": closed}
+        else:
+            self.call("session_close", handle)
+        return {"handle": handle, "connect": result, "error": error}
 
     def listen(self):
         self.listener = self.session()
@@ -166,7 +165,7 @@ class Client:
 
 OPERATIONS = {
     "attach": lambda client, request: client.attach(request["cert"], request["key"]),
-    "connect": lambda client, request: client.connect(request["success"]),
+    "connect": lambda client, request: client.connect(),
     "listen": lambda client, request: client.listen(),
     "accept": lambda client, request: client.accept(),
     "close": lambda client, request: client.close(),

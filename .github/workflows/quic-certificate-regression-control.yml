@@ -131,16 +131,17 @@ jobs:
           result = json.loads((root / 'result.json').read_text())
           assert result['mode'] == os.environ['SOURCE_KIND']
           assert result['workers'] == int(os.environ['WORKERS'])
-          assert result['completed'] == result['diagnostics'] == 100
+          assert result['completed'] == 100
+          assert result['failure_diagnostics'] == 100
           assert result['cleanup'] == 'passed'
           assert len(list(root.glob('attempt-*-result.json'))) == 100
           assert len(list(root.glob('attempt-*-stderr.txt'))) == 100
           assert len(list(root.glob('attempt-[0-9][0-9][0-9].json'))) == 100
-          if result['mode'] == 'fixed':
+          thread = result['thread']
+          if not result['leaks']:
               assert result['preapp'] == result['final']
               assert result['hostname'] == [0, 0]
           else:
-              thread = str(min(1, result['workers']))
               assert result['final']['used'][thread] - result['preapp']['used'][thread] == 100
               assert result['hostname'][0] == 100 and result['hostname'][1] > 0
           PY

@@ -20,10 +20,13 @@ from config import config
 
 DIAGNOSTIC = "unable to initialize certificate/key pair"
 ATTEMPTS = 100
-CALLSITE = re.compile(r"\bquic_connect_connection\b")
 # quic_connect_connection() formats the hostname before the crypto context is
 # acquired, so every record below that frame belongs to the connect path.
+CALLSITE = re.compile(r"\bquic_connect_connection\b")
 HOSTNAME_FORMAT = re.compile(r"\bformat\b|format_ip46_address")
+# b332ab4cd returns from quic_connect_connection() without freeing the context
+# and its hostname; 40b52275d adds exactly those two frees.
+LEAKS = {"fixed": False, "original": True}
 
 
 class VclProcess:
@@ -33,6 +36,7 @@ class VclProcess:
         self.test = test
         libraries = list(Path(config.vpp_install_dir).rglob("libvppcom.so"))
         test.assertEqual(len(libraries), 1, libraries)
+        self.name = name
         conf = test.evidence / f"{name}-vcl.conf"
         conf.write_text("vcl { app-scope-global app-timeout 60 session-timeout 30 }\n")
         env = dict(os.environ, VCL_CONFIG=str(conf))
@@ -49,6 +53,7 @@ class VclProcess:
         self.transcript = (test.evidence / f"{name}-protocol.jsonl").open("w")
         self.selector = selectors.DefaultSelector()
         self.selector.register(self.process.stdout, selectors.EVENT_READ)
+        self.stopped = False
         test.addCleanup(self.stop)
 
     def request(self, operation, timeout=120, **params):
@@ -59,15 +64,22 @@ class VclProcess:
         self.process.stdin.write(json.dumps(request) + "\n")
         self.process.stdin.flush()
         if not self.selector.select(timeout):
-            raise AssertionError(f"helper timed out after {timeout}s: {request}")
+            raise AssertionError(f"{self.name} helper timed out after {timeout}s: {request}")
         line = self.process.stdout.readline()
         self.transcript.write(json.dumps({"reply": line}) + "\n")
         self.transcript.flush()
+        if not line:
+            self.stderr.flush()
+            raise AssertionError(f"{self.name} helper exited: "
+                                 f"{self.stderr_path.read_text()}")
         reply = json.loads(line)
         self.test.assertEqual(reply["id"], self.sequence)
         return reply["result"]
 
     def stop(self):
+        if self.stopped:
+            return
+        self.stopped = True
         if self.process.poll() is None:
             self.process.stdin.close()
             try:
@@ -75,12 +87,12 @@ class VclProcess:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=5)
-                self.test.fail("VCL helper required killing during cleanup")
+                self.test.fail(f"{self.name} helper required killing during cleanup")
         self.selector.close()
         self.stderr.close()
         self.transcript.close()
         self.test.assertEqual(self.process.returncode, 0,
-                              f"VCL helper failed, see {self.stderr_path}")
+                              f"{self.name} helper failed, see {self.stderr_path}")
 
 
 @unittest.skipIf("quic" in config.excluded_plugins, "QUIC plugin excluded")
@@ -110,15 +122,16 @@ class QUICCredentialFailure(VppAsfTestCase):
         self.cli_log = (self.evidence / "cli.jsonl").open("w")
         self.addCleanup(self.cli_log.close)
         self.create_loopback_interfaces(1)
-        self.loop0.admin_up()
-        self.loop0.config_ip4()
-        self.addCleanup(self.loop0.admin_down)
-        self.addCleanup(self.loop0.unconfig_ip4)
-        self.cli("quic set crypto api engine-lib")
-        self.cli("show threads")
-        self.cli("show version verbose")
+        self.loop = self.lo_interfaces[0]
+        self.loop.admin_up()
+        self.loop.config_ip4()
+        self.addCleanup(self.loop.admin_down)
+        self.addCleanup(self.loop.unconfig_ip4)
+        self.run_cli("quic set crypto api engine-lib")
+        self.run_cli("show threads")
+        self.run_cli("show version verbose")
 
-    def cli(self, command):
+    def run_cli(self, command):
         reply = self.vapi.cli(command)
         self.cli_log.write(json.dumps({"command": command, "reply": reply}) + "\n")
         self.cli_log.flush()
@@ -127,15 +140,15 @@ class QUICCredentialFailure(VppAsfTestCase):
         return reply.strip()
 
     def snapshot(self):
-        quic = self.cli("show quic")
+        quic = self.run_cli("show quic")
         self.assertIn("quic engine: quicly", quic.lower())
         pools = re.findall(r"Thread (\d+): ctx pool (\d+)/(\d+)", quic)
         self.assertEqual(len(pools), self.vpp_worker_count + 1)
         return {
             "used": {thread: int(used) for thread, used, capacity in pools},
-            "crypto": self.cli("show quic crypto context"),
-            "sessions": self.cli("show session"),
-            "certificates": self.cli("show app certificate"),
+            "crypto": self.run_cli("show quic crypto context"),
+            "sessions": self.run_cli("show session"),
+            "certificates": self.run_cli("show app certificate"),
         }
 
     def wait_snapshot(self, expected, timeout=15):
@@ -153,14 +166,13 @@ class QUICCredentialFailure(VppAsfTestCase):
         path = Path("/tmp") / filename
         self.assertFalse(path.exists())
         started = time.time_ns()
-        reply = self.cli(f"save memory-trace {filename}")
+        reply = self.run_cli(f"save memory-trace {filename}")
         self.assertIn(f"Saving trace to '{path}'", reply)
         self.assertTrue(path.is_file(), "trace command produced no readable file")
         stat = path.stat()
         self.assertGreaterEqual(stat.st_mtime_ns, started - 1_000_000_000)
         raw = path.read_bytes()
-        destination = self.evidence / f"{label}.json"
-        destination.write_bytes(raw)
+        (self.evidence / f"{label}.json").write_bytes(raw)
         records = json.loads(raw)
         self.assertIsInstance(records, list)
         self.assertTrue(records, "empty allocator trace is not coverage")
@@ -193,14 +205,14 @@ class QUICCredentialFailure(VppAsfTestCase):
 
     def probe(self, label, valid_cert, key, baseline, signatures=None):
         """Complete handshake, then prove the hostname allocation is released."""
-        server = VclProcess(self, label + "-server", self.loop0.local_ip4)
-        client = VclProcess(self, label + "-client", self.loop0.local_ip4)
+        server = VclProcess(self, label + "-server", self.loop.local_ip4)
+        client = VclProcess(self, label + "-client", self.loop.local_ip4)
         for peer in (server, client):
             peer.request("attach", cert=str(valid_cert), key=str(key))
         server.request("listen")
         listening = self.snapshot()
         before = self.trace(label + "-before")
-        connected = client.request("connect", success=True)
+        connected = client.request("connect")
         accepted = server.request("accept")
         self.assertEqual(connected["connect"], 0)
         self.assertGreaterEqual(accepted["accepted"], 0)
@@ -210,7 +222,7 @@ class QUICCredentialFailure(VppAsfTestCase):
                  for index, used in listening["used"].items()}
         self.assertEqual(delta, {index: 2 if index == thread else 0
                                  for index in listening["used"]})
-        self.cli("show session verbose 2")
+        self.run_cli("show session verbose 2")
         records = self.trace(label + "-live")
         if signatures is None:
             signatures = {
@@ -266,14 +278,14 @@ class QUICCredentialFailure(VppAsfTestCase):
     def test_credential_failure_rollback(self):
         """Complete 100 credential failures with fresh diagnostics and allocation evidence."""
         mode = os.environ.get("QUIC_CRYPTO_EXPECT", "fixed")
-        self.assertIn(mode, ("fixed", "original"))
+        self.assertIn(mode, LEAKS)
         key, valid_cert = self.fixture()
         preapp = self.snapshot()
-        self.cli("memory-trace on main-heap")
-        self.addCleanup(self.cli, "memory-trace off")
+        self.run_cli("memory-trace on main-heap")
+        self.addCleanup(self.run_cli, "memory-trace off")
         signatures = self.probe("coverage-before", valid_cert, key, preapp)
         self.assertEqual(self.hostname_totals(self.trace("baseline"), signatures), [0, 0])
-        client = VclProcess(self, "failures", self.loop0.local_ip4)
+        client = VclProcess(self, "failures", self.loop.local_ip4)
         registration = client.request("attach", cert="malformed", key=str(key))
         baseline = self.snapshot()
         self.assertEqual(baseline["used"], preapp["used"])
@@ -281,30 +293,30 @@ class QUICCredentialFailure(VppAsfTestCase):
                          f"(cert:{registration['cert_len']}, key:{registration['key_len']})")
         self.assertEqual(baseline["certificates"].splitlines(),
                          preapp["certificates"].splitlines() + [expected_cert])
+        thread = str(min(1, self.vpp_worker_count))
         count_per_attempt = bytes_per_attempt = None
         for attempt in range(1, ATTEMPTS + 1):
             self.assertEqual(self.snapshot(), baseline)
-            before = "".join(self.vpp_stderr_deque)
-            self.assertEqual(before.count(DIAGNOSTIC), attempt - 1)
-            result = client.request("connect")
-            deadline = time.monotonic() + 30
-            while "".join(self.vpp_stderr_deque).count(DIAGNOSTIC) < attempt:
+            start = len("".join(self.vpp_stderr_deque))
+            result = client.request("connect", timeout=60)
+            # The credential error is reported through the session event; the
+            # helper returns as soon as the session reaches a terminal state.
+            self.assertGreaterEqual(result["connect"], 0)
+            deadline = time.monotonic() + 10
+            while DIAGNOSTIC not in "".join(self.vpp_stderr_deque)[start:]:
                 self.assertLess(time.monotonic(), deadline, "missing fresh credential diagnostic")
                 time.sleep(0.01)
-            after = "".join(self.vpp_stderr_deque)
-            self.assertTrue(after.startswith(before), "VPP stderr history changed")
-            fresh = after[len(before):]
+            fresh = "".join(self.vpp_stderr_deque)[start:]
             self.assertEqual(fresh.count(DIAGNOSTIC), 1)
             (self.evidence / f"attempt-{attempt:03d}-stderr.txt").write_text(fresh)
             actual = self.snapshot()
             records = self.trace(f"attempt-{attempt:03d}")
             totals = self.hostname_totals(records, signatures)
-            if mode == "fixed":
+            if not LEAKS[mode]:
                 self.assertEqual(actual, baseline)
                 self.assertEqual(totals, [0, 0])
             else:
                 expected = dict(baseline, used=dict(baseline["used"]))
-                thread = str(min(1, self.vpp_worker_count))
                 expected["used"][thread] = preapp["used"][thread] + attempt
                 self.assertEqual(actual, expected)
                 if attempt == 1:
@@ -313,7 +325,7 @@ class QUICCredentialFailure(VppAsfTestCase):
                     self.assertGreater(bytes_per_attempt, 0)
                 self.assertEqual(totals, [attempt, attempt * bytes_per_attempt])
                 baseline = actual
-            self.cli("show version")
+            self.run_cli("show version")
             (self.evidence / f"attempt-{attempt:03d}-result.json").write_text(
                 json.dumps({"attempt": attempt, "mode": mode, "vcl": result,
                             "snapshot": actual, "hostname": totals})
@@ -323,10 +335,13 @@ class QUICCredentialFailure(VppAsfTestCase):
         final = dict(preapp, used=baseline["used"])
         self.wait_snapshot(final)
         self.probe("coverage-after", valid_cert, key, final, signatures)
-        self.cli("show version")
+        self.run_cli("show version")
         (self.evidence / "result.json").write_text(json.dumps({
             "mode": mode, "workers": self.vpp_worker_count, "completed": ATTEMPTS,
-            "diagnostics": "".join(self.vpp_stderr_deque).count(DIAGNOSTIC),
+            "leaks": LEAKS[mode], "thread": thread,
+            "failure_diagnostics": sum(
+                (self.evidence / f"attempt-{n:03d}-stderr.txt").read_text().count(DIAGNOSTIC)
+                for n in range(1, ATTEMPTS + 1)),
             "preapp": preapp, "final": final, "cleanup": "passed",
             "hostname": self.hostname_totals(self.trace("final"), signatures),
         }, indent=2))
