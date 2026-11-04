@@ -211,6 +211,8 @@ ip_neighbor_list_remove (ip_neighbor_t * ipn)
       clib_llist_remove (ip_neighbor_elt_pool, ipne_anchor, elt);
 
       ipn->ipn_elt = ~0;
+
+      pool_put (ip_neighbor_elt_pool, elt);
     }
 }
 
