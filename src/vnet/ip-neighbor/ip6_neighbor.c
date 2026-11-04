@@ -99,7 +99,7 @@ ip6_neighbor_advertise (vlib_main_t *vm, vnet_main_t *vnm, u32 sw_if_index,
       rewrite_len = vec_len (rewrite);
       vlib_buffer_advance (b, -rewrite_len);
       ethernet_header_t *e = vlib_buffer_get_current (b);
-      clib_memcpy (e->dst_address, rewrite, rewrite_len);
+      clib_memcpy (e->dst_address, rewrite, sizeof (e->dst_address));
       vec_free (rewrite);
 
       /* Send unsolicited ND advertisement packet out the specified interface */
