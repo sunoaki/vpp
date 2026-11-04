@@ -11,8 +11,8 @@ import ctypes as ct
 import json
 import socket
 import sys
+import time
 from pathlib import Path
-
 
 PROTO_QUIC = 4
 APP_SCOPE_GLOBAL = 1
@@ -21,6 +21,10 @@ ATTR_SET_CKPAIR = 35
 # A certificate that ptls_load_certificate_chain() rejects while the private
 # key loads, so the crypto context is built but no certificate chain is.
 MALFORMED_CERT = b"-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n"
+# Upper bound on how long connect() polls a non-blocking session before it
+# closes the handle, so a stalled attempt cannot reach the VCL session-timeout.
+CONNECT_POLL_LIMIT_S = 5.0
+CONNECT_POLL_INTERVAL_S = 0.01
 
 
 class Endpoint(ct.Structure):
@@ -54,7 +58,10 @@ SIGNATURES = {
     "add_cert_key_pair": ([ct.POINTER(CertKeyPair)], ct.c_int),
     "del_cert_key_pair": ([ct.c_uint32], ct.c_int),
     "session_create": ([ct.c_uint8, ct.c_uint8], ct.c_int),
-    "session_attr": ([ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(ct.c_uint32)], ct.c_int),
+    "session_attr": (
+        [ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(ct.c_uint32)],
+        ct.c_int,
+    ),
     "session_connect": ([ct.c_uint32, ct.POINTER(Endpoint)], ct.c_int),
     "session_bind": ([ct.c_uint32, ct.POINTER(Endpoint)], ct.c_int),
     "session_listen": ([ct.c_uint32, ct.c_uint32], ct.c_int),
@@ -89,7 +96,9 @@ class Client:
         return result
 
     def attach(self, cert, key):
-        self.require_zero(self.call("app_create", b"quic-credential-regression"), "app_create")
+        self.require_zero(
+            self.call("app_create", b"quic-credential-regression"), "app_create"
+        )
         self.attached = True
         cert_bytes = MALFORMED_CERT if cert == "malformed" else Path(cert).read_bytes()
         key_bytes = Path(key).read_bytes()
@@ -98,37 +107,68 @@ class Client:
         self.pair = self.call("add_cert_key_pair", ct.byref(pair))
         if self.pair < 0:
             raise RuntimeError(f"add_cert_key_pair failed: {self.pair}")
-        return {"app_create": 0, "pair": self.pair,
-                "cert_len": len(cert_bytes), "key_len": len(key_bytes)}
+        return {
+            "app_create": 0,
+            "pair": self.pair,
+            "cert_len": len(cert_bytes),
+            "key_len": len(key_bytes),
+        }
 
     def session(self):
-        handle = self.call("session_create", PROTO_QUIC, 0)
+        handle = self.call("session_create", PROTO_QUIC, 1)
         if handle < 0:
             raise RuntimeError(f"session_create failed: {handle}")
         index = ct.c_uint32(self.pair)
         length = ct.c_uint32(ct.sizeof(ct.c_uint32))
         self.require_zero(
-            self.call("session_attr", handle, ATTR_SET_CKPAIR, ct.byref(index), ct.byref(length)),
+            self.call(
+                "session_attr",
+                handle,
+                ATTR_SET_CKPAIR,
+                ct.byref(index),
+                ct.byref(length),
+            ),
             "session_attr SET_CKPAIR",
         )
         return handle
 
     def connect(self):
+        """Start a non-blocking connect and poll the session error for a bound."""
         handle = self.session()
         result = self.call("session_connect", handle, ct.byref(self.endpoint))
-        error = self.call("session_get_error", handle)
+        errors = []
+        polls = 0
+        started = time.monotonic()
+        while result != 0 and time.monotonic() - started < CONNECT_POLL_LIMIT_S:
+            time.sleep(CONNECT_POLL_INTERVAL_S)
+            polls += 1
+            error = self.call("session_get_error", handle)
+            if error != (errors[-1] if errors else None):
+                errors.append(error)
+            if error != 0:
+                break
+        waited = time.monotonic() - started
         if result == 0:
             self.connection = handle
         else:
             self.call("session_close", handle)
-        return {"handle": handle, "connect": result, "error": error}
+        return {
+            "handle": handle,
+            "connect": result,
+            "errors": errors,
+            "polls": polls,
+            "waited_s": round(waited, 3),
+        }
 
     def listen(self):
         self.listener = self.session()
         self.require_zero(
-            self.call("session_bind", self.listener, ct.byref(self.endpoint)), "session_bind"
+            self.call("session_bind", self.listener, ct.byref(self.endpoint)),
+            "session_bind",
         )
-        self.require_zero(self.call("session_listen", self.listener, 8), "session_listen")
+        self.require_zero(
+            self.call("session_listen", self.listener, 8), "session_listen"
+        )
         return {"listener": self.listener}
 
     def accept(self):
@@ -183,8 +223,10 @@ def main():
             operation = OPERATIONS.get(request["operation"])
             if operation is None:
                 raise ValueError(f"unknown operation {request['operation']}")
-            print(json.dumps({"id": request["id"], "result": operation(client, request)}),
-                  flush=True)
+            print(
+                json.dumps({"id": request["id"], "result": operation(client, request)}),
+                flush=True,
+            )
     finally:
         client.destroy()
 
