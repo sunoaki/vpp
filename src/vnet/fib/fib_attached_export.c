@@ -294,6 +294,16 @@ fib_attached_export_import (fib_entry_t *fib_entry,
 	}
     }
 
+    if (FIB_NODE_INDEX_INVALID == import->faei_export_entry)
+    {
+	/*
+	 * no entry covers the prefix in the export table. nothing to
+	 * track and nothing to import.
+	 */
+	pool_put(fib_ae_import_pool, import);
+	return;
+    }
+
     /*
      * track the entry in the export table so we can update appropriately
      * when it changes.
