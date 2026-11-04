@@ -213,11 +213,18 @@ jobs:
           mkdir -p "$EVIDENCE/harness"
           # The harness writes under TMP_DIR and FAILED_DIR, both inside the
           # evidence root; /tmp is still scanned because test/Makefile hardcodes
-          # expand_ppp.py --basedir=/tmp and reset still touches it.
-          for directory in "$EVIDENCE"/tmp/vpp-unittest-* "$EVIDENCE"/failed \
-                           /tmp/vpp-unittest-* /tmp/vpp-failed-unittests; do
+          # expand_ppp.py --basedir=/tmp and reset still touches it. Those /tmp
+          # entries are shared with the other matrix jobs on this host, so they
+          # are copied under a per-job path and labelled in run-context.json.
+          for directory in "$EVIDENCE"/tmp/vpp-unittest-* "$EVIDENCE"/failed; do
             [ -d "$directory" ] || continue
             cp -a "$directory" "$EVIDENCE/harness/"
+          done
+          host_tmp="$EVIDENCE/harness/host-tmp/$MATRIX_JOB"
+          mkdir -p "$host_tmp"
+          for directory in /tmp/vpp-unittest-* /tmp/vpp-failed-unittests; do
+            [ -d "$directory" ] || continue
+            cp -a "$directory" "$host_tmp/"
           done
           ps -ef > "$EVIDENCE/processes.txt"
           git -C source diff --binary > "$EVIDENCE/post-run.diff"
@@ -233,6 +240,19 @@ jobs:
               if path.is_file() and not path.is_symlink():
                   manifest[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
           (root / 'artifact-sha256.json').write_text(json.dumps(manifest, indent=2))
+          context_path = root / 'run-context.json'
+          context = json.loads(context_path.read_text())
+          context["host_tmp_copy"] = {
+              "path": f"harness/host-tmp/{os.environ['MATRIX_JOB']}",
+              "source": "/tmp",
+              "shared_with_matrix_jobs": True,
+              "note": (
+                  "Copied from the host /tmp shared by all matrix jobs; entries "
+                  "may have been produced by another job and are not evidence "
+                  "this job produced."
+              ),
+          }
+          context_path.write_text(json.dumps(context, indent=2) + "\n")
           PY
 
       - uses: actions/upload-artifact@v4

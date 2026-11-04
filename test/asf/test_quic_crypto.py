@@ -235,9 +235,10 @@ class QUICCredentialFailure(VppAsfTestCase):
         server.request("listen")
         listening = self.snapshot()
         before = self.trace(label + "-before")
-        connected = client.request("connect")
-        accepted = server.request("accept")
+        connected = client.request("connect", timeout=15)
+        accepted = server.request("accept", timeout=15)
         self.assertEqual(connected["connect"], 0)
+        self.assertLessEqual(connected["waited_s"], 5.0, connected)
         self.assertGreaterEqual(accepted["accepted"], 0)
         live = self.snapshot()
         thread = str(min(1, self.vpp_worker_count))
@@ -379,6 +380,14 @@ class QUICCredentialFailure(VppAsfTestCase):
             # bounded by that poll limit plus one snapshot and one trace.
             self.assertIn(result["connect"], (0, -115), result)
             self.assertLessEqual(result["waited_s"], 5.0, result)
+            # A poll that timed out without observing the session error would
+            # also satisfy the two assertions above, so require the observed
+            # error sequence to end in VPPCOM_EFAULT (-14), which
+            # vppcom_session_get_error returns for any non-NONE vpp_error, and
+            # keep the poll count under the 5 s / 10 ms ceiling of 500.
+            self.assertTrue(result["errors"], result)
+            self.assertEqual(result["errors"][-1], -14, result)
+            self.assertLess(result["polls"], 500, result)
             deadline = time.monotonic() + 10
             while DIAGNOSTIC not in "".join(self.vpp_stderr_deque)[start:]:
                 self.assertLess(
