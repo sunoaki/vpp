@@ -2831,5 +2831,97 @@ class NeighborFlush(VppTestCase):
                 )
 
 
+class NeighborChurnTestCase(VppTestCase):
+    """Dynamic neighbour create/delete cycles"""
+
+    N_HOSTS = 32
+    N_CYCLES = 200
+
+    @classmethod
+    def setUpClass(cls):
+        super(NeighborChurnTestCase, cls).setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super(NeighborChurnTestCase, cls).tearDownClass()
+
+    def setUp(self):
+        super(NeighborChurnTestCase, self).setUp()
+
+        self.create_pg_interfaces(range(1))
+
+        for i in self.pg_interfaces:
+            i.admin_up()
+            i.config_ip4()
+            i.config_ip6()
+
+    def tearDown(self):
+        super(NeighborChurnTestCase, self).tearDown()
+
+        for i in self.pg_interfaces:
+            i.unconfig_ip4()
+            i.unconfig_ip6()
+            i.admin_down()
+
+    def add_dynamic_neighbors(self):
+        for n in range(self.N_HOSTS):
+            VppNeighbor(
+                self,
+                self.pg0.sw_if_index,
+                self.pg0.remote_hosts[n].mac,
+                self.pg0.remote_hosts[n].ip4,
+            ).add_vpp_config()
+
+    def assert_no_neighbors(self):
+        af = VppEnum.vl_api_address_family_t
+        self.assertFalse(
+            self.vapi.ip_neighbor_dump(sw_if_index=0xFFFFFFFF, af=af.ADDRESS_IP4)
+        )
+
+        # the age-sorted list is walked by the CLI; a stale or freed list
+        # element shows up here
+        self.vapi.cli("show ip4 neighbor-sorted")
+
+    def test_churn(self):
+        """Dynamic neighbour create/delete cycles"""
+
+        af = VppEnum.vl_api_address_family_t
+
+        self.pg0.generate_remote_hosts(self.N_HOSTS)
+
+        #
+        # each cycle links N_HOSTS elements into the age-sorted list and
+        # unlinks them again.  Before ip_neighbor_list_remove returned its
+        # element to the pool, every cycle leaked N_HOSTS pool entries.
+        #
+        for _ in range(self.N_CYCLES):
+            self.add_dynamic_neighbors()
+            self.assertEqual(
+                len(
+                    self.vapi.ip_neighbor_dump(
+                        sw_if_index=0xFFFFFFFF, af=af.ADDRESS_IP4
+                    )
+                ),
+                self.N_HOSTS,
+            )
+
+            self.vapi.ip_neighbor_flush(af.ADDRESS_IP4, 0xFFFFFFFF)
+            self.assert_no_neighbors()
+
+        #
+        # the same cycle through the neighbour delete API, one entry at a time
+        #
+        for _ in range(self.N_CYCLES):
+            self.add_dynamic_neighbors()
+            for n in range(self.N_HOSTS):
+                self.vapi.ip_neighbor_add_del(
+                    self.pg0.sw_if_index,
+                    self.pg0.remote_hosts[n].mac,
+                    self.pg0.remote_hosts[n].ip4,
+                    is_add=0,
+                )
+            self.assert_no_neighbors()
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=VppTestRunner)
