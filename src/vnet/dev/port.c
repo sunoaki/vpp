@@ -812,6 +812,7 @@ vnet_dev_port_if_create (vlib_main_t *vm, vnet_dev_port_t *port, void *ptr)
 	  vlib_register_errors (vm, rx_node_index,
 				port->rx_node.n_error_counters, 0,
 				port->rx_node.error_counters);
+	  vlib_node_update_runtime_errors (vm, rx_node_index);
 	}
       else
 	{
