@@ -6,7 +6,9 @@
 
 #include <vnet/vnet.h>
 #include <gre/gre.h>
+#include <vnet/adj/adj_delegate.h>
 #include <vnet/adj/adj_midchain.h>
+#include <vnet/fib/fib_types.h>
 #include <vnet/tunnel/tunnel_dp.h>
 #include <vpp/app/version.h>
 #include <vnet/plugin/plugin.h>
@@ -425,16 +427,173 @@ gre_get_fixup (fib_protocol_t fproto, vnet_link_t lt)
   return (gre44_fixup);
 }
 
-void
-gre_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
+/*
+ * The rewrite of an adjacency of a tunnel is the tunnel's outer header. Its
+ * length is fixed by the outer protocol and by whether the tunnel carries a
+ * key.
+ */
+static u32
+gre_rewrite_len (const gre_tunnel_t *t)
+{
+  u32 len;
+
+  if (t->tunnel_dst.fp_proto == FIB_PROTOCOL_IP6)
+    len = sizeof (ip6_and_gre_header_t);
+  else
+    len = sizeof (ip4_and_gre_header_t);
+
+  if (gre_key_is_valid (t->gre_key))
+    len += sizeof (gre_key_t);
+
+  return (len);
+}
+
+/*
+ * An L3 tunnel carries IP or MPLS behind its outer header. A non-L3 tunnel
+ * carries the ethernet header of its link type. An adjacency of the other
+ * kind would be given a GRE protocol it does not transport.
+ */
+static u8
+gre_link_type_matches (const gre_tunnel_t *t, vnet_link_t link_type)
+{
+  if (GRE_TUNNEL_TYPE_L3 == t->type)
+    return (VNET_LINK_ETHERNET != link_type);
+
+  return (VNET_LINK_ETHERNET == link_type);
+}
+
+/*
+ * Build the rewrite that stacks an adjacency's payload behind the tunnel's
+ * outer header. The length is fixed by the outer protocol and the key alone,
+ * so a rewrite of a different length, or one built for a link type the tunnel
+ * does not carry, does not belong to this tunnel. Both cases warn once and
+ * return NULL, leaving the adjacency without a rewrite; its caller stacks it
+ * on the drop, so no packet leaves behind a header of the wrong kind or size.
+ */
+static u8 *
+gre_build_midchain_rewrite (vnet_main_t *vnm, u32 sw_if_index, gre_tunnel_t *t,
+			    vnet_link_t link_type, const ip46_address_t *dst)
+{
+  u8 *rewrite;
+
+  rewrite = NULL;
+
+  if (gre_link_type_matches (t, link_type))
+    rewrite = gre_build_rewrite (vnm, sw_if_index, link_type, dst);
+
+  if ((NULL != rewrite) && (vec_len (rewrite) == gre_rewrite_len (t)))
+    return (rewrite);
+
+  if (!t->rewrite_warned)
+    {
+      t->rewrite_warned = 1;
+      vlib_log_warn (gre_main.log_class,
+		     "%U: a %U adjacency got a %d byte rewrite where the "
+		     "tunnel's outer header is %d bytes; dropping its traffic",
+		     format_vnet_sw_if_index_name, vnet_get_main (), t->sw_if_index,
+		     format_vnet_link, link_type, NULL == rewrite ? 0 : vec_len (rewrite),
+		     gre_rewrite_len (t));
+    }
+
+  vec_free (rewrite);
+
+  return (NULL);
+}
+
+/*
+ * A subsystem other than the tunnel can rewrite one of its adjacencies, an
+ * ethernet neighbour added on the tunnel's interface for instance, replacing
+ * the tunnel's outer header with one of a different length. Check that the
+ * adjacency still holds the tunnel's outer header and restore it when it does
+ * not.
+ */
+static void
+gre_adj_rewrite_check (gre_tunnel_t *t, adj_index_t ai)
+{
+  ip_adjacency_t *adj;
+
+  adj = adj_get (ai);
+
+  /* a tunnel with no path leaves its adjacencies without a rewrite */
+  if (0 == adj->rewrite_header.data_bytes)
+    return;
+
+  if ((IP_LOOKUP_NEXT_MIDCHAIN == adj->lookup_next_index) &&
+      (gre_rewrite_len (t) == adj->rewrite_header.data_bytes))
+    return;
+
+  if (!t->rewrite_warned)
+    {
+      t->rewrite_warned = 1;
+      vlib_log_warn (gre_main.log_class,
+		     "%U: adjacency %d holds a %d byte rewrite where the "
+		     "tunnel's outer header is %d bytes; restoring it",
+		     format_vnet_sw_if_index_name, vnet_get_main (), t->sw_if_index, ai,
+		     adj->rewrite_header.data_bytes, gre_rewrite_len (t));
+    }
+
+  if (TUNNEL_MODE_MP == t->mode)
+    mgre_update_adj (vnet_get_main (), t->sw_if_index, ai);
+  else
+    gre_update_adj (vnet_get_main (), t->sw_if_index, ai);
+}
+
+static adj_delegate_type_t gre_adj_delegate_type;
+
+static void
+gre_adj_delegate_adj_modified (adj_delegate_t *aed)
 {
   gre_tunnel_t *t;
-  adj_flags_t af;
 
-  t = gre_tunnel_find_by_sw_if_index (sw_if_index);
-
-  if (0 == t)
+  if (pool_is_free_index (gre_main.tunnels, aed->ad_index))
     return;
+
+  t = pool_elt_at_index (gre_main.tunnels, aed->ad_index);
+
+  gre_adj_rewrite_check (t, aed->ad_adj_index);
+}
+
+static const adj_delegate_vft_t gre_adj_delegate_vft = {
+  .adv_adj_modified = gre_adj_delegate_adj_modified,
+};
+
+static clib_error_t *
+gre_adj_delegate_init (vlib_main_t *vm)
+{
+  gre_adj_delegate_type = adj_delegate_register_new_type (&gre_adj_delegate_vft);
+
+  return (0);
+}
+
+VLIB_INIT_FUNCTION (gre_adj_delegate_init);
+
+/*
+ * Track the tunnel on its adjacency so an external rewrite of the adjacency is
+ * noticed. The delegate is added once; a second add returns -1.
+ */
+static void
+gre_adj_delegate_track (adj_index_t ai, gre_tunnel_t *t)
+{
+  (void) adj_delegate_add (adj_get (ai), gre_adj_delegate_type, t - gre_main.tunnels);
+}
+
+/*
+ * Install the tunnel's outer header as the rewrite of an adjacency. A rewrite
+ * the builder rejects leaves the adjacency without one, and the caller stacks
+ * the midchain on the drop instead of on the tunnel path, so packets are
+ * discarded rather than sent behind a header of the wrong kind or size.
+ * Returns whether a rewrite was installed.
+ */
+static u8
+gre_install_adj_rewrite (adj_index_t ai, gre_tunnel_t *t, vnet_main_t *vnm,
+			 const ip46_address_t *dst)
+{
+  vnet_link_t link_type;
+  adj_flags_t af;
+  u8 *rewrite;
+  u8 installed;
+
+  link_type = adj_get_link_type (ai);
 
   af = ADJ_FLAG_NONE;
 
@@ -446,39 +605,43 @@ gre_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
   if (!(t->flags & TUNNEL_ENCAP_DECAP_FLAG_ENCAP_INNER_HASH))
     af |= ADJ_FLAG_MIDCHAIN_IP_STACK;
 
-  adj_nbr_midchain_update_rewrite (
-    ai, gre_get_fixup (t->tunnel_dst.fp_proto, adj_get_link_type (ai)),
-    uword_to_pointer (t->flags, void *), af,
-    gre_build_rewrite (vnm, sw_if_index, adj_get_link_type (ai),
-		       &t->tunnel_dst.fp_addr));
+  rewrite = gre_build_midchain_rewrite (vnm, t->sw_if_index, t, link_type, dst);
 
-  gre_tunnel_stack (ai);
+  installed = (NULL != rewrite);
+
+  adj_nbr_midchain_update_rewrite (ai, gre_get_fixup (t->tunnel_dst.fp_proto, link_type),
+				   uword_to_pointer (t->flags, void *), af, rewrite);
+
+  gre_adj_delegate_track (ai, t);
+
+  return (installed);
+}
+
+void
+gre_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
+{
+  gre_tunnel_t *t;
+
+  t = gre_tunnel_find_by_sw_if_index (sw_if_index);
+
+  if (0 == t)
+    return;
+
+  if (gre_install_adj_rewrite (ai, t, vnm, &t->tunnel_dst.fp_addr))
+    gre_tunnel_stack (ai);
+  else
+    adj_midchain_delegate_unstack (ai);
 }
 
 adj_walk_rc_t
 mgre_mk_complete_walk (adj_index_t ai, void *data)
 {
   mgre_walk_ctx_t *ctx = data;
-  adj_flags_t af;
 
-  af = ADJ_FLAG_NONE;
-
-  /*
-   * the user has not requested that the load-balancing be based on
-   * a flow hash of the inner packet. so use the stacking to choose
-   * a path.
-   */
-  if (!(ctx->t->flags & TUNNEL_ENCAP_DECAP_FLAG_ENCAP_INNER_HASH))
-    af |= ADJ_FLAG_MIDCHAIN_IP_STACK;
-
-  adj_nbr_midchain_update_rewrite (
-    ai, gre_get_fixup (ctx->t->tunnel_dst.fp_proto, adj_get_link_type (ai)),
-    uword_to_pointer (ctx->t->flags, void *), af,
-    gre_build_rewrite (vnet_get_main (), ctx->t->sw_if_index,
-		       adj_get_link_type (ai),
-		       &teib_entry_get_nh (ctx->ne)->fp_addr));
-
-  teib_entry_adj_stack (ctx->ne, ai);
+  if (gre_install_adj_rewrite (ai, ctx->t, vnet_get_main (), &teib_entry_get_nh (ctx->ne)->fp_addr))
+    teib_entry_adj_stack (ctx->ne, ai);
+  else
+    adj_midchain_delegate_unstack (ai);
 
   return (ADJ_WALK_RC_CONTINUE);
 }
@@ -520,6 +683,7 @@ mgre_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
       adj_nbr_midchain_update_rewrite (
 	ai, gre_get_fixup (t->tunnel_dst.fp_proto, adj_get_link_type (ai)),
 	uword_to_pointer (t->flags, void *), ADJ_FLAG_NONE, NULL);
+      gre_adj_delegate_track (ai, t);
       return;
     }
 
@@ -831,6 +995,7 @@ gre_init (vlib_main_t *vm)
   clib_memset (gm, 0, sizeof (gm[0]));
   gm->vlib_main = vm;
   gm->vnet_main = vnet_get_main ();
+  gm->log_class = vlib_log_register_class ("gre", 0);
 
   if ((error = vlib_call_init_function (vm, ip_main_init)))
     return error;

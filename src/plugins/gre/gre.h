@@ -214,6 +214,12 @@ typedef struct
   tunnel_encap_decap_flags_t flags;
 
   /**
+   * Set once an adjacency of this tunnel was found carrying a rewrite that is
+   * not the tunnel's own outer header, so the warning is emitted once.
+   */
+  u8 rewrite_warned;
+
+  /**
    * an L2 tunnel always rquires an L2 midchain. cache here for DP.
    */
   adj_index_t l2_adj_index;
@@ -293,6 +299,8 @@ typedef struct
   /* Record used instances */
   uword *instance_used;
 
+  vlib_log_class_t log_class;
+
   u16 msg_id_base;
 } gre_main_t;
 
@@ -326,10 +334,11 @@ extern clib_error_t *gre_interface_admin_up_down (vnet_main_t *vnm,
 
 extern void gre_tunnel_stack (adj_index_t ai);
 extern void gre_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai);
+extern void mgre_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai);
 
 typedef struct mgre_walk_ctx_t_
 {
-  const gre_tunnel_t *t;
+  gre_tunnel_t *t;
   const teib_entry_t *ne;
 } mgre_walk_ctx_t;
 
