@@ -108,7 +108,7 @@ create_dad_ns_buffer (vlib_main_t *vm, ip6_dad_entry_t *entry)
   ASSERT (bogus_length == 0);
 
   /* Ethernet header: multicast destination */
-  ip6_multicast_ethernet_address (dst_mac, id | (0xff << 24));
+  ip6_multicast_ethernet_address (dst_mac, id | (0xffU << 24));
   rewrite = ethernet_build_rewrite (vnm, entry->sw_if_index, VNET_LINK_IP6, dst_mac);
   rewrite_len = vec_len (rewrite);
   vlib_buffer_advance (b, -rewrite_len);
@@ -291,20 +291,23 @@ ip6_dad_process (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame
 
   ASSERT (vm->thread_index == 0); /* Main thread only */
 
-  /* Initialize */
-  next_timeout = 1e70; /* Far in the future */
+  /* No active DAD timer until an entry is added. */
+  next_timeout = 0;
 
   while (1)
     {
       /* Wait for event or timeout */
-      vlib_process_wait_for_event_or_clock (vm, next_timeout);
+      if (next_timeout == 0)
+	vlib_process_wait_for_event (vm);
+      else
+	vlib_process_wait_for_event_or_clock (vm, next_timeout);
 
       /* Get events */
       event_type = vlib_process_get_events (vm, &event_data);
 
       /* Current time */
       now = vlib_time_now (vm);
-      next_timeout = 1e70;
+      next_timeout = 0;
 
       /* Process events */
       if (event_type == IP6_DAD_EVENT_START)
@@ -344,14 +347,14 @@ ip6_dad_process (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame
 
 	  /* Update next timeout */
 	  due_time = entry->dad_next_send_time;
-	  if (due_time < next_timeout)
+	  if (next_timeout == 0 || due_time < next_timeout)
 	    next_timeout = due_time;
 	}
 
       /* Calculate sleep time */
       if (next_timeout > now)
 	next_timeout = next_timeout - now;
-      else
+      else if (next_timeout != 0)
 	next_timeout = 0.001; /* Wake up soon */
 
       vec_reset_length (event_data);
@@ -580,7 +583,7 @@ format_ip6_dad_entry (u8 *s, va_list *args)
 static clib_error_t *
 ip6_dad_enable_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 {
-  u8 transmits = 0;
+  u32 transmits = 0;
   f64 delay = 0;
   bool has_transmits = false;
   bool has_delay = false;
@@ -594,6 +597,9 @@ ip6_dad_enable_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_co
       else
 	return clib_error_return (0, "unknown input '%U'", format_unformat_error, input);
     }
+
+  if (has_transmits && (transmits < 1 || transmits > 10))
+    return clib_error_return (0, "transmits must be 1-10");
 
   DAD_DBG (" enable command, has_transmits=%d", has_transmits);
 
@@ -619,7 +625,7 @@ ip6_dad_enable_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_co
       if (!has_delay)
 	delay = cur_delay;
 
-      error = ip6_dad_config (transmits, delay);
+      error = ip6_dad_config ((u8) transmits, delay);
       if (error)
 	{
 	  /* Rollback: restore initial DAD state */
