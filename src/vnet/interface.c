@@ -10,6 +10,7 @@
 #include <vnet/adj/adj.h>
 #include <vnet/adj/adj_mcast.h>
 #include <vnet/ip/ip.h>
+#include <vnet/ip/ip6_link.h>
 #include <vnet/interface/rx_queue_funcs.h>
 #include <vnet/interface/tx_queue_funcs.h>
 
@@ -774,6 +775,7 @@ setup_tx_node (vlib_main_t * vm,
   vlib_register_errors (vm, node_index, dev_class->tx_function_n_errors,
 			dev_class->tx_function_error_strings,
 			dev_class->tx_function_error_counters);
+  vlib_node_update_runtime_errors (vm, node_index);
 }
 
 static void
@@ -1112,10 +1114,11 @@ vnet_delete_hw_interface (vnet_main_t * vnm, u32 hw_if_index)
 	  rt->is_deleted = 1;
 	}
 
-      vlib_node_rename (vm, hw->output_node_index,
-			"interface-%d-output-deleted", hw_if_index);
-      vlib_node_rename (vm, hw->tx_node_index, "interface-%d-tx-deleted",
-			hw_if_index);
+      /* Interface and node pools can reuse elements in different orders.
+       * Use the node index to keep deleted node names unique. */
+      vlib_node_rename (vm, hw->output_node_index, "interface-%u-output-deleted",
+			hw->output_node_index);
+      vlib_node_rename (vm, hw->tx_node_index, "interface-%u-tx-deleted", hw->tx_node_index);
       vlib_unregister_errors (vm, hw->output_node_index);
       vlib_unregister_errors (vm, hw->tx_node_index);
       vec_add2 (im->deleted_hw_interface_nodes, dn, 1);
@@ -1740,7 +1743,10 @@ vnet_sw_interface_update_unnumbered (u32 unnumbered_sw_if_index,
   if (was_unnum != (si->flags & VNET_SW_INTERFACE_FLAG_UNNUMBERED))
     {
       ip4_sw_interface_enable_disable (unnumbered_sw_if_index, enable);
-      ip6_sw_interface_enable_disable (unnumbered_sw_if_index, enable);
+      if (enable)
+	ip6_link_enable (unnumbered_sw_if_index, NULL);
+      else
+	ip6_link_disable (unnumbered_sw_if_index);
     }
 
   return 0;
