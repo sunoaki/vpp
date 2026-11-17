@@ -189,14 +189,12 @@ lcp_router_ip4_mroutes_add_del (u32 sw_if_index, u8 is_add)
     {
       if (is_add)
 	{
-	  mfib_table_entry_path_update (mfib_index, &ip4_specials[ii],
-					MFIB_SOURCE_PLUGIN_LOW,
+	  mfib_table_entry_path_update (mfib_index, &ip4_specials[ii], MFIB_SOURCE_SPECIAL,
 					MFIB_ENTRY_FLAG_NONE, &path);
 	}
       else
 	{
-	  mfib_table_entry_path_remove (mfib_index, &ip4_specials[ii],
-					MFIB_SOURCE_PLUGIN_LOW, &path);
+	  mfib_table_entry_path_remove (mfib_index, &ip4_specials[ii], MFIB_SOURCE_SPECIAL, &path);
 	}
     }
 }
@@ -222,14 +220,12 @@ lcp_router_ip6_mroutes_add_del (u32 sw_if_index, u8 is_add)
     {
       if (is_add)
 	{
-	  mfib_table_entry_path_update (mfib_index, &ip6_specials[ii],
-					MFIB_SOURCE_PLUGIN_LOW,
+	  mfib_table_entry_path_update (mfib_index, &ip6_specials[ii], MFIB_SOURCE_SPECIAL,
 					MFIB_ENTRY_FLAG_NONE, &path);
 	}
       else
 	{
-	  mfib_table_entry_path_remove (mfib_index, &ip6_specials[ii],
-					MFIB_SOURCE_PLUGIN_LOW, &path);
+	  mfib_table_entry_path_remove (mfib_index, &ip6_specials[ii], MFIB_SOURCE_SPECIAL, &path);
 	}
     }
 }
@@ -619,19 +615,37 @@ lcp_router_mk_addr (const struct nl_addr *rna, ip_address_t *ia)
       return -1;
     }
 
+  /*
+   * ip_address_set() copies the whole family-sized struct out of the netlink
+   * buffer, whose length is whatever the message carried. Reject an oversized
+   * attribute instead of reading past it.
+   */
+  if (nl_addr_get_len (rna) > ip_version_to_size (AF_INET == family ? AF_IP4 : AF_IP6))
+    {
+      LCP_ROUTER_ERROR ("ignore address with a %u byte attribute", nl_addr_get_len (rna));
+      return -1;
+    }
+
   fproto = lcp_router_proto_k2f (family);
 
-  ip_address_set (ia, nl_addr_get_binary_addr (rna),
-		  FIB_PROTOCOL_IP4 == fproto ? AF_IP4 : AF_IP6);
+  ip_address_set (ia, nl_addr_get_binary_addr (rna), FIB_PROTOCOL_IP4 == fproto ? AF_IP4 : AF_IP6);
 
   return 0;
 }
 
-static fib_protocol_t
-lcp_router_mk_addr46 (const struct nl_addr *rna, ip46_address_t *ia)
+/*
+ * Convert a libnl address into an ip46_address_t and report its family.
+ * Returns 0 on success and -1 when the address has no IP meaning or its
+ * netlink attribute is longer than the destination field. The callers reject
+ * the whole record rather than continuing with a reset address that would be
+ * read as 0.0.0.0 / ::.
+ */
+static int
+lcp_router_mk_addr46 (const struct nl_addr *rna, ip46_address_t *ia, fib_protocol_t *out_fproto)
 {
   uint32_t family = nl_addr_get_family (rna);
   fib_protocol_t fproto;
+  unsigned int alen;
 
   /* Same gate as lcp_router_mk_addr(): an address that is neither IPv4 nor
    * IPv6 has no ip46_address_t representation, so the callers drop the path
@@ -639,18 +653,28 @@ lcp_router_mk_addr46 (const struct nl_addr *rna, ip46_address_t *ia)
   if (AF_INET != family && AF_INET6 != family)
     {
       LCP_ROUTER_ERROR ("ignore address of family %u", family);
-      return FIB_PROTOCOL_NONE;
+      return -1;
     }
 
   fproto = lcp_router_proto_k2f (family);
 
   ip46_address_reset (ia);
+  alen = nl_addr_get_len (rna);
   if (FIB_PROTOCOL_IP4 == fproto)
-    memcpy (&ia->ip4, nl_addr_get_binary_addr (rna), nl_addr_get_len (rna));
+    {
+      if (PREDICT_FALSE (alen > sizeof (ia->ip4)))
+	return -1;
+      memcpy (&ia->ip4, nl_addr_get_binary_addr (rna), alen);
+    }
   else
-    memcpy (&ia->ip6, nl_addr_get_binary_addr (rna), nl_addr_get_len (rna));
+    {
+      if (PREDICT_FALSE (alen > sizeof (ia->ip6)))
+	return -1;
+      memcpy (&ia->ip6, nl_addr_get_binary_addr (rna), alen);
+    }
 
-  return (fproto);
+  *out_fproto = fproto;
+  return 0;
 }
 
 static u32
@@ -963,7 +987,10 @@ lcp_router_table_add_del_special_routes (lcp_router_table_t *nlt, u8 is_add)
 {
   if (FIB_PROTOCOL_IP4 == nlt->nlt_proto)
     {
-      /* Set the all 1s address in this table to punt */
+      /* Set the all 1s address in this table to punt. Installed under the
+       * plugin's own unswept source: it must survive the route sweep at the
+       * end of a synchronization, and it ranks below a learned static route
+       * at the same prefix but above a learned dynamic one. */
       if (is_add)
 	fib_table_entry_special_add (nlt->nlt_fib_index, &pfx_all1s, lcp_rt_fib_src_special,
 				     FIB_ENTRY_FLAG_LOCAL);
@@ -985,10 +1012,10 @@ lcp_router_table_add_del_special_routes (lcp_router_table_t *nlt, u8 is_add)
 	{
 	  if (is_add)
 	    mfib_table_entry_path_update (nlt->nlt_mfib_index, &ip4_specials[ii],
-					  MFIB_SOURCE_PLUGIN_LOW, MFIB_ENTRY_FLAG_NONE, &path);
+					  MFIB_SOURCE_SPECIAL, MFIB_ENTRY_FLAG_NONE, &path);
 	  else
 	    mfib_table_entry_path_remove (nlt->nlt_mfib_index, &ip4_specials[ii],
-					  MFIB_SOURCE_PLUGIN_LOW, &path);
+					  MFIB_SOURCE_SPECIAL, &path);
 	}
     }
   else if (FIB_PROTOCOL_IP6 == nlt->nlt_proto)
@@ -1008,10 +1035,10 @@ lcp_router_table_add_del_special_routes (lcp_router_table_t *nlt, u8 is_add)
 	{
 	  if (is_add)
 	    mfib_table_entry_path_update (nlt->nlt_mfib_index, &ip6_specials[ii],
-					  MFIB_SOURCE_PLUGIN_LOW, MFIB_ENTRY_FLAG_NONE, &path);
+					  MFIB_SOURCE_SPECIAL, MFIB_ENTRY_FLAG_NONE, &path);
 	  else
 	    mfib_table_entry_path_remove (nlt->nlt_mfib_index, &ip6_specials[ii],
-					  MFIB_SOURCE_PLUGIN_LOW, &path);
+					  MFIB_SOURCE_SPECIAL, &path);
 	}
     }
 }
@@ -1107,6 +1134,13 @@ lcp_router_table_state (u32 table_id, fib_protocol_t proto, lcp_router_table_sta
   return 1;
 }
 
+/*
+ * Build the fib_prefix_t for the destination of a netlink route. The
+ * destination is only as long as the netlink attribute that carried it, so a
+ * malformed message can hand over more bytes than the address family holds.
+ * Reject such a record rather than copying past the field, or leaving fp_len
+ * at 0 which would hijack 0.0.0.0/0 or ::/0.
+ */
 static int
 lcp_router_route_mk_prefix (struct rtnl_route *r, fib_prefix_t *p)
 {
@@ -1137,9 +1171,13 @@ lcp_router_route_mk_prefix (struct rtnl_route *r, fib_prefix_t *p)
       p->fp_eos = MPLS_NON_EOS;
       return 0;
     case FIB_PROTOCOL_IP4:
+      if (PREDICT_FALSE (blen > sizeof (paddr->ip4)))
+	return -1;
       memcpy (&paddr->ip4, baddr, blen);
       break;
     case FIB_PROTOCOL_IP6:
+      if (PREDICT_FALSE (blen > sizeof (paddr->ip6)))
+	return -1;
       memcpy (&paddr->ip6, baddr, blen);
       break;
     default:
@@ -1154,24 +1192,30 @@ lcp_router_route_mk_prefix (struct rtnl_route *r, fib_prefix_t *p)
   return 0;
 }
 
+/*
+ * Build the mfib_prefix_t for a multicast netlink route. Either the group or
+ * the source address is rejected when the netlink attribute is longer than
+ * its ip46_address_t field can hold.
+ */
 static int
 lcp_router_route_mk_mprefix (struct rtnl_route *r, mfib_prefix_t *p)
 {
   const struct nl_addr *addr;
+  fib_protocol_t fproto;
 
   addr = rtnl_route_get_dst (r);
 
   p->fp_len = nl_addr_get_prefixlen (addr);
-  p->fp_proto = lcp_router_mk_addr46 (addr, &p->fp_grp_addr);
-  if (FIB_PROTOCOL_NONE == p->fp_proto)
+  if (lcp_router_mk_addr46 (addr, &p->fp_grp_addr, &fproto))
     return -1;
+  p->fp_proto = fproto;
 
   addr = rtnl_route_get_src (r);
   if (addr)
     {
-      p->fp_proto = lcp_router_mk_addr46 (addr, &p->fp_src_addr);
-      if (FIB_PROTOCOL_NONE == p->fp_proto)
+      if (lcp_router_mk_addr46 (addr, &p->fp_src_addr, &fproto))
 	return -1;
+      p->fp_proto = fproto;
     }
 
   return 0;
@@ -1213,6 +1257,7 @@ typedef struct lcp_router_route_path_parse_t_
   fib_route_path_t *paths;
   fib_protocol_t route_proto;
   bool is_mcast;
+  bool invalid;
   fib_route_path_flags_t type_flags;
   u8 preference;
 } lcp_router_route_path_parse_t;
@@ -1224,6 +1269,9 @@ lcp_router_route_path_parse (struct rtnl_nexthop *rnh, void *arg)
   fib_route_path_t *path;
   u32 sw_if_index;
   int label_count = 0;
+
+  if (ctx->invalid)
+    return;
 
   sw_if_index = lcp_router_intf_h2p (rtnl_route_nh_get_ifindex (rnh));
 
@@ -1268,12 +1316,14 @@ lcp_router_route_path_parse (struct rtnl_nexthop *rnh, void *arg)
 
       if (addr)
 	{
-	  fproto = lcp_router_mk_addr46 (addr, &path->frp_addr);
-	  if (FIB_PROTOCOL_NONE == fproto)
+	  if (lcp_router_mk_addr46 (addr, &path->frp_addr, &fproto))
 	    {
-	      /* lcp_router_mk_addr46() rejected the gateway address; drop the
-	       * path that was just added. */
-	      vec_del1 (ctx->paths, vec_len (ctx->paths) - 1);
+	      /* Reject the whole route: installing the remaining paths would
+	       * leave a partial path set in the FIB. Drop the path that was just
+	       * added and let the caller release the rest. */
+	      LCP_ROUTER_ERROR ("invalid nexthop address");
+	      ctx->invalid = true;
+	      vec_dec_len (ctx->paths, 1);
 	      return;
 	    }
 	}
@@ -1313,6 +1363,17 @@ lcp_router_route_path_parse (struct rtnl_nexthop *rnh, void *arg)
 
       LCP_ROUTER_DBG (" path:[%U]", format_fib_route_path, path);
     }
+}
+
+/* Rejected paths have not transferred label ownership to the FIB. */
+static void
+lcp_router_route_paths_discard (fib_route_path_t *paths)
+{
+  fib_route_path_t *path;
+
+  vec_foreach (path, paths)
+    vec_free (path->frp_label_stack);
+  vec_free (paths);
 }
 
 /*
@@ -1406,7 +1467,10 @@ lcp_router_route_del (struct rtnl_route *rr)
     return;
 
   if (lcp_router_route_mk_prefix (rr, &pfx))
-    return;
+    {
+      LCP_ROUTER_ERROR ("route del: invalid destination");
+      return;
+    }
   entry_flags = lcp_router_route_mk_entry_flags (rtype, table_id, rproto);
 
   /* Skip any kernel routes and IPv6 LL or multicast routes */
@@ -1434,6 +1498,11 @@ lcp_router_route_del (struct rtnl_route *rr)
   };
 
   rtnl_route_foreach_nexthop (rr, lcp_router_route_path_parse, &np);
+  if (np.invalid)
+    {
+      lcp_router_route_paths_discard (np.paths);
+      return;
+    }
   lcp_router_route_path_add_special (rr, &np);
 
   if (0 != vec_len (np.paths))
@@ -1495,6 +1564,7 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
   fib_entry_flag_t entry_flags;
   uint32_t table_id;
   fib_prefix_t pfx;
+  mfib_prefix_t mpfx = {};
   lcp_router_table_t *nlt;
   uint8_t rtype, rproto;
 
@@ -1507,7 +1577,10 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
     return;
 
   if (lcp_router_route_mk_prefix (rr, &pfx))
-    return;
+    {
+      LCP_ROUTER_ERROR ("route add: invalid destination");
+      return;
+    }
   entry_flags = lcp_router_route_mk_entry_flags (rtype, table_id, rproto);
 
   /* Skip any kernel routes and IPv6 LL or multicast routes */
@@ -1524,6 +1597,14 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
 		  rtnl_route_get_table (rr), format_fib_prefix, &pfx,
 		  format_fib_entry_flags, entry_flags);
 
+  /* Reject a malformed multicast prefix before the table reference is taken,
+   * so the early return leaves no lock behind. */
+  if (rtype == RTN_MULTICAST && lcp_router_route_mk_mprefix (rr, &mpfx))
+    {
+      LCP_ROUTER_ERROR ("route add: invalid mcast prefix");
+      return;
+    }
+
   lcp_router_route_path_parse_t np = {
     .route_proto = pfx.fp_proto,
     .is_mcast = (rtype == RTN_MULTICAST),
@@ -1532,26 +1613,15 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
   };
 
   rtnl_route_foreach_nexthop (rr, lcp_router_route_path_parse, &np);
+  if (np.invalid)
+    {
+      lcp_router_route_paths_discard (np.paths);
+      return;
+    }
   lcp_router_route_path_add_special (rr, &np);
 
   if (0 != vec_len (np.paths))
     {
-      mfib_prefix_t mpfx = {};
-
-      /* Build the multicast prefix before the table is locked, so rejecting
-       * the route here leaves no reference behind. */
-      if (rtype == RTN_MULTICAST && lcp_router_route_mk_mprefix (rr, &mpfx))
-	{
-	  fib_route_path_t *rpath;
-
-	  /* The FIB takes ownership of a path's label stack, so the parsed
-	   * paths must release their own on a route that is not installed. */
-	  vec_foreach (rpath, np.paths)
-	    vec_free (rpath->frp_label_stack);
-	  vec_free (np.paths);
-	  return;
-	}
-
       nlt = lcp_router_table_add_or_lock (table_id, pfx.fp_proto);
 
       if (rtype == RTN_MULTICAST)
