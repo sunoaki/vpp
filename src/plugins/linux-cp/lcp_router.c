@@ -43,6 +43,32 @@ static uword *lcp_router_table_db[FIB_PROTOCOL_MAX];
 static lcp_router_table_t *lcp_router_table_pool;
 static vlib_log_class_t lcp_router_logger;
 
+/*
+ * A route can name a nexthop device that belongs to a different FIB table than
+ * the table the route is installed into.  Whether such a path forwards depends
+ * on the source address the route's table selects being local in the nexthop's
+ * table, so the condition cannot be resolved here.  The route is installed
+ * unchanged; these keys remember which paths have already been reported, so a
+ * netlink replay or a socket rebuild reports each one once.  The keys are
+ * bounded: past the limit the whole set is dropped and the paths are reported
+ * again rather than growing without limit.
+ */
+#define LCP_ROUTER_CROSS_FIB_MAX_KEYS 1024
+
+typedef struct
+{
+  u32 lcf_key_table_id;
+  u32 lcf_sw_if_index;
+  u32 lcf_fib_index;
+  u32 lcf_nexthop_fib_index;
+  ip46_address_t lcf_addr;
+  u16 lcf_prefix_len;
+  fib_protocol_t lcf_proto;
+} lcp_router_cross_fib_key_t;
+
+static uword *lcp_router_cross_fib_db;
+static u32 lcp_router_cross_fib_reports;
+
 const static fib_prefix_t pfx_all1s = {
   .fp_addr = {
     .ip4 = {
@@ -1134,6 +1160,12 @@ lcp_router_table_state (u32 table_id, fib_protocol_t proto, lcp_router_table_sta
   return 1;
 }
 
+u32
+lcp_router_cross_fib_nexthop_count (void)
+{
+  return lcp_router_cross_fib_reports;
+}
+
 /*
  * Build the fib_prefix_t for the destination of a netlink route. The
  * destination is only as long as the netlink attribute that carried it, so a
@@ -1559,6 +1591,95 @@ lcp_router_fib_route_path_dup (fib_route_path_t *old)
 }
 
 static void
+lcp_router_cross_fib_db_free (void)
+{
+  hash_pair_t *p;
+
+  if (NULL == lcp_router_cross_fib_db)
+    return;
+
+  hash_foreach_pair (p, lcp_router_cross_fib_db,
+		     ({ clib_mem_free (uword_to_pointer (p->key, void *)); }));
+  hash_free (lcp_router_cross_fib_db);
+  lcp_router_cross_fib_db = NULL;
+}
+
+/*
+ * Report a path whose nexthop device lives in a different FIB table than the
+ * route being installed.  The path is left in the route: the kernel route is
+ * the authority for the table it belongs to, and a path like this does forward
+ * when the source address the route's table selects is local in the nexthop's
+ * table.  Only the first report for a given path is emitted.
+ */
+static void
+lcp_router_route_cross_fib_report (const fib_route_path_t *rpath, const fib_prefix_t *pfx,
+				   const lcp_router_table_t *nlt, u32 kernel_table_id)
+{
+  lcp_router_cross_fib_key_t key;
+  u32 nexthop_fib_index;
+
+  if (~0 == rpath->frp_sw_if_index)
+    return;
+
+  nexthop_fib_index = fib_table_get_index_for_sw_if_index (nlt->nlt_proto, rpath->frp_sw_if_index);
+  if (nexthop_fib_index == nlt->nlt_fib_index)
+    return;
+
+  /*
+   * An interface that is not yet bound to any table has no FIB to compare
+   * against; its binding is a separate condition and reporting ~0 as the
+   * nexthop's FIB index would only mislead.
+   */
+  if (~0 == nexthop_fib_index)
+    {
+      LCP_ROUTER_DBG ("skip cross fib check for unbound sw_if_index %u", rpath->frp_sw_if_index);
+      return;
+    }
+
+  if (hash_elts (lcp_router_cross_fib_db) >= LCP_ROUTER_CROSS_FIB_MAX_KEYS)
+    lcp_router_cross_fib_db_free ();
+  if (NULL == lcp_router_cross_fib_db)
+    lcp_router_cross_fib_db = hash_create_mem (0, sizeof (key), sizeof (uword));
+
+  clib_memset (&key, 0, sizeof (key));
+  key.lcf_key_table_id = kernel_table_id;
+  key.lcf_sw_if_index = rpath->frp_sw_if_index;
+  key.lcf_fib_index = nlt->nlt_fib_index;
+  key.lcf_nexthop_fib_index = nexthop_fib_index;
+  key.lcf_addr = pfx->fp_addr;
+  key.lcf_prefix_len = pfx->fp_len;
+  key.lcf_proto = pfx->fp_proto;
+
+  if (hash_get_mem (lcp_router_cross_fib_db, &key))
+    return;
+
+  hash_set_mem_alloc (&lcp_router_cross_fib_db, &key, 1);
+  lcp_router_cross_fib_reports++;
+
+  LCP_ROUTER_ERROR ("route %d:%U nexthop sw_if_index %u is in fib %u, not in fib %u",
+		    kernel_table_id, format_fib_prefix, pfx, rpath->frp_sw_if_index,
+		    nexthop_fib_index, nlt->nlt_fib_index);
+}
+
+/*
+ * Multicast and MPLS paths reuse frp_sw_if_index with different FIB semantics,
+ * so the unicast table lookup above does not apply to them.
+ */
+static void
+lcp_router_route_paths_cross_fib_report (const fib_route_path_t *paths, const fib_prefix_t *pfx,
+					 u8 rtype, const lcp_router_table_t *nlt,
+					 u32 kernel_table_id)
+{
+  const fib_route_path_t *rpath;
+
+  if (RTN_MULTICAST == rtype || FIB_PROTOCOL_MPLS == pfx->fp_proto)
+    return;
+
+  vec_foreach (rpath, paths)
+    lcp_router_route_cross_fib_report (rpath, pfx, nlt, kernel_table_id);
+}
+
+static void
 lcp_router_route_add (struct rtnl_route *rr, int is_replace)
 {
   fib_entry_flag_t entry_flags;
@@ -1623,6 +1744,8 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
   if (0 != vec_len (np.paths))
     {
       nlt = lcp_router_table_add_or_lock (table_id, pfx.fp_proto);
+
+      lcp_router_route_paths_cross_fib_report (np.paths, &pfx, rtype, nlt, table_id);
 
       if (rtype == RTN_MULTICAST)
 	{

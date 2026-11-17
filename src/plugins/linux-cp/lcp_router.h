@@ -16,4 +16,7 @@ typedef struct
 __clib_export int lcp_router_table_state (u32 table_id, fib_protocol_t proto,
 					  lcp_router_table_state_t *state);
 
+/* Number of distinct cross FIB nexthop diagnostics emitted so far. */
+__clib_export u32 lcp_router_cross_fib_nexthop_count (void);
+
 #endif

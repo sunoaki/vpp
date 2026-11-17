@@ -253,6 +253,26 @@ lcp_router_test_entry (vlib_main_t *vm, unformat_input_t *input, fib_protocol_t 
 }
 
 static clib_error_t *
+lcp_router_test_cross_fib_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  u32 (*cross_fib_count) (void) =
+    vlib_get_plugin_symbol ("linux_nl_plugin.so", "lcp_router_cross_fib_nexthop_count");
+
+  if (!cross_fib_count)
+    return clib_error_return (0, "linux_nl router symbols unavailable");
+
+  vlib_cli_output (vm, "cross-fib:%u", cross_fib_count ());
+
+  return 0;
+}
+
+VLIB_CLI_COMMAND (test_lcp_router_cross_fib_command, static) = {
+  .path = "test lcp cross-fib",
+  .short_help = "test lcp cross-fib",
+  .function = lcp_router_test_cross_fib_cmd,
+};
+
+static clib_error_t *
 lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 {
   const nl_vft_t *vft = vlib_get_plugin_symbol ("linux_nl_plugin.so", "lcp_router_vft");
