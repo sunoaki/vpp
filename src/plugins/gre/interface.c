@@ -136,6 +136,22 @@ gre_tunnel_db_add (gre_tunnel_t *t, gre_tunnel_key_t *key)
 }
 
 /**
+ * gre_adj_rewrite_rejected
+ *
+ * A midchain adjacency of a tunnel carries the tunnel's outer header in its
+ * rewrite. `gre_build_midchain_rewrite` installs none when the rewrite does
+ * not belong to the tunnel, and such an adjacency is stacked on the drop.
+ * Stacking it on the tunnel path instead would forward packets with no outer
+ * header at all.
+ */
+static u8
+gre_adj_rewrite_rejected (const ip_adjacency_t *adj)
+{
+  return ((IP_LOOKUP_NEXT_MIDCHAIN == adj->lookup_next_index) &&
+	  (0 == adj->rewrite_header.data_bytes));
+}
+
+/**
  * gre_tunnel_stack
  *
  * 'stack' (resolve the recursion for) the tunnel's midchain adjacency
@@ -157,6 +173,12 @@ gre_tunnel_stack (adj_index_t ai)
 
   gt = pool_elt_at_index (gm->tunnels,
 			  gm->tunnel_index_by_sw_if_index[sw_if_index]);
+
+  if (gre_adj_rewrite_rejected (adj))
+    {
+      adj_midchain_delegate_unstack (ai);
+      return;
+    }
 
   if ((vnet_hw_interface_get_flags (vnet_get_main (), gt->hw_if_index) &
        VNET_HW_INTERFACE_FLAG_LINK_UP) == 0)
@@ -191,6 +213,12 @@ mgre_tunnel_stack (adj_index_t ai)
 
   gt = pool_elt_at_index (gm->tunnels,
 			  gm->tunnel_index_by_sw_if_index[sw_if_index]);
+
+  if (gre_adj_rewrite_rejected (adj))
+    {
+      adj_midchain_delegate_unstack (ai);
+      return;
+    }
 
   if ((vnet_hw_interface_get_flags (vnet_get_main (), gt->hw_if_index) &
        VNET_HW_INTERFACE_FLAG_LINK_UP) == 0)

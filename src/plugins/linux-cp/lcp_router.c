@@ -909,6 +909,19 @@ lcp_router_neigh_add (struct rtnl_neigh *rn)
 	  return;
 	}
 
+      /*
+       * A kernel neighbour is a link layer address of the interface's link.
+       * An interface without an ethernet header, such as an L3 tunnel, has no
+       * such link, and the neighbour's rewrite would replace the tunnel's own
+       * outer header.
+       */
+      if (!ip_neighbor_sw_if_index_has_ethernet_rewrite (sw_if_index))
+	{
+	  LCP_ROUTER_DBG ("ignore non-ethernet neighbor add: %U %U", format_ip_address, &nh,
+			  format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index);
+	  return;
+	}
+
       ll = rtnl_neigh_get_lladdr (rn);
       state = rtnl_neigh_get_state (rn);
 

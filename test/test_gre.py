@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import re
 import unittest
 
 import scapy.compat
@@ -13,6 +14,7 @@ from framework import VppTestCase
 from asfframework import VppTestRunner, tag_fixme_vpp_workers
 from vpp_sub_interface import L2_VTR_OP, VppDot1QSubint
 from vpp_gre_interface import VppGreInterface
+from vpp_neighbor import VppNeighbor
 from vpp_ipsec import VppIpsecSA
 from vpp_teib import VppTeib
 from vpp_ip import DpoProto
@@ -1019,6 +1021,101 @@ class TestGRE(VppTestCase):
         self.send_gre_header_copy(tunnel, IP, self.pg0.remote_ip4)
         route.remove_vpp_config()
         teib.remove_vpp_config()
+        tunnel.remove_vpp_config()
+
+    def midchain_rewrite(self, tunnel):
+        """Rewrite of the tunnel's own adjacency, from 'show adj nbr'.
+
+        A midchain adjacency prints its rewrite and then a 'stacked-on'
+        section for the DPO underneath it, which carries a rewrite of its own.
+        Only the part before that section belongs to the tunnel.
+
+        A tunnel has one adjacency per outer protocol, so the one whose next
+        hop is 0.0.0.0, the automatic adjacency of a point to point link, is
+        selected explicitly rather than assuming there is only one.
+
+        format_hex_bytes switches to a form with an 'offset: ' prefix on every
+        32 byte block once the rewrite is longer than that, which the outer
+        header of an IPv6 tunnel is, so the prefixes are stripped.
+        """
+        out = self.vapi.cli(f"show adj nbr {tunnel.name}")
+        own = out.split("stacked-on")[0]
+        rewrites = [
+            hexstr
+            for via, hexstr in re.findall(
+                r"via (\S+) .*?flags:\[[^\]]*\]\s+([0-9a-f: \n]+)", own, re.S
+            )
+            if via == "0.0.0.0"
+        ]
+        self.assertEqual(
+            1,
+            len(rewrites),
+            f"one automatic adjacency expected on {tunnel.name}:\n{out}",
+        )
+        return bytes.fromhex(re.sub(r"[0-9a-f]{8}:|\s", "", rewrites[0]))
+
+    def test_l3_midchain_rewrite_is_the_outer_header(self):
+        """A neighbour must not replace the outer header of a GRE tunnel"""
+        for key in (0, 0x0FFF0304):
+            with self.subTest(key=key):
+                tunnel = VppGreInterface(
+                    self, self.pg0.local_ip4, self.pg0.remote_ip4, gre_key=key
+                )
+                tunnel.add_vpp_config()
+                tunnel.admin_up()
+                tunnel.config_ip4()
+                route = VppIpRoute(
+                    self, "4.4.4.4", 32, [VppRoutePath("0.0.0.0", tunnel.sw_if_index)]
+                )
+                route.add_vpp_config()
+
+                rewrite = self.midchain_rewrite(tunnel)
+                self.assertEqual(len(rewrite), 28 if key else 24, rewrite.hex())
+                self.assertEqual(rewrite[0], 0x45)
+                self.assertEqual(rewrite[8], 254)
+                self.assertEqual(rewrite[9], 47)
+                if key:
+                    self.assertEqual(rewrite[20:22], b"\x20\x00")
+                    self.assertEqual(rewrite[22:24], b"\x08\x00")
+                    self.assertEqual(rewrite[24:28], key.to_bytes(4, "big"))
+                else:
+                    self.assertEqual(rewrite[20:24], b"\x00\x00\x08\x00")
+
+                # the kernel reports a neighbour for the zero next hop of a
+                # point-to-point link, and linux-cp used to import it
+                nbr = VppNeighbor(
+                    self,
+                    tunnel.sw_if_index,
+                    "00:00:00:00:33:00",
+                    "0.0.0.0",
+                    is_static=True,
+                )
+                nbr.add_vpp_config()
+                self.assertTrue(nbr.query_vpp_config())
+                self.assertEqual(self.midchain_rewrite(tunnel), rewrite)
+                nbr.remove_vpp_config()
+
+                route.remove_vpp_config()
+                tunnel.remove_vpp_config()
+
+        # the same with an IPv6 outer header
+        tunnel = VppGreInterface(self, self.pg2.local_ip6, self.pg2.remote_ip6)
+        tunnel.add_vpp_config()
+        tunnel.admin_up()
+        tunnel.config_ip4()
+        route = VppIpRoute(
+            self, "4.4.4.5", 32, [VppRoutePath("0.0.0.0", tunnel.sw_if_index)]
+        )
+        route.add_vpp_config()
+
+        rewrite = self.midchain_rewrite(tunnel)
+        self.assertEqual(len(rewrite), 44, rewrite.hex())
+        self.assertEqual(rewrite[0], 0x60)
+        self.assertEqual(rewrite[6], 47)
+        self.assertEqual(rewrite[7], 255)
+        self.assertEqual(rewrite[40:44], b"\x00\x00\x08\x00")
+
+        route.remove_vpp_config()
         tunnel.remove_vpp_config()
 
     def test_non_erspan_session_id_is_rejected(self):

@@ -15,6 +15,7 @@
 #include <vnet/ip/ip46_address.h>
 #include <vnet/fib/fib_table.h>
 #include <vnet/adj/adj_mcast.h>
+#include <vnet/ethernet/ethernet.h>
 
 ip_neighbor_counters_t ip_neighbor_counters[] =
 {
@@ -410,9 +411,42 @@ ip_neighbor_adj_fib_remove (ip_neighbor_t * ipn, u32 fib_index)
     }
 }
 
+/*
+ * A neighbour's rewrite is the ethernet header of the interface it is
+ * reachable through, so a neighbour only has meaning on an interface that
+ * ethernet_build_rewrite can build a rewrite for. An L3 tunnel is a hardware
+ * interface whose class builds an IP rewrite of its own and whose hw_instance
+ * is not an index into the ethernet interface pool, so ethernet_build_rewrite
+ * would return the header of an unrelated interface, of the wrong length for
+ * the tunnel. Such an interface also has no ARP or ND, so nothing is gained by
+ * installing the neighbour's rewrite on it.
+ */
+u8
+ip_neighbor_sw_if_index_has_ethernet_rewrite (u32 sw_if_index)
+{
+  vnet_main_t *vnm = vnet_get_main ();
+  vnet_hw_interface_t *hw;
+
+  if (!vnet_sw_interface_is_valid (vnm, sw_if_index))
+    return 0;
+
+  hw = vnet_get_sup_hw_interface (vnm, sw_if_index);
+
+  return (NULL != ethernet_get_interface (&ethernet_main, hw->hw_if_index));
+}
+
 static void
 ip_neighbor_mk_complete (adj_index_t ai, ip_neighbor_t * ipn)
 {
+  if (PREDICT_FALSE (
+	!ip_neighbor_sw_if_index_has_ethernet_rewrite (ipn->ipn_key->ipnk_sw_if_index)))
+    {
+      IP_NEIGHBOR_DBG ("not an ethernet interface, leaving the rewrite of "
+		       "adj %d alone",
+		       ai);
+      return;
+    }
+
   adj_nbr_update_rewrite (ai, ADJ_NBR_REWRITE_FLAG_COMPLETE,
 			  ethernet_build_rewrite (vnet_get_main (),
 						  ipn->
@@ -425,6 +459,15 @@ static void
 ip_neighbor_mk_incomplete (adj_index_t ai)
 {
   ip_adjacency_t *adj = adj_get (ai);
+
+  if (PREDICT_FALSE (
+	!ip_neighbor_sw_if_index_has_ethernet_rewrite (adj->rewrite_header.sw_if_index)))
+    {
+      IP_NEIGHBOR_DBG ("not an ethernet interface, leaving the rewrite of "
+		       "adj %d alone",
+		       ai);
+      return;
+    }
 
   adj_nbr_update_rewrite (ai,
 			  ADJ_NBR_REWRITE_FLAG_INCOMPLETE,
@@ -729,6 +772,15 @@ ip_neighbor_update (vnet_main_t * vnm, adj_index_t ai)
   switch (adj->lookup_next_index)
     {
     case IP_LOOKUP_NEXT_ARP:
+      if (PREDICT_FALSE (
+	    !ip_neighbor_sw_if_index_has_ethernet_rewrite (adj->rewrite_header.sw_if_index)))
+	{
+	  IP_NEIGHBOR_DBG ("not an ethernet interface, leaving the rewrite of "
+			   "adj %d alone",
+			   ai);
+	  break;
+	}
+
       if (NULL != ipn)
 	{
 	  adj_nbr_walk_nh (adj->rewrite_header.sw_if_index,

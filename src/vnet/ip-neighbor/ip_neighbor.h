@@ -22,6 +22,12 @@ __clib_export extern int ip_neighbor_add (const ip_address_t *ip, const mac_addr
 					  u32 *stats_index);
 __clib_export extern int ip_neighbor_del (const ip_address_t *ip, u32 sw_if_index);
 
+/**
+ * @brief Whether a neighbour on this interface is carried by an ethernet
+ * header, i.e. whether ethernet_build_rewrite can build its rewrite.
+ */
+__clib_export extern u8 ip_neighbor_sw_if_index_has_ethernet_rewrite (u32 sw_if_index);
+
 extern int ip_neighbor_config (ip_address_family_t af,
 			       u32 limit, u32 age, bool recycle);
 extern int ip_neighbor_get_config (ip_address_family_t af, u32 *limit,
