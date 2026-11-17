@@ -820,16 +820,23 @@ class TestLinuxCPCrossFibNexthop(TestLinuxCPNetNSBase):
         self.assertIn("cross-fib:", output)
         return int(output.strip().split("cross-fib:")[-1])
 
+    def _vif_index(self):
+        return next(
+            entry
+            for entry in self.vapi.vpp.details_iter(self.vapi.lcp_itf_pair_get)
+            if entry.phy_sw_if_index == self.phy.sw_if_index
+        ).vif_index
+
     def test_cross_fib_nexthop_reported_and_installed(self):
         """The mismatch is reported once and the route stays in the target table."""
-        command = (
-            f"test lcp route phy {self.phy.sw_if_index} "
-            f"table {self.route_table} ip4"
-        )
-        prefix = "0.0.0.0/0"
+        # A concrete prefix, not 0.0.0.0/0: every table carries that one as a
+        # default drop entry, so it would be present either way.
+        prefix = "198.18.90.0/24"
+        base = f"ip4 table {self.route_table}"
+        route = f"{prefix} proto 4 vif {self._vif_index()} via 192.0.2.1"
         before = self._cross_fib_count()
         try:
-            self.vapi.cli(f"{command} add valid")
+            self.vapi.cli(f"test lcp router {base} add {route}")
             self.assertEqual(
                 self._cross_fib_count(),
                 before + 1,
@@ -842,27 +849,36 @@ class TestLinuxCPCrossFibNexthop(TestLinuxCPNetNSBase):
                 logging,
             )
             # Repeated netlink replays of the same route are deduplicated.
-            self.vapi.cli(f"{command} add valid")
-            self.vapi.cli(f"{command} replace valid")
+            self.vapi.cli(f"test lcp router {base} add {route}")
+            self.vapi.cli(f"test lcp router {base} replace {route}")
             self.assertEqual(self._cross_fib_count(), before + 1)
-            # The path is still installed in the route's table.
+            # The path is still installed in the route's table, reachable
+            # through the nexthop device that lives in the other table.
             self.assertTrue(
-                find_route(self, "0.0.0.0", 0, table_id=self.route_table),
+                find_route(
+                    self,
+                    "198.18.90.0",
+                    24,
+                    table_id=self.route_table,
+                    sw_if_index=self.phy.sw_if_index,
+                ),
                 "cross FIB nexthop route was not installed",
             )
         finally:
-            self.vapi.cli(f"{command} del valid")
+            self.vapi.cli(f"test lcp router {base} del {route}")
 
     def test_mpls_paths_are_not_checked(self):
-        """MPLS paths use their own FIB index mapping and are left out of the check."""
-        pair = next(
-            entry
-            for entry in self.vapi.vpp.details_iter(self.vapi.lcp_itf_pair_get)
-            if entry.phy_sw_if_index == self.phy.sw_if_index
-        )
+        """MPLS paths use their own FIB index mapping and are left out of the check.
+
+        The IPv4 route in the same table, over the same device, does qualify for
+        the check, so the unchanged counter is due to the MPLS skip and not to a
+        path that would have been ignored anyway.
+        """
+        vif = self._vif_index()
         label = 18802
         base = f"mpls table {self.route_table}"
-        route = f"{label} proto 4 vif {pair.vif_index} via 192.0.2.1"
+        route = f"{label} proto 4 vif {vif} via 192.0.2.1"
+        ip4 = f"198.18.91.0/24 proto 4 vif {vif} via 192.0.2.1"
         before = self._cross_fib_count()
         try:
             self.vapi.cli(f"test lcp router {base} add {route}")
@@ -876,6 +892,13 @@ class TestLinuxCPCrossFibNexthop(TestLinuxCPNetNSBase):
                 for entry in self.vapi.mpls_route_dump(self.route_table)
             ]
             self.assertIn(label, labels, "MPLS route was not installed")
+            self.vapi.cli(f"test lcp router ip4 table {self.route_table} add {ip4}")
+            self.assertEqual(
+                self._cross_fib_count(),
+                before + 1,
+                "IPv4 path over the same device did not qualify for the check",
+            )
+            self.vapi.cli(f"test lcp router ip4 table {self.route_table} del {ip4}")
         finally:
             self.vapi.cli(f"test lcp router {base} del {route}")
 
