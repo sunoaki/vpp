@@ -155,6 +155,13 @@ A completed attempt can still have queued notifications to process.
 These diagnostics do not add periodic reconciliation or guarantee
 recovery from changes for which no error was detected.
 
+Route mirroring reports, once per path, a nexthop device that is bound
+to a different IPv4 or IPv6 FIB table than the mirrored route. Whether
+such a path forwards depends on the source address selected in the
+route's table being local in the nexthop's table, which mirroring does
+not evaluate, so the route is installed unchanged. Multicast and MPLS
+paths are not checked this way.
+
 Forwarding
 __________
 

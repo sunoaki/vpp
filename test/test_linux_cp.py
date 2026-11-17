@@ -780,6 +780,130 @@ class TestLinuxCPMalformedRoutes(TestLinuxCPNetNSBase):
 
 
 @unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
+@unittest.skipIf(
+    "linux-cp" in config.excluded_plugins or "linux-nl" in config.excluded_plugins,
+    "Exclude linux-cp route tests",
+)
+class TestLinuxCPCrossFibNexthop(TestLinuxCPNetNSBase):
+    """A route whose nexthop lives in another FIB table is reported, not dropped."""
+
+    extra_vpp_plugin_config = TestLinuxCPNetNSBase.extra_vpp_plugin_config + [
+        "plugin",
+        "linux_cp_unittest_plugin.so",
+        "{",
+        "enable",
+        "}",
+    ]
+
+    dev_table = 65200
+    route_table = 65201
+
+    def setUp(self):
+        super().setUp()
+        self.create_pg_interfaces(range(2))
+        self.phy, self.host = self.pg_interfaces
+        self.phy.admin_up()
+        self.host.admin_up()
+        self.pair = VppLcpPair(self, self.phy, self.host).add_vpp_config()
+        for table_id in (self.dev_table, self.route_table):
+            VppIpTable(self, table_id, create_mfib=False).add_vpp_config()
+        # The nexthop device lives in a table of its own; the route below is
+        # installed into another one.
+        self.vapi.cli(f"set interface ip table {self.phy.name} {self.dev_table}")
+
+    def tearDown(self):
+        self.vapi.cli(f"set interface ip table {self.phy.name} 0")
+        super().tearDown()
+
+    def _cross_fib_count(self):
+        output = self.vapi.cli("test lcp cross-fib")
+        self.assertIn("cross-fib:", output)
+        return int(output.strip().split("cross-fib:")[-1])
+
+    def _vif_index(self):
+        return next(
+            entry
+            for entry in self.vapi.vpp.details_iter(self.vapi.lcp_itf_pair_get)
+            if entry.phy_sw_if_index == self.phy.sw_if_index
+        ).vif_index
+
+    def test_cross_fib_nexthop_reported_and_installed(self):
+        """The mismatch is reported once and the route stays in the target table."""
+        # A concrete prefix, not 0.0.0.0/0: every table carries that one as a
+        # default drop entry, so it would be present either way.
+        prefix = "198.18.90.0/24"
+        base = f"ip4 table {self.route_table}"
+        route = f"{prefix} proto 4 vif {self._vif_index()} via 192.0.2.1"
+        before = self._cross_fib_count()
+        try:
+            self.vapi.cli(f"test lcp router {base} add {route}")
+            self.assertEqual(
+                self._cross_fib_count(),
+                before + 1,
+                "cross FIB nexthop diagnostic did not fire exactly once",
+            )
+            logging = self.vapi.cli("show logging")
+            self.assertIn(
+                f"route {self.route_table}:{prefix} nexthop sw_if_index "
+                f"{self.phy.sw_if_index} is in fib",
+                logging,
+            )
+            # Repeated netlink replays of the same route are deduplicated.
+            self.vapi.cli(f"test lcp router {base} add {route}")
+            self.vapi.cli(f"test lcp router {base} replace {route}")
+            self.assertEqual(self._cross_fib_count(), before + 1)
+            # The path is still installed in the route's table, reachable
+            # through the nexthop device that lives in the other table.
+            self.assertTrue(
+                find_route(
+                    self,
+                    "198.18.90.0",
+                    24,
+                    table_id=self.route_table,
+                    sw_if_index=self.phy.sw_if_index,
+                ),
+                "cross FIB nexthop route was not installed",
+            )
+        finally:
+            self.vapi.cli(f"test lcp router {base} del {route}")
+
+    def test_mpls_paths_are_not_checked(self):
+        """MPLS paths use their own FIB index mapping and are left out of the check.
+
+        The IPv4 route in the same table, over the same device, does qualify for
+        the check, so the unchanged counter is due to the MPLS skip and not to a
+        path that would have been ignored anyway.
+        """
+        vif = self._vif_index()
+        label = 18802
+        base = f"mpls table {self.route_table}"
+        route = f"{label} proto 4 vif {vif} via 192.0.2.1"
+        ip4 = f"198.18.91.0/24 proto 4 vif {vif} via 192.0.2.1"
+        before = self._cross_fib_count()
+        try:
+            self.vapi.cli(f"test lcp router {base} add {route}")
+            self.assertEqual(
+                self._cross_fib_count(),
+                before,
+                "MPLS path was checked against the unicast FIB table",
+            )
+            labels = [
+                entry.mr_route.mr_label
+                for entry in self.vapi.mpls_route_dump(self.route_table)
+            ]
+            self.assertIn(label, labels, "MPLS route was not installed")
+            self.vapi.cli(f"test lcp router ip4 table {self.route_table} add {ip4}")
+            self.assertEqual(
+                self._cross_fib_count(),
+                before + 1,
+                "IPv4 path over the same device did not qualify for the check",
+            )
+            self.vapi.cli(f"test lcp router ip4 table {self.route_table} del {ip4}")
+        finally:
+            self.vapi.cli(f"test lcp router {base} del {route}")
+
+
+@unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
 class TestLinuxCPRoutes(TestLinuxCPNetNSBase):
     """Linux CP Routes"""
 
