@@ -30,6 +30,7 @@
 
 #include <vnet/ip-neighbor/ip4_neighbor.h>
 #include <vnet/ip-neighbor/ip_neighbor.api_enum.h>
+#include <vnet/ip-neighbor/ip_neighbor.h>
 #include <vnet/ethernet/ethernet.h>
 #include <vnet/util/throttle.h>
 #include <vnet/fib/fib_sas.h>
@@ -75,6 +76,13 @@ ip4_neighbor_advertise (vlib_main_t *vm, vnet_main_t *vnm, u32 sw_if_index,
   /* The advertisement carries this interface's MAC address. */
   if (PREDICT_FALSE (NULL == hi->hw_address))
     return 0;
+
+  /* An advertisement is an ethernet packet, built from the interface's
+   * ethernet header. A GRE tunnel or a kernel tap has no ARP to answer and
+   * building the header from another interface's pool slot would send a
+   * packet with the wrong source MAC, or read past the end of the pool. */
+  if (PREDICT_FALSE (!ip_neighbor_sw_if_index_has_ethernet_rewrite (sw_if_index)))
+    return;
 
   if (NULL == addr)
     {

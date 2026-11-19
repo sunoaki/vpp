@@ -63,6 +63,18 @@ ethernet_build_rewrite (vnet_main_t * vnm,
   u8 *rewrite = NULL;
   u8 is_p2p = 0;
 
+  /*
+   * Only an ethernet hardware interface has its MAC address in the ethernet
+   * interface pool. A tunnel or a kernel tap allocates hw_instance from a
+   * counter of its own, so indexing the ethernet pool with it would read the
+   * address of an unrelated interface, or past the end of the pool. Callers
+   * that have such an interface get to the hardware class's own
+   * build_rewrite through vnet_build_rewrite_for_sw_interface.
+   */
+  ei = ethernet_get_interface (em, hw->hw_if_index);
+  if (PREDICT_FALSE (NULL == ei))
+    return NULL;
+
   if ((sub_sw->type == VNET_SW_INTERFACE_TYPE_P2P) ||
       (sub_sw->type == VNET_SW_INTERFACE_TYPE_PIPE))
     is_p2p = 1;
@@ -111,7 +123,6 @@ ethernet_build_rewrite (vnet_main_t * vnm,
 
   vec_validate (rewrite, n_bytes - 1);
   h = (ethernet_header_t *) rewrite;
-  ei = pool_elt_at_index (em->interfaces, hw->hw_instance);
   clib_memcpy (h->src_address, &ei->address, sizeof (h->src_address));
   if (is_p2p)
     {
