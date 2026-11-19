@@ -553,7 +553,7 @@ vlib_error_counts_get (vlib_main_t *vm, vlib_error_counts_t *c)
    * exchange it, rather than replacing it under the reader. */
   vlib_error_desc_lock_get ();
 
-  vec_foreach (n, main_vm->node_main.nodes)
+  vec_foreach_pointer (n, main_vm->node_main.nodes)
     {
       if (n->n_errors == 0)
 	continue;
