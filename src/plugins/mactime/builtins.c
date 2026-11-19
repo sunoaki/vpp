@@ -31,6 +31,16 @@ handle_get_mactime (hss_url_handler_args_t *args)
   u8 *s = 0;
   int need_comma = 0;
 
+  /* Nothing to report before the timebase and counters exist */
+  if (mm->feature_initialized == 0)
+    {
+      args->data = format (0, "{%smactime%s: []}\n", q, q);
+      args->data_len = vec_len (args->data);
+      args->ct = HTTP_CONTENT_APP_JSON;
+      args->free_vec_data = 1;
+      return HSS_URL_HANDLER_OK;
+    }
+
   /* Walk all ip4 neighbours on all interfaces */
   vec_reset_length (mm->arp_cache_copy);
   ip_neighbor_walk (AF_IP4, ~0, mactime_ip_neighbor_copy, mm);
@@ -129,6 +139,13 @@ handle_get_mactime (hss_url_handler_args_t *args)
       for (j = 0; j < vec_len (mm->arp_cache_copy); j++)
 	{
 	  n = ip_neighbor_get (mm->arp_cache_copy[j]);
+
+	  /* Neighbour deleted since the walk above, e.g. by another thread;
+	     arp_cache_copy is a snapshot of the shared neighbour pool, not the
+	     HTTP server's thread-owned copy. */
+	  if (n == 0)
+	    continue;
+
 	  if (!memcmp (dp->mac_address,
 		       ip_neighbor_get_mac (n), sizeof (mac_address_t)))
 	    {
