@@ -844,6 +844,73 @@ lcp_router_address_mark (index_t index, void *ctx)
 }
 
 static void
+lcp_router_address_sweep (u32 sw_if_index, u8 is_ip4)
+{
+  ip_lookup_main_t *lm = is_ip4 ? &ip4_main.lookup_main : &ip6_main.lookup_main;
+  ip4_address_t *ip4_addrs = 0;
+  ip6_address_t *ip6_addrs = 0;
+  u32 *masks = 0;
+  ip_interface_address_t *ia = 0;
+  int i;
+
+  foreach_ip_interface_address (lm, ia, sw_if_index, 1 /* honor unnumbered */, ({
+				  if (ia->flags & IP_INTERFACE_ADDRESS_FLAG_STALE)
+				    {
+				      void *addr = ip_interface_address_get_address (lm, ia);
+
+				      ia->flags &= ~IP_INTERFACE_ADDRESS_FLAG_STALE;
+				      if (is_ip4)
+					vec_add1 (ip4_addrs, (*(ip4_address_t *) addr));
+				      else
+					vec_add1 (ip6_addrs, (*(ip6_address_t *) addr));
+				      vec_add1 (masks, ia->address_length);
+				    }
+				}));
+
+  for (i = 0; i < vec_len (masks); i++)
+    {
+      if (is_ip4)
+	ip4_add_del_interface_address (vlib_get_main (), sw_if_index, &ip4_addrs[i], masks[i],
+				       1 /* is_del */);
+      else
+	ip6_add_del_interface_address (vlib_get_main (), sw_if_index, &ip6_addrs[i], masks[i],
+				       1 /* is_del */);
+    }
+
+  vec_free (ip4_addrs);
+  vec_free (ip6_addrs);
+  vec_free (masks);
+}
+
+/*
+ * Remove the addresses the preceding mark pass left stale. Only the sw
+ * interfaces linux-cp marked are swept: ip_interface_address_sweep() visits
+ * every sw interface, and the stale flag is shared with the
+ * sw_interface_address_replace API, so a sweep on all interfaces would delete
+ * addresses a replace pass marked but then abandoned.
+ */
+static walk_rc_t
+lcp_router_address_sweep_pair (index_t index, void *ctx)
+{
+  lcp_itf_pair_t *lip = lcp_itf_pair_get (index);
+  vnet_main_t *vnm = vnet_get_main ();
+  vnet_sw_interface_t *sw;
+  ip_address_family_t af;
+
+  if (!lip)
+    return WALK_CONTINUE;
+
+  sw = vnet_get_sw_interface_or_null (vnm, lip->lip_phy_sw_if_index);
+  if (NULL == sw)
+    return WALK_CONTINUE;
+
+  FOR_EACH_IP_ADDRESS_FAMILY (af)
+  lcp_router_address_sweep (sw->sw_if_index, AF_IP4 == af);
+
+  return WALK_CONTINUE;
+}
+
+static void
 lcp_router_link_addr_sync_begin (void)
 {
   lcp_itf_pair_walk (lcp_router_address_mark, 0);
@@ -854,7 +921,7 @@ lcp_router_link_addr_sync_begin (void)
 static void
 lcp_router_link_addr_sync_end (void)
 {
-  ip_interface_address_sweep ();
+  lcp_itf_pair_walk (lcp_router_address_sweep_pair, 0);
 
   LCP_ROUTER_INFO ("End synchronization of interface addresses");
 }
