@@ -217,6 +217,9 @@ class ARPTestCase(VppTestCase):
 
         self.assertTrue(find_nbr(self, self.pg1.sw_if_index, nbr_addr))
         self.assertEqual(self.get_adj_sourced_routes(table), [nbr_addr])
+        self.assertEqual(
+            self.get_adj_sourced_routes(VppIpTable(self, 0, register=False)), []
+        )
 
         #
         # the interface leaves the table before the neighbour goes away. The
