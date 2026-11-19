@@ -2041,6 +2041,280 @@ class TestLinuxCPLinuxToVPP(TestLinuxCPNetNSBase):
 
 
 @unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
+@unittest.skipIf(
+    "linux-cp" in config.excluded_plugins or "linux-nl" in config.excluded_plugins,
+    "Exclude linux-cp route tests",
+)
+class TestLinuxCPOnlinkRoute(TestLinuxCPNetNSBase):
+    """A route whose gateway the kernel marks onlink is installed into the FIB."""
+
+    # The gateway belongs to no prefix connected on hloop0: hloop0 holds
+    # 10.10.1.2/24, and this route names 10.10.9.1 beyond its edge.
+    prefix = "199.18.0.0/26"
+    gateway = "10.10.9.1"
+    loop0_address = "10.10.1.2/24"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.create_loopback_interfaces(1)
+        cls.loop0 = cls.lo_interfaces[0]
+        cls.vapi.cli(f"lcp create loop0 host-if hloop0 netns {cls.ns_name}")
+        cls.vapi.sw_interface_add_del_address(
+            sw_if_index=cls.loop0.sw_if_index, prefix=cls.loop0_address
+        )
+        cls.loop0.admin_up()
+
+    def _namespace_route(self, *extra):
+        """Run ip route against the namespace, returning the completed process."""
+        return subprocess.run(
+            ["ip", "netns", "exec", self.ns_name, "ip", "route", *extra],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def _exact_entry_flags(self, prefix):
+        """Return the source flags of the exact FIB entry, or None.
+
+        The CLI lookup is longest-prefix, so the flags of a covering entry
+        would be reported for a prefix that has no entry of its own. The
+        header line names the entry actually found, and only a header equal to
+        the requested prefix is accepted.
+        """
+        output = self.vapi.cli(f"show ip fib table 0 {prefix} detail")
+        found = False
+        for line in output.splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            if not line[0].isspace():
+                found = fields[0] == prefix
+                continue
+            if not found:
+                continue
+            for field in fields:
+                if field.startswith("entry-flags:"):
+                    return field.split(":", 1)[1]
+        return None
+
+    def _gateway_attached(self, gateway=None):
+        gateway = self.gateway if gateway is None else gateway
+        return "attached," in (self._exact_entry_flags(f"{gateway}/32") or "")
+
+    def _route_paths(self):
+        """Return the paths of the exact prefix, as the API reports them."""
+        for entry in self.vapi.ip_route_dump(0, False):
+            if str(entry.route.prefix) == self.prefix:
+                return entry.route.paths
+        return None
+
+    def test_onlink_gateway_route(self):
+        """An onlink route's gateway gets the attached prefix it needs to resolve"""
+        # The kernel refuses this gateway without the flag, which establishes
+        # that it is outside every prefix connected on hloop0.
+        outside = self._namespace_route(
+            "add", self.prefix, "via", self.gateway, "dev", "hloop0"
+        )
+        self.assertNotEqual(
+            outside.returncode,
+            0,
+            f"the kernel accepted {self.gateway} without onlink: the test needs "
+            "a gateway outside every connected prefix",
+        )
+        self.assertIsNone(
+            self._exact_entry_flags(f"{self.gateway}/32"),
+            "the gateway already has a FIB entry: the test cannot tell the fix "
+            "from the state before it",
+        )
+
+        onlink = self._namespace_route(
+            "add", self.prefix, "via", self.gateway, "dev", "hloop0", "onlink"
+        )
+        self.assertEqual(onlink.returncode, 0, onlink.stderr)
+        try:
+            # The route reaches the FIB with the gateway as its nexthop.
+            self.poll_for(
+                f"{self.prefix} in VPP",
+                lambda: self._route_paths() is not None,
+                True,
+            )
+            paths = self._route_paths()
+            self.assertEqual(len(paths), 1)
+            self.assertEqual(paths[0].sw_if_index, self.loop0.sw_if_index)
+            self.assertEqual(str(paths[0].nh.address.ip4), self.gateway)
+
+            # The gateway's host prefix is installed as an attached entry.
+            # This is the shape arp_reply() requires before it accepts a reply
+            # from an address no connected prefix covers; without it the
+            # gateway is never learned and the route carries no usable
+            # neighbour. Nothing else in VPP installs this entry: the kernel
+            # route is not a host route, so it would not exist before the fix.
+            self.poll_for(
+                f"{self.gateway}/32 attached in VPP",
+                self._gateway_attached,
+                True,
+            )
+        finally:
+            self._namespace_route("del", self.prefix)
+            self.poll_for(
+                f"{self.prefix} removed from VPP",
+                lambda: self._route_paths() is None,
+                True,
+            )
+            # The attached host prefix goes with the last route naming it, so
+            # a deleted route leaves nothing behind.
+            self.poll_for(
+                f"{self.gateway}/32 gone from VPP",
+                lambda: self._exact_entry_flags(f"{self.gateway}/32"),
+                None,
+            )
+
+    def test_offnet_gateway_without_onlink(self):
+        """A route without the flag installs no attached host entry of its own"""
+        gateway = "10.10.1.1"
+        prefix = "199.19.0.0/26"
+
+        added = self._namespace_route("add", prefix, "via", gateway, "dev", "hloop0")
+        self.assertEqual(added.returncode, 0, added.stderr)
+        try:
+            self.poll_for(
+                f"{prefix} in VPP",
+                lambda: any(
+                    str(entry.route.prefix) == prefix
+                    for entry in self.vapi.ip_route_dump(0, False)
+                ),
+                True,
+            )
+            # The gateway sits inside 10.10.1.2/24, so the kernel route needs
+            # no attached prefix of ours, and none is installed: the plugin's
+            # onlink source owns no entry with the gateway's exact prefix. The
+            # CLI lookup is longest-prefix, so the detail of the gateway's
+            # prefix reaches the connected entry that covers it; asking for
+            # the exact entry is what tells the two apart.
+            self.assertIsNone(
+                self._exact_entry_flags(f"{gateway}/32"),
+                "a route without RTNH_F_ONLINK must not install an attached "
+                "host prefix",
+            )
+        finally:
+            self._namespace_route("del", prefix)
+
+    def test_onlink_partial_delete_keeps_surviving_gateway(self):
+        """Deleting one nexthop of an onlink route leaves the other resolvable"""
+        second = "10.10.9.2"
+
+        added = self._namespace_route(
+            "add",
+            self.prefix,
+            "via",
+            self.gateway,
+            "dev",
+            "hloop0",
+            "onlink",
+            "metric",
+            "10",
+        )
+        self.assertEqual(added.returncode, 0, added.stderr)
+        added = self._namespace_route(
+            "add", self.prefix, "via", second, "dev", "hloop0", "onlink", "metric", "20"
+        )
+        self.assertEqual(added.returncode, 0, added.stderr)
+        try:
+            # Two nexthops, and an attached host prefix for each gateway.
+            self.poll_for(
+                f"{self.prefix} with two paths in VPP",
+                lambda: len(self._route_paths() or []) == 2,
+                True,
+            )
+            for gateway in (self.gateway, second):
+                self.poll_for(
+                    f"{gateway}/32 attached in VPP",
+                    lambda gateway=gateway: "attached,"
+                    in (self._exact_entry_flags(f"{gateway}/32") or ""),
+                    True,
+                )
+
+            # The kernel deletes one nexthop. The route stays, so the gateway
+            # of the path that goes must give its attached host prefix up and
+            # the one of the path that stays must keep its own.
+            removed = self._namespace_route("del", self.prefix, "via", self.gateway)
+            self.assertEqual(removed.returncode, 0, removed.stderr)
+            self.poll_for(
+                "the surviving path is the only one in VPP",
+                lambda: [str(path.nh.address.ip4) for path in self._route_paths() or []]
+                == [second],
+                True,
+            )
+            self.poll_for(
+                f"{self.gateway}/32 gone from VPP",
+                lambda: self._exact_entry_flags(f"{self.gateway}/32"),
+                None,
+            )
+            self.assertEqual(
+                self._gateway_attached(second),
+                True,
+                "the surviving path's gateway lost the attached host prefix "
+                "that makes it resolvable",
+            )
+        finally:
+            self._namespace_route("del", self.prefix)
+
+    def test_blackhole_delete_keeps_unicast_gateway(self):
+        """Deleting a blackhole route leaves the unicast route of the prefix alone"""
+        # The kernel keys routes by prefix, so the two coexist and the delete
+        # of the blackhole route carries no nexthop at all. The unicast route
+        # and its gateway must be untouched by it.
+        added = self._namespace_route(
+            "add",
+            self.prefix,
+            "via",
+            self.gateway,
+            "dev",
+            "hloop0",
+            "onlink",
+            "metric",
+            "10",
+        )
+        self.assertEqual(added.returncode, 0, added.stderr)
+        added = self._namespace_route("add", "blackhole", self.prefix, "metric", "20")
+        self.assertEqual(added.returncode, 0, added.stderr)
+        try:
+            self.poll_for(
+                f"{self.prefix} in VPP",
+                lambda: self._route_paths() is not None,
+                True,
+            )
+            self.poll_for(
+                f"{self.gateway}/32 attached in VPP",
+                self._gateway_attached,
+                True,
+            )
+
+            removed = self._namespace_route(
+                "del", "blackhole", self.prefix, "metric", "20"
+            )
+            self.assertEqual(removed.returncode, 0, removed.stderr)
+            # The kernel keeps the unicast route, and so must the plugin keep
+            # its gateway's attached prefix.
+            self.poll_for(
+                "the unicast route is still the only path in VPP",
+                lambda: [str(path.nh.address.ip4) for path in self._route_paths() or []]
+                == [self.gateway],
+                True,
+            )
+            self.assertEqual(
+                self._gateway_attached(),
+                True,
+                "deleting the blackhole route tore down the attached host "
+                "prefix of the unicast route that survived it",
+            )
+        finally:
+            self._namespace_route("del", "blackhole", self.prefix, "metric", "20")
+            self._namespace_route("del", self.prefix)
+
+
+@unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
 class TestLinuxCPPairManagement(TestLinuxCPNetNSBase):
     """Linux CP Interface Pair Management"""
 

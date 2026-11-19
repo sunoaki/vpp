@@ -253,7 +253,7 @@ extern int fib_prefix_is_cover(const fib_prefix_t *p1,
  * \brief Return true is the prefix is a host prefix
  */
 extern int fib_prefix_is_host(const fib_prefix_t *p);
-extern u8 fib_prefix_get_host_length (fib_protocol_t proto);
+__clib_export extern u8 fib_prefix_get_host_length (fib_protocol_t proto);
 
 /**
  * normalise a prefix (i.e. mask the host bits according to the
