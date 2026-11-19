@@ -10,6 +10,7 @@
  */
 /*? %%clicmd:group_label Network Delay Simulator %% ?*/
 
+#include <math.h>
 #include <vnet/vnet.h>
 #include <vnet/plugin/plugin.h>
 #include <nsim/nsim.h>
@@ -158,13 +159,30 @@ nsim_output_feature_enable_disable (nsim_main_t * nsm, u32 sw_if_index,
   return rv;
 }
 
+/* Upper bound on the memory one configuration command may map for all of its
+ * wheels and service departure queues. A configuration that needs more is
+ * rejected before a single page is mapped, so a mistyped bandwidth or delay
+ * cannot turn into an allocation failure in the forwarding path. */
+#define NSIM_MAX_CONFIG_MEMORY (1ULL << 30)
+
+typedef struct
+{
+  /* Set once the sizes below have been computed; before that a rejection
+   * cannot name a size. */
+  int computed;
+  u64 required;
+  u32 wheel_count;
+} nsim_config_size_t;
+
+/* Return the new wheel, or a null pointer if the mapping cannot be made. */
 static nsim_wheel_t *
 nsim_wheel_alloc (u32 wheel_slots, u64 mmap_size)
 {
   nsim_wheel_t *wp;
 
   wp = clib_mem_vm_alloc (mmap_size);
-  ASSERT (wp != 0);
+  if (wp == 0)
+    return 0;
   wp->wheel_size = wheel_slots;
   wp->cursize = 0;
   wp->head = 0;
@@ -173,6 +191,60 @@ nsim_wheel_alloc (u32 wheel_slots, u64 mmap_size)
   wp->entries = (void *) (wp + 1);
 
   return wp;
+}
+
+static u64
+nsim_size_rounded_to_page (u64 size)
+{
+  u64 pagesize = getpagesize ();
+
+  return (size + pagesize - 1) & ~(pagesize - 1);
+}
+
+/* Zero the size report, so a rejection that happens before the sizes are
+ * computed still prints a defined value. */
+static void
+nsim_config_size_init (nsim_config_size_t *size)
+{
+  clib_memset (size, 0, sizeof (*size));
+}
+
+/* One wheel, or two when reordering holds a copy, is mapped for every vpp
+ * thread. Reject sizes that are far larger than this process can ever map,
+ * before anything is allocated. */
+static int
+nsim_validate_wheel_memory (nsim_config_size_t *size, u64 mmap_size, u32 mmap_count,
+			    u64 service_departures_per_wrk, u32 num_workers)
+{
+  u64 count = mmap_count * (u64) (num_workers + 1);
+
+  size->wheel_count = count;
+  size->required = mmap_size * count + sizeof (f64) * service_departures_per_wrk * count;
+  size->computed = 1;
+
+  return size->required > NSIM_MAX_CONFIG_MEMORY ? VNET_API_ERROR_INVALID_MEMORY_SIZE : 0;
+}
+
+/* Explain the rejection, naming the size the requested parameters need and
+ * the size vpp accepts. A rejection that happened before the sizes were
+ * computed says so instead of quoting a size of zero; a rejection with a size
+ * below the limit means an allocation failed. */
+static clib_error_t *
+nsim_config_memory_error (const nsim_config_size_t *size)
+{
+  if (!size->computed)
+    return clib_error_return (0, "nsim wheel is too large");
+
+  if (size->required > NSIM_MAX_CONFIG_MEMORY)
+    return clib_error_return (0,
+			      "nsim configuration needs %U in %u allocations, "
+			      "limit is %U",
+			      format_memory_size, size->required, size->wheel_count,
+			      format_memory_size, (u64) NSIM_MAX_CONFIG_MEMORY);
+
+  return clib_error_return (0, "nsim out of memory mapping %U in %u allocations of %U",
+			    format_memory_size, size->required, size->wheel_count,
+			    format_memory_size, (u64) NSIM_MAX_CONFIG_MEMORY);
 }
 
 static_always_inline u32
@@ -250,15 +322,30 @@ nsim_wheels_busy (nsim_main_t *nsm)
 }
 
 static int
+nsim_wheel_sizes_valid (u64 queue_slots, u64 wheel_slots)
+{
+  return queue_slots <= CLIB_U32_MAX && wheel_slots >= 1 && wheel_slots <= CLIB_U32_MAX;
+}
+
+static int
 nsim_configure (nsim_main_t *nsm, f64 bandwidth, f64 delay, u32 packet_size,
 		const nsim_loss_model_t *loss, f64 reorder_fraction, f64 reorder_delay,
-		const nsim_model_config_t *model, u32 seed, u32 poll_main_thread)
+		const nsim_model_config_t *model, u32 seed, u32 poll_main_thread,
+		nsim_config_size_t *size)
 {
   nsim_worker_t *new_workers = 0, *old_workers;
   u64 queue_slots_per_wrk, wheel_slots_per_wrk, mmap_size, old_mmap_size;
-  u32 pagesize = getpagesize ();
+  u32 mmap_count = reorder_fraction > 0.0 ? 2 : 1;
   int i, num_workers = vlib_num_workers ();
   vlib_main_t *vm = nsm->vlib_main;
+
+  nsim_config_size_init (size);
+
+  /* A NaN passes every range comparison below, and truncating an out-of-range
+   * f64 would install a wheel far smaller than the request. */
+  if (!isfinite (bandwidth) || !isfinite (delay) || !isfinite (reorder_fraction) ||
+      !isfinite (reorder_delay))
+    return VNET_API_ERROR_INVALID_VALUE;
 
   if (bandwidth <= 0.0)
     return VNET_API_ERROR_INVALID_VALUE;
@@ -294,8 +381,40 @@ nsim_configure (nsim_main_t *nsm, f64 bandwidth, f64 delay, u32 packet_size,
   queue_slots_per_wrk = nsim_model_queue_slots (model, bandwidth, packet_size);
   wheel_slots_per_wrk = nsim_model_wheel_slots (
     model, bandwidth, delay, reorder_fraction > 0.0 ? reorder_delay : 0.0, packet_size);
-  if (queue_slots_per_wrk > CLIB_U32_MAX || wheel_slots_per_wrk > CLIB_U32_MAX)
+  if (!nsim_wheel_sizes_valid (queue_slots_per_wrk, wheel_slots_per_wrk))
     return VNET_API_ERROR_INVALID_MEMORY_SIZE;
+
+  mmap_size = nsim_size_rounded_to_page (sizeof (nsim_wheel_t) +
+					 wheel_slots_per_wrk * sizeof (nsim_wheel_entry_t));
+  if (nsim_validate_wheel_memory (size, mmap_size, mmap_count, queue_slots_per_wrk, num_workers))
+    return VNET_API_ERROR_INVALID_MEMORY_SIZE;
+
+  /* Everything below may still fail. Install the new workers, and the
+   * parameters that describe them, only once every allocation has succeeded;
+   * until then the running configuration stays untouched. */
+  vec_validate (new_workers, num_workers);
+
+  /* Initialize the output scheduler wheels */
+  i = (!poll_main_thread && num_workers) ? 1 : 0;
+  for (; i < num_workers + 1; i++)
+    {
+      new_workers[i].wheel = nsim_wheel_alloc (wheel_slots_per_wrk, mmap_size);
+      if (new_workers[i].wheel == 0)
+	goto no_memory;
+      if (queue_slots_per_wrk)
+	{
+	  vec_validate (new_workers[i].service_departures, queue_slots_per_wrk - 1);
+	  if (new_workers[i].service_departures == 0)
+	    goto no_memory;
+	}
+      /* Side wheel for late-reordered packets, same geometry */
+      if (reorder_fraction > 0.0)
+	{
+	  new_workers[i].reorder_wheel = nsim_wheel_alloc (wheel_slots_per_wrk, mmap_size);
+	  if (new_workers[i].reorder_wheel == 0)
+	    goto no_memory;
+	}
+    }
 
   nsm->delay = delay;
   nsm->loss_config = *loss;
@@ -309,22 +428,6 @@ nsim_configure (nsim_main_t *nsm, f64 bandwidth, f64 delay, u32 packet_size,
   nsm->packet_size = packet_size;
   nsm->queue_slots_per_wrk = queue_slots_per_wrk;
   nsm->wheel_slots_per_wrk = wheel_slots_per_wrk;
-
-  mmap_size = sizeof (nsim_wheel_t) + wheel_slots_per_wrk * sizeof (nsim_wheel_entry_t);
-  mmap_size = (mmap_size + pagesize - 1) & ~(pagesize - 1);
-  vec_validate (new_workers, num_workers);
-
-  /* Initialize the output scheduler wheels */
-  i = (!poll_main_thread && num_workers) ? 1 : 0;
-  for (; i < num_workers + 1; i++)
-    {
-      new_workers[i].wheel = nsim_wheel_alloc (wheel_slots_per_wrk, mmap_size);
-      if (queue_slots_per_wrk)
-	vec_validate (new_workers[i].service_departures, queue_slots_per_wrk - 1);
-      /* Side wheel for late-reordered packets, same geometry */
-      if (reorder_fraction > 0.0)
-	new_workers[i].reorder_wheel = nsim_wheel_alloc (wheel_slots_per_wrk, mmap_size);
-    }
 
   vlib_worker_thread_barrier_sync (vm);
 
@@ -351,6 +454,12 @@ nsim_configure (nsim_main_t *nsm, f64 bandwidth, f64 delay, u32 packet_size,
 
   nsm->is_configured = 1;
   return 0;
+
+no_memory:
+  /* Release everything this command mapped and keep the previous
+   * configuration, or the unconfigured state, exactly as it was. */
+  nsim_workers_free (new_workers, mmap_size);
+  return VNET_API_ERROR_INVALID_MEMORY_SIZE;
 }
 
 /*
@@ -523,6 +632,7 @@ vl_api_nsim_configure_t_handler (vl_api_nsim_configure_t *mp)
   nsim_model_spec_t model_spec = {};
   nsim_model_config_t model;
   nsim_loss_model_t loss;
+  nsim_config_size_t config_size;
   f64 delay, bandwidth, drop_fraction = 0.0, reorder_rate = 0.0;
   u32 packet_size, packets_per_drop;
   int rv;
@@ -538,7 +648,8 @@ vl_api_nsim_configure_t_handler (vl_api_nsim_configure_t *mp)
   nsim_loss_model_uniform (&loss, drop_fraction);
   nsim_model_configure (&model, &model_spec, bandwidth, packet_size);
   rv = nsim_configure (nsm, bandwidth, delay, packet_size, &loss, reorder_rate,
-		       reorder_rate > 0.0 ? delay : 0.0, &model, nsm->seed, nsm->poll_main_thread);
+		       reorder_rate > 0.0 ? delay : 0.0, &model, nsm->seed, nsm->poll_main_thread,
+		       &config_size);
 
   REPLY_MACRO (VL_API_NSIM_CONFIGURE_REPLY);
 }
@@ -551,6 +662,7 @@ vl_api_nsim_configure2_t_handler (vl_api_nsim_configure2_t *mp)
   nsim_model_spec_t model_spec = {};
   nsim_model_config_t model;
   nsim_loss_model_t loss;
+  nsim_config_size_t config_size;
   f64 delay, bandwidth, drop_fraction = 0.0, reorder_rate = 0.0;
   u32 packet_size, packets_per_drop, packets_per_reorder;
   int rv;
@@ -570,7 +682,8 @@ vl_api_nsim_configure2_t_handler (vl_api_nsim_configure2_t *mp)
   nsim_loss_model_uniform (&loss, drop_fraction);
   nsim_model_configure (&model, &model_spec, bandwidth, packet_size);
   rv = nsim_configure (nsm, bandwidth, delay, packet_size, &loss, reorder_rate,
-		       reorder_rate > 0.0 ? delay : 0.0, &model, nsm->seed, nsm->poll_main_thread);
+		       reorder_rate > 0.0 ? delay : 0.0, &model, nsm->seed, nsm->poll_main_thread,
+		       &config_size);
 
   REPLY_MACRO (VL_API_NSIM_CONFIGURE2_REPLY);
 }
@@ -898,6 +1011,7 @@ set_nsim_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
   nsim_model_config_t model;
   nsim_loss_spec_t loss_spec = {};
   nsim_loss_model_t loss;
+  nsim_config_size_t config_size;
   i32 packets_per_reorder;
   u32 packet_size = 1500;
   nsim_main_t *nsm = &nsim_main;
@@ -961,7 +1075,7 @@ set_nsim_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
   nsim_model_configure (&model, &model_spec, bandwidth, packet_size);
 
   rv = nsim_configure (nsm, bandwidth, delay, packet_size, &loss, reorder_fraction, reorder_delay,
-		       &model, seed, poll_main_thread);
+		       &model, seed, poll_main_thread, &config_size);
 
   switch (rv)
     {
@@ -987,7 +1101,7 @@ set_nsim_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
       return clib_error_return (0, "nsim still has scheduled packets");
 
     case VNET_API_ERROR_INVALID_MEMORY_SIZE:
-      return clib_error_return (0, "nsim wheel is too large");
+      return nsim_config_memory_error (&config_size);
 
     case VNET_API_ERROR_UNSUPPORTED:
       return clib_error_return (0, "release batching cannot be combined with packet reordering");
@@ -1027,7 +1141,9 @@ VLIB_CLI_COMMAND (set_nsim_command, static) = {
 		"    [batch-gap <time> probability <f64>]\n"
 		"    [packets-per-drop <nn>] "
 		"[drop-fraction <f64: 0.0 - 1.0>]\n"
-		"    [seed <u32>]\n"
+		"    [packets-per-reorder <nn> | reorder-fraction <f64: 0.0 - 1.0>]\n"
+		"    [reorder-delay <time>]\n"
+		"    [seed <u32>] [poll-main-thread]\n"
 		"    [wifi | rate-stall bandwidth <bps> every <time> for <time> |\n"
 		"     rate-cycle bandwidth <bad-bps> good <time> bad <time>]",
   .function = set_nsim_command_fn,
