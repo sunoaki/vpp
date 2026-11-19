@@ -726,6 +726,7 @@ VLIB_CLI_COMMAND (ip6_show_fib_command, static) = {
     .path = "show ip6 fib",
     .short_help = "show ip6 fib [summary] [table <table-id>] [index <fib-id>] [<ip6-addr>[/<width>]] [detail]",
     .function = ip6_show_fib,
+    .is_mp_safe = 1,
 };
 
 static clib_error_t *

@@ -1220,41 +1220,49 @@ VLIB_CLI_COMMAND (show_ip_neighbors_cmd_node, static) = {
   .path = "show ip neighbors",
   .function = ip_neighbor_show,
   .short_help = "show ip neighbors [interface]",
+  .is_mp_safe = 1,
 };
 VLIB_CLI_COMMAND (show_ip4_neighbors_cmd_node, static) = {
   .path = "show ip4 neighbors",
   .function = ip4_neighbor_show,
   .short_help = "show ip4 neighbors [interface]",
+  .is_mp_safe = 1,
 };
 VLIB_CLI_COMMAND (show_ip6_neighbors_cmd_node, static) = {
   .path = "show ip6 neighbors",
   .function = ip6_neighbor_show,
   .short_help = "show ip6 neighbors [interface]",
+  .is_mp_safe = 1,
 };
 VLIB_CLI_COMMAND (show_ip_neighbor_cmd_node, static) = {
   .path = "show ip neighbor",
   .function = ip_neighbor_show,
   .short_help = "show ip neighbor [interface]",
+  .is_mp_safe = 1,
 };
 VLIB_CLI_COMMAND (show_ip4_neighbor_cmd_node, static) = {
   .path = "show ip4 neighbor",
   .function = ip4_neighbor_show,
   .short_help = "show ip4 neighbor [interface]",
+  .is_mp_safe = 1,
 };
 VLIB_CLI_COMMAND (show_ip6_neighbor_cmd_node, static) = {
   .path = "show ip6 neighbor",
   .function = ip6_neighbor_show,
   .short_help = "show ip6 neighbor [interface]",
+  .is_mp_safe = 1,
 };
 VLIB_CLI_COMMAND (show_ip4_neighbor_sorted_cmd_node, static) = {
   .path = "show ip4 neighbor-sorted",
   .function = ip4_neighbor_show_sorted,
   .short_help = "show ip4 neighbor-sorted",
+  .is_mp_safe = 1,
 };
 VLIB_CLI_COMMAND (show_ip6_neighbor_sorted_cmd_node, static) = {
   .path = "show ip6 neighbor-sorted",
   .function = ip6_neighbor_show_sorted,
   .short_help = "show ip6 neighbor-sorted",
+  .is_mp_safe = 1,
 };
 
 static ip_neighbor_vft_t ip_nbr_vfts[N_AF];

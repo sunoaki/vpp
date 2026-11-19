@@ -681,6 +681,7 @@ VLIB_CLI_COMMAND (show_buffers_command, static) = {
   .path = "show buffers",
   .short_help = "show buffers [detail] - show packet buffer allocation",
   .function = show_buffers,
+  .is_mp_safe = 1,
 };
 
 clib_error_t *

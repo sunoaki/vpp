@@ -611,6 +611,7 @@ VLIB_CLI_COMMAND (ip4_show_fib_command, static) = {
     .path = "show ip fib",
     .short_help = "show ip fib [summary] [table <table-id>] [index <fib-id>] [<ip4-addr>[/<mask>]] [mtrie] [detail] [memory]",
     .function = ip4_show_fib,
+    .is_mp_safe = 1,
 };
 
 static clib_error_t *
