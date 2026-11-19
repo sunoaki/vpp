@@ -3,6 +3,8 @@
 
 import unittest
 import random
+import re
+import time
 
 from config import config
 from scapy.packet import Raw
@@ -16,7 +18,12 @@ from util import Host, ppp
 from ipaddress import IPv4Network, IPv6Network
 
 from vpp_lo_interface import VppLoInterface
-from vpp_acl import AclRule, VppAcl, VppAclInterface, VppEtypeWhitelist
+from vpp_acl import (
+    AclRule,
+    VppAcl,
+    VppAclInterface,
+    VppEtypeWhitelist,
+)
 from vpp_ip import INVALID_INDEX
 
 
@@ -1620,6 +1627,261 @@ class TestACLplugin(VppTestCase):
         intf[0].remove_vpp_config()
 
         self.logger.info("ACLP_TEST_FINISH_0315")
+
+    PERMIT_REFLECT = 2
+
+    def _apply_acl(self, sw_if_index, rules, tag):
+        """Apply an ACL to the input of an interface."""
+        acl = VppAcl(self, rules, tag=tag)
+        acl.add_vpp_config()
+        acl_if = VppAclInterface(self, sw_if_index=sw_if_index, n_input=1, acls=[acl])
+        acl_if.add_vpp_config()
+        return acl_if
+
+    def _permit_reflect_rules(self):
+        return [
+            self.create_rule(self.IPV4, self.PERMIT_REFLECT, self.PORTS_ALL, 0),
+            self.create_rule(self.IPV4, self.DENY, self.PORTS_ALL, 0),
+        ]
+
+    def _show_sessions(self):
+        return self.vapi.cli("show acl-plugin sessions")
+
+    def _sessions_by_interface(self):
+        """Sum the add and del figures every worker printed, per interface.
+
+        `show acl-plugin sessions` prints one block per worker, each repeating
+        the same sw_if_index, and lists only the interfaces that still exist.
+        The figures are cumulative for the lifetime of the test run.
+        """
+        sessions = {}
+        for line in self._show_sessions().splitlines():
+            match = re.search(r"sw_if_index (\d+): add (\d+) - del (\d+)", line)
+            if match:
+                sw_if_index, adds, dels = (int(g) for g in match.groups())
+                previous = sessions.get(sw_if_index, (0, 0))
+                sessions[sw_if_index] = (previous[0] + adds, previous[1] + dels)
+        return sessions
+
+    def _session_adds_delta(self, before, sw_if_index):
+        """Count the sessions that appeared on an interface since a snapshot."""
+        after = self._sessions_by_interface().get(sw_if_index, (0, 0))
+        return after[0] - before.get(sw_if_index, (0, 0))[0]
+
+    def _sessions_snapshot(self):
+        """Record the figures every existing interface shows right now."""
+        return self._sessions_by_interface()
+
+    def _tcp_packet(self, src_host, dst_host, sport, dport, payload, src_mac=None):
+        pkt = (
+            Ether(dst=dst_host.mac, src=src_mac or src_host.mac)
+            / IP(src=src_host.ip4, dst=dst_host.ip4)
+            / TCP(sport=sport, dport=dport)
+            / Raw(payload)
+        )
+        self.extend_packet(pkt, 64)
+        return pkt
+
+    def _send_packets(self, pg_if, pkts, receiver, forwarded):
+        """Inject the packets, wait for the generator to drain, count the captures.
+
+        `pg_send` returns once the generator was enabled, not once it drained,
+        so the session table may still be empty right after it. The receiving
+        interface writes its capture file only after it processed the stream,
+        and reading that file with an explicit count waits for this. `forwarded`
+        is the number of packets the ACL lets through to `receiver`; a packet
+        the ACL drops never reaches it.
+        """
+        self.pg_send(pg_if, pkts, trace=False)
+        receiver.get_capture(forwarded)
+
+    def _forget_acl_interface(self, sw_if_index):
+        """Drop an interface's ACL list from the registry.
+
+        Called after the interface is gone. The deletion path resets the ACL
+        lists itself, so applying an empty list through the API with the
+        closed index would be rejected; removing the entry by hand keeps the
+        teardown walk from querying an interface that no longer exists.
+        """
+        self.registry.unregister("acl-if-list-%d" % sw_if_index, self.logger)
+
+    def _active_sessions(self, output=None):
+        """Return the number of sessions no one has deactivated yet.
+
+        `show acl-plugin sessions` reports this process-wide figure, so it
+        covers every worker and every interface, including the ones that no
+        longer exist. Wiping a session takes it out of the lookup hashes right
+        away and parks it for the reclaim that waits for the purge timeout, so
+        this figure drops as soon as the worker wiped it. A session of a
+        deleted interface that nothing wiped keeps the figure up.
+        """
+        output = output if output is not None else self._show_sessions()
+        match = re.search(r"Sessions active: add \d+ - deact \d+ = (\d+)", output)
+        if match is None:
+            self.fail("no session figures in `show acl-plugin sessions`:\n%s" % output)
+        return int(match.group(1))
+
+    def _wait_for_active_sessions(self, expected, timeout=5.0):
+        """Wait until no more than `expected` sessions are active.
+
+        Deleting an interface only asks the workers to wipe its sessions; each
+        of them does so on the interrupt that follows. Poll instead of
+        sleeping for a fixed time, and report what the table still holds when
+        the timeout passes.
+        """
+        deadline = time.time() + timeout
+        while True:
+            output = self._show_sessions()
+            if self._active_sessions(output) <= expected:
+                return
+            if time.time() > deadline:
+                self.fail(
+                    "expected at most %d active sessions within %ss, found:\n%s"
+                    % (expected, timeout, output)
+                )
+            self.sleep(0.05)
+
+    def test_0400_sessions_cleared_on_intf_delete(self):
+        """deleting an interface drops its sessions before the index is reused"""
+        self.logger.info("ACLP_TEST_START_0400")
+
+        pg0_index = self.pg0.sw_if_index
+        pg1_index = self.pg1.sw_if_index
+        src_host = self.hosts_by_pg_idx[pg0_index][0]
+        dst_host = self.hosts_by_pg_idx[pg1_index][0]
+        sport, dport = self.tcp_sport_from, self.tcp_dport_from
+        pg1 = self.pg1
+
+        # 1. pg0 with permit+reflect: one TCP SYN creates a session
+        before = self._sessions_snapshot()
+        baseline = self._active_sessions()
+        self._apply_acl(pg0_index, self._permit_reflect_rules(), "permit+reflect")
+        self._send_packets(
+            self.pg0,
+            [self._tcp_packet(src_host, dst_host, sport, dport, "a")],
+            self.pg1,
+            forwarded=1,
+        )
+        self.assertEqual(self._session_adds_delta(before, pg0_index), 1)
+        self.assertEqual(self._session_adds_delta(before, pg1_index), 0)
+        self.assertEqual(self._active_sessions(), baseline + 1)
+
+        # 2. deleting the interface drops the session with it. The ACL list is
+        #    still applied here: if applying an empty list were what cleared
+        #    the session, this delete would clear nothing.
+        self.pg0.remove_vpp_config()
+        self._forget_acl_interface(pg0_index)
+        self._wait_for_active_sessions(baseline)
+
+        # 3. the new interface takes the same sw_if_index and a deny ACL.
+        #    Nothing else allocates a software interface in between, and the
+        #    pool hands out its lowest free slot, so this is deterministic and
+        #    is the premise of the assertion below. `create_pg_interfaces`
+        #    replaces the class-level list with what it created, so put the
+        #    surviving pg1 back into it rather than leave a list of one.
+        new_pg0 = self.create_pg_interfaces([0])[0]
+        type(self).pg_interfaces = [new_pg0, pg1]
+        self.assertEqual(new_pg0.sw_if_index, pg0_index)
+        # the class setup put pg0 up and into the bridge domain; a frame on an
+        # interface that is down never reaches the ACL node, and the assertion
+        # below must not pass for that reason
+        new_pg0.admin_up()
+        self.vapi.sw_interface_set_l2_bridge(
+            rx_sw_if_index=new_pg0.sw_if_index, bd_id=self.bd_id
+        )
+        deny_rules = [self.create_rule(self.IPV4, self.DENY, self.PORTS_ALL, 0)]
+        acl_if = self._apply_acl(new_pg0.sw_if_index, deny_rules, "deny")
+        self.assertEqual(len(acl_if.current_acl_indexes()), 1)
+
+        # 4. the same 5-tuple again: a leftover permit+reflect session of the
+        #    deleted interface would let it through, and an interface with a
+        #    deny ACL creates no session of its own. The counters are
+        #    cumulative for a sw_if_index, so the snapshot is taken now that
+        #    the re-created interface is live and lists its inherited figure.
+        before = self._sessions_snapshot()
+        self._send_packets(
+            new_pg0,
+            [self._tcp_packet(src_host, dst_host, sport, dport, "a")],
+            pg1,
+            forwarded=0,
+        )
+        self.assertEqual(self._session_adds_delta(before, pg0_index), 0)
+        self.assertEqual(self._session_adds_delta(before, pg1_index), 0)
+
+        self.logger.info("ACLP_TEST_FINISH_0400")
+
+    def test_0401_sessions_cleared_on_intf_delete_only(self):
+        """deleting an interface drops only its sessions, not those of another
+
+        The scenario uses two packet-generator interfaces rather than a
+        loopback: a frame injected on one of them keeps that interface in
+        `VLIB_RX` through the ACL nodes, whereas only the bridge domain input
+        path (a BVI) rewrites it. A loopback belongs to no bridge domain here,
+        so no frame could reach it and no session could name it.
+        """
+        self.logger.info("ACLP_TEST_START_0401")
+
+        pg0_index = self.pg0.sw_if_index
+        pg1_index = self.pg1.sw_if_index
+        pg0_host = self.hosts_by_pg_idx[pg0_index][0]
+        pg1_host = self.hosts_by_pg_idx[pg1_index][0]
+        pg1 = self.pg1
+
+        # a permit+reflect ACL on pg0, and a session sourced from pg0
+        before = self._sessions_snapshot()
+        baseline = self._active_sessions()
+        self._apply_acl(pg0_index, self._permit_reflect_rules(), "pg0")
+        self._send_packets(
+            self.pg0,
+            [
+                self._tcp_packet(
+                    pg0_host, pg1_host, self.tcp_sport_from, self.tcp_dport_from, "b"
+                )
+            ],
+            pg1,
+            forwarded=1,
+        )
+        self.assertEqual(self._session_adds_delta(before, pg0_index), 1)
+
+        # a second session, sourced from pg1. Its session is enqueued after
+        # pg0's, so it sits at the tail of the list the cleanup walks, and a
+        # cleanup that stops at the first session of another interface finds
+        # it and nothing else.
+        self._apply_acl(pg1_index, self._permit_reflect_rules(), "pg1")
+        self._send_packets(
+            pg1,
+            [
+                self._tcp_packet(
+                    pg1_host,
+                    pg0_host,
+                    self.tcp_sport_from_2,
+                    self.tcp_dport_from_2,
+                    "c",
+                )
+            ],
+            self.pg0,
+            forwarded=1,
+        )
+        self.assertEqual(self._session_adds_delta(before, pg1_index), 1)
+        self.assertEqual(self._session_adds_delta(before, pg0_index), 1)
+        self.assertEqual(self._active_sessions(), baseline + 2)
+
+        # both interfaces hold a session now; remember pg1's exact figures so
+        # the assertion below covers both a new session and a deletion
+        pg1_sessions = self._sessions_by_interface()[pg1_index]
+
+        # pg0 goes away, taking its own session and only that one. Its ACL
+        # list is still applied, so nothing but the interface deletion can
+        # clear the session.
+        self.pg0.remove_vpp_config()
+        self._forget_acl_interface(pg0_index)
+        type(self).pg_interfaces = [self.pg1]
+        self._wait_for_active_sessions(baseline + 1)
+
+        self.assertNotIn(pg0_index, self._sessions_by_interface())
+        self.assertEqual(self._sessions_by_interface()[pg1_index], pg1_sessions)
+
+        self.logger.info("ACLP_TEST_FINISH_0401")
 
 
 if __name__ == "__main__":

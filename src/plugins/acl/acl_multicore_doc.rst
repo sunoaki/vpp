@@ -304,51 +304,49 @@ In order to tackle this, we need to modify the logic which decides
 whether to requeue the connection on the end of the list, or to delete
 it due to idle timeout:
 
-We define a point in time, and have each worker thread fast-forward
-through its FIFO, in the process looking for sessions that satisfy the
-criteria, and either keeping them or requeueing them.
+The interface to clear is identified in the pending bitmap of each
+worker (pending_clear_sw_if_index_bitmap), and each worker walks its own
+lists back from their tails, deleting the sessions whose sw_if_index is
+pending. Walking back from the tail visits a pending session wherever it
+sits: a session keeps its place in the list between two timer restarts,
+so stepping over the sessions of the other interfaces reaches it.
 
-To keep the ease of appearance to the outside world, we still process
-this as an event within the connection cleaner thread, but this event
-handler does as follows: 1) it creates the bitmap of the sw_if_index
-values requested to be cleared 2) for each worker, it waits to ensure
-there is no cleanup operation in progress (and if there is one, it
-waits), and then makes a copy of the bitmap, sets the per-worker flag of
-a cleanup operation, and sends an interrupt. 3) wait until all cleanup
-operations have completed.
+A request reaches the worker through a queue of its own. The interface
+deletion callback only signals the connection cleaner thread, which is
+the single place that appends the sw_if_index to the per-worker queue
+(pending_clear_sw_if_indices) under a spinlock and sends an interrupt;
+neither of them touches the bitmap. The worker swaps that queue with
+its own work-in-progress copy at the top of its interrupt and sets the
+bits from it. From then until the walk below returns, the bitmap and the
+session lists are that worker's own, so no lock guards them and nothing
+reallocates the bitmap under a reader. A request that arrives meanwhile
+lands in the queue and is served by the next interrupt.
 
-Within the worker interrupt node, we check if the “cleanup in progress”
-is set, and if it is, we check the “fast forward time” value. If unset,
-we initialize it to value now, and compare the requested bitmap of
-sw_if_index values (pending_clear_sw_if_index_bitmap) with the bitmap of
-sw_if_index that this worker deals with.
+The worker then deletes the sessions of the pending interfaces. A
+session that the data path may still hold leaves its list and goes to
+the purgatory list, which releases it once the purge timeout passes; the
+walk steps over that list and leaves it to its own scan. The walk stops
+after the same per-cycle limit as the idle scan it shares its interrupt
+with, and asks for another interrupt when it stopped early, so a large
+batch is spread over several interrupts instead of holding one. Once the
+walk reaches the ends of the lists, the worker zeroizes the bitmap of
+sw_if_index-es requested to be cleaned. The sessions of the other
+interfaces are left to the idle scan that follows, within its per-cycle
+limit.
 
-(we set the bit in the bitmap every time we enqueue the packet onto a
-FIFO - serviced_sw_if_index_bitmap in acl_fa_conn_list_add_session).
-
-If the result of this AND operation is zero - then we can clear the flag
-of cleanup in progress and return. Else we kick off the quantum of
-cleanup, and make sure we get another interrupt ASAP if that cleanup
-operation returns non-zero, meaning there is more work to do. When that
-operation returns zero, everything has been processed, we can clear the
-“cleanup-in-progress” flag, and zeroize the bitmap of sw_if_index-es
-requested to be cleaned.
-
-The interrupt node signals its wish to receive an interrupt ASAP by
-setting interrupt_is_needed flag within the per-worker structure. The
-main thread, while waiting for the cleanup operation to complete, checks
-if there is a request for interrupt, and if there is - it sends one.
+The connection cleaner thread neither waits for the workers nor
+publishes the bitmap, so an interface deletion never blocks the main
+thread. The interrupt node signals its wish to receive an interrupt
+ASAP by setting interrupt_is_needed flag within the per-worker
+structure, and the connection cleaner thread sends one when it sees it
+on its next pass.
 
 This approach gives us a way to mass-clean the connections which is
 reusing the code of the regular idle connection cleanup.
 
-One potential inefficiency is the bitmap values set by the session
-insertion in the data path - there is nothing to clear them.
-
-So, if one rearranges the interface placement with the workers, then the
-cleanups will cause some unnecessary work. For now, we consider it an
-acceptable limitation. It can be resolved by having another per-worker
-bitmap, which, when set, would trigger the cleanup of the bits in the
-serviced_sw_if_index_bitmap).
+The serviced_sw_if_index_bitmap, which records the interfaces a worker
+saw sessions for, is not cleared, so a “clear all” cleanup still walks
+the sessions of interfaces that no longer have any. Clearing a single
+interface is driven by the pending bitmap, so it carries no such cost.
 
 === the end ===

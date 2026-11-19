@@ -3538,14 +3538,17 @@ acl_plugin_show_sessions (acl_main_t * am,
 		       pw->cnt_already_deleted_sessions);
       vlib_cli_output (vm, "  Session timers restarted: %lu",
 		       pw->cnt_session_timer_restarted);
-      vlib_cli_output (vm, "  Swipe until this time: %lu",
-		       pw->swipe_end_time);
       vlib_cli_output (vm, "  sw_if_index serviced bitmap: %U",
 		       format_bitmap_hex, pw->serviced_sw_if_index_bitmap);
+      /*
+       * The pending clear bitmap belongs to the worker alone. Dumping it is
+       * safe only because this command is not mp-safe: the barrier that
+       * vlib_cli_dispatch_sub_commands takes parks every worker. An
+       * .is_mp_safe flag would let a worker realloc it under the reader.
+       */
       vlib_cli_output (vm, "  pending clear intfc bitmap : %U",
 		       format_bitmap_hex,
 		       pw->pending_clear_sw_if_index_bitmap);
-      vlib_cli_output (vm, "  clear in progress: %u", pw->clear_in_process);
       vlib_cli_output (vm, "  interrupt is pending: %d",
 		       pw->interrupt_is_pending);
       vlib_cli_output (vm, "  interrupt is needed: %d",
@@ -3971,6 +3974,7 @@ acl_init (vlib_main_t * vm)
 	if (tm->n_vlib_mains > 1)
 	  {
 	    clib_spinlock_init (&pw->pending_session_change_request_lock);
+	    clib_spinlock_init (&pw->pending_clear_sw_if_index_lock);
 	  }
 	vec_validate (pw->expired,
 		      ACL_N_TIMEOUTS *

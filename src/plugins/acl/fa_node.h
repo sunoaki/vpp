@@ -198,14 +198,14 @@ typedef struct {
   u64 cnt_already_deleted_sessions;
   /* Number of times we requeued a session to a head of the list */
   u64 cnt_session_timer_restarted;
-  /* swipe up to this enqueue time, rather than following the timeouts */
-  u64 swipe_end_time;
   /* bitmap of sw_if_index serviced by this worker */
   uword *serviced_sw_if_index_bitmap;
-  /* bitmap of sw_if_indices to clear. set by main thread, cleared by worker */
+  /* bitmap of sw_if_indices to clear, owned by this worker alone */
   uword *pending_clear_sw_if_index_bitmap;
-  /* atomic, indicates that the swipe-deletion of connections is in progress */
-  u32 clear_in_process;
+  /* sw_if_indices to add to that bitmap, guarded by the lock below */
+  clib_spinlock_t pending_clear_sw_if_index_lock;
+  u32 *pending_clear_sw_if_indices;
+  u32 *wip_clear_sw_if_indices;
   /* Interrupt is pending from main thread */
   int interrupt_is_pending;
   /*
