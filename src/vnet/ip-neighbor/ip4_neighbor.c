@@ -63,10 +63,9 @@ ip4_neighbor_probe_dst (u32 sw_if_index, clib_thread_index_t thread_index,
 			vnet_get_main (), adj_get (ai), &src, dst);
 }
 
-void
+u8
 ip4_neighbor_advertise (vlib_main_t *vm, vnet_main_t *vnm, u32 sw_if_index,
-			clib_thread_index_t thread_index,
-			const ip4_address_t *addr)
+			clib_thread_index_t thread_index, const ip4_address_t *addr)
 {
   vnet_hw_interface_t *hi = vnet_get_sup_hw_interface (vnm, sw_if_index);
   ip4_main_t *i4m = &ip4_main;
@@ -75,7 +74,7 @@ ip4_neighbor_advertise (vlib_main_t *vm, vnet_main_t *vnm, u32 sw_if_index,
 
   /* The advertisement carries this interface's MAC address. */
   if (PREDICT_FALSE (NULL == hi->hw_address))
-    return;
+    return 0;
 
   if (NULL == addr)
     {
@@ -84,55 +83,54 @@ ip4_neighbor_advertise (vlib_main_t *vm, vnet_main_t *vnm, u32 sw_if_index,
 	addr = &tmp;
     }
 
-  if (addr)
+  if (!addr)
+    return 0;
+
+  log_debug ("Sending GARP for IP4 address %U on sw_if_idex %d", format_ip4_address, addr,
+	     sw_if_index);
+
+  /* Form GARP packet for output - Gratuitous ARP is an ARP request packet
+     where the interface IP/MAC pair is used for both source and request
+     MAC/IP pairs in the request */
+  u32 bi = 0;
+  ethernet_arp_header_t *h =
+    vlib_packet_template_get_packet (vm, &i4m->ip4_arp_request_packet_template, &bi);
+
+  if (!h)
+    return 0;
+
+  mac_address_from_bytes (&h->ip4_over_ethernet[0].mac, hi->hw_address);
+  mac_address_from_bytes (&h->ip4_over_ethernet[1].mac, hi->hw_address);
+  h->ip4_over_ethernet[0].ip4 = addr[0];
+  h->ip4_over_ethernet[1].ip4 = addr[0];
+
+  /* Setup MAC header with ARP Etype and broadcast DMAC */
+  vlib_buffer_t *b = vlib_get_buffer (vm, bi);
+  rewrite = ethernet_build_rewrite (vnm, sw_if_index, VNET_LINK_ARP,
+				    VNET_REWRITE_FOR_SW_INTERFACE_ADDRESS_BROADCAST);
+  if (PREDICT_FALSE (NULL == rewrite))
     {
-      log_debug ("Sending GARP for IP4 address %U on sw_if_idex %d",
-		 format_ip4_address, addr, sw_if_index);
-
-      /* Form GARP packet for output - Gratuitous ARP is an ARP request packet
-         where the interface IP/MAC pair is used for both source and request
-         MAC/IP pairs in the request */
-      u32 bi = 0;
-      ethernet_arp_header_t *h = vlib_packet_template_get_packet
-	(vm, &i4m->ip4_arp_request_packet_template, &bi);
-
-      if (!h)
-	return;
-
-      mac_address_from_bytes (&h->ip4_over_ethernet[0].mac, hi->hw_address);
-      mac_address_from_bytes (&h->ip4_over_ethernet[1].mac, hi->hw_address);
-      h->ip4_over_ethernet[0].ip4 = addr[0];
-      h->ip4_over_ethernet[1].ip4 = addr[0];
-
-      /* Setup MAC header with ARP Etype and broadcast DMAC */
-      vlib_buffer_t *b = vlib_get_buffer (vm, bi);
-      rewrite =
-	ethernet_build_rewrite (vnm, sw_if_index, VNET_LINK_ARP,
-				VNET_REWRITE_FOR_SW_INTERFACE_ADDRESS_BROADCAST);
-      if (PREDICT_FALSE (NULL == rewrite))
-	{
-	  vlib_buffer_free (vm, &bi, 1);
-	  return;
-	}
-      rewrite_len = vec_len (rewrite);
-      vlib_buffer_advance (b, -rewrite_len);
-      ethernet_header_t *e = vlib_buffer_get_current (b);
-      clib_memcpy_fast (e->dst_address, rewrite, sizeof (e->dst_address));
-      vec_free (rewrite);
-
-      /* Send GARP packet out the specified interface */
-      vnet_buffer (b)->sw_if_index[VLIB_RX] =
-	vnet_buffer (b)->sw_if_index[VLIB_TX] = sw_if_index;
-      vlib_frame_t *f = vlib_get_frame_to_node (vm, hi->output_node_index);
-      u32 *to_next = vlib_frame_vector_args (f);
-      to_next[0] = bi;
-      f->n_vectors = 1;
-      vlib_put_frame_to_node (vm, hi->output_node_index, f);
-
-      vlib_increment_simple_counter (
-	&ip_neighbor_counters[AF_IP4].ipnc[VLIB_TX][IP_NEIGHBOR_CTR_GRAT],
-	thread_index, sw_if_index, 1);
+      vlib_buffer_free (vm, &bi, 1);
+      return 0;
     }
+  rewrite_len = vec_len (rewrite);
+  vlib_buffer_advance (b, -rewrite_len);
+  ethernet_header_t *e = vlib_buffer_get_current (b);
+  clib_memcpy_fast (e->dst_address, rewrite, sizeof (e->dst_address));
+  vec_free (rewrite);
+
+  /* Send GARP packet out the specified interface */
+  vnet_buffer (b)->sw_if_index[VLIB_RX] = vnet_buffer (b)->sw_if_index[VLIB_TX] = sw_if_index;
+  vlib_frame_t *f = vlib_get_frame_to_node (vm, hi->output_node_index);
+  u32 *to_next = vlib_frame_vector_args (f);
+  to_next[0] = bi;
+  f->n_vectors = 1;
+  vlib_put_frame_to_node (vm, hi->output_node_index, f);
+
+  vlib_increment_simple_counter (&ip_neighbor_counters[AF_IP4].ipnc[VLIB_TX][IP_NEIGHBOR_CTR_GRAT],
+				 thread_index, sw_if_index, 1);
+
+  return 1;
 }
 
 always_inline uword
