@@ -12,6 +12,8 @@
 #include <vnet/ip-neighbor/ip4_neighbor.h>
 #include <vnet/ip-neighbor/ip6_neighbor.h>
 #include <arping/arping.h>
+#include <vnet/interface_funcs.h>
+#include <vnet/api_errno.h>
 
 arping_main_t arping_main;
 
@@ -480,18 +482,22 @@ arping_neighbor_advertisement (vlib_main_t *vm, arping_args_t *args)
 {
   vnet_main_t *vnm = vnet_get_main ();
   u32 send_count = 0;
+  u8 garp_failed = 0;
 
   while (args->repeat > 0)
     {
+      u8 sent;
+
       send_count++;
       if (args->address.version == AF_IP4)
 	{
-	  if (args->silence == 0)
+	  sent = ip4_neighbor_advertise (vm, vnm, args->sw_if_index, vlib_get_thread_index (),
+					 &args->address.ip.ip4);
+	  if (sent && args->silence == 0)
 	    vlib_cli_output (vm, "Sending %u GARP to %U", send_count,
 			     format_ip4_address, &args->address.ip.ip4);
-	  ip4_neighbor_advertise (vm, vnm, args->sw_if_index,
-				  vlib_get_thread_index (),
-				  &args->address.ip.ip4);
+	  else if (!sent)
+	    garp_failed = 1;
 	}
       else
 	{
@@ -508,7 +514,14 @@ arping_neighbor_advertisement (vlib_main_t *vm, arping_args_t *args)
 	vlib_process_suspend (vm, args->interval);
     }
 
-  return 0;
+  if (!garp_failed)
+    return 0;
+
+  args->rv = VNET_API_ERROR_UNSUPPORTED;
+  return clib_error_return (0,
+			    "GARP is an ethernet ARP request and interface `%U' carries no "
+			    "ethernet header, so no packet was sent",
+			    format_vnet_sw_if_index_name, vnm, args->sw_if_index);
 }
 
 static void

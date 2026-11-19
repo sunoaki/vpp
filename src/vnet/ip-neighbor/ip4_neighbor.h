@@ -12,9 +12,9 @@
 
 __clib_export extern void ip4_neighbor_probe_dst (u32 sw_if_index, clib_thread_index_t thread_index,
 						  const ip4_address_t *dst);
-__clib_export extern void ip4_neighbor_advertise (vlib_main_t *vm, vnet_main_t *vnm,
-						  u32 sw_if_index, clib_thread_index_t thread_index,
-						  const ip4_address_t *addr);
+__clib_export extern u8 ip4_neighbor_advertise (vlib_main_t *vm, vnet_main_t *vnm, u32 sw_if_index,
+						clib_thread_index_t thread_index,
+						const ip4_address_t *addr);
 
 always_inline vlib_buffer_t *
 ip4_neighbor_probe (vlib_main_t *vm, vnet_main_t *vnm,
