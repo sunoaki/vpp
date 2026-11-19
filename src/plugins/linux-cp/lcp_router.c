@@ -125,7 +125,14 @@ static fib_source_t lcp_rt_fib_src_onlink;
 
 #define LCP_ROUTER_INFO(...) vlib_log_notice (lcp_router_logger, __VA_ARGS__);
 
+#define LCP_ROUTER_WARN(...) vlib_log_warn (lcp_router_logger, __VA_ARGS__);
+
 #define LCP_ROUTER_ERROR(...) vlib_log_err (lcp_router_logger, __VA_ARGS__);
+
+/* Set between the neighbour synchronization's begin and end steps. A dump
+ * delivers every neighbour's current state, so a failed neighbour arrives
+ * there on every resynchronization and is reported at debug level instead. */
+static u8 lcp_router_neigh_sync_active;
 
 static const mfib_prefix_t ip4_specials[] = {
   /* ALL prefixes are in network order */
@@ -1126,8 +1133,44 @@ lcp_router_neigh_add (struct rtnl_neigh *rn)
 	    }
 	}
       else
-	/* It's a delete */
-	lcp_router_neigh_del (rn);
+	{
+	  /*
+	   * The kernel reports a failed neighbour as RTM_NEWNEIGH with
+	   * NUD_FAILED and no state that makes it valid, so it reaches the
+	   * delete below like an aged-out entry. The delete is the same, but
+	   * an explicit failure is the record of a host that stopped
+	   * answering, which an operator chasing a stale link layer address
+	   * has no other way to see. Report it outside a synchronization only:
+	   * a dump repeats the state of every failed neighbour on each
+	   * resynchronization.
+	   */
+	  if (state & NUD_FAILED)
+	    {
+	      mac_address_t mac;
+	      u8 *mac_str = NULL;
+
+	      ll = rtnl_neigh_get_lladdr (rn);
+	      if (ll && nl_addr_get_len (ll) == sizeof (mac_address_t))
+		{
+		  lcp_router_mk_mac_addr (ll, &mac);
+		  mac_str = format (NULL, "%U", format_mac_address_t, &mac);
+		}
+
+	      if (lcp_router_neigh_sync_active)
+		LCP_ROUTER_DBG ("neighbor failed: %U %U %v", format_ip_address, &nh,
+				format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index,
+				mac_str);
+	      else
+		LCP_ROUTER_WARN ("neighbor failed: %U %U %v", format_ip_address, &nh,
+				 format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index,
+				 mac_str);
+
+	      vec_free (mac_str);
+	    }
+
+	  /* It's a delete */
+	  lcp_router_neigh_del (rn);
+	}
     }
   else
     LCP_ROUTER_INFO ("ignore neighbour add on: %d",
@@ -1179,6 +1222,8 @@ lcp_router_neighbor_mark (index_t index, void *ctx)
 static void
 lcp_router_neigh_sync_begin (void)
 {
+  lcp_router_neigh_sync_active = 1;
+
   if (lcp_get_del_dynamic_on_link_down ())
     lcp_itf_pair_walk (lcp_router_neighbor_mark, 0);
 
@@ -1195,6 +1240,8 @@ lcp_router_neigh_sync_sweep (void)
 static void
 lcp_router_neigh_sync_end (void)
 {
+  lcp_router_neigh_sync_active = 0;
+
   if (lcp_get_del_dynamic_on_link_down ())
     lcp_router_neigh_sync_sweep ();
 
