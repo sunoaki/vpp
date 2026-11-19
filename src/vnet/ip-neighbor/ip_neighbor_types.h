@@ -75,6 +75,14 @@ typedef struct ip_neighbor_t_
    * The index of the adj fib created for this neighbour
    */
   fib_node_index_t ipn_fib_entry_index;
+
+  /**
+   * The FIB table the adj fib was added to, and whose count this neighbour
+   * holds. Not the table the interface is bound to now, since that binding
+   * can change while the entry stays where it was put. INDEX_INVALID for an
+   * IPv6 link-local address, whose table ip6_ll_table.c owns.
+   */
+  u32 ipn_fib_index;
 } ip_neighbor_t;
 
 extern u8 *format_ip_neighbor_flags (u8 * s, va_list * args);
