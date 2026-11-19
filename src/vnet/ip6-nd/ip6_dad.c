@@ -110,6 +110,14 @@ create_dad_ns_buffer (vlib_main_t *vm, ip6_dad_entry_t *entry)
   /* Ethernet header: multicast destination */
   ip6_multicast_ethernet_address (dst_mac, id | (0xffU << 24));
   rewrite = ethernet_build_rewrite (vnm, entry->sw_if_index, VNET_LINK_IP6, dst_mac);
+  if (!rewrite)
+    {
+      /* Not an interface that carries an ethernet header, so there is no NS
+	 to send. Returning ~0 keeps DAD from declaring the address PREFERRED
+	 on the strength of a transmission that never happened. */
+      vlib_buffer_free (vm, &bi, 1);
+      return ~0;
+    }
   rewrite_len = vec_len (rewrite);
   vlib_buffer_advance (b, -rewrite_len);
   ethernet_header_t *e = vlib_buffer_get_current (b);
@@ -126,7 +134,7 @@ create_dad_ns_buffer (vlib_main_t *vm, ip6_dad_entry_t *entry)
 /**
  * Send DAD NS from main thread
  */
-static void
+static int
 send_dad_ns (vlib_main_t *vm, ip6_dad_entry_t *entry)
 {
   vnet_main_t *vnm = vnet_get_main ();
@@ -144,7 +152,7 @@ send_dad_ns (vlib_main_t *vm, ip6_dad_entry_t *entry)
   if (bi == ~0)
     {
       DAD_ERR ("Failed to create DAD NS buffer for %U", format_ip6_address, &entry->address);
-      return;
+      return 0;
     }
 
   /* Send to interface output node */
@@ -160,6 +168,8 @@ send_dad_ns (vlib_main_t *vm, ip6_dad_entry_t *entry)
   /* Send TENTATIVE notification after sending NS */
   ip6_dad_send_event (entry->sw_if_index, &entry->address, IP6_DAD_STATE_TENTATIVE,
 		      entry->dad_count + 1, entry->dad_transmits);
+
+  return 1;
 }
 
 /**
@@ -329,9 +339,11 @@ ip6_dad_process (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame
 	    {
 	      if (entry->dad_count < entry->dad_transmits)
 		{
-		  /* Send NS (this will also send TENTATIVE event) */
-		  send_dad_ns (vm, entry);
-		  entry->dad_count++;
+		  /* Send NS (this will also send TENTATIVE event). A failed send is
+		     not counted, so DAD keeps retrying instead of running out of
+		     transmits with no NS having left the box. */
+		  if (send_dad_ns (vm, entry))
+		    entry->dad_count++;
 
 		  /* Schedule next transmission */
 		  entry->dad_next_send_time = now + entry->dad_retransmit_delay;
