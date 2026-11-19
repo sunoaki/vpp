@@ -82,7 +82,7 @@ ip4_neighbor_advertise (vlib_main_t *vm, vnet_main_t *vnm, u32 sw_if_index,
    * building the header from another interface's pool slot would send a
    * packet with the wrong source MAC, or read past the end of the pool. */
   if (PREDICT_FALSE (!ip_neighbor_sw_if_index_has_ethernet_rewrite (sw_if_index)))
-    return;
+    return 0;
 
   if (NULL == addr)
     {
