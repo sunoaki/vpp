@@ -1155,9 +1155,11 @@ lcp_router_neigh_add (struct rtnl_neigh *rn)
 		}
 
 	      if (lcp_router_neigh_sync_active)
-		LCP_ROUTER_DBG ("neighbor failed: %U %U %v", format_ip_address, &nh,
-				format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index,
-				mac_str);
+		{
+		  LCP_ROUTER_DBG ("neighbor failed: %U %U %v", format_ip_address, &nh,
+				  format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index,
+				  mac_str);
+		}
 	      else
 		{
 		  LCP_ROUTER_WARN ("neighbor failed: %U %U %v", format_ip_address, &nh,
