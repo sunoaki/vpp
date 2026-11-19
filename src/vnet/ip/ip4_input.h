@@ -23,8 +23,12 @@ typedef enum
   IP4_INPUT_N_NEXT,
 } ip4_input_next_t;
 
+/* Check the version and the IHL, then the header checksum. The IHL is read
+   from the packet, so is the header size the checksum covers; both are
+   validated against the received length and the length the header declares
+   before any byte past the base header is read. */
 static_always_inline void
-check_ver_opt_csum (ip4_header_t * ip, u8 * error, int verify_checksum)
+check_ver_opt_csum (ip4_header_t *ip, u32 cur_len, u8 *error, int verify_checksum)
 {
   if (PREDICT_FALSE (ip->ip_version_and_header_length != 0x45))
     {
@@ -34,10 +38,19 @@ check_ver_opt_csum (ip4_header_t * ip, u8 * error, int verify_checksum)
 	*error = IP4_ERROR_HDR_TOO_SHORT;
       else
 	{
+	  u16 ip_len = clib_net_to_host_u16 (ip->length);
+	  int header_len = ip4_header_bytes (ip);
+
 	  *error = IP4_ERROR_OPTIONS;
-	  if (verify_checksum &&
-	      clib_ip_csum ((u8 *) ip, ip4_header_bytes (ip)) != 0)
-	    *error = IP4_ERROR_BAD_CHECKSUM;
+	  if (PREDICT_FALSE (header_len > cur_len || header_len > ip_len))
+	    *error = IP4_ERROR_BAD_LENGTH;
+	  else
+	    {
+	      u16 sum = clib_ip_csum ((u8 *) ip, header_len);
+
+	      if (verify_checksum && sum != 0)
+		*error = IP4_ERROR_BAD_CHECKSUM;
+	    }
 	}
     }
   else if (PREDICT_FALSE (verify_checksum &&
@@ -61,10 +74,15 @@ ip4_input_check_x4 (vlib_main_t * vm,
 
   error0 = error1 = error2 = error3 = IP4_ERROR_NONE;
 
-  check_ver_opt_csum (ip[0], &error0, verify_checksum);
-  check_ver_opt_csum (ip[1], &error1, verify_checksum);
-  check_ver_opt_csum (ip[2], &error2, verify_checksum);
-  check_ver_opt_csum (ip[3], &error3, verify_checksum);
+  cur_len0 = vlib_buffer_length_in_chain (vm, p[0]);
+  cur_len1 = vlib_buffer_length_in_chain (vm, p[1]);
+  cur_len2 = vlib_buffer_length_in_chain (vm, p[2]);
+  cur_len3 = vlib_buffer_length_in_chain (vm, p[3]);
+
+  check_ver_opt_csum (ip[0], cur_len0, &error0, verify_checksum);
+  check_ver_opt_csum (ip[1], cur_len1, &error1, verify_checksum);
+  check_ver_opt_csum (ip[2], cur_len2, &error2, verify_checksum);
+  check_ver_opt_csum (ip[3], cur_len3, &error3, verify_checksum);
 
   if (PREDICT_FALSE (ip[0]->ttl < 1))
     error0 = IP4_ERROR_TIME_EXPIRED;
@@ -96,11 +114,6 @@ ip4_input_check_x4 (vlib_main_t * vm,
   error1 = ip_len1 < sizeof (ip[1][0]) ? IP4_ERROR_TOO_SHORT : error1;
   error2 = ip_len2 < sizeof (ip[2][0]) ? IP4_ERROR_TOO_SHORT : error2;
   error3 = ip_len3 < sizeof (ip[3][0]) ? IP4_ERROR_TOO_SHORT : error3;
-
-  cur_len0 = vlib_buffer_length_in_chain (vm, p[0]);
-  cur_len1 = vlib_buffer_length_in_chain (vm, p[1]);
-  cur_len2 = vlib_buffer_length_in_chain (vm, p[2]);
-  cur_len3 = vlib_buffer_length_in_chain (vm, p[3]);
 
   len_diff0 = cur_len0 - ip_len0;
   len_diff1 = cur_len1 - ip_len1;
@@ -184,8 +197,11 @@ ip4_input_check_x2 (vlib_main_t * vm,
 
   error0 = error1 = IP4_ERROR_NONE;
 
-  check_ver_opt_csum (ip0, &error0, verify_checksum);
-  check_ver_opt_csum (ip1, &error1, verify_checksum);
+  cur_len0 = vlib_buffer_length_in_chain (vm, p0);
+  cur_len1 = vlib_buffer_length_in_chain (vm, p1);
+
+  check_ver_opt_csum (ip0, cur_len0, &error0, verify_checksum);
+  check_ver_opt_csum (ip1, cur_len1, &error1, verify_checksum);
 
   if (PREDICT_FALSE (ip0->ttl < 1))
     error0 = IP4_ERROR_TIME_EXPIRED;
@@ -205,9 +221,6 @@ ip4_input_check_x2 (vlib_main_t * vm,
   /* IP length must be at least minimal IP header. */
   error0 = ip_len0 < sizeof (ip0[0]) ? IP4_ERROR_TOO_SHORT : error0;
   error1 = ip_len1 < sizeof (ip1[0]) ? IP4_ERROR_TOO_SHORT : error1;
-
-  cur_len0 = vlib_buffer_length_in_chain (vm, p0);
-  cur_len1 = vlib_buffer_length_in_chain (vm, p1);
 
   len_diff0 = cur_len0 - ip_len0;
   len_diff1 = cur_len1 - ip_len1;
@@ -257,7 +270,9 @@ ip4_input_check_x1 (vlib_main_t * vm,
 
   error0 = IP4_ERROR_NONE;
 
-  check_ver_opt_csum (ip0, &error0, verify_checksum);
+  cur_len0 = vlib_buffer_length_in_chain (vm, p0);
+
+  check_ver_opt_csum (ip0, cur_len0, &error0, verify_checksum);
 
   if (PREDICT_FALSE (ip0->ttl < 1))
     error0 = IP4_ERROR_TIME_EXPIRED;
@@ -271,8 +286,6 @@ ip4_input_check_x1 (vlib_main_t * vm,
 
   /* IP length must be at least minimal IP header. */
   error0 = ip_len0 < sizeof (ip0[0]) ? IP4_ERROR_TOO_SHORT : error0;
-
-  cur_len0 = vlib_buffer_length_in_chain (vm, p0);
 
   len_diff0 = cur_len0 - ip_len0;
 
