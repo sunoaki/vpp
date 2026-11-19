@@ -692,7 +692,7 @@ lcp_itf_pair_walk (lcp_itf_pair_walk_cb_t cb, void *ctx)
 
   pool_foreach_index (api, lcp_itf_pair_pool)
     {
-      if (!cb (api, ctx))
+      if (cb (api, ctx) == WALK_STOP)
 	break;
     };
 }
