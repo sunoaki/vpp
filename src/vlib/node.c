@@ -40,24 +40,58 @@ node_set_elog_name (vlib_main_t * vm, uword node_index)
     elog_string (vlib_get_elog_main (), "%v%c", n->name, 0);
 }
 
+/* A reader may hold the node name without the worker barrier, as
+ * vlib_error_counts_get does while it copies it, so the name is exchanged
+ * rather than freed in place. The copy runs under vlib_error_desc_lock, which
+ * this holds while it exchanges the name, and the previous name is retired
+ * into a list that the next section of the name lock frees, after every
+ * reader that could still hold it has copied it. */
 void
 vlib_node_rename (vlib_main_t * vm, u32 node_index, char *fmt, ...)
 {
   va_list va;
   vlib_node_main_t *nm = &vm->node_main;
   vlib_node_t *n = vlib_get_node (vm, node_index);
+  u8 *old_name, *name;
+  u8 names_locked;
 
   va_start (va, fmt);
-  hash_unset (nm->node_by_name, n->name);
-  vec_free (n->name);
-  n->name = va_format (0, fmt, &va);
+  name = va_format (0, fmt, &va);
   va_end (va);
+
+  vlib_error_desc_lock_get ();
+
+  names_locked = vlib_node_name_lock_get ();
+
+  /* Names retired by earlier renames go first, unless a section this call
+   * reached retired them itself. Whichever they are, their section has
+   * ended, and no reader of a name retired outside this call's own section
+   * can still be copying it. */
+  if (names_locked && !vlib_node_name_waiting_in_section ())
+    vlib_node_name_reap ();
+
+  old_name = n->name;
+  n->name = name;
+  hash_unset (nm->node_by_name, old_name);
   hash_set (nm->node_by_name, n->name, n->index);
 
   node_set_elog_name (vm, node_index);
 
-  /* Propagate the change to all worker threads */
+  /* Propagate the change to all worker threads. A core registered between
+   * this and the update sees the new name. */
   vlib_worker_thread_node_runtime_update ();
+
+  /* Read by a barrier-free reader until it has copied the new name. */
+  vlib_node_name_retire (node_index, old_name);
+
+  vlib_error_desc_lock_put ();
+
+  if (!names_locked || !vlib_node_name_lock_put ())
+    return;
+
+  /* A name retired here is freed by the next rename outside the section this
+   * call reached, never by one inside it. */
+  vlib_node_name_section_ended ();
 }
 
 static void

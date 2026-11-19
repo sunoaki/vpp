@@ -91,34 +91,177 @@ format_stats_counter_name (u8 *s, va_list *va)
   return s;
 }
 
-/* Nodes replace their error descriptions in vlib_register_errors, and free
- * the replaced strings, so reading or copying a description has to wait for
- * this lock. It is allocated on first use because error counters are
- * registered during early initialization.
+/* The error bookkeeping takes three locks, and every path takes them in this
+ * order, from the outside in:
  *
- * Callers of the getter normally hold the worker barrier, which serializes
- * them against each other, so a caller without it must not spin here: no
- * holder of this lock ever waits for the barrier. */
+ * 1. the stats segment lock, vlib_stats_segment_lock. Error counters live in
+ *    a vector in the stats segment, so growing it, and adding or removing the
+ *    entries that name counters, take this lock. vlib_register_errors takes it
+ *    from its first step to its last.
+ *
+ * 2. vlib_error_desc_lock. Nodes replace and free their error descriptions
+ *    under it, so every copy of a description, and of the node name that
+ *    names the descriptions, takes it.
+ *
+ * 3. vlib_node_name_lock. vlib_node_rename exchanges a node name under it, so
+ *    a reader sees the previous or the new name and never one being freed.
+ *    A rename also holds it while it frees the names retired by earlier
+ *    renames, and that free takes the stats segment lock inside it.
+ *
+ * vlib_register_errors takes the stats segment lock and then the
+ * descriptions. vlib_unregister_errors takes the descriptions and then the
+ * names, and runs from vlib_register_errors, with the stats segment lock
+ * held, and from vlib_node_rename, without it. vlib_stats_remove_entry takes
+ * the stats segment lock again inside, which is the lock already held
+ * outermost on the first path and the innermost lock on the second, so it is
+ * the only place where the order is not strict from outside in, and it is
+ * consistent with both. A caller which already holds a lock, as
+ * vlib_unregister_errors does when vlib_register_errors calls it, leaves the
+ * outside ones to its caller.
+ *
+ * A name is read without the worker barrier by vlib_error_counts_get, so it is
+ * freed only once no reader can still hold it. A rename frees the names that
+ * earlier renames retired, and never those retired in its own call or in a
+ * section it reached, so the free runs in a section that started after every
+ * reader that could have held them had copied them or would now read the new
+ * name. A reader that copied a name before its retirement holds the stats
+ * segment lock or the description lock throughout, and a worker main loop
+ * refuses to take the stats segment lock while it has work to do, so the free
+ * cannot run under such a copy.
+ *
+ * No holder of the description lock waits for the worker barrier. Callers of
+ * the getter normally hold the barrier, which serializes them against each
+ * other, and the only holder that has no barrier takes the lock around a
+ * single node rename, so a barrier-free reader such as vlib_error_counts_get
+ * never spins on a holder that is about to take the barrier. */
 static clib_spinlock_t vlib_error_desc_lock;
+static clib_spinlock_t vlib_node_name_lock;
 
-static void
-vlib_error_desc_lock_init (void)
+/* Names an exchange retired, one vector per node index, freed by a later
+ * rename. They are kept apart from the nodes so that vlib_node_rename retires
+ * a name without touching the node structure. */
+static u8 ***vlib_node_retired_names;
+
+/* Set when a section of this thread retired a name. Names waiting to be freed
+ * were retired before that section started, so its own next rename must not
+ * free them: they include the names it retired itself, which a reader may
+ * still be copying. The call that ends the section clears it again. */
+static __thread u8 vlib_node_name_waiting;
+
+/* Whether this thread must not reap the names waiting to be reaped. */
+u8
+vlib_node_name_waiting_in_section (void)
 {
-  if (vlib_error_desc_lock == 0)
-    clib_spinlock_init (&vlib_error_desc_lock);
+  return vlib_node_name_waiting;
 }
 
-static void
+void
+vlib_node_name_retire (u32 node_index, u8 *name)
+{
+  vec_validate (vlib_node_retired_names, node_index);
+  vec_add1 (vlib_node_retired_names[node_index], name);
+  vlib_node_name_waiting = 1;
+}
+
+/* The thread holding the name lock section, and how many callers of that
+ * thread are still inside it. vlib_node_rename calls a core, and the main
+ * loop calls vlib_unregister_errors, inside the section, so the section
+ * belongs to the thread and lasts until the last of its callers leaves. */
+#define VLIB_NODE_NAME_NO_OWNER ((clib_thread_index_t) ~0)
+static __thread clib_thread_index_t vlib_node_name_lock_owner = VLIB_NODE_NAME_NO_OWNER;
+static __thread u32 vlib_node_name_lock_depth;
+
+/* The two locks are initialized once, before the first worker thread can take
+ * either, so that no thread ever runs a lock against a zero pointer. */
+void
+vlib_error_lock_init (void)
+{
+  clib_spinlock_init (&vlib_error_desc_lock);
+  clib_spinlock_init (&vlib_node_name_lock);
+}
+
+void
 vlib_error_desc_lock_get (void)
 {
-  vlib_error_desc_lock_init ();
   clib_spinlock_lock (&vlib_error_desc_lock);
 }
 
-static void
+void
 vlib_error_desc_lock_put (void)
 {
   clib_spinlock_unlock (&vlib_error_desc_lock);
+}
+
+/* Drops the retired names. The caller holds the name lock, so no rename is
+ * running, and the section it holds started after the last rename retired
+ * them. */
+static void
+vlib_node_name_free_retired (void)
+{
+  u32 i, j;
+
+  vlib_stats_segment_lock ();
+  for (i = 0; i < vec_len (vlib_node_retired_names); i++)
+    {
+      u8 **names = vlib_node_retired_names[i];
+
+      for (j = 0; j < vec_len (names); j++)
+	vec_free (names[j]);
+      vec_free (names);
+    }
+  vec_free (vlib_node_retired_names);
+  vlib_node_retired_names = 0;
+  vlib_stats_segment_unlock ();
+}
+
+u8
+vlib_node_name_lock_get (void)
+{
+  if (vlib_node_name_lock_owner != VLIB_NODE_NAME_NO_OWNER)
+    {
+      vlib_node_name_lock_depth++;
+      return 0;
+    }
+
+  clib_spinlock_lock (&vlib_node_name_lock);
+
+  vlib_node_name_lock_owner = os_get_thread_index ();
+  vlib_node_name_lock_depth = 1;
+  return 1;
+}
+
+/* Leaves a call inside the section. Returns 1 when this call leaves the
+ * section, and 0 when a caller of the same thread is still inside it. */
+u8
+vlib_node_name_lock_put (void)
+{
+  ASSERT (vlib_node_name_lock_owner == os_get_thread_index ());
+  ASSERT (vlib_node_name_lock_depth > 0);
+
+  if (--vlib_node_name_lock_depth > 0)
+    return 0;
+
+  vlib_node_name_lock_owner = VLIB_NODE_NAME_NO_OWNER;
+  clib_spinlock_unlock (&vlib_node_name_lock);
+  return 1;
+}
+
+/* Records that the section of a thread that retired names has ended. */
+void
+vlib_node_name_section_ended (void)
+{
+  ASSERT (vlib_node_name_lock_owner == VLIB_NODE_NAME_NO_OWNER);
+
+  vlib_node_name_waiting = 0;
+}
+
+/* Frees the names earlier renames retired. A rename calls it right after it
+ * takes the name lock, so no other rename is running, and its own section has
+ * retired nothing yet. */
+void
+vlib_node_name_reap (void)
+{
+  vlib_node_name_free_retired ();
 }
 
 void
@@ -127,6 +270,7 @@ vlib_unregister_errors (vlib_main_t *vm, u32 node_index)
   vlib_error_main_t *em = &vm->error_main;
   vlib_node_t *n = vlib_get_node (vm, node_index);
   vlib_error_desc_t *cd;
+  u8 names_locked;
 
   if (n->n_errors > 0)
     {
@@ -134,6 +278,7 @@ vlib_unregister_errors (vlib_main_t *vm, u32 node_index)
        * names point into them. */
       vlib_error_desc_lock_get ();
 
+      names_locked = vlib_node_name_lock_get ();
       cd = vec_elt_at_index (em->counters_heap, n->error_heap_index);
       for (u32 i = 0; i < n->n_errors; i++)
 	vlib_stats_remove_entry (cd[i].stats_entry_index);
@@ -141,6 +286,10 @@ vlib_unregister_errors (vlib_main_t *vm, u32 node_index)
       n->n_errors = 0;
 
       vlib_error_desc_lock_put ();
+
+      /* A name retired here is freed by the next rename. */
+      if (names_locked)
+	vlib_node_name_lock_put ();
     }
 }
 
@@ -400,8 +549,8 @@ vlib_error_counts_get (vlib_main_t *vm, vlib_error_counts_t *c)
 
   /* Unregistering a node frees its entries in counters_heap, and registering
    * one replaces them, so read them under the description lock. The node name
-   * is copied under the same lock, but vlib_node_rename replaces it without
-   * taking the lock, so that copy is the one read this lock does not cover. */
+   * is copied under the same lock, and vlib_node_rename takes the lock to
+   * exchange it, rather than replacing it under the reader. */
   vlib_error_desc_lock_get ();
 
   vec_foreach (n, main_vm->node_main.nodes)
