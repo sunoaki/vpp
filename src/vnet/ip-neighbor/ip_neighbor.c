@@ -1649,7 +1649,6 @@ ip_neighbor_walk_covered (index_t ipni, void *arg)
   return (WALK_CONTINUE);
 }
 
-
 /*
  * callback when an interface address is added or deleted
  */
