@@ -186,6 +186,66 @@ class ARPTestCase(VppTestCase):
         """Get ARP RX grat stats for and interface"""
         return self.statistics["/net/arp/tx/gratuitous"][:, itf.sw_if_index].sum()
 
+    def test_arp_adj_fib_unbind(self):
+        """adj-fib is gone once its neighbour is, whatever the binding
+
+        The unbind only removes the address, which leaves the dynamic
+        neighbour alone, so it is still there when the interface has moved
+        to the new table and it is the one being deleted at the end. That is
+        what makes the case worth testing: the adj-fib is in a table the
+        binding no longer names.
+
+        The table lock the adj-fib keeps cannot be read back, so this pins
+        the entry, which the binding walk alone already removed before the
+        fix, and not the lock that outlived it.
+        """
+        self.pg1.generate_remote_hosts(1)
+        nbr_addr = self.pg1.remote_hosts[0].ip4
+        table = VppIpTable(self, 100).add_vpp_config()
+
+        nbr = VppNeighbor(
+            self, self.pg1.sw_if_index, self.pg1.remote_hosts[0].mac, nbr_addr
+        )
+        nbr.add_vpp_config()
+        self.assertTrue(find_nbr(self, self.pg1.sw_if_index, nbr_addr))
+
+        #
+        # the neighbour follows the interface into table 100
+        #
+        self.pg1.unconfig_ip4()
+        self.pg1.set_table_ip4(100)
+
+        self.assertTrue(find_nbr(self, self.pg1.sw_if_index, nbr_addr))
+        self.assertEqual(self.get_adj_sourced_routes(table), [nbr_addr])
+
+        #
+        # the interface leaves the table before the neighbour goes away. The
+        # adj-fib is in table 100 and the binding no longer says so, which
+        # used to leave the entry and the table lock behind for good
+        #
+        self.pg1.set_table_ip4(0)
+        nbr.remove_vpp_config()
+
+        self.assertFalse(find_nbr(self, self.pg1.sw_if_index, nbr_addr))
+        self.assertEqual(self.get_adj_sourced_routes(table), [])
+
+        table.remove_vpp_config()
+
+    def get_adj_sourced_routes(self, table):
+        """The addresses table holds a route for from the adjacency source"""
+        adj_source = None
+        for source in self.vapi.fib_source_dump():
+            if source.src.name == "adjacency":
+                adj_source = source.src
+
+        if adj_source is None:
+            raise AssertionError("the FIB has no adjacency source to look up")
+
+        return [
+            route.route.prefix.address
+            for route in self.vapi.ip_route_v2_dump(table.table_id, src=adj_source.id)
+        ]
+
     def test_arp(self):
         """ARP"""
 

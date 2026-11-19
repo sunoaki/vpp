@@ -399,6 +399,19 @@ ip_af_type_pfx_len (ip_address_family_t type)
   return (type == AF_IP4 ? 32 : 128);
 }
 
+/*
+ * For a next hop in the table the interface is bound to, the count of
+ * neighbours per table and the FIB_SOURCE_ADJ lock of the table are held for
+ * as long as, and only for as long as, one of this module's adj fibs is in it.
+ * So both follow the entry, and the table is recorded with the entry: the
+ * table the interface is bound to is not where the entry is, once the
+ * interface moves to another table or stops being bound to one.
+ *
+ * An IPv6 link-local next hop is the exception, and no count is kept for it.
+ * Its entry goes in the interface's link-local table, which ip6_ll_table.c
+ * locks once while that table lives and unlocks when its last ND entry goes,
+ * so there is neither a count nor a lock here to follow it.
+ */
 static void
 ip_neighbor_adj_fib_add (ip_neighbor_t * ipn, u32 fib_index)
 {
@@ -439,6 +452,16 @@ ip_neighbor_adj_fib_add (ip_neighbor_t * ipn, u32 fib_index)
 				  ipn->ipn_key->ipnk_sw_if_index,
 				  ~0, 1, NULL, FIB_ROUTE_PATH_FLAG_NONE);
 
+      /*
+       * The table exists for the entry, not the other way around: an add that
+       * installed nothing holds no count and no lock, or the table is leaked
+       * with nothing left in it to release it.
+       */
+      if (FIB_NODE_INDEX_INVALID == ipn->ipn_fib_entry_index)
+	return;
+
+      ipn->ipn_fib_index = fib_index;
+
       vec_validate (ip_neighbor_db[af].ipndb_n_elts_per_fib, fib_index);
 
       ip_neighbor_db[af].ipndb_n_elts_per_fib[fib_index]++;
@@ -449,7 +472,7 @@ ip_neighbor_adj_fib_add (ip_neighbor_t * ipn, u32 fib_index)
 }
 
 static void
-ip_neighbor_adj_fib_remove (ip_neighbor_t * ipn, u32 fib_index)
+ip_neighbor_adj_fib_remove (ip_neighbor_t *ipn)
 {
   ip_address_family_t af;
 
@@ -469,30 +492,39 @@ ip_neighbor_adj_fib_remove (ip_neighbor_t * ipn, u32 fib_index)
 	}
       else
 	{
-	  if (INDEX_INVALID == fib_index)
-	    return;
 	  fib_protocol_t fproto;
+	  fib_prefix_t pfx;
+	  u32 fib_index;
 
 	  fproto = ip_address_family_to_fib_proto (af);
+	  fib_index = ipn->ipn_fib_index;
 
-	  fib_prefix_t pfx = {
-	    .fp_len = ip_af_type_pfx_len (af),
-	    .fp_proto = fproto,
-	    .fp_addr = ip_addr_46 (&ipn->ipn_key->ipnk_ip),
-	  };
+	  ipn->ipn_fib_entry_index = FIB_NODE_INDEX_INVALID;
+	  ipn->ipn_fib_index = INDEX_INVALID;
 
-	  fib_table_entry_path_remove (fib_index,
-				       &pfx,
-				       FIB_SOURCE_ADJ,
-				       fib_proto_to_dpo (fproto),
-				       &pfx.fp_addr,
-				       ipn->ipn_key->ipnk_sw_if_index,
-				       ~0, 1, FIB_ROUTE_PATH_FLAG_NONE);
+	  if (INDEX_INVALID != fib_index)
+	    {
+	      pfx = (fib_prefix_t) {
+		.fp_len = ip_af_type_pfx_len (af),
+		.fp_proto = fproto,
+		.fp_addr = ip_addr_46 (&ipn->ipn_key->ipnk_ip),
+	      };
 
-	  ip_neighbor_db[af].ipndb_n_elts_per_fib[fib_index]--;
+	      fib_table_entry_path_remove (
+		fib_index, &pfx, FIB_SOURCE_ADJ, fib_proto_to_dpo (fproto), &pfx.fp_addr,
+		ipn->ipn_key->ipnk_sw_if_index, ~0, 1, FIB_ROUTE_PATH_FLAG_NONE);
 
-	  if (0 == ip_neighbor_db[af].ipndb_n_elts_per_fib[fib_index])
-	    fib_table_unlock (fib_index, fproto, FIB_SOURCE_ADJ);
+	      /*
+	       * the count belongs to the entry that was added, which is why it
+	       * is released against the table recorded then, and not against
+	       * the table the interface is bound to now: that binding can be
+	       * gone by the time the neighbour is.
+	       */
+	      ip_neighbor_db[af].ipndb_n_elts_per_fib[fib_index]--;
+
+	      if (0 == ip_neighbor_db[af].ipndb_n_elts_per_fib[fib_index])
+		fib_table_unlock (fib_index, fproto, FIB_SOURCE_ADJ);
+	    }
 	}
     }
 }
@@ -600,10 +632,7 @@ ip_neighbor_destroy (ip_neighbor_t * ipn)
 		   ip_address_family_to_fib_proto (af),
 		   &ip_addr_46 (&ipn->ipn_key->ipnk_ip),
 		   ip_neighbor_mk_incomplete_walk, ipn);
-  ip_neighbor_adj_fib_remove
-    (ipn,
-     fib_table_get_index_for_sw_if_index
-     (ip_address_family_to_fib_proto (af), ipn->ipn_key->ipnk_sw_if_index));
+  ip_neighbor_adj_fib_remove (ipn);
 
   ip_neighbor_list_remove (ipn);
   ip_neighbor_db_remove (ipn);
@@ -654,6 +683,7 @@ ip_neighbor_alloc (const ip_neighbor_key_t * key,
   clib_memcpy (ipn->ipn_key, key, sizeof (*ipn->ipn_key));
 
   ipn->ipn_fib_entry_index = FIB_NODE_INDEX_INVALID;
+  ipn->ipn_fib_index = INDEX_INVALID;
   ipn->ipn_flags = flags;
   ipn->ipn_elt = ~0;
 
@@ -1731,7 +1761,6 @@ ip_neighbor_add_del_interface_address_v6 (ip6_main_t * im,
 typedef struct ip_neighbor_table_bind_ctx_t_
 {
   u32 new_fib_index;
-  u32 old_fib_index;
 } ip_neighbor_table_bind_ctx_t;
 
 static walk_rc_t
@@ -1741,20 +1770,23 @@ ip_neighbor_walk_table_bind (index_t ipni, void *arg)
   ip_neighbor_t *ipn;
 
   ipn = ip_neighbor_get (ipni);
-  ip_neighbor_adj_fib_remove (ipn, ctx->old_fib_index);
-  ip_neighbor_adj_fib_add (ipn, ctx->new_fib_index);
+  ip_neighbor_adj_fib_remove (ipn);
+
+  if (!(ipn->ipn_flags & IP_NEIGHBOR_FLAG_NO_FIB_ENTRY))
+    ip_neighbor_adj_fib_add (ipn, ctx->new_fib_index);
 
   return (WALK_CONTINUE);
 }
 
+/*
+ * The old table is not needed: the neighbour knows the table it put its adj
+ * fib in, and releasing that is what ip_neighbor_adj_fib_remove does.
+ */
 static void
-ip_neighbor_table_bind_v4 (ip4_main_t * im,
-			   uword opaque,
-			   u32 sw_if_index,
-			   u32 new_fib_index, u32 old_fib_index)
+ip_neighbor_table_bind_v4 (ip4_main_t *im, uword opaque, u32 sw_if_index, u32 new_fib_index,
+			   CLIB_UNUSED (u32 old_fib_index))
 {
   ip_neighbor_table_bind_ctx_t ctx = {
-    .old_fib_index = old_fib_index,
     .new_fib_index = new_fib_index,
   };
 
@@ -1762,13 +1794,10 @@ ip_neighbor_table_bind_v4 (ip4_main_t * im,
 }
 
 static void
-ip_neighbor_table_bind_v6 (ip6_main_t * im,
-			   uword opaque,
-			   u32 sw_if_index,
-			   u32 new_fib_index, u32 old_fib_index)
+ip_neighbor_table_bind_v6 (ip6_main_t *im, uword opaque, u32 sw_if_index, u32 new_fib_index,
+			   CLIB_UNUSED (u32 old_fib_index))
 {
   ip_neighbor_table_bind_ctx_t ctx = {
-    .old_fib_index = old_fib_index,
     .new_fib_index = new_fib_index,
   };
 
