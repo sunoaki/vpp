@@ -12,6 +12,7 @@
 #include <vnet/ip6-nd/ip6_nd.h>
 #include <vnet/ip/ip6_forward.h>
 #include <vnet/ip-neighbor/ip6_neighbor.h>
+#include <vnet/ip-neighbor/ip_neighbor.h>
 #include <vnet/ethernet/ethernet.h>
 #include <vnet/fib/fib_table.h>
 
@@ -110,6 +111,13 @@ create_dad_ns_buffer (vlib_main_t *vm, ip6_dad_entry_t *entry)
   /* Ethernet header: multicast destination */
   ip6_multicast_ethernet_address (dst_mac, id | (0xffU << 24));
   rewrite = ethernet_build_rewrite (vnm, entry->sw_if_index, VNET_LINK_IP6, dst_mac);
+  if (!rewrite)
+    {
+      /* This interface carries no ethernet header, so there is no NS to
+       * send, and no point retrying against it. */
+      vlib_buffer_free (vm, &bi, 1);
+      return ~0;
+    }
   rewrite_len = vec_len (rewrite);
   vlib_buffer_advance (b, -rewrite_len);
   ethernet_header_t *e = vlib_buffer_get_current (b);
@@ -126,7 +134,7 @@ create_dad_ns_buffer (vlib_main_t *vm, ip6_dad_entry_t *entry)
 /**
  * Send DAD NS from main thread
  */
-static void
+static int
 send_dad_ns (vlib_main_t *vm, ip6_dad_entry_t *entry)
 {
   vnet_main_t *vnm = vnet_get_main ();
@@ -142,10 +150,7 @@ send_dad_ns (vlib_main_t *vm, ip6_dad_entry_t *entry)
   /* Create a fresh NS buffer */
   bi = create_dad_ns_buffer (vm, entry);
   if (bi == ~0)
-    {
-      DAD_ERR ("Failed to create DAD NS buffer for %U", format_ip6_address, &entry->address);
-      return;
-    }
+    return 0;
 
   /* Send to interface output node */
   f = vlib_get_frame_to_node (vm, hi->output_node_index);
@@ -160,6 +165,8 @@ send_dad_ns (vlib_main_t *vm, ip6_dad_entry_t *entry)
   /* Send TENTATIVE notification after sending NS */
   ip6_dad_send_event (entry->sw_if_index, &entry->address, IP6_DAD_STATE_TENTATIVE,
 		      entry->dad_count + 1, entry->dad_transmits);
+
+  return 1;
 }
 
 /**
@@ -329,9 +336,11 @@ ip6_dad_process (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame
 	    {
 	      if (entry->dad_count < entry->dad_transmits)
 		{
-		  /* Send NS (this will also send TENTATIVE event) */
-		  send_dad_ns (vm, entry);
-		  entry->dad_count++;
+		  /* Send NS (this will also send TENTATIVE event). A failed send is
+		   * not counted, so DAD keeps retrying instead of running out of
+		   * transmits with no NS having left the box. */
+		  if (send_dad_ns (vm, entry))
+		    entry->dad_count++;
 
 		  /* Schedule next transmission */
 		  entry->dad_next_send_time = now + entry->dad_retransmit_delay;
@@ -420,6 +429,13 @@ ip6_dad_start (u32 sw_if_index, const ip6_address_t *address, u8 address_length)
 
   DAD_INFO ("DAD started for %U on sw_if_index %u (%u transmits)", format_ip6_address, address,
 	    sw_if_index, entry->dad_transmits);
+
+  /* Sends on such an interface cannot succeed, so say so once here instead
+   * of once per retransmit for as long as the entry stays tentative. The
+   * address stays TENTATIVE and the retries stay in place. */
+  if (!ip_neighbor_sw_if_index_has_ethernet_rewrite (sw_if_index))
+    DAD_ERR ("DAD cannot send on %U: no ethernet header", format_vnet_sw_if_index_name,
+	     vnet_get_main (), sw_if_index);
 
   /* Send initial TENTATIVE notification (count=0, before first NS) */
   ip6_dad_send_event (sw_if_index, address, IP6_DAD_STATE_TENTATIVE, 0, entry->dad_transmits);
