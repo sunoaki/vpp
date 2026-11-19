@@ -557,10 +557,21 @@ acl_fa_worker_conn_cleaner_process (vlib_main_t *vm, vlib_node_runtime_t *rt, vl
     clib_bitmap_zero (pw->pending_clear_sw_if_index_bitmap);
   elog_acl_maybe_trace_X2 (am, "acl_fa_worker_conn_cleaner: now %lu, checked %d sessions", "i8i4",
 			   now, (u32) num_expired);
-  if (clear_left || num_expired > 0)
+  if (clear_left)
+    {
+      /*
+       * The clear walk has more than a pass can do, and the cleaner process
+       * sends the interrupt that continues it. Sending one from here as well
+       * would run the worker back to back while the lists still hold more
+       * sessions than a pass clears, and the idle scan would not run between
+       * the passes. Ask for it with the flag instead, which makes the cleaner
+       * process halve its wait on its next pass.
+       */
+      pw->interrupt_is_needed = 1;
+    }
+  else if (num_expired > 0)
     {
       /* there was too much work, we should get an interrupt ASAP */
-      // pw->interrupt_is_needed = 1;
       send_one_worker_interrupt (vm, am, thread_index);
       pw->interrupt_is_unwanted = 0;
     }
