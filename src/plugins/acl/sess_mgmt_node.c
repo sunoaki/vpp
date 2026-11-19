@@ -413,6 +413,73 @@ aclp_swap_wip_and_pending_session_change_requests (acl_main_t *am, u32 target_th
 }
 
 /*
+ * Where the clear walk stopped in each timeout list, for the next interrupt.
+ *
+ * The sessions the walk has stepped over stay in place ahead of the point it
+ * stopped at, so remembering that point per list lets the next interrupt
+ * continue from it rather than step over the same stretch again.
+ *
+ * A worker's lists and pool are changed by that worker's own thread alone;
+ * another thread posts a session change request, and the owning worker runs
+ * it from its own interrupt. The cursors need no lock for the same reason,
+ * and they live here rather than in the per-worker structure because nothing
+ * else reads them.
+ *
+ * A request that adds an interface to the pending bitmap drops them, because
+ * the walk for the interfaces already pending may have passed the point where
+ * the sessions of the new one sit.
+ */
+static u32 *acl_fa_clear_cursors;
+
+static u32 *
+acl_fa_clear_cursor_of (clib_thread_index_t thread_index)
+{
+  vec_validate_init_empty (acl_fa_clear_cursors, ACL_N_TIMEOUTS * (thread_index + 1) - 1,
+			   FA_SESSION_BOGUS_INDEX);
+  return acl_fa_clear_cursors + ACL_N_TIMEOUTS * thread_index;
+}
+
+/*
+ * Answer whether the walk may start again at the session it stopped at last
+ * time, and hand that session back when it may.
+ *
+ * The walk stops on a session of an interface that is not waiting for a
+ * clear and leaves it in its list. The idle scan restarts a timer only from a
+ * list head, which is always nearer the tail than the session the walk
+ * stopped at, and the purgatory walk takes its sessions from the head of its
+ * own list, so nothing moves that session between two passes. A session that
+ * left the pool, or moved to another list, is one the walk must not resume
+ * at: its list starts over from the tail.
+ *
+ * The walk frees sessions as it deletes them, so the index it remembers can
+ * name a slot the pool took back. get_session_ptr does not ask the pool
+ * whether it still owns the slot, and reading a freed one is a use after free
+ * under a sanitized build, so the pool answers first.
+ *
+ * The pool keeps no generation for its slots. If a slot was freed and handed
+ * to a new session of the same list, the check cannot tell the two apart and
+ * the walk resumes at the new session, reading the links it was given, so it
+ * stays inside its list. The sessions between the new one and the point the
+ * walk had reached are then read once more before the clear ends.
+ */
+static fa_session_t *
+acl_fa_clear_resume (acl_main_t *am, clib_thread_index_t thread_index, u8 list_id,
+		     u32 session_index)
+{
+  acl_fa_per_worker_data_t *pw = &am->per_worker_data[thread_index];
+  fa_session_t *sess;
+
+  if (session_index >= vec_len (pw->fa_sessions_pool) ||
+      pool_is_free_index (pw->fa_sessions_pool, session_index))
+    return 0;
+  sess = get_session_ptr (am, thread_index, session_index);
+
+  if (sess == 0 || sess->thread_index != thread_index || sess->link_list_id != list_id)
+    return 0;
+  return sess;
+}
+
+/*
  * Delete the sessions of the interfaces waiting for a clear off this worker's
  * lists, and report whether the walk stopped before it reached their ends.
  *
@@ -429,14 +496,16 @@ aclp_swap_wip_and_pending_session_change_requests (acl_main_t *am, u32 target_th
  * every other step moves on to the session before it.
  *
  * The walk stops after the per-cycle limit, like the idle scan it shares its
- * interrupt with, and reports that as work left. The next interrupt resumes
- * it: the sessions of the waiting interfaces that it has not reached yet keep
- * their own places, so nothing is skipped.
+ * interrupt with, and reports that as work left. Each list remembers the
+ * session the walk stopped at, so the next interrupt starts there instead of
+ * stepping over the sessions it has already passed. A list whose remembered
+ * session is gone starts over from its tail.
  */
 static int
 acl_fa_clear_pending_interfaces (acl_main_t *am, clib_thread_index_t thread_index, u64 now)
 {
   acl_fa_per_worker_data_t *pw = &am->per_worker_data[thread_index];
+  u32 *cursor = acl_fa_clear_cursor_of (thread_index);
   fa_full_session_id_t fsid;
   int n_cleared = 0;
   u8 tt;
@@ -445,25 +514,57 @@ acl_fa_clear_pending_interfaces (acl_main_t *am, clib_thread_index_t thread_inde
 
   for (tt = 0; tt < ACL_N_TIMEOUTS; tt++)
     {
-      u32 session_index = pw->fa_conn_list_tail[tt];
+      u32 saved = cursor[tt];
+      u32 session_index = saved;
+      fa_session_t *sess = 0;
+
+      /* a list this pass reaches keeps a new position or none at all */
+      cursor[tt] = FA_SESSION_BOGUS_INDEX;
+
+      if (FA_SESSION_BOGUS_INDEX == saved ||
+	  (sess = acl_fa_clear_resume (am, thread_index, tt, session_index)) == 0)
+	{
+	  /* nothing to resume from in this list, so start at its tail */
+	  sess = 0;
+	  session_index = pw->fa_conn_list_tail[tt];
+	}
 
       while (FA_SESSION_BOGUS_INDEX != session_index)
 	{
-	  fa_session_t *sess = get_session_ptr (am, thread_index, session_index);
 	  /*
 	   * Read the link now: deleting the session unlinks it, and parking it
 	   * moves it to the purgatory list with the links rewritten.
 	   */
-	  u32 prev_session_index = sess->link_prev_idx;
+	  u32 prev_session_index;
+
+	  if (sess == 0)
+	    sess = get_session_ptr (am, thread_index, session_index);
+	  prev_session_index = sess->link_prev_idx;
 
 	  if (tt == ACL_TIMEOUT_PURGATORY ||
 	      !clib_bitmap_get (pw->pending_clear_sw_if_index_bitmap, sess->sw_if_index))
 	    {
-	      session_index = prev_session_index;
+	      /*
+	       * The sessions this pass has stepped over are not read again:
+	       * this one is where the next interrupt starts.
+	       */
+	      cursor[tt] = session_index;
+	      session_index = FA_SESSION_BOGUS_INDEX;
 	      continue;
 	    }
+	  /*
+	   * The limit is reached only after a deletion, so the session before
+	   * this one is where the next pass starts. Saving this one instead
+	   * would return to it without deleting it and hit the limit again.
+	   */
 	  if (n_cleared >= am->fa_max_deleted_sessions_per_interval)
-	    return 1;
+	    {
+	      if (FA_SESSION_BOGUS_INDEX != prev_session_index)
+		cursor[tt] = prev_session_index;
+	      else
+		cursor[tt] = FA_SESSION_BOGUS_INDEX;
+	      return 1;
+	    }
 	  fsid.session_index = session_index;
 	  acl_fa_conn_list_delete_session (am, fsid, now);
 	  /*
@@ -475,6 +576,7 @@ acl_fa_clear_pending_interfaces (acl_main_t *am, clib_thread_index_t thread_inde
 	   */
 	  acl_fa_two_stage_delete_session (am, sess->sw_if_index, fsid, now);
 	  n_cleared++;
+	  sess = 0;
 	  session_index = prev_session_index;
 	}
     }
@@ -536,6 +638,12 @@ acl_fa_worker_conn_cleaner_process (vlib_main_t *vm, vlib_node_runtime_t *rt, vl
 	    clib_bitmap_set (pw->pending_clear_sw_if_index_bitmap, *sw_if_index0, 1);
 	}
       vec_set_len (pw->wip_clear_sw_if_indices, 0);
+      /*
+       * The walk for the interfaces already pending may have stopped part way
+       * into the lists, and the sessions of the interfaces just added can sit
+       * behind that point. Start every list from its tail for them.
+       */
+      clib_memset (acl_fa_clear_cursor_of (thread_index), 0xff, ACL_N_TIMEOUTS * sizeof (u32));
     }
   cleared = !clib_bitmap_is_zero (pw->pending_clear_sw_if_index_bitmap);
   if (cleared)
@@ -565,7 +673,10 @@ acl_fa_worker_conn_cleaner_process (vlib_main_t *vm, vlib_node_runtime_t *rt, vl
        * would run the worker back to back while the lists still hold more
        * sessions than a pass clears, and the idle scan would not run between
        * the passes. Ask for it with the flag instead, which makes the cleaner
-       * process halve its wait on its next pass.
+       * process halve its wait on its next pass. The cleaner reads both flags
+       * and narrows the interval when any worker asks for an interrupt, before
+       * it would widen it for a worker that does not, so a pass with work left
+       * to continue never also counts an unwanted interrupt.
        */
       pw->interrupt_is_needed = 1;
     }
