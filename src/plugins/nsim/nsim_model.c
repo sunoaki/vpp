@@ -309,6 +309,8 @@ nsim_model_queue_slots (const nsim_model_config_t *c, f64 bandwidth, u32 packet_
 
   if (c->buffer_time <= 0.0)
     return 0;
+  if (packet_size == 0)
+    return 0;
   bytes = ((c->buffer_time * bandwidth) / 8.0) + 0.5;
   return bytes / packet_size + 1;
 }
@@ -324,6 +326,8 @@ nsim_model_wheel_slots (const nsim_model_config_t *c, f64 bandwidth, f64 delay, 
   u64 holding_bytes = ((holding_time * bandwidth) / 8.0) + 0.5;
   u64 queue_slots = nsim_model_queue_slots (c, bandwidth, packet_size);
 
+  if (packet_size == 0)
+    return 0;
   if (queue_slots)
     return queue_slots + (holding_bytes + packet_size - 1) / packet_size;
   return holding_bytes / packet_size + 1;
