@@ -1893,6 +1893,10 @@ vlib_main (vlib_main_t * volatile vm, unformat_input_t * input)
       goto done;
     }
 
+  /* Before any worker thread can reach the locks it takes to read or replace
+   * a node name. */
+  vlib_error_lock_init ();
+
   if ((error = vlib_thread_init (vm)))
     {
       clib_error_report (error);
