@@ -520,7 +520,6 @@ vlib_error_counts_get (vlib_main_t *vm, vlib_error_counts_t *c)
 {
   vlib_main_t *main_vm = vlib_get_first_main ();
   vlib_error_main_t *em = &main_vm->error_main;
-  vlib_node_t *n;
   char *name;
   u32 i, index;
 
