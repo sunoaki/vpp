@@ -58,6 +58,31 @@ typedef struct
   u16 *next_by_protocol;
 } gre_input_runtime_t;
 
+/* Length check on the GRE header. On success, *gre_hdr_length receives the
+   size of the fixed header plus the key when the key bit is set. Returns 0
+   when the packet does not carry that many bytes past the IP header. */
+always_inline u8
+gre_input_header_length (vlib_main_t *vm, vlib_buffer_t *b, int is_ipv6, u16 *gre_hdr_length)
+{
+  u16 fixed = is_ipv6 ? sizeof (ip6_header_t) : sizeof (ip4_header_t);
+  uword len = vlib_buffer_length_in_chain (vm, b);
+  const gre_header_t *gre;
+
+  if (PREDICT_FALSE (len < fixed + sizeof (*gre)))
+    return 0;
+
+  gre = (const gre_header_t *) ((u8 *) vlib_buffer_get_current (b) + fixed);
+  *gre_hdr_length = sizeof (*gre);
+  if (gre->flags_and_version & clib_host_to_net_u16 (GRE_FLAGS_KEY))
+    {
+      if (PREDICT_FALSE (len - fixed < sizeof (*gre) + sizeof (gre_key_t)))
+	return 0;
+      *gre_hdr_length += sizeof (gre_key_t);
+    }
+
+  return 1;
+}
+
 always_inline void
 gre_trace (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_buffer_t *b,
 	   u32 tun_sw_if_index, const ip6_header_t *ip6,
@@ -154,20 +179,45 @@ gre_input (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame,
 	  vlib_prefetch_buffer_header (b[5], STORE);
 	}
 
+      /* ip4/ip6_local hands us the ip header, not the gre header */
       if (is_ipv6)
 	{
-	  /* ip6_local hands us the ip header, not the gre header */
 	  ip6[0] = vlib_buffer_get_current (b[0]);
 	  ip6[1] = vlib_buffer_get_current (b[1]);
+	}
+      else
+	{
+	  ip4[0] = vlib_buffer_get_current (b[0]);
+	  ip4[1] = vlib_buffer_get_current (b[1]);
+	}
+
+      /* Calculate total header size for each packet, and drop the packets
+	 that do not carry it: gre[0] and gre[1] are only valid past here. */
+      u16 gre_hdr_size0, gre_hdr_size1;
+      u8 gre_hdr_valid0 = gre_input_header_length (vm, b[0], is_ipv6, &gre_hdr_size0);
+      u8 gre_hdr_valid1 = gre_input_header_length (vm, b[1], is_ipv6, &gre_hdr_size1);
+      if (PREDICT_FALSE (!(gre_hdr_valid0 & gre_hdr_valid1)))
+	{
+	  if (!gre_hdr_valid0)
+	    {
+	      b[0]->error = node->errors[GRE_ERROR_INPUT_SHORT];
+	      next[0] = GRE_INPUT_NEXT_DROP;
+	    }
+	  if (!gre_hdr_valid1)
+	    {
+	      b[1]->error = node->errors[GRE_ERROR_INPUT_SHORT];
+	      next[1] = GRE_INPUT_NEXT_DROP;
+	    }
+	  b += 2;
+	  next += 2;
+	  n_left_from -= 2;
+	  continue;
+	}
+
+      if (is_ipv6)
+	{
 	  gre[0] = (void *) (ip6[0] + 1);
 	  gre[1] = (void *) (ip6[1] + 1);
-	  /* Calculate total header size for each packet */
-	  u16 gre_hdr_size0 = sizeof (*gre[0]);
-	  u16 gre_hdr_size1 = sizeof (*gre[1]);
-	  if (gre[0]->flags_and_version & clib_host_to_net_u16 (GRE_FLAGS_KEY))
-	    gre_hdr_size0 += sizeof (gre_key_t);
-	  if (gre[1]->flags_and_version & clib_host_to_net_u16 (GRE_FLAGS_KEY))
-	    gre_hdr_size1 += sizeof (gre_key_t);
 
 	  /* Single buffer advance for each packet */
 	  vlib_buffer_advance (b[0], sizeof (*ip6[0]) + gre_hdr_size0);
@@ -175,18 +225,8 @@ gre_input (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame,
 	}
       else
 	{
-	  /* ip4_local hands us the ip header, not the gre header */
-	  ip4[0] = vlib_buffer_get_current (b[0]);
-	  ip4[1] = vlib_buffer_get_current (b[1]);
 	  gre[0] = (void *) (ip4[0] + 1);
 	  gre[1] = (void *) (ip4[1] + 1);
-	  /* Calculate total header size for each packet */
-	  u16 gre_hdr_size0 = sizeof (*gre[0]);
-	  u16 gre_hdr_size1 = sizeof (*gre[1]);
-	  if (gre[0]->flags_and_version & clib_host_to_net_u16 (GRE_FLAGS_KEY))
-	    gre_hdr_size0 += sizeof (gre_key_t);
-	  if (gre[1]->flags_and_version & clib_host_to_net_u16 (GRE_FLAGS_KEY))
-	    gre_hdr_size1 += sizeof (gre_key_t);
 
 	  /* Single buffer advance for each packet */
 	  vlib_buffer_advance (b[0], sizeof (*ip4[0]) + gre_hdr_size0);
@@ -343,29 +383,34 @@ gre_input (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame,
 	  vlib_prefetch_buffer_header (b[2], STORE);
 	}
 
+      /* ip4/ip6_local hands us the ip header, not the gre header */
+      if (is_ipv6)
+	ip6[0] = vlib_buffer_get_current (b[0]);
+      else
+	ip4[0] = vlib_buffer_get_current (b[0]);
+
+      /* Calculate total header size and drop the packet that does not carry
+	 it: gre[0] is only valid past here. */
+      u16 gre_hdr_size;
+      if (PREDICT_FALSE (!gre_input_header_length (vm, b[0], is_ipv6, &gre_hdr_size)))
+	{
+	  b[0]->error = node->errors[GRE_ERROR_INPUT_SHORT];
+	  next[0] = GRE_INPUT_NEXT_DROP;
+	  b += 1;
+	  next += 1;
+	  n_left_from -= 1;
+	  continue;
+	}
+
+      /* Single buffer advance */
       if (is_ipv6)
 	{
-	  /* ip6_local hands us the ip header, not the gre header */
-	  ip6[0] = vlib_buffer_get_current (b[0]);
 	  gre[0] = (void *) (ip6[0] + 1);
-
-	  /* Calculate total header size */
-	  u16 gre_hdr_size = sizeof (*gre[0]);
-	  if (gre[0]->flags_and_version & clib_host_to_net_u16 (GRE_FLAGS_KEY))
-	    gre_hdr_size += sizeof (gre_key_t);
-	  /* Single buffer advance */
 	  vlib_buffer_advance (b[0], sizeof (*ip6[0]) + gre_hdr_size);
 	}
       else
 	{
-	  /* ip4_local hands us the ip header, not the gre header */
-	  ip4[0] = vlib_buffer_get_current (b[0]);
 	  gre[0] = (void *) (ip4[0] + 1);
-	  /* Calculate total header size */
-	  u16 gre_hdr_size = sizeof (*gre[0]);
-	  if (gre[0]->flags_and_version & clib_host_to_net_u16 (GRE_FLAGS_KEY))
-	    gre_hdr_size += sizeof (gre_key_t);
-	  /* Single buffer advance */
 	  vlib_buffer_advance (b[0], sizeof (*ip4[0]) + gre_hdr_size);
 	}
 

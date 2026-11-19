@@ -158,6 +158,17 @@ class TestGRE(VppTestCase):
             pkts.append(p)
         return pkts
 
+    def create_short_gre_stream_4(self, src_if, dst_ip):
+        pkts = []
+        for i in range(0, 257):
+            info = self.create_packet_info(src_if, src_if)
+            p = Ether(dst=src_if.local_mac, src=src_if.remote_mac) / IP(
+                src=src_if.remote_ip4, dst=dst_ip, proto=47, flags="DF"
+            )
+            info.data = p.copy()
+            pkts.append(p)
+        return pkts
+
     def create_tunnel_stream_4o4(self, src_if, tunnel_src, tunnel_dst, src_ip, dst_ip):
         pkts = []
         for i in range(0, 257):
@@ -852,6 +863,42 @@ class TestGRE(VppTestCase):
         # Cleanup
         route_tun_dst.remove_vpp_config()
         route_via_tun.remove_vpp_config()
+        gre_if.remove_vpp_config()
+
+    def test_gre_input_short_header(self):
+        """GRE input drops a protocol 47 packet with no GRE header"""
+        gre_if = VppGreInterface(self, self.pg0.local_ip4, "1.1.1.2")
+        gre_if.add_vpp_config()
+
+        short_counter = self.statistics.get_err_counter(
+            "/err/gre4-input/GRE input packets dropped due to short header"
+        )
+        decap_counter = self.statistics.get_err_counter(
+            "/err/gre4-input/GRE input packets decapsulated"
+        )
+
+        #
+        # A 20 byte IPv4 packet with protocol 47 carries no GRE header.
+        # gre4-input must drop it instead of reading past the packet.
+        #
+        tx = self.create_short_gre_stream_4(self.pg0, self.pg0.local_ip4)
+        self.pg_send(self.pg0, tx)
+        for pg_if in self.pg_interfaces:
+            self.assertEqual(len(pg_if.get_capture(0)), 0)
+
+        self.assertEqual(
+            self.statistics.get_err_counter(
+                "/err/gre4-input/GRE input packets dropped due to short header"
+            ),
+            short_counter + len(tx),
+        )
+        self.assertEqual(
+            self.statistics.get_err_counter(
+                "/err/gre4-input/GRE input packets decapsulated"
+            ),
+            decap_counter,
+        )
+
         gre_if.remove_vpp_config()
 
     def verify_gre_header_copy(self, capture, expected_inner, tunnel, tunnel_dst):
