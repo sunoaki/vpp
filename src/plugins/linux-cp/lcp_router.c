@@ -30,6 +30,19 @@
 #include <vnet/ip-neighbor/ip_neighbor.h>
 #include <vnet/ip/ip6_link.h>
 
+/*
+ * A group or source and group pair the plugin installed in the MFIB. The
+ * plugin keeps the list because the MFIB offers no way to ask which entries
+ * a given source installed, and a synchronization has to tell the ones the
+ * kernel no longer has from the ones it does.
+ */
+typedef struct
+{
+  mfib_prefix_t lcme_prefix;
+  /* the synchronization in progress replayed this one */
+  u8 lcme_replayed;
+} lcp_router_mcast_entry_t;
+
 typedef struct lcp_router_table_t_
 {
   uint32_t nlt_id;
@@ -37,6 +50,8 @@ typedef struct lcp_router_table_t_
   u32 nlt_fib_index;
   u32 nlt_mfib_index;
   u32 nlt_refs;
+  /* multicast routes the plugin holds in nlt_mfib_index, one reference each */
+  lcp_router_mcast_entry_t *nlt_mcast_entries;
 } lcp_router_table_t;
 
 static uword *lcp_router_table_db[FIB_PROTOCOL_MAX];
@@ -1132,6 +1147,125 @@ lcp_router_table_unlock (lcp_router_table_t *nlt)
     }
 }
 
+/*
+ * Find the recorded entry that covers the same group, and source when the
+ * prefix names one. The list holds the routes of one table only and is kept
+ * small by the synchronization removing what the kernel dropped, so a scan
+ * is enough.
+ */
+static lcp_router_mcast_entry_t *
+lcp_router_table_mcast_find (lcp_router_table_t *nlt, const mfib_prefix_t *prefix)
+{
+  lcp_router_mcast_entry_t *entry;
+
+  vec_foreach (entry, nlt->nlt_mcast_entries)
+    {
+      if (entry->lcme_prefix.fp_proto != prefix->fp_proto ||
+	  entry->lcme_prefix.fp_len != prefix->fp_len)
+	continue;
+      if (0 != clib_memcmp (&entry->lcme_prefix.fp_grp_addr, &prefix->fp_grp_addr,
+			    sizeof (prefix->fp_grp_addr)))
+	continue;
+      /* (*,G) stops here; (S,G) also has to name the same source */
+      if (prefix->fp_len > 2 * sizeof (ip4_address_t) * 8 &&
+	  0 != clib_memcmp (&entry->lcme_prefix.fp_src_addr, &prefix->fp_src_addr,
+			    sizeof (prefix->fp_src_addr)))
+	continue;
+      return entry;
+    }
+
+  return NULL;
+}
+
+/*
+ * Take the reference a multicast route the plugin installs in this table
+ * holds. A route the kernel replays was installed already and holds its
+ * reference still, which is what keeps a repeated synchronization from
+ * leaking one per pass.
+ */
+static void
+lcp_router_table_mcast_record (lcp_router_table_t *nlt, const mfib_prefix_t *prefix)
+{
+  lcp_router_mcast_entry_t *entry = lcp_router_table_mcast_find (nlt, prefix);
+
+  if (NULL == entry)
+    {
+      vec_add2 (nlt->nlt_mcast_entries, entry, 1);
+      entry->lcme_prefix = *prefix;
+      nlt->nlt_refs++;
+    }
+  entry->lcme_replayed = 1;
+}
+
+/*
+ * Give back what one route holds: its reference, and nothing that belongs to
+ * the other routes of the table. The entry is removed before the last
+ * reference can go, so the caller's pointer stays valid.
+ */
+static void
+lcp_router_table_mcast_forget (lcp_router_table_t *nlt, lcp_router_mcast_entry_t *entry)
+{
+  lcp_router_mcast_entry_t *last = vec_end (nlt->nlt_mcast_entries) - 1;
+
+  /* Moving the last route into the hole leaves the order alone; the
+   * synchronization walks the list by index, hence the swap. */
+  if (entry != last)
+    *entry = *last;
+  vec_dec_len (nlt->nlt_mcast_entries, 1);
+  lcp_router_table_unlock (nlt);
+}
+
+/*
+ * The synchronization in progress reached this table, so it can tell at its
+ * end which of the routes recorded for it the kernel still has. A table the
+ * dump does not reach is not entered, and keeps every route it holds.
+ */
+static void
+lcp_router_table_mcast_sync_begin (lcp_router_table_t *nlt)
+{
+  lcp_router_mcast_entry_t *entry;
+
+  vec_foreach (entry, nlt->nlt_mcast_entries)
+    entry->lcme_replayed = 0;
+}
+
+/*
+ * Remove the multicast routes of a table the dump of the synchronization
+ * that just ended replayed no route for, and the ones of a table the dump
+ * did not reach at all. Only the routes the plugin recorded for the table
+ * are considered: another source can have installed multicast routes in the
+ * same MFIB table, and those are none of the plugin's business.
+ */
+static void
+lcp_router_table_mcast_sync_end (lcp_router_table_t *nlt)
+{
+  lcp_router_mcast_entry_t *entry;
+  u32 ii = 0;
+
+  while (ii < vec_len (nlt->nlt_mcast_entries))
+    {
+      entry = vec_elt_at_index (nlt->nlt_mcast_entries, ii);
+      if (entry->lcme_replayed)
+	{
+	  entry->lcme_replayed = 0;
+	  ii++;
+	  continue;
+	}
+
+      /* Nothing but a netlink delete or a replace that names no nexthop takes
+       * a route away, and both forget the record as they go. So the MFIB can
+       * hold no entry here only for a prefix whose paths went another way;
+       * removing what is not there would only warn. */
+      if (FIB_NODE_INDEX_INVALID !=
+	  mfib_table_lookup_exact_match (nlt->nlt_mfib_index, &entry->lcme_prefix))
+	mfib_table_entry_delete (nlt->nlt_mfib_index, &entry->lcme_prefix, MFIB_SOURCE_PLUGIN_LOW);
+      /* The route at this index is the one moved into its place, or the list
+       * has shortened; either way the next one to look at is at the same
+       * index. */
+      lcp_router_table_mcast_forget (nlt, entry);
+    }
+}
+
 static u32
 lcp_router_table_source_count (const lcp_router_table_t *nlt, fib_source_t source)
 {
@@ -1169,6 +1303,7 @@ lcp_router_table_state (u32 table_id, fib_protocol_t proto, lcp_router_table_sta
     .fib_index = nlt->nlt_fib_index,
     .mfib_index = nlt->nlt_mfib_index,
     .sources = { lcp_rt_fib_src, lcp_rt_fib_src_dynamic, lcp_rt_fib_src_special },
+    .mcast_routes = vec_len (nlt->nlt_mcast_entries),
   };
   return 1;
 }
@@ -1494,6 +1629,59 @@ lcp_router_route_mk_entry_flags (uint8_t rtype, int table_id, uint8_t rproto)
   return (fef);
 }
 
+/*
+ * Remove what a multicast route added. Both calls act in the MFIB table,
+ * which is where lcp_router_route_add installs a multicast route; the unicast
+ * table of the same table id never holds it.
+ *
+ * mfib_table_entry_delete drops the source together with its entry flags and
+ * every path the source carries, which is the whole of the route the plugin
+ * installed. Removing the paths first and the flags afterwards cannot do that
+ * any better: MFIB drops the flags of a source once its last path is gone, so
+ * the second call would then have no source left to act on.
+ *
+ * The paths still go in, as mfib_table_entry_paths_remove leaves untouched a
+ * path the source no longer has. They cover an entry another source keeps
+ * alive: MFIB may leave the paths of a removed source in place, and the call
+ * takes them out along with the source that held them.
+ *
+ * The table is taken for the call and released again, so a caller that holds
+ * no reference of its own can drop a route too.
+ */
+static void
+lcp_router_route_mcast_del (u32 table_id, fib_protocol_t proto, const mfib_prefix_t *prefix,
+			    const fib_route_path_t *paths)
+{
+  lcp_router_mcast_entry_t *entry;
+  lcp_router_table_t *nlt;
+
+  nlt = lcp_router_table_find (lcp_router_table_k2f (table_id), proto);
+  if (NULL == nlt)
+    return;
+
+  /* The kernel can send a delete for a route it never announced, and can
+   * repeat one; the plugin holds nothing for it in either case. */
+  entry = lcp_router_table_mcast_find (nlt, prefix);
+  if (NULL == entry)
+    {
+      LCP_ROUTER_DBG ("route del: multicast route %U not held", format_mfib_prefix, prefix);
+      return;
+    }
+
+  nlt->nlt_refs++;
+  /* The source may have lost every path already, which takes the entry's
+   * last path with it; MFIB warns about a removal of what is not there and
+   * would take the entry away from a source that still has paths. */
+  if (FIB_NODE_INDEX_INVALID != mfib_table_lookup_exact_match (nlt->nlt_mfib_index, prefix))
+    {
+      mfib_table_entry_delete (nlt->nlt_mfib_index, prefix, MFIB_SOURCE_PLUGIN_LOW);
+      if (paths)
+	mfib_table_entry_paths_remove (nlt->nlt_mfib_index, prefix, MFIB_SOURCE_PLUGIN_LOW, paths);
+    }
+  lcp_router_table_mcast_forget (nlt, entry);
+  lcp_router_table_unlock (nlt);
+}
+
 static void
 lcp_router_route_del (struct rtnl_route *rr)
 {
@@ -1552,32 +1740,45 @@ lcp_router_route_del (struct rtnl_route *rr)
 
   if (0 != vec_len (np.paths))
     {
-      fib_source_t fib_src;
-
-      fib_src = lcp_router_proto_fib_source (rproto);
-      u32 before = lcp_router_table_source_count (nlt, fib_src);
-      if (rtype != RTN_MULTICAST)
-	nlt->nlt_refs++;
-
-      switch (pfx.fp_proto)
-	{
-	case FIB_PROTOCOL_IP6:
-	  fib_table_entry_delete (nlt->nlt_fib_index, &pfx, fib_src);
-	  break;
-	case FIB_PROTOCOL_MPLS:
-	  fib_table_entry_path_remove2 (nlt->nlt_fib_index, &pfx, fib_src,
-					np.paths);
-	  /* delete the EOS route in addition to NEOS - fallthrough */
-	  pfx.fp_eos = MPLS_EOS;
-	default:
-	  fib_table_entry_path_remove2 (nlt->nlt_fib_index, &pfx, fib_src,
-					np.paths);
-	}
-
       if (rtype == RTN_MULTICAST)
-	lcp_router_table_unlock (nlt);
+	{
+	  mfib_prefix_t mpfx = {};
+
+	  if (lcp_router_route_mk_mprefix (rr, &mpfx) || mpfx.fp_proto != pfx.fp_proto)
+	    {
+	      LCP_ROUTER_ERROR ("route del: invalid mcast prefix");
+	      vec_free (np.paths);
+	      return;
+	    }
+	  /* The route's own reference goes with the call, and the copy of the
+	   * table taken above is released after it, as on the unicast side. */
+	  nlt->nlt_refs++;
+	  lcp_router_route_mcast_del (table_id, pfx.fp_proto, &mpfx, np.paths);
+	  lcp_router_table_unlock (nlt);
+	}
       else
-	lcp_router_table_reconcile (nlt, fib_src, before);
+	{
+	  fib_source_t fib_src;
+
+	  fib_src = lcp_router_proto_fib_source (rproto);
+	  u32 before = lcp_router_table_source_count (nlt, fib_src);
+	  nlt->nlt_refs++;
+
+	  switch (pfx.fp_proto)
+	    {
+	    case FIB_PROTOCOL_IP6:
+	      fib_table_entry_delete (nlt->nlt_fib_index, &pfx, fib_src);
+	      break;
+	    case FIB_PROTOCOL_MPLS:
+	      fib_table_entry_path_remove2 (nlt->nlt_fib_index, &pfx, fib_src, np.paths);
+	      /* delete the EOS route in addition to NEOS - fallthrough */
+	      pfx.fp_eos = MPLS_EOS;
+	    default:
+	      fib_table_entry_path_remove2 (nlt->nlt_fib_index, &pfx, fib_src, np.paths);
+	    }
+
+	  lcp_router_table_reconcile (nlt, fib_src, before);
+	}
     }
 
   vec_free (np.paths);
@@ -1763,14 +1964,16 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
       if (rtype == RTN_MULTICAST)
 	{
 	  /* it's not clear to me how linux expresses the RPF paramters
-	   * so we'll allow from all interfaces and hope for the best */
-	  mfib_table_entry_update (nlt->nlt_mfib_index, &mpfx,
-				   MFIB_SOURCE_PLUGIN_LOW, MFIB_RPF_ID_NONE,
-				   MFIB_ENTRY_FLAG_ACCEPT_ALL_ITF);
-
-	  mfib_table_entry_paths_update (nlt->nlt_mfib_index, &mpfx,
-					 MFIB_SOURCE_PLUGIN_LOW,
-					 MFIB_ENTRY_FLAG_NONE, np.paths);
+	   * so we'll allow from all interfaces and hope for the best.
+	   *
+	   * The entry flags are set in the same call that installs the paths.
+	   * Setting them in a call of their own feeds MFIB_ENTRY_FLAG_NONE to
+	   * a source that keeps its paths, and the source then reads as one
+	   * with nothing left, so a later delete of that source takes the
+	   * entry away with it. */
+	  mfib_table_entry_paths_update (nlt->nlt_mfib_index, &mpfx, MFIB_SOURCE_PLUGIN_LOW,
+					 MFIB_ENTRY_FLAG_ACCEPT_ALL_ITF, np.paths);
+	  lcp_router_table_mcast_record (nlt, &mpfx);
 	}
       else
 	{
@@ -1821,6 +2024,18 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
       LCP_ROUTER_DBG ("no paths for route: %d:%U %U",
 		      rtnl_route_get_table (rr), format_fib_prefix, &pfx,
 		      format_fib_entry_flags, entry_flags);
+
+      /* The kernel can replace a route with one that names no nexthop. An
+       * MFIB entry whose paths are all gone loses its source, so a record
+       * left behind would hold a reference for a route the MFIB no longer
+       * has; the route goes as a delete would take it.
+       *
+       * Only a replace can do that. The kernel also sends an add with no
+       * nexthop, for a route it dropped itself; nothing was installed for
+       * one, and the prefix may be one another source owns, such as the
+       * table's own (*,224.0.0.1) and (*,224.0.0.2). */
+      if (RTN_MULTICAST == rtype && is_replace)
+	lcp_router_route_mcast_del (table_id, pfx.fp_proto, &mpfx, NULL);
     }
   vec_free (np.paths);
 }
@@ -1835,6 +2050,7 @@ lcp_router_route_sync_begin (void)
       fib_table_mark (nlt->nlt_fib_index, nlt->nlt_proto, lcp_rt_fib_src);
       fib_table_mark (nlt->nlt_fib_index, nlt->nlt_proto,
 		      lcp_rt_fib_src_dynamic);
+      lcp_router_table_mcast_sync_begin (nlt);
 
       LCP_ROUTER_INFO ("Begin synchronization of %U routes in table %u",
 		       format_fib_protocol, nlt->nlt_proto,
@@ -1854,6 +2070,11 @@ lcp_router_route_sync_end (void)
   vec_foreach (index, indices)
     {
       nlt = pool_elt_at_index (lcp_router_table_pool, *index);
+      /* Before the reference below, which keeps the table alive while the
+       * routes go: what the multicast routes hold is what keeps the table
+       * removed once nothing else does. */
+      lcp_router_table_mcast_sync_end (nlt);
+
       nlt->nlt_refs++;
       u32 before = lcp_router_table_source_count (nlt, lcp_rt_fib_src) +
 		   lcp_router_table_source_count (nlt, lcp_rt_fib_src_dynamic);

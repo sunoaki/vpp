@@ -16,6 +16,8 @@
 #include <vnet/fib/fib_table.h>
 #include <vnet/dpo/load_balance.h>
 #include <vnet/mfib/mfib_table.h>
+#include <vnet/mfib/mfib_entry_src.h>
+#include <vppinfra/hash.h>
 #include <netlink/route/nexthop.h>
 #include <linux/mpls.h>
 
@@ -168,6 +170,85 @@ VLIB_CLI_COMMAND (test_lcp_netlink_error_command, static) = {
   .function = lcp_nl_error_cmd,
 };
 
+static u32
+lcp_router_test_mroute_index (u32 table, u32 group, u8 wildcard, const ip4_address_t *source)
+{
+  u32 mfib_index = mfib_table_find (FIB_PROTOCOL_IP4, table);
+  mfib_prefix_t mprefix = {
+    .fp_proto = FIB_PROTOCOL_IP4,
+    /* (*,G) is indexed at 32 bits and (S,G) at 64. The fixture receives both
+     * addresses in the byte order of unformat_ip4_address. */
+    .fp_len = wildcard ? 32 : 64,
+  };
+
+  memcpy (&mprefix.fp_grp_addr.ip4, &group, sizeof (group));
+  memcpy (&mprefix.fp_src_addr.ip4, source, sizeof (ip4_address_t));
+
+  return mfib_index == ~0 ? ~0 : mfib_table_lookup_exact_match (mfib_index, &mprefix);
+}
+
+/* The source names MFIB formats an entry with. The numeric value has no API
+ * constant to read it from, so the fixture prints the name beside the id. */
+static const char *lcp_router_test_mfib_source_names[] = MFIB_SOURCE_NAMES;
+
+static clib_error_t *
+lcp_router_test_mroute_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  ip4_address_t source = {};
+  u32 table, group, entry;
+  u8 wildcard = 0;
+  mfib_entry_t *mfib_entry;
+
+  if (!unformat (input, "table %u", &table) ||
+      !unformat (input, "%U", unformat_ip4_address, &group))
+    return clib_error_return (0, "expected table and group");
+  if (unformat (input, "wildcard"))
+    wildcard = 1;
+  else if (!unformat (input, "source %U", unformat_ip4_address, &source))
+    return clib_error_return (0, "expected wildcard or source");
+
+  if (wildcard)
+    source.as_u32 = 0;
+
+  entry = lcp_router_test_mroute_index (table, group, wildcard, &source);
+  if (entry == ~0)
+    {
+      vlib_cli_output (vm, "entry:absent");
+      return 0;
+    }
+
+  mfib_entry = mfib_entry_get (entry);
+  {
+    u32 ii;
+    mfib_entry_src_t *source_ep;
+
+    /* The id of the source the linux-nl plugin installs its routes under, so a
+     * test can name it without an API constant for its numeric value. */
+    vlib_cli_output (vm, "entry:present plugin-low:%d", MFIB_SOURCE_PLUGIN_LOW);
+    vec_foreach_index (ii, mfib_entry->mfe_srcs)
+      {
+	source_ep = vec_elt_at_index (mfib_entry->mfe_srcs, ii);
+	vlib_cli_output (vm, "source:%d name:%s flags:%s paths:%u itfs:%u", source_ep->mfes_src,
+			 source_ep->mfes_src < ARRAY_LEN (lcp_router_test_mfib_source_names) ?
+			   lcp_router_test_mfib_source_names[source_ep->mfes_src] :
+			   "unknown",
+			 (source_ep->mfes_flags & MFIB_ENTRY_SRC_FLAG_STALE) ? "stale" : "replayed",
+			 source_ep->mfes_pl == FIB_NODE_INDEX_INVALID ?
+			   0 :
+			   fib_path_list_get_n_paths (source_ep->mfes_pl),
+			 source_ep->mfes_itfs ? hash_elts (source_ep->mfes_itfs) : 0);
+      }
+  }
+
+  return 0;
+}
+
+VLIB_CLI_COMMAND (test_lcp_router_mroute_command, static) = {
+  .path = "test lcp mroute",
+  .short_help = "test lcp mroute table <id> <group> [source <addr>|wildcard]",
+  .function = lcp_router_test_mroute_cmd,
+};
+
 static fib_table_walk_rc_t
 lcp_router_test_refs (fib_node_index_t entry, void *arg)
 {
@@ -185,6 +266,7 @@ static void
 lcp_router_test_state (vlib_main_t *vm, fib_protocol_t proto, lcp_router_table_state_t *state)
 {
   vlib_cli_output (vm, "refs:%u fib:%u mfib:%u", state->refs, state->fib_index, state->mfib_index);
+  vlib_cli_output (vm, "mcast-routes:%u", state->mcast_routes);
   state->refs = 0;
   fib_table_walk (state->fib_index, proto, lcp_router_test_refs, state);
   vlib_cli_output (vm, "invalid-source-refs:%u", state->refs);
@@ -286,6 +368,7 @@ lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
   struct nl_addr *dst = NULL;
   struct rtnl_route *route;
   u8 is_del = 0, replace = 0;
+  u8 rtype;
 
   if (!vft || !get_state)
     return clib_error_return (0, "linux_nl router symbols unavailable");
@@ -360,12 +443,36 @@ lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
   rtnl_route_set_protocol (route, protocol);
   rtnl_route_set_dst (route, dst);
   nl_addr_put (dst);
+  rtype = RTN_UNICAST;
+  if (unformat (input, "multicast"))
+    {
+      /* An IPv4 multicast destination names the group and nothing else. */
+      rtype = RTN_MULTICAST;
+      nl_addr_set_prefixlen (rtnl_route_get_dst (route), 32);
+    }
   if (unformat (input, "drop"))
     rtnl_route_set_type (route, RTN_BLACKHOLE);
   else
     {
       u32 vif;
-      rtnl_route_set_type (route, RTN_UNICAST);
+
+      rtnl_route_set_type (route, rtype);
+      if (RTN_MULTICAST == rtype)
+	{
+	  /* The destination is the group; a netlink multicast route carries
+	   * its source where every route carries the address it selects on. */
+	  ip4_address_t source = {};
+
+	  if (unformat_check_input (input) != UNFORMAT_END_OF_INPUT &&
+	      !unformat (input, "source %U", unformat_ip4_address, &source))
+	    {
+	      rtnl_route_put (route);
+	      return clib_error_return (0, "expected multicast source");
+	    }
+	  struct nl_addr *nl_source = nl_addr_build (AF_INET, &source, sizeof (source));
+	  rtnl_route_set_src (route, nl_source);
+	  nl_addr_put (nl_source);
+	}
       while (unformat (input, "vif %u", &vif))
 	{
 	  struct rtnl_nexthop *nh = rtnl_route_nh_alloc ();

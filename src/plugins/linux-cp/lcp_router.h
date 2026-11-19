@@ -11,6 +11,9 @@ typedef struct
   u32 fib_index;
   u32 mfib_index;
   fib_source_t sources[3];
+  /* multicast routes installed in the MFIB, reported so that a test can
+   * follow what the plugin holds there */
+  u32 mcast_routes;
 } lcp_router_table_state_t;
 
 __clib_export int lcp_router_table_state (u32 table_id, fib_protocol_t proto,
