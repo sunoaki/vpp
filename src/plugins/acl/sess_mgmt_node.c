@@ -135,8 +135,7 @@ acl_fa_get_list_head_expiry_time (acl_main_t *am, acl_fa_per_worker_data_t *pw,
 }
 
 static int
-acl_fa_conn_time_to_check (acl_main_t *am, acl_fa_per_worker_data_t *pw,
-			   u64 now, clib_thread_index_t thread_index,
+acl_fa_conn_time_to_check (acl_main_t *am, u64 now, clib_thread_index_t thread_index,
 			   u32 session_index)
 {
   if (session_index == FA_SESSION_BOGUS_INDEX)
@@ -144,8 +143,7 @@ acl_fa_conn_time_to_check (acl_main_t *am, acl_fa_per_worker_data_t *pw,
   fa_session_t *sess = get_session_ptr (am, thread_index, session_index);
   u64 timeout_time =
     sess->link_enqueue_time + fa_session_get_list_timeout (am, sess);
-  return (timeout_time < now)
-    || (sess->link_enqueue_time <= pw->swipe_end_time);
+  return (timeout_time < now);
 }
 
 /*
@@ -185,15 +183,13 @@ acl_fa_check_idle_sessions (acl_main_t *am, clib_thread_index_t thread_index,
 
   {
     u8 tt = 0;
-    int n_pending_swipes = 0;
     for (tt = 0; tt < ACL_N_TIMEOUTS; tt++)
       {
 	int n_expired = 0;
 	while (n_expired < am->fa_max_deleted_sessions_per_interval)
 	  {
 	    fsid.session_index = pw->fa_conn_list_head[tt];
-	    if (!acl_fa_conn_time_to_check
-		(am, pw, now, thread_index, pw->fa_conn_list_head[tt]))
+	    if (!acl_fa_conn_time_to_check (am, now, thread_index, pw->fa_conn_list_head[tt]))
 	      {
 		break;
 	      }
@@ -208,19 +204,6 @@ acl_fa_check_idle_sessions (acl_main_t *am, clib_thread_index_t thread_index,
 	    n_expired++;
 	    acl_fa_conn_list_delete_session (am, fsid, now);
 	  }
-      }
-    for (tt = 0; tt < ACL_N_TIMEOUTS; tt++)
-      {
-	u32 session_index = pw->fa_conn_list_head[tt];
-	if (session_index == FA_SESSION_BOGUS_INDEX)
-	  break;
-	fa_session_t *sess =
-	  get_session_ptr (am, thread_index, session_index);
-	n_pending_swipes += sess->link_enqueue_time <= pw->swipe_end_time;
-      }
-    if (n_pending_swipes == 0)
-      {
-	pw->swipe_end_time = 0;
       }
   }
 
@@ -302,11 +285,6 @@ acl_fa_check_idle_sessions (acl_main_t *am, clib_thread_index_t thread_index,
   /* zero out the vector which we have acted on */
   if (pw->expired)
     vec_set_len (pw->expired, 0);
-  /* if we were advancing and reached the end
-   * (no more sessions to recycle), reset the fast-forward timestamp */
-
-  if (pw->swipe_end_time && 0 == total_expired)
-    pw->swipe_end_time = 0;
 
   elog_acl_maybe_trace_X1 (am,
 			   "acl_fa_check_idle_sessions: done, total sessions expired: %d",
@@ -385,9 +363,45 @@ aclp_post_session_change_request (acl_main_t *am, u32 target_thread,
   clib_spinlock_unlock_if_init (&pw->pending_session_change_request_lock);
 }
 
+/*
+ * Ask a worker to wipe the sessions of the given interface.
+ *
+ * The bitmap the worker consults is its own, so the caller must not touch it:
+ * the worker adds to that vector, and doing so from here would reallocate it
+ * under the worker while it reads it. The sw_if_index goes to a queue the
+ * worker drains on its own thread instead, and the worker sets the bit.
+ */
 void
-aclp_swap_wip_and_pending_session_change_requests (acl_main_t * am,
-						   u32 target_thread)
+aclp_post_clear_sw_if_index_request (acl_main_t *am, u32 target_thread, u32 sw_if_index)
+{
+  acl_fa_per_worker_data_t *pw = &am->per_worker_data[target_thread];
+
+  clib_spinlock_lock_if_init (&pw->pending_clear_sw_if_index_lock);
+  /* vec_add1 might cause a reallocation */
+  vec_add1 (pw->pending_clear_sw_if_indices, sw_if_index);
+  if (vec_len (pw->pending_clear_sw_if_indices) == 1)
+    {
+      /* ensure the request gets processed */
+      send_one_worker_interrupt (am->vlib_main, am, target_thread);
+    }
+  clib_spinlock_unlock_if_init (&pw->pending_clear_sw_if_index_lock);
+}
+
+void
+aclp_swap_wip_and_pending_clear_sw_if_indices (acl_main_t *am, clib_thread_index_t thread_index)
+{
+  acl_fa_per_worker_data_t *pw = &am->per_worker_data[thread_index];
+  u32 *tmp;
+
+  clib_spinlock_lock_if_init (&pw->pending_clear_sw_if_index_lock);
+  tmp = pw->pending_clear_sw_if_indices;
+  pw->pending_clear_sw_if_indices = pw->wip_clear_sw_if_indices;
+  pw->wip_clear_sw_if_indices = tmp;
+  clib_spinlock_unlock_if_init (&pw->pending_clear_sw_if_index_lock);
+}
+
+void
+aclp_swap_wip_and_pending_session_change_requests (acl_main_t *am, u32 target_thread)
 {
   acl_fa_per_worker_data_t *pw = &am->per_worker_data[target_thread];
   u64 *tmp;
@@ -398,6 +412,74 @@ aclp_swap_wip_and_pending_session_change_requests (acl_main_t * am,
   clib_spinlock_unlock_if_init (&pw->pending_session_change_request_lock);
 }
 
+/*
+ * Delete the sessions of the interfaces waiting for a clear off this worker's
+ * lists, and report whether the walk stopped before it reached their ends.
+ *
+ * The lists hold sessions from every interface and are not ordered by
+ * interface, so a session of a waiting interface may sit anywhere between
+ * other interfaces' sessions. A session keeps its place in the list between
+ * two timer restarts, so walking back from the tail and stepping over the
+ * sessions of the other interfaces reaches every waiting session, wherever it
+ * sits.
+ *
+ * A session that the data path may still hold leaves the list being walked
+ * and goes to the purgatory list, which releases it once the purge timeout
+ * passes. That list is left to its own scan, so the walk steps over it, and
+ * every other step moves on to the session before it.
+ *
+ * The walk stops after the per-cycle limit, like the idle scan it shares its
+ * interrupt with, and reports that as work left. The next interrupt resumes
+ * it: the sessions of the waiting interfaces that it has not reached yet keep
+ * their own places, so nothing is skipped.
+ */
+static int
+acl_fa_clear_pending_interfaces (acl_main_t *am, clib_thread_index_t thread_index, u64 now)
+{
+  acl_fa_per_worker_data_t *pw = &am->per_worker_data[thread_index];
+  fa_full_session_id_t fsid;
+  int n_cleared = 0;
+  u8 tt;
+
+  fsid.thread_index = thread_index;
+
+  for (tt = 0; tt < ACL_N_TIMEOUTS; tt++)
+    {
+      u32 session_index = pw->fa_conn_list_tail[tt];
+
+      while (FA_SESSION_BOGUS_INDEX != session_index)
+	{
+	  fa_session_t *sess = get_session_ptr (am, thread_index, session_index);
+	  /*
+	   * Read the link now: deleting the session unlinks it, and parking it
+	   * moves it to the purgatory list with the links rewritten.
+	   */
+	  u32 prev_session_index = sess->link_prev_idx;
+
+	  if (tt == ACL_TIMEOUT_PURGATORY ||
+	      !clib_bitmap_get (pw->pending_clear_sw_if_index_bitmap, sess->sw_if_index))
+	    {
+	      session_index = prev_session_index;
+	      continue;
+	    }
+	  if (n_cleared >= am->fa_max_deleted_sessions_per_interval)
+	    return 1;
+	  fsid.session_index = session_index;
+	  acl_fa_conn_list_delete_session (am, fsid, now);
+	  /*
+	   * Unlinking alone leaves the session in the lookup hashes, where it
+	   * would keep answering the packets of an interface that reuses this
+	   * sw_if_index. Take it out of the hashes and park it in the purgatory
+	   * list, which reclaims the pool entry once no packet can still
+	   * reference it.
+	   */
+	  acl_fa_two_stage_delete_session (am, sess->sw_if_index, fsid, now);
+	  n_cleared++;
+	  session_index = prev_session_index;
+	}
+    }
+  return 0;
+}
 
 static int
 purgatory_has_connections (vlib_main_t * vm, acl_main_t * am,
@@ -416,128 +498,81 @@ purgatory_has_connections (vlib_main_t * vm, acl_main_t * am,
  * to clean idle connections if there are no packets
  */
 static uword
-acl_fa_worker_conn_cleaner_process (vlib_main_t * vm,
-				    vlib_node_runtime_t * rt,
-				    vlib_frame_t * f)
+acl_fa_worker_conn_cleaner_process (vlib_main_t *vm, vlib_node_runtime_t *rt, vlib_frame_t *f)
 {
   acl_main_t *am = &acl_main;
   u64 now = clib_cpu_time_now ();
   clib_thread_index_t thread_index = os_get_thread_index ();
   acl_fa_per_worker_data_t *pw = &am->per_worker_data[thread_index];
   int num_expired;
-  elog_acl_maybe_trace_X1 (am,
-			   "acl_fa_worker_conn_cleaner interrupt: now %lu",
-			   "i8", now);
+  int cleared;
+  int clear_left = 0;
+  elog_acl_maybe_trace_X1 (am, "acl_fa_worker_conn_cleaner interrupt: now %lu", "i8", now);
   /* allow another interrupt to be queued */
   pw->interrupt_is_pending = 0;
-  if (pw->clear_in_process)
+  /*
+   * Add the sw_if_indices the main thread asked to clear to this worker's own
+   * bitmap. Only this worker touches that bitmap, so nothing reallocates it
+   * under a reader, and the lock in front of the queue is the only state
+   * shared with the main thread.
+   */
+  aclp_swap_wip_and_pending_clear_sw_if_indices (am, thread_index);
+  if (vec_len (pw->wip_clear_sw_if_indices) > 0)
     {
-      if (0 == pw->swipe_end_time)
+      u32 *sw_if_index0;
+      vec_foreach (sw_if_index0, pw->wip_clear_sw_if_indices)
 	{
 	  /*
-	   * Someone has just set the flag to start clearing.
-	   * we do this by combing through the connections up to a "time T"
-	   * which is now, and requeueing everything except the expired
-	   * connections and those matching the interface(s) being cleared.
+	   * An index of ~0 asks for every interface this worker services at
+	   * once, which is the bitmap it already keeps for them.
 	   */
-
-	  /*
-	   * first filter the sw_if_index bitmap that they want from us, by
-	   * a bitmap of sw_if_index for which we actually have connections.
-	   */
-	  if ((pw->pending_clear_sw_if_index_bitmap == 0)
-	      || (pw->serviced_sw_if_index_bitmap == 0))
+	  if (*sw_if_index0 == ~0)
 	    {
-	      elog_acl_maybe_trace_X1 (am,
-				       "acl_fa_worker_conn_cleaner: now %lu, someone tried to call clear but one of the bitmaps are empty",
-				       "i8", now);
-	      clib_bitmap_zero (pw->pending_clear_sw_if_index_bitmap);
+	      pw->pending_clear_sw_if_index_bitmap = clib_bitmap_or (
+		pw->pending_clear_sw_if_index_bitmap, pw->serviced_sw_if_index_bitmap);
+	      continue;
 	    }
-	  else
-	    {
-#ifdef FA_NODE_VERBOSE_DEBUG
-	      clib_warning
-		("WORKER-CLEAR: (before and) swiping sw-if-index bitmap: %U, my serviced bitmap %U",
-		 format_bitmap_hex, pw->pending_clear_sw_if_index_bitmap,
-		 format_bitmap_hex, pw->serviced_sw_if_index_bitmap);
-#endif
-	      pw->pending_clear_sw_if_index_bitmap =
-		clib_bitmap_and (pw->pending_clear_sw_if_index_bitmap,
-				 pw->serviced_sw_if_index_bitmap);
-	    }
-
-	  if (clib_bitmap_is_zero (pw->pending_clear_sw_if_index_bitmap))
-	    {
-	      /* if the cross-section is a zero vector, no need to do anything. */
-	      elog_acl_maybe_trace_X1 (am,
-				       "acl_fa_worker_conn_cleaner: now %lu, clearing done, nothing to do",
-				       "i8", now);
-	      pw->clear_in_process = 0;
-	      pw->swipe_end_time = 0;
-	    }
-	  else
-	    {
-#ifdef FA_NODE_VERBOSE_DEBUG
-	      clib_warning
-		("WORKER-CLEAR: swiping sw-if-index bitmap: %U, my serviced bitmap %U",
-		 format_bitmap_hex, pw->pending_clear_sw_if_index_bitmap,
-		 format_bitmap_hex, pw->serviced_sw_if_index_bitmap);
-#endif
-	      elog_acl_maybe_trace_X1 (am,
-				       "acl_fa_worker_conn_cleaner: swiping until %lu",
-				       "i8", now);
-	      /* swipe through the connection lists until enqueue timestamps become above "now" */
-	      pw->swipe_end_time = now;
-	    }
+	  pw->pending_clear_sw_if_index_bitmap =
+	    clib_bitmap_set (pw->pending_clear_sw_if_index_bitmap, *sw_if_index0, 1);
 	}
+      vec_set_len (pw->wip_clear_sw_if_indices, 0);
+    }
+  cleared = !clib_bitmap_is_zero (pw->pending_clear_sw_if_index_bitmap);
+  if (cleared)
+    {
+      /*
+       * The walk visits the sessions of the waiting interfaces whatever their
+       * idle state, and reports whether it stopped at the per-cycle limit
+       * before reaching the ends of the lists. The bitmap stays set until the
+       * scan below returns, which keeps that scan's own check of the
+       * interfaces being cleared.
+       */
+      clear_left = acl_fa_clear_pending_interfaces (am, thread_index, now);
+      elog_acl_maybe_trace_X2 (
+	am, "acl_fa_worker_conn_cleaner: now %lu, clearing cycle done, more left: %d", "i8i4", now,
+	(u32) clear_left);
     }
   num_expired = acl_fa_check_idle_sessions (am, thread_index, now);
-  // clib_warning("WORKER-CLEAR: checked %d sessions (clear_in_progress: %d)", num_expired, pw->clear_in_process);
-  elog_acl_maybe_trace_X2 (am,
-			   "acl_fa_worker_conn_cleaner: checked %d sessions (clear_in_process: %d)",
-			   "i4i4", (u32) num_expired,
-			   (u32) pw->clear_in_process);
-  if (pw->clear_in_process)
+  if (cleared && !clear_left)
+    clib_bitmap_zero (pw->pending_clear_sw_if_index_bitmap);
+  elog_acl_maybe_trace_X2 (am, "acl_fa_worker_conn_cleaner: now %lu, checked %d sessions", "i8i4",
+			   now, (u32) num_expired);
+  if (clear_left || num_expired > 0)
     {
-      if (pw->swipe_end_time == 0)
-	{
-	  /* we were clearing but we could not process any more connections. time to stop. */
-	  clib_bitmap_zero (pw->pending_clear_sw_if_index_bitmap);
-	  pw->clear_in_process = 0;
-	  elog_acl_maybe_trace_X1 (am,
-				   "acl_fa_worker_conn_cleaner: now %lu, clearing done - all done",
-				   "i8", now);
-	}
-      else
-	{
-	  elog_acl_maybe_trace_X1 (am,
-				   "acl_fa_worker_conn_cleaner: now %lu, more work to do - requesting interrupt",
-				   "i8", now);
-	  /* should continue clearing.. So could they please sent an interrupt again? */
-	  send_one_worker_interrupt (vm, am, thread_index);
-	  // pw->interrupt_is_needed = 1;
-	}
+      /* there was too much work, we should get an interrupt ASAP */
+      // pw->interrupt_is_needed = 1;
+      send_one_worker_interrupt (vm, am, thread_index);
+      pw->interrupt_is_unwanted = 0;
     }
   else
     {
-      if (num_expired > 0)
-	{
-	  /* there was too much work, we should get an interrupt ASAP */
-	  // pw->interrupt_is_needed = 1;
-	  send_one_worker_interrupt (vm, am, thread_index);
-	  pw->interrupt_is_unwanted = 0;
-	}
-      else
-	{
-	  /* the current rate of interrupts is ok */
-	  pw->interrupt_is_needed = 0;
-	  pw->interrupt_is_unwanted = 0;
-	}
-      elog_acl_maybe_trace_X3 (am,
-			       "acl_fa_worker_conn_cleaner: now %lu, interrupt needed: %u, interrupt unwanted: %u",
-			       "i8i4i4", now, ((u32) pw->interrupt_is_needed),
-			       ((u32) pw->interrupt_is_unwanted));
+      /* the current rate of interrupts is ok */
+      pw->interrupt_is_needed = 0;
+      pw->interrupt_is_unwanted = 0;
     }
+  elog_acl_maybe_trace_X3 (
+    am, "acl_fa_worker_conn_cleaner: now %lu, interrupt needed: %u, interrupt unwanted: %u",
+    "i8i4i4", now, ((u32) pw->interrupt_is_needed), ((u32) pw->interrupt_is_unwanted));
   /* be persistent about quickly deleting the connections from the purgatory */
   if (purgatory_has_connections (vm, am, thread_index))
     {
@@ -659,111 +694,40 @@ acl_fa_session_cleaner_process (vlib_main_t * vm, vlib_node_runtime_t * rt,
 	  break;
 	case ACL_FA_CLEANER_DELETE_BY_SW_IF_INDEX:
 	  {
-	    uword *clear_sw_if_index_bitmap = 0;
 	    uword *sw_if_index0;
-	    int clear_all = 0;
 	    now = clib_cpu_time_now ();
 	    elog_acl_maybe_trace_X1 (am,
-				     "acl_fa_session_cleaner_process: now %lu, received ACL_FA_CLEANER_DELETE_BY_SW_IF_INDEX",
+				     "acl_fa_session_cleaner_process: now %lu, received "
+				     "ACL_FA_CLEANER_DELETE_BY_SW_IF_INDEX",
 				     "i8", now);
+	    /*
+	     * A session remembers the sw_if_index it was created on, which is
+	     * all a clear needs. The interface may be gone by now: its deletion
+	     * callback runs before the sw_if_index leaves the interface pool,
+	     * and asking whether the interface still exists is what used to
+	     * keep the sessions of a deleted interface alive.
+	     *
+	     * The session lists and the bitmap naming the interfaces to clear
+	     * both belong to a worker, so the request is queued to each of them
+	     * and this process moves on. The worker sets its own bit and wipes
+	     * its own lists on the interrupt that follows, which keeps the
+	     * command path free of any wait.
+	     */
 	    vec_foreach (sw_if_index0, event_data)
-	    {
-	      am->fa_cleaner_cnt_delete_by_sw_index++;
-	      elog_acl_maybe_trace_X1 (am,
-				       "acl_fa_session_cleaner_process: ACL_FA_CLEANER_DELETE_BY_SW_IF_INDEX %u",
-				       "i4", *sw_if_index0);
-	      if (*sw_if_index0 == ~0)
-		{
-		  clear_all = 1;
-		}
-	      else
-		{
-		  if (!pool_is_free_index
-		      (am->vnet_main->interface_main.sw_interfaces,
-		       *sw_if_index0))
-		    {
-		      clear_sw_if_index_bitmap =
-			clib_bitmap_set (clear_sw_if_index_bitmap,
-					 *sw_if_index0, 1);
-		    }
-		}
-	    }
-	    acl_log_info
-	      ("ACL_FA_CLEANER_DELETE_BY_SW_IF_INDEX bitmap: %U, clear_all: %u",
-	       format_bitmap_hex, clear_sw_if_index_bitmap, clear_all);
-	    vec_foreach (pw0, am->per_worker_data)
-	    {
-	      CLIB_MEMORY_BARRIER ();
-	      while (pw0->clear_in_process)
-		{
-		  CLIB_MEMORY_BARRIER ();
-		  elog_acl_maybe_trace_X1 (am,
-					   "ACL_FA_NODE_CLEAN: waiting previous cleaning cycle to finish on %u",
-					   "i4",
-					   (u32) (pw0 - am->per_worker_data));
-		  vlib_process_suspend (vm, 0.0001);
-		  if (pw0->interrupt_is_needed)
-		    {
-		      send_one_worker_interrupt (vm, am,
-						 (pw0 - am->per_worker_data));
-		    }
-		}
-	      if (pw0->clear_in_process)
-		{
-		  acl_log_err
-		    ("ERROR-BUG! Could not initiate cleaning on worker because another cleanup in progress");
-		}
-	      else
-		{
-		  clib_bitmap_free (pw0->pending_clear_sw_if_index_bitmap);
-		  if (clear_all)
-		    {
-		      /* if we need to clear all, then just clear the interfaces that we are servicing */
-		      pw0->pending_clear_sw_if_index_bitmap =
-			clib_bitmap_dup (pw0->serviced_sw_if_index_bitmap);
-		    }
-		  else
-		    {
-		      pw0->pending_clear_sw_if_index_bitmap =
-			clib_bitmap_dup (clear_sw_if_index_bitmap);
-		    }
-		  acl_log_info
-		    ("ACL_FA_CLEANER: thread %u, pending clear bitmap: %U",
-		     (am->per_worker_data - pw0), format_bitmap_hex,
-		     pw0->pending_clear_sw_if_index_bitmap);
-		  pw0->clear_in_process = 1;
-		}
-	    }
-	    /* send some interrupts so they can start working */
-	    send_interrupts_to_workers (vm, am);
-
-	    /* now wait till they all complete */
-	    acl_log_info ("CLEANER mains len: %u per-worker len: %d",
-			  vlib_get_n_threads (),
-			  vec_len (am->per_worker_data));
-	    vec_foreach (pw0, am->per_worker_data)
-	    {
-	      CLIB_MEMORY_BARRIER ();
-	      while (pw0->clear_in_process)
-		{
-		  CLIB_MEMORY_BARRIER ();
-		  elog_acl_maybe_trace_X1 (am,
-					   "ACL_FA_NODE_CLEAN: waiting for my cleaning cycle to finish on %u",
-					   "i4",
-					   (u32) (pw0 - am->per_worker_data));
-		  vlib_process_suspend (vm, 0.0001);
-		  if (pw0->interrupt_is_needed)
-		    {
-		      send_one_worker_interrupt (vm, am,
-						 (pw0 - am->per_worker_data));
-		    }
-		}
-	    }
-	    acl_log_info ("ACL_FA_NODE_CLEAN: cleaning done");
-	    clib_bitmap_free (clear_sw_if_index_bitmap);
+	      {
+		am->fa_cleaner_cnt_delete_by_sw_index++;
+		elog_acl_maybe_trace_X1 (
+		  am, "acl_fa_session_cleaner_process: ACL_FA_CLEANER_DELETE_BY_SW_IF_INDEX %u",
+		  "i4", *sw_if_index0);
+		vec_foreach (pw0, am->per_worker_data)
+		  {
+		    aclp_post_clear_sw_if_index_request (am, (u32) (pw0 - am->per_worker_data),
+							 *sw_if_index0);
+		  }
+	      }
+	    am->fa_cleaner_cnt_delete_by_sw_index_ok++;
+	    break;
 	  }
-	  am->fa_cleaner_cnt_delete_by_sw_index_ok++;
-	  break;
 	default:
 #ifdef FA_NODE_VERBOSE_DEBUG
 	  clib_warning ("ACL plugin connection cleaner: unknown event %u",

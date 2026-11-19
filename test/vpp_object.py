@@ -78,6 +78,18 @@ class VppObjectRegistry:
         else:
             logger.debug("REG: duplicate add, ignoring (%s)" % obj)
 
+    def unregister(self, object_id: str, logger) -> None:
+        """Remove one object registration by its id.
+
+        An object whose configuration is gone before the registry runs, such
+        as an interface a test deleted, must leave the registry as well:
+        querying it would read a closed sw_if_index.
+        """
+        obj = self._object_dict.pop(object_id, None)
+        if obj is not None:
+            self._object_registry.remove(obj)
+            logger.debug("REG: unregistering %s" % obj)
+
     def unregister_all(self, logger) -> None:
         """Remove all object registrations from registry."""
         logger.debug("REG: removing all object registrations")

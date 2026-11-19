@@ -344,7 +344,12 @@ class VppAclInterface(VppObject):
                 count=self.count,
                 acls=self.encode_acls(),
             )
-            self._test.registry.register(self, self._test.logger)
+            if self.count == 0:
+                # the list is gone, so there is nothing left for the registry
+                # to query: dumping a closed sw_if_index would read a free slot
+                self._test.registry.unregister(self.object_id(), self._test.logger)
+            else:
+                self._test.registry.register(self, self._test.logger)
             if expect_error:
                 self._test.fail("Unexpected api reply")
             return self
@@ -358,6 +363,9 @@ class VppAclInterface(VppObject):
             reply = self._test.vapi.acl_interface_set_acl_list(
                 sw_if_index=self._sw_if_index, n_input=0, count=0, acls=[]
             )
+            # the list is gone, so there is nothing left for the registry to
+            # query: dumping a closed sw_if_index would read a free slot
+            self._test.registry.unregister(self.object_id(), self._test.logger)
             if expect_error:
                 self._test.fail("Unexpected api reply")
         except UnexpectedApiReturnValueError:
@@ -370,6 +378,15 @@ class VppAclInterface(VppObject):
             if acl_list.count > 0:
                 return True
         return False
+
+    def current_acl_indexes(self, n_input=1):
+        """Return the ACL indexes applied to the interface in one direction."""
+        for acl_list in self._test.vapi.acl_interface_list_dump(
+            sw_if_index=self._sw_if_index
+        ):
+            if acl_list.n_input == n_input:
+                return list(acl_list.acls[: acl_list.count])
+        return []
 
     def object_id(self):
         return "acl-if-list-%d" % (self._sw_if_index)
