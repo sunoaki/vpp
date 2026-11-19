@@ -43,6 +43,25 @@ typedef struct
   u8 lcme_replayed;
 } lcp_router_mcast_entry_t;
 
+/*
+ * An IPv4 route whose kernel nexthop carries RTNH_F_ONLINK names a gateway the
+ * kernel treats as directly reachable although no connected prefix covers it.
+ * The FIB has no path flag with that meaning, and arp_reply() accepts a reply
+ * only when an attached or connected FIB entry covers its sender, so without
+ * such an entry the gateway's neighbour is never learned and the route never
+ * forwards.  The plugin installs the gateway's host prefix as an attached
+ * entry of its own, shaped like the adj-fib ip_neighbor_adj_fib_add() creates,
+ * and keeps one record per route and gateway that holds it: a gateway named by
+ * several routes is installed once and removed when the last record goes.
+ */
+typedef struct
+{
+  /* the route that named the gateway */
+  fib_prefix_t lcor_route;
+  ip46_address_t lcor_gateway;
+  u32 lcor_sw_if_index;
+} lcp_router_onlink_route_t;
+
 typedef struct lcp_router_table_t_
 {
   uint32_t nlt_id;
@@ -52,6 +71,8 @@ typedef struct lcp_router_table_t_
   u32 nlt_refs;
   /* multicast routes the plugin holds in nlt_mfib_index, one reference each */
   lcp_router_mcast_entry_t *nlt_mcast_entries;
+  /* onlink gateways the plugin installed an attached host prefix for */
+  lcp_router_onlink_route_t *nlt_onlink_routes;
 } lcp_router_table_t;
 
 static uword *lcp_router_table_db[FIB_PROTOCOL_MAX];
@@ -97,6 +118,8 @@ const static fib_prefix_t pfx_all1s = {
 static fib_source_t lcp_rt_fib_src;
 static fib_source_t lcp_rt_fib_src_dynamic;
 static fib_source_t lcp_rt_fib_src_special;
+/* attached host prefixes installed for RTNH_F_ONLINK gateways */
+static fib_source_t lcp_rt_fib_src_onlink;
 
 #define LCP_ROUTER_DBG(...) vlib_log_debug (lcp_router_logger, __VA_ARGS__);
 
@@ -1198,8 +1221,259 @@ lcp_router_table_unlock (lcp_router_table_t *nlt)
 	mfib_table_unlock (nlt->nlt_mfib_index, nlt->nlt_proto, MFIB_SOURCE_PLUGIN_LOW);
 
       hash_unset (lcp_router_table_db[nlt->nlt_proto], nlt->nlt_id);
+      vec_free (nlt->nlt_onlink_routes);
       pool_put (lcp_router_table_pool, nlt);
     }
+}
+
+/*
+ * Find the record of an attached host prefix the plugin installed for a
+ * gateway on this route. Each route and gateway pair holds one record, so a
+ * gateway several routes name is installed once and removed with the last one.
+ */
+static lcp_router_onlink_route_t *
+lcp_router_table_onlink_find (lcp_router_table_t *nlt, const fib_prefix_t *route,
+			      const ip46_address_t *gateway, u32 sw_if_index)
+{
+  lcp_router_onlink_route_t *entry;
+
+  vec_foreach (entry, nlt->nlt_onlink_routes)
+    {
+      if (entry->lcor_sw_if_index != sw_if_index)
+	continue;
+      if (0 != ip46_address_cmp (&entry->lcor_gateway, gateway))
+	continue;
+      if (fib_prefix_cmp (&entry->lcor_route, route))
+	continue;
+      return entry;
+    }
+
+  return NULL;
+}
+
+/*
+ * Whether a route other than the one being released still needs the same
+ * gateway over the same interface. The attached host prefix is removed only
+ * when none does.
+ */
+static bool
+lcp_router_table_onlink_gateway_held (lcp_router_table_t *nlt,
+				      const lcp_router_onlink_route_t *released,
+				      const ip46_address_t *gateway, u32 sw_if_index)
+{
+  const lcp_router_onlink_route_t *entry;
+
+  vec_foreach (entry, nlt->nlt_onlink_routes)
+    {
+      if (entry == released)
+	continue;
+      if (entry->lcor_sw_if_index != sw_if_index)
+	continue;
+      if (0 == ip46_address_cmp (&entry->lcor_gateway, gateway))
+	return true;
+    }
+
+  return false;
+}
+
+/*
+ * Whether a path the route still has in the FIB, under the source the route
+ * came from, names the same gateway over the same interface. The attached host
+ * prefix outlives the record for as long as one does: a multipath route keeps
+ * the prefix its surviving paths resolve through.
+ */
+static bool
+lcp_router_table_onlink_path_held (lcp_router_table_t *nlt, const fib_prefix_t *route,
+				   fib_source_t source, const ip46_address_t *gateway,
+				   u32 sw_if_index)
+{
+  fib_node_index_t fei;
+  fib_entry_t *fib_entry;
+  fib_entry_src_t *esrc;
+  fib_path_encode_ctx_t ctx = {
+    .rpaths = NULL,
+  };
+  fib_route_path_t *rpath;
+  bool held = false;
+
+  fei = fib_table_lookup_exact_match (nlt->nlt_fib_index, route);
+  if (FIB_NODE_INDEX_INVALID == fei)
+    return false;
+
+  fib_entry = fib_entry_get (fei);
+  esrc = fib_entry_src_find (fib_entry, source);
+  if (NULL == esrc || FIB_NODE_INDEX_INVALID == esrc->fes_pl)
+    return false;
+
+  fib_path_list_walk_w_ext (esrc->fes_pl, NULL, fib_path_encode, &ctx);
+  vec_foreach (rpath, ctx.rpaths)
+    {
+      if (rpath->frp_sw_if_index != sw_if_index)
+	continue;
+      if (0 == ip46_address_cmp (&rpath->frp_addr, gateway))
+	{
+	  held = true;
+	  break;
+	}
+    }
+  vec_free (ctx.rpaths);
+
+  return held;
+}
+
+/*
+ * Drop one record and, unless something still needs it, the attached host
+ * prefix it installed. The caller decides whether the prefix outlives the
+ * record: the routes that go before the FIB has the new paths consult the
+ * records, the one that goes after consults the FIB.
+ */
+static void
+lcp_router_table_onlink_remove (lcp_router_table_t *nlt, lcp_router_onlink_route_t *entry,
+				const fib_prefix_t *host, fib_protocol_t proto, bool keep_host)
+{
+  if (!keep_host)
+    fib_table_entry_path_remove (nlt->nlt_fib_index, host, lcp_rt_fib_src_onlink,
+				 fib_proto_to_dpo (proto), &host->fp_addr, entry->lcor_sw_if_index,
+				 ~0, 1, FIB_ROUTE_PATH_FLAG_NONE);
+
+  vec_del1 (nlt->nlt_onlink_routes, entry - nlt->nlt_onlink_routes);
+  lcp_router_table_unlock (nlt);
+}
+
+/*
+ * Install, or refresh, the attached host prefix for a gateway the kernel
+ * marked RTNH_F_ONLINK. The path is shaped like the adj-fib that
+ * ip_neighbor_adj_fib_add() installs: attached, with the address itself as the
+ * next hop, so that arp_reply() accepts the reply the gateway sends and the
+ * neighbour is learned. The source is the plugin's own, which the route
+ * synchronization neither marks nor sweeps.
+ */
+static void
+lcp_router_table_onlink_add (lcp_router_table_t *nlt, const fib_prefix_t *route,
+			     const ip46_address_t *gateway, u32 sw_if_index, fib_protocol_t proto)
+{
+  lcp_router_onlink_route_t *entry;
+
+  if (NULL != lcp_router_table_onlink_find (nlt, route, gateway, sw_if_index))
+    return;
+
+  /*
+   * One attached host prefix serves every route naming the gateway, so it is
+   * installed only when no record holds it yet, and it goes when the last
+   * record does.
+   */
+  if (!lcp_router_table_onlink_gateway_held (nlt, NULL, gateway, sw_if_index))
+    {
+      fib_prefix_t host = {
+	.fp_proto = proto,
+	.fp_len = fib_prefix_get_host_length (proto),
+	.fp_addr = *gateway,
+      };
+
+      fib_table_entry_path_add (nlt->nlt_fib_index, &host, lcp_rt_fib_src_onlink,
+				FIB_ENTRY_FLAG_ATTACHED, fib_proto_to_dpo (proto), &host.fp_addr,
+				sw_if_index, ~0, 1, NULL, FIB_ROUTE_PATH_FLAG_NONE);
+    }
+
+  vec_add2 (nlt->nlt_onlink_routes, entry, 1);
+  entry->lcor_route = *route;
+  entry->lcor_gateway = *gateway;
+  entry->lcor_sw_if_index = sw_if_index;
+  nlt->nlt_refs++;
+}
+
+/*
+ * Give up the gateways of this route that no path in the FIB resolves through
+ * any more, and keep the ones it still does. The FIB is the judge, not the
+ * message: the kernel keys routes by prefix alone, so a prefix can hold a
+ * unicast route and a blackhole route at once, and one source can hold what
+ * another of the plugin's sources does not, so both of those sources are
+ * asked. Only what is left in the FIB says which gateways are still in use.
+ * The record follows its paths, so the last one to go gives the attached host
+ * prefix up.
+ */
+static void
+lcp_router_table_onlink_sync_paths (lcp_router_table_t *nlt, const fib_prefix_t *route,
+				    fib_protocol_t proto)
+{
+  u32 ii = 0;
+
+  nlt->nlt_refs++;
+  while (ii < vec_len (nlt->nlt_onlink_routes))
+    {
+      lcp_router_onlink_route_t *entry = vec_elt_at_index (nlt->nlt_onlink_routes, ii);
+
+      if (fib_prefix_cmp (&entry->lcor_route, route) ||
+	  lcp_router_table_onlink_path_held (nlt, route, lcp_rt_fib_src, &entry->lcor_gateway,
+					     entry->lcor_sw_if_index) ||
+	  lcp_router_table_onlink_path_held (nlt, route, lcp_rt_fib_src_dynamic,
+					     &entry->lcor_gateway, entry->lcor_sw_if_index))
+	{
+	  ii++;
+	  continue;
+	}
+
+      /* The record is removed in place, so the next one to look at is at the
+       * same index. */
+      {
+	fib_prefix_t host = {
+	  .fp_proto = proto,
+	  .fp_len = fib_prefix_get_host_length (proto),
+	  .fp_addr = entry->lcor_gateway,
+	};
+	lcp_router_table_onlink_remove (
+	  nlt, entry, &host, proto,
+	  lcp_router_table_onlink_gateway_held (nlt, entry, &entry->lcor_gateway,
+						entry->lcor_sw_if_index));
+      }
+    }
+  lcp_router_table_unlock (nlt);
+}
+
+/*
+ * Give up the gateways of a route the plugin no longer holds in this table.
+ * A route can go without a netlink delete: the interface going down flushes
+ * its routes in the kernel without a message, and the synchronization sweeps
+ * what the kernel did not replay. The record follows the route, so a route
+ * that no longer sources the table gives its gateway up.
+ */
+static void
+lcp_router_table_onlink_prune (lcp_router_table_t *nlt)
+{
+  u32 ii = 0;
+
+  /* As in the release, the reference keeps the table alive while the last
+   * record of the last route removes the last of them. */
+  nlt->nlt_refs++;
+  while (ii < vec_len (nlt->nlt_onlink_routes))
+    {
+      lcp_router_onlink_route_t *entry = vec_elt_at_index (nlt->nlt_onlink_routes, ii);
+      fib_node_index_t fei;
+
+      fei = fib_table_lookup_exact_match (nlt->nlt_fib_index, &entry->lcor_route);
+      if ((FIB_NODE_INDEX_INVALID != fei) && (fib_entry_is_sourced (fei, lcp_rt_fib_src) ||
+					      fib_entry_is_sourced (fei, lcp_rt_fib_src_dynamic)))
+	{
+	  ii++;
+	  continue;
+	}
+
+      /* The record is removed in place, so the next one to look at is at the
+       * same index. The route is gone, so only another record can still need
+       * the gateway. */
+      {
+	fib_prefix_t host = {
+	  .fp_proto = nlt->nlt_proto,
+	  .fp_len = fib_prefix_get_host_length (nlt->nlt_proto),
+	  .fp_addr = entry->lcor_gateway,
+	};
+	lcp_router_table_onlink_remove (
+	  nlt, entry, &host, nlt->nlt_proto,
+	  lcp_router_table_onlink_gateway_held (nlt, entry, &entry->lcor_gateway,
+						entry->lcor_sw_if_index));
+      }
+    }
+  lcp_router_table_unlock (nlt);
 }
 
 /*
@@ -1487,6 +1761,12 @@ lcp_router_mpls_nladdr_to_path (fib_route_path_t *path, struct nl_addr *addr)
   return label_count;
 }
 
+typedef struct
+{
+  ip46_address_t lcor_gateway;
+  u32 lcor_sw_if_index;
+} lcp_router_onlink_nexthop_t;
+
 typedef struct lcp_router_route_path_parse_t_
 {
   fib_route_path_t *paths;
@@ -1495,6 +1775,11 @@ typedef struct lcp_router_route_path_parse_t_
   bool invalid;
   fib_route_path_flags_t type_flags;
   u8 preference;
+  /* whether the caller installs the gateways; a delete asks the FIB instead,
+   * because the message does not say which paths it took away */
+  bool collect_onlink;
+  /* gateways the kernel marked RTNH_F_ONLINK, one entry each */
+  lcp_router_onlink_nexthop_t *onlink;
 } lcp_router_route_path_parse_t;
 
 static void
@@ -1566,6 +1851,26 @@ lcp_router_route_path_parse (struct rtnl_nexthop *rnh, void *arg)
 	fproto = ctx->route_proto;
 
       path->frp_proto = fib_proto_to_dpo (fproto);
+
+      /*
+       * The kernel lets a route name a gateway no connected prefix covers
+       * when the nexthop carries RTNH_F_ONLINK. The FIB has no path flag for
+       * that, and the gateway's neighbour is never learned until an attached
+       * entry covers it, so the caller installs one per gateway. MPLS and
+       * multicast routes are left alone: neither resolves an IPv4 neighbour
+       * through an attached prefix.
+       */
+      if (ctx->collect_onlink && (RTNH_F_ONLINK & rtnl_route_nh_get_flags (rnh)) &&
+	  !ctx->is_mcast && FIB_PROTOCOL_IP4 == fproto && !ip46_address_is_zero (&path->frp_addr))
+	{
+	  lcp_router_onlink_nexthop_t *entry;
+
+	  vec_add2 (ctx->onlink, entry, 1);
+	  entry->lcor_gateway = path->frp_addr;
+	  entry->lcor_sw_if_index = sw_if_index;
+	  LCP_ROUTER_DBG (" onlink gateway %U", format_ip46_address, &path->frp_addr,
+			  IP46_TYPE_ANY);
+	}
 
       if (ctx->route_proto == FIB_PROTOCOL_MPLS)
 	{
@@ -1788,10 +2093,18 @@ lcp_router_route_del (struct rtnl_route *rr)
   rtnl_route_foreach_nexthop (rr, lcp_router_route_path_parse, &np);
   if (np.invalid)
     {
+      vec_free (np.onlink);
       lcp_router_route_paths_discard (np.paths);
       return;
     }
   lcp_router_route_path_add_special (rr, &np);
+
+  /*
+   * The reference keeps the table alive for the rest of the delete: a table
+   * that holds nothing but the gateway records goes when the last of them is
+   * released, and still has a route to take away below.
+   */
+  nlt->nlt_refs++;
 
   if (0 != vec_len (np.paths))
     {
@@ -1802,7 +2115,9 @@ lcp_router_route_del (struct rtnl_route *rr)
 	  if (lcp_router_route_mk_mprefix (rr, &mpfx) || mpfx.fp_proto != pfx.fp_proto)
 	    {
 	      LCP_ROUTER_ERROR ("route del: invalid mcast prefix");
+	      vec_free (np.onlink);
 	      vec_free (np.paths);
+	      lcp_router_table_unlock (nlt);
 	      return;
 	    }
 	  /* The route's own reference goes with the call, and the copy of the
@@ -1836,7 +2151,20 @@ lcp_router_route_del (struct rtnl_route *rr)
 	}
     }
 
+  /*
+   * What the message named does not decide which gateways go: the kernel keys
+   * routes by prefix, so the delete of a blackhole route carries no nexthop
+   * and the unicast route of the same prefix stays, and one of the plugin's
+   * sources can hold what the other does not. The paths are away by now, so
+   * the FIB says which records are stale. A delete that took nothing away
+   * leaves every path in place and so every record too.
+   */
+  if (rtype != RTN_MULTICAST && FIB_PROTOCOL_IP4 == pfx.fp_proto)
+    lcp_router_table_onlink_sync_paths (nlt, &pfx, pfx.fp_proto);
+
+  vec_free (np.onlink);
   vec_free (np.paths);
+  lcp_router_table_unlock (nlt);
 }
 
 static fib_route_path_t *
@@ -2000,11 +2328,13 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
     .is_mcast = (rtype == RTN_MULTICAST),
     .type_flags = lcp_router_route_type_frpflags[rtype],
     .preference = (u8) rtnl_route_get_priority (rr),
+    .collect_onlink = true,
   };
 
   rtnl_route_foreach_nexthop (rr, lcp_router_route_path_parse, &np);
   if (np.invalid)
     {
+      vec_free (np.onlink);
       lcp_router_route_paths_discard (np.paths);
       return;
     }
@@ -2015,6 +2345,20 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
       nlt = lcp_router_table_add_or_lock (table_id, pfx.fp_proto);
 
       lcp_router_route_paths_cross_fib_report (np.paths, &pfx, rtype, nlt, table_id);
+
+      if (rtype != RTN_MULTICAST && FIB_PROTOCOL_IP4 == pfx.fp_proto)
+	{
+	  lcp_router_onlink_nexthop_t *onlink;
+
+	  /* The new gateways arrive before the route itself, so that the
+	   * attached prefix is in place when the route first resolves. A
+	   * replace then gives up only the gateways it no longer names: one
+	   * the route keeps finds its record already there, and keeps the
+	   * attached prefix and the neighbour state hanging off it. */
+	  vec_foreach (onlink, np.onlink)
+	    lcp_router_table_onlink_add (nlt, &pfx, &onlink->lcor_gateway, onlink->lcor_sw_if_index,
+					 pfx.fp_proto);
+	}
 
       if (rtype == RTN_MULTICAST)
 	{
@@ -2071,6 +2415,12 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
 	  else
 	    fib_table_entry_path_add2 (nlt->nlt_fib_index, &pfx, fib_src,
 				       entry_flags, np.paths);
+
+	  /* A replace may name fewer gateways than the route it replaces. The
+	   * FIB has the new paths now, so it says which records are stale. */
+	  if (is_replace && rtype != RTN_MULTICAST && FIB_PROTOCOL_IP4 == pfx.fp_proto)
+	    lcp_router_table_onlink_sync_paths (nlt, &pfx, pfx.fp_proto);
+
 	  lcp_router_table_reconcile (nlt, fib_src, before);
 	}
     }
@@ -2091,7 +2441,18 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
        * table's own (*,224.0.0.1) and (*,224.0.0.2). */
       if (RTN_MULTICAST == rtype && is_replace)
 	lcp_router_route_mcast_del (table_id, pfx.fp_proto, &mpfx, NULL);
+      /* A replace that names no nexthop no longer holds the gateways of the
+       * route it replaces. Nothing was taken out of the FIB, so what it
+       * still holds decides: a prefix another message left in place keeps
+       * its gateways, and the ones whose paths the FIB no longer has go. */
+      else if (RTN_MULTICAST != rtype && is_replace && FIB_PROTOCOL_IP4 == pfx.fp_proto)
+	{
+	  nlt = lcp_router_table_add_or_lock (table_id, pfx.fp_proto);
+	  lcp_router_table_onlink_sync_paths (nlt, &pfx, pfx.fp_proto);
+	  lcp_router_table_unlock (nlt);
+	}
     }
+  vec_free (np.onlink);
   vec_free (np.paths);
 }
 
@@ -2134,8 +2495,11 @@ lcp_router_route_sync_end (void)
       u32 before = lcp_router_table_source_count (nlt, lcp_rt_fib_src) +
 		   lcp_router_table_source_count (nlt, lcp_rt_fib_src_dynamic);
       fib_table_sweep (nlt->nlt_fib_index, nlt->nlt_proto, lcp_rt_fib_src);
-      fib_table_sweep (nlt->nlt_fib_index, nlt->nlt_proto,
-		       lcp_rt_fib_src_dynamic);
+      fib_table_sweep (nlt->nlt_fib_index, nlt->nlt_proto, lcp_rt_fib_src_dynamic);
+      /* The sweep took away the routes the kernel no longer has; their
+       * gateways go with them. This releases table references of its own,
+       * which the reference taken above keeps safe. */
+      lcp_router_table_onlink_prune (nlt);
 
       LCP_ROUTER_INFO ("End synchronization of %U routes in table %u",
 		       format_fib_protocol, nlt->nlt_proto,
@@ -2239,6 +2603,11 @@ lcp_router_table_flush (lcp_router_table_t *nlt, u32 *sw_if_index_to_bool,
   LCP_ROUTER_DBG ("Flush table: entries number to delete %u",
 		  vec_len (ctx.lrtf_entries));
 
+  /* A flush of the plugin's own sources can take a route away without a
+   * netlink delete, so the gateways it held are released here. The reference
+   * keeps the table alive while the routes go, the same way the loop below
+   * relies on; it is released once at the end. */
+  nlt->nlt_refs++;
   vec_foreach (lrtfe, ctx.lrtf_entries)
     {
       int is_sourced;
@@ -2250,6 +2619,9 @@ lcp_router_table_flush (lcp_router_table_t *nlt, u32 *sw_if_index_to_bool,
       if (!is_sourced)
 	lcp_router_table_unlock (nlt);
     }
+  if (lcp_rt_fib_src == source || lcp_rt_fib_src_dynamic == source)
+    lcp_router_table_onlink_prune (nlt);
+  lcp_router_table_unlock (nlt);
 
   vec_free (ctx.lrtf_entries);
 }
@@ -2388,6 +2760,9 @@ lcp_router_init (vlib_main_t *vm)
 
   lcp_rt_fib_src_special =
     fib_source_allocate ("lcp-rt-special", FIB_SOURCE_PRIORITY_HI, FIB_SOURCE_BH_API);
+
+  lcp_rt_fib_src_onlink =
+    fib_source_allocate ("lcp-rt-onlink", FIB_SOURCE_PRIORITY_HI, FIB_SOURCE_BH_API);
 
   return (NULL);
 }
