@@ -22,4 +22,8 @@ __clib_export int lcp_router_table_state (u32 table_id, fib_protocol_t proto,
 /* Number of distinct cross FIB nexthop diagnostics emitted so far. */
 __clib_export u32 lcp_router_cross_fib_nexthop_count (void);
 
+/* The steps of a neighbour synchronization, for the test plugin. */
+__clib_export void lcp_router_neigh_test_mark_all (void);
+__clib_export void lcp_router_neigh_test_end (void);
+
 #endif

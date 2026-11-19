@@ -47,6 +47,7 @@ from vpp_ip_route import (
     VppRoutePath,
     find_route,
 )
+from vpp_neighbor import VppNeighbor, find_nbr
 from vpp_gre_interface import VppGreInterface
 from vpp_qemu_utils import (
     add_namespace_route,
@@ -3002,6 +3003,80 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
 
         self._check_recovery(attempts_before, completed_before, "invalid-fd")
         self._check_linux_update_reaches_vpp()
+
+    def _netlink_attempts(self):
+        return self._netlink_count(self._netlink_stats(), "synchronization attempts")
+
+    def _set_link_down_flag(self, name, enable):
+        self.vapi.cli(f"lcp param {name} {'on' if enable else 'off'}")
+        self.addCleanup(self.vapi.cli, f"lcp param {name} off")
+
+    def _kernel_neighbor_present(self, address):
+        command = ["ip", "netns", "exec", self.ns_name, "ip", "neigh", "show", address]
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        return address in result.stdout
+
+    def _add_unsynced_neighbor(self, address, mac, is_static=False):
+        """Add a neighbour to VPP that the kernel never learns.
+
+        The registry removes it at teardown after checking it is still there,
+        so a test may let the sweep delete it without failing the cleanup.
+        """
+        sw_if_index = self.lo_interfaces[0].sw_if_index
+        neighbor = VppNeighbor(self, sw_if_index, mac, address, is_static=is_static)
+        neighbor.add_vpp_config()
+        self.assertFalse(
+            self._kernel_neighbor_present(address),
+            f"{address} is already known to the kernel",
+        )
+        self.assertTrue(find_nbr(self, sw_if_index, address, is_static=is_static))
+        return sw_if_index
+
+    def _force_resync(self):
+        """Run a synchronization cycle by reporting a netlink polling error."""
+        attempts_before = self._netlink_attempts()
+        self._invoke_netlink_error_callback()
+        self.poll_for(
+            "synchronization did not complete",
+            lambda: self._netlink_attempts() > attempts_before,
+            True,
+            timeout=self.NETLINK_RECOVERY_TIMEOUT,
+            interval=0.25,
+        )
+
+    def _run_neigh_steps(self, *steps):
+        """Drive the neighbour synchronization steps of the plugin directly."""
+        for step in steps:
+            self.vapi.cli(f"test lcp router neigh {step}")
+
+    def test_neigh_resync_keeps_unsynced_dynamic_neighbor(self):
+        """A dynamic neighbour the kernel never dumped survives with the flag off"""
+        sw_if_index = self._add_unsynced_neighbor("10.10.1.101", "02:01:02:03:04:07")
+        self._set_link_down_flag("del-dynamic-on-link-down", False)
+
+        # A real synchronization cycle, then the steps it runs driven
+        # directly, because the dump and the mark race inside the netlink
+        # process node. Marking every neighbour is what the begin step did
+        # before the fix; the end step is the production sweep.
+        self._force_resync()
+        self._run_neigh_steps("mark", "end")
+
+        self.assertTrue(
+            find_nbr(self, sw_if_index, "10.10.1.101"),
+            "dynamic neighbour absent from the dump was removed by the sweep",
+        )
+
+    def test_neigh_resync_sweeps_unsynced_neighbor_with_flag_on(self):
+        """A dynamic neighbour the kernel never dumped is removed with the flag on"""
+        sw_if_index = self._add_unsynced_neighbor("10.10.1.103", "02:01:02:03:04:09")
+        self._set_link_down_flag("del-dynamic-on-link-down", True)
+
+        self._run_neigh_steps("mark", "end")
+
+        self.assertFalse(
+            find_nbr(self, sw_if_index, "10.10.1.103"),
+            "dynamic neighbour absent from the dump survived the sweep",
+        )
 
     def _router(self, arguments):
         return self.vapi.cli(f"test lcp router {arguments}")

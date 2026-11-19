@@ -984,6 +984,35 @@ lcp_router_neigh_add (struct rtnl_neigh *rn)
 		     rtnl_neigh_get_ifindex (rn));
 }
 
+/*
+ * A synchronization marks every dynamic neighbour on a paired interface and,
+ * at its end, sweeps the ones the kernel did not report. It does this only
+ * while del-dynamic-on-link-down is on; with the flag off VPP owns those
+ * neighbours and the kernel only mirrors them. The dump is then not an
+ * authoritative view of them, because the kernel drops an entry from its
+ * neighbour table once a probe goes unanswered, so sweeping on the dump alone
+ * would delete the neighbour together with every flow that resolves through
+ * it. They are removed by the explicit RTM_DELNEIGH records instead.
+ *
+ * Static neighbours take no part in the sweep. ip_neighbor_sweep() destroys
+ * every stale entry whatever its kind, so a static entry marked here could
+ * only be cleared by the same sweep that removes dynamic ones, and marking it
+ * without sweeping would leave STALE set for the next sweep of the neighbour
+ * replace API to destroy. A synchronization therefore leaves static
+ * neighbours alone; del-static-on-link-down governs routes only and does not
+ * reach them.
+ */
+static walk_rc_t
+lcp_router_neigh_mark_dynamic (index_t ipni, void *ctx)
+{
+  ip_neighbor_t *ipn = ip_neighbor_get (ipni);
+
+  if (ipn->ipn_flags & IP_NEIGHBOR_FLAG_DYNAMIC)
+    ipn->ipn_flags |= IP_NEIGHBOR_FLAG_STALE;
+
+  return WALK_CONTINUE;
+}
+
 static walk_rc_t
 lcp_router_neighbor_mark (index_t index, void *ctx)
 {
@@ -991,8 +1020,8 @@ lcp_router_neighbor_mark (index_t index, void *ctx)
   if (!lip)
     return WALK_CONTINUE;
 
-  ip_neighbor_walk (AF_IP4, lip->lip_phy_sw_if_index, ip_neighbor_mark_one, 0);
-  ip_neighbor_walk (AF_IP6, lip->lip_phy_sw_if_index, ip_neighbor_mark_one, 0);
+  ip_neighbor_walk (AF_IP4, lip->lip_phy_sw_if_index, lcp_router_neigh_mark_dynamic, 0);
+  ip_neighbor_walk (AF_IP6, lip->lip_phy_sw_if_index, lcp_router_neigh_mark_dynamic, 0);
 
   return WALK_CONTINUE;
 }
@@ -1000,18 +1029,44 @@ lcp_router_neighbor_mark (index_t index, void *ctx)
 static void
 lcp_router_neigh_sync_begin (void)
 {
-  lcp_itf_pair_walk (lcp_router_neighbor_mark, 0);
+  if (lcp_get_del_dynamic_on_link_down ())
+    lcp_itf_pair_walk (lcp_router_neighbor_mark, 0);
 
   LCP_ROUTER_INFO ("Begin synchronization of neighbors");
 }
 
 static void
-lcp_router_neigh_sync_end (void)
+lcp_router_neigh_sync_sweep (void)
 {
   ip_neighbor_sweep (AF_IP4);
   ip_neighbor_sweep (AF_IP6);
+}
+
+static void
+lcp_router_neigh_sync_end (void)
+{
+  if (lcp_get_del_dynamic_on_link_down ())
+    lcp_router_neigh_sync_sweep ();
 
   LCP_ROUTER_INFO ("End synchronization of neighbors");
+}
+
+/*
+ * Steps of a neighbor synchronization, driven by the test plugin so a test
+ * does not depend on whether a real dump happens to deliver a record before
+ * the sweep runs. Marking regardless of the ownership flag is what the begin
+ * step used to do, which is the condition a regression test reproduces.
+ */
+void
+lcp_router_neigh_test_mark_all (void)
+{
+  lcp_itf_pair_walk (lcp_router_neighbor_mark, 0);
+}
+
+void
+lcp_router_neigh_test_end (void)
+{
+  lcp_router_neigh_sync_end ();
 }
 
 static lcp_router_table_t *

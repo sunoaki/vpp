@@ -354,6 +354,30 @@ VLIB_CLI_COMMAND (test_lcp_router_cross_fib_command, static) = {
   .function = lcp_router_test_cross_fib_cmd,
 };
 
+static void *
+lcp_router_neigh_step_symbol (unformat_input_t *input)
+{
+  if (unformat (input, "mark"))
+    return vlib_get_plugin_symbol ("linux_nl_plugin.so", "lcp_router_neigh_test_mark_all");
+  if (unformat (input, "end"))
+    return vlib_get_plugin_symbol ("linux_nl_plugin.so", "lcp_router_neigh_test_end");
+
+  return NULL;
+}
+
+static clib_error_t *
+lcp_router_test_neigh_sync_cmd (vlib_main_t *vm, unformat_input_t *input)
+{
+  void *step = lcp_router_neigh_step_symbol (input);
+
+  if (!step)
+    return clib_error_return (0, "expected neighbor step mark|end");
+
+  ((void (*) (void)) step) ();
+
+  return 0;
+}
+
 static clib_error_t *
 lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 {
@@ -382,6 +406,9 @@ lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
       vft->nvl_rt_route_sync_end.cb ();
       return 0;
     }
+  /* The neighbor steps are dispatched before an address family is required. */
+  if (unformat (input, "neigh"))
+    return lcp_router_test_neigh_sync_cmd (vm, input);
   if (unformat (input, "ip4"))
     proto = FIB_PROTOCOL_IP4;
   else if (unformat (input, "ip6"))
@@ -506,8 +533,8 @@ lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
 
 VLIB_CLI_COMMAND (test_lcp_router_command, static) = {
   .path = "test lcp router",
-  .short_help = "test lcp router begin|end|<ip4|ip6|mpls> table <id> "
-		"state|entry|add|replace|del ...",
+  .short_help = "test lcp router begin|end|neigh mark|end|"
+		"<ip4|ip6|mpls> table <id> state|entry|add|replace|del ...",
   .function = lcp_router_test_cmd,
 };
 
