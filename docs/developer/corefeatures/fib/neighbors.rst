@@ -33,6 +33,20 @@ The *ip_neighbor_t* for an IPv4 peer (learned e.g. over ARP) will
 install a *link_type=IPv4* when the entry is created and a
 link_type=MPLS on demand (i.e. when a route with output labels resolves via the peer).
 
+A neighbour is keyed by its address and interface, so the same address can
+exist on several interfaces. When that happens in one IP table, both entries
+install a */32* adj-fib for the same prefix and only one of them can be what the
+control plane intends. VPP keeps both and logs a warning naming the two
+interfaces, leaving the choice to the operator.
+
+Removing the last interface address that covers a neighbour also removes the
+neighbour, and its adj-fib, whether the entry is dynamic or static. A static
+entry is operator configuration and nothing re-adds it, so it is kept as long
+as any address still configured on the interface covers it: deleting one of
+several addresses that share a prefix does not discard neighbours the others
+still resolve. A dynamic entry is removed with the address and is learned
+again from the next packet.
+
 Adjacency
 ---------
 

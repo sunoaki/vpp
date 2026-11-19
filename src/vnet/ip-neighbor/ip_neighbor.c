@@ -141,6 +141,8 @@ static ip_neighbor_db_t ip_neighbor_db[N_AF] = {
 #define IP_NEIGHBOR_INFO(...)                          \
     vlib_log_notice (ipn_logger, __VA_ARGS__);
 
+#define IP_NEIGHBOR_WARN(...) vlib_log_warn (ipn_logger, __VA_ARGS__);
+
 typedef enum ip_neighbor_flush_type_t_
 {
   IP_NBR_FLUSH_TYPE_DEFAULT,
@@ -305,6 +307,90 @@ ip_neighbor_db_find (const ip_neighbor_key_t * key)
     return ip_neighbor_get (p[0]);
 
   return (NULL);
+}
+
+/*
+ * Find the neighbour for this address on any other interface that resolves
+ * through the same FIB table. Only that combination competes: two such
+ * neighbours each add a FIB_SOURCE_ADJ path for the same prefix into the same
+ * table, so the entry the control plane does not expect keeps pulling traffic
+ * to a device the address no longer lives on.
+ *
+ * The number of interfaces is small, so this costs one hash lookup per
+ * interface rather than a walk of every neighbour. Interfaces are indexed
+ * directly in ipndb_hash, which is what keeps the search that cheap.
+ */
+static ip_neighbor_t *
+ip_neighbor_db_find_other_sw_if (const ip_neighbor_key_t *key, u32 fib_index)
+{
+  ip_address_family_t af;
+  fib_protocol_t fproto;
+  uword **hashes;
+  u32 sw_if_index;
+
+  af = ip_addr_version (&key->ipnk_ip);
+
+  /*
+   * An interface without a table has no adj-fib, so nothing competes. An IPv6
+   * link-local address is scoped to its link and is expected to be identical
+   * on several interfaces, so it is not a conflict either.
+   */
+  if (INDEX_INVALID == fib_index)
+    return NULL;
+
+  if (AF_IP6 == af && ip6_address_is_link_local_unicast (&ip_addr_v6 (&key->ipnk_ip)))
+    return NULL;
+
+  fproto = ip_address_family_to_fib_proto (af);
+  hashes = ip_neighbor_db[af].ipndb_hash;
+
+  vec_foreach_index (sw_if_index, hashes)
+    {
+      ip_neighbor_key_t other;
+      uword *p;
+
+      if (sw_if_index == key->ipnk_sw_if_index || NULL == hashes[sw_if_index])
+	continue;
+
+      if (fib_table_get_index_for_sw_if_index (fproto, sw_if_index) != fib_index)
+	continue;
+
+      other = *key;
+      other.ipnk_sw_if_index = sw_if_index;
+
+      p = hash_get_mem (hashes[sw_if_index], &other);
+      if (p)
+	return ip_neighbor_get (p[0]);
+    }
+
+  return NULL;
+}
+
+/*
+ * The same address now has a neighbour on this interface and on another one
+ * that resolves through the same FIB table. Both add a FIB_SOURCE_ADJ path for
+ * the same prefix, so only one of them can be what the control plane intends,
+ * and from here there is no way to tell which. Coexistence is legitimate
+ * (test_arp_duplicates relies on it), so this reports the conflict and leaves
+ * the choice to the operator rather than guessing and blackholing traffic.
+ */
+static void
+ip_neighbor_report_other_sw_if (const ip_neighbor_key_t *key, u32 fib_index)
+{
+  ip_neighbor_t *other;
+
+  other = ip_neighbor_db_find_other_sw_if (key, fib_index);
+
+  if (NULL == other)
+    return;
+
+  IP_NEIGHBOR_WARN ("%U now has a neighbour on %U while one remains on %U "
+		    "with flags %U; two adj-fibs compete for the same prefix, "
+		    "delete the stale one with 'set ip neighbor delete'",
+		    format_ip_address, &key->ipnk_ip, format_vnet_sw_if_index_name,
+		    vnet_get_main (), key->ipnk_sw_if_index, format_vnet_sw_if_index_name,
+		    vnet_get_main (), other->ipn_key->ipnk_sw_if_index, format_ip_neighbor_flags,
+		    other->ipn_flags);
 }
 
 static u8
@@ -603,7 +689,7 @@ ip_neighbor_add (const ip_address_t * ip,
   ASSERT (0 == vlib_get_thread_index ());
 
   if (!vnet_sw_interface_is_valid (vnet_get_main (), sw_if_index))
-    return 0;
+    return (VNET_API_ERROR_INVALID_SW_IF_INDEX);
 
   fproto = ip_address_family_to_fib_proto (ip_addr_version (ip));
 
@@ -622,17 +708,40 @@ ip_neighbor_add (const ip_address_t * ip,
 		       format_ip_neighbor_flags, flags, format_mac_address_t,
 		       mac);
 
-      ip_neighbor_touch (ipn);
-
-      /* Refuse to over-write static neighbor entry. */
+      /*
+       * Refuse to over-write static neighbor entry. This runs before
+       * ip_neighbor_touch(), which would clear IP_NEIGHBOR_FLAG_STALE and
+       * reset ipn_n_probes: a refused learn does not confirm the entry it was
+       * refused by, or the refusal would extend the life of a stale entry
+       * through ip_neighbor_sweep().
+       */
       if (!(flags & IP_NEIGHBOR_FLAG_STATIC) &&
 	  (ipn->ipn_flags & IP_NEIGHBOR_FLAG_STATIC))
 	{
 	  /* if MAC address match, still check to send event */
 	  if (0 == mac_address_cmp (&ipn->ipn_mac, mac))
-	    goto check_customers;
-	  return -2;
+	    {
+	      ip_neighbor_touch (ipn);
+	      goto check_customers;
+	    }
+
+	  /*
+	   * The entry exists, it is static, and the new MAC differs. Refusing
+	   * is deliberate: a static entry is programmed by the control plane
+	   * and must be removed by it. Report the refusal with the error code
+	   * that describes it, and log it, so that a data-plane learning
+	   * attempt cannot fail silently. The log class rate-limits at
+	   * log_main.default_rate_limit messages per second.
+	   */
+	  IP_NEIGHBOR_WARN ("static entry %U on %U not updated by learning "
+			    "with mac %U",
+			    format_ip_address, ip, format_vnet_sw_if_index_name, vnet_get_main (),
+			    sw_if_index, format_mac_address_t, mac);
+
+	  return (VNET_API_ERROR_ENTRY_ALREADY_EXISTS);
 	}
+
+      ip_neighbor_touch (ipn);
 
       /* A dynamic entry can become static, but not vice-versa.
        * i.e. since if it was programmed by the CP then it must
@@ -673,6 +782,9 @@ ip_neighbor_add (const ip_address_t * ip,
 
       if (NULL == ipn)
 	return VNET_API_ERROR_LIMIT_EXCEEDED;
+
+      ip_neighbor_report_other_sw_if (&key,
+				      fib_table_get_index_for_sw_if_index (fproto, sw_if_index));
     }
 
   /* Update time stamp and flags. */
@@ -1450,6 +1562,44 @@ ip_neighbor_add_del_sw_interface (vnet_main_t *vnm, u32 sw_if_index,
 
 VNET_SW_INTERFACE_ADD_DEL_FUNCTION (ip_neighbor_add_del_sw_interface);
 
+/*
+ * Whether any address still configured on the interface covers this
+ * neighbour, so that removing one address does not take the neighbour with it
+ * while a sibling address of the same prefix keeps the subnet reachable.
+ *
+ * ip_interface_address_del() unlinks the address being removed before the
+ * add/del callbacks run, so this sees only the surviving addresses.
+ */
+static bool
+ip_neighbor_sw_if_still_covers (const ip_neighbor_key_t *key)
+{
+  ip_address_family_t af;
+  ip_interface_address_t *ia = NULL;
+
+  af = ip_addr_version (&key->ipnk_ip);
+
+  if (AF_IP4 == af)
+    return (NULL != ip4_interface_address_matching_destination (
+		      &ip4_main, &ip_addr_v4 (&key->ipnk_ip), key->ipnk_sw_if_index, &ia));
+
+  return (NULL != ip6_interface_address_matching_destination (
+		    &ip6_main, &ip_addr_v6 (&key->ipnk_ip), key->ipnk_sw_if_index, &ia));
+}
+
+/*
+ * Whether an address covers this neighbour's address.
+ */
+static bool
+ip_neighbor_is_covered (const ip_neighbor_t *ipn, const ip_address_t *addr, u32 length)
+{
+  if (AF_IP4 == ip_addr_version (addr))
+    return ip4_destination_matches_route (&ip4_main, &ip_addr_v4 (&ipn->ipn_key->ipnk_ip),
+					  &ip_addr_v4 (addr), length);
+
+  return ip6_destination_matches_route (&ip6_main, &ip_addr_v6 (&ipn->ipn_key->ipnk_ip),
+					&ip_addr_v6 (addr), length);
+}
+
 typedef struct ip_neighbor_walk_covered_ctx_t_
 {
   ip_address_t addr;
@@ -1465,28 +1615,29 @@ ip_neighbor_walk_covered (index_t ipni, void *arg)
 
   ipn = ip_neighbor_get (ipni);
 
-  if (AF_IP4 == ip_addr_version (&ctx->addr))
-    {
-      if (ip4_destination_matches_route (&ip4_main,
-					 &ip_addr_v4 (&ipn->ipn_key->ipnk_ip),
-					 &ip_addr_v4 (&ctx->addr),
-					 ctx->length) &&
-	  ip_neighbor_is_dynamic (ipn))
-	{
-	  vec_add1 (ctx->ipnis, ip_neighbor_get_index (ipn));
-	}
-    }
-  else if (AF_IP6 == ip_addr_version (&ctx->addr))
-    {
-      if (ip6_destination_matches_route (&ip6_main,
-					 &ip_addr_v6 (&ipn->ipn_key->ipnk_ip),
-					 &ip_addr_v6 (&ctx->addr),
-					 ctx->length) &&
-	  ip_neighbor_is_dynamic (ipn))
-	{
-	  vec_add1 (ctx->ipnis, ip_neighbor_get_index (ipn));
-	}
-    }
+  /*
+   * Static entries are included, unlike the dynamic-only admin-down flush.
+   * Deleting the address that covers a static neighbour is the only event
+   * left that can remove it: the interface-delete path flushes everything but
+   * only when the interface goes away. Left behind, it and its adj-fib /32
+   * outlive the address and keep pulling traffic to an interface the address
+   * no longer lives on.
+   *
+   * A static entry is operator configuration and nothing re-adds it, so it
+   * only goes when no surviving address on the interface still covers it.
+   * Several addresses from one prefix may be configured on one interface, and
+   * removing one of them must not discard neighbours the others still
+   * resolve. A dynamic entry recovers from the next packet, so it keeps
+   * going with the deleted address as it always has.
+   */
+  if (!ip_neighbor_is_covered (ipn, &ctx->addr, ctx->length))
+    return (WALK_CONTINUE);
+
+  if (!ip_neighbor_is_dynamic (ipn) && ip_neighbor_sw_if_still_covers (ipn->ipn_key))
+    return (WALK_CONTINUE);
+
+  vec_add1 (ctx->ipnis, ip_neighbor_get_index (ipn));
+
   return (WALK_CONTINUE);
 }
 

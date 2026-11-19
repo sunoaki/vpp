@@ -36,6 +36,9 @@ arp_opts = {"who-has": 1, "is-at": 2}
 class ARPTestCase(VppTestCase):
     """ARP Test Case"""
 
+    # src/vnet/error.h: VNET_API_ERROR_ENTRY_ALREADY_EXISTS
+    VNET_API_ERROR_ENTRY_ALREADY_EXISTS = -116
+
     @classmethod
     def setUpClass(cls):
         super(ARPTestCase, cls).setUpClass()
@@ -1541,9 +1544,18 @@ class ARPTestCase(VppTestCase):
         self.assertTrue(find_route(self, self.pg2.remote_hosts[1].ip4, 32))
 
         #
-        # remove the connected
+        # remove the connected. A static neighbour covered by the address
+        # goes with it: nothing else would ever remove it, and its adj-fib
+        # /32 would keep pointing at this interface.
         #
         self.pg2.unconfig_ip4()
+
+        self.assertFalse(
+            find_nbr(
+                self, self.pg2.sw_if_index, self.pg2.remote_hosts[1].ip4, is_static=1
+            )
+        )
+        self.assertFalse(find_route(self, self.pg2.remote_hosts[1].ip4, 32))
 
         #
         # put the interface into table 1
@@ -1551,18 +1563,140 @@ class ARPTestCase(VppTestCase):
         self.pg2.set_table_ip4(1)
 
         #
-        # configure the same connected and expect to find the
-        # adj fib in the new table
+        # configure the same connected and re-add the static neighbour, then
+        # expect to find the adj fib in the new table
         #
         self.pg2.config_ip4()
+        static_arp.add_vpp_config()
         self.assertTrue(find_route(self, self.pg2.remote_hosts[1].ip4, 32, table_id=1))
 
         #
         # clean-up
         #
         self.pg2.unconfig_ip4()
-        static_arp.remove_vpp_config()
         self.pg2.set_table_ip4(0)
+
+    def test_arp_static_vs_learn(self):
+        """Dynamic learning against a static entry is reported"""
+        self.pg2.generate_remote_hosts(2)
+
+        static_arp = VppNeighbor(
+            self,
+            self.pg2.sw_if_index,
+            self.pg2.remote_hosts[0].mac,
+            self.pg2.remote_hosts[0].ip4,
+            is_static=1,
+        )
+        static_arp.add_vpp_config()
+
+        #
+        # A dynamic update for the same address with a different MAC must be
+        # refused, and the refusal must carry an error code that says what
+        # happened, not -2 (invalid sw_if_index). Before the fix this returned
+        # -2 and the caller could not tell a static conflict from a bad
+        # interface index.
+        #
+        with self.vapi.assert_known_api_retval(
+            retvals=[self.VNET_API_ERROR_ENTRY_ALREADY_EXISTS]
+        ):
+            self.vapi.ip_neighbor_add_del(
+                self.pg2.sw_if_index,
+                self.pg2.remote_hosts[1].mac,
+                self.pg2.remote_hosts[0].ip4,
+                is_add=1,
+                flags=VppEnum.vl_api_ip_neighbor_flags_t.IP_API_NEIGHBOR_FLAG_NONE,
+            )
+
+        #
+        # the static entry keeps its MAC
+        #
+        self.assertTrue(
+            find_nbr(
+                self,
+                self.pg2.sw_if_index,
+                self.pg2.remote_hosts[0].ip4,
+                is_static=1,
+                mac=self.pg2.remote_hosts[0].mac,
+            )
+        )
+
+        self.logger.info(self.vapi.cli("show logging"))
+        logging = self.vapi.cli("show logging")
+        self.assertIn("not updated by learning", logging)
+
+        static_arp.remove_vpp_config()
+
+    def test_arp_same_ip_other_sw_if(self):
+        """Same IP on a second interface in the same table is reported"""
+        self.pg1.generate_remote_hosts(1)
+        self.pg2.generate_remote_hosts(1)
+
+        #
+        # the same address is reachable through two interfaces of the same
+        # table. Both entries get an adj-fib /32 for that prefix, so only one
+        # can be intended; the conflict is logged for the operator.
+        #
+        nbr_pg1 = VppNeighbor(
+            self,
+            self.pg1.sw_if_index,
+            self.pg1.remote_hosts[0].mac,
+            self.pg1.remote_hosts[0].ip4,
+        )
+        nbr_pg1.add_vpp_config()
+
+        nbr_pg2 = VppNeighbor(
+            self,
+            self.pg2.sw_if_index,
+            self.pg2.remote_hosts[0].mac,
+            self.pg1.remote_hosts[0].ip4,
+        )
+        nbr_pg2.add_vpp_config()
+
+        self.logger.info(self.vapi.cli("show logging"))
+        logging = self.vapi.cli("show logging")
+        self.assertIn("adj-fibs compete for the same prefix", logging)
+
+        nbr_pg2.remove_vpp_config()
+        nbr_pg1.remove_vpp_config()
+
+    def test_arp_static_survives_sibling_address(self):
+        """Static neighbours outlive a sibling address of the same prefix"""
+        self.pg2.generate_remote_hosts(1)
+
+        #
+        # two addresses from one prefix on one interface. Deleting the first
+        # must not discard a static neighbour, because the second still makes
+        # the subnet connected. Before the fix the covered walk destroyed it
+        # unconditionally and nothing re-adds an operator-programmed entry.
+        #
+        sibling = VppIpInterfaceAddress(
+            self, self.pg2, "10.99.0.1", 24
+        ).add_vpp_config()
+        other = VppIpInterfaceAddress(self, self.pg2, "10.99.0.2", 24).add_vpp_config()
+
+        static_arp = VppNeighbor(
+            self,
+            self.pg2.sw_if_index,
+            "aa:bb:cc:dd:ee:ff",
+            "10.99.0.3",
+            is_static=1,
+        )
+        static_arp.add_vpp_config()
+        self.assertTrue(find_nbr(self, self.pg2.sw_if_index, "10.99.0.3", is_static=1))
+
+        #
+        # remove one of the two addresses. The prefix is still configured.
+        #
+        other.remove_vpp_config()
+        self.assertTrue(find_nbr(self, self.pg2.sw_if_index, "10.99.0.3", is_static=1))
+
+        #
+        # removing the last address covering the prefix takes the static
+        # neighbour and its adj-fib /32 with it
+        #
+        sibling.remove_vpp_config()
+        self.assertFalse(find_nbr(self, self.pg2.sw_if_index, "10.99.0.3", is_static=1))
+        self.assertFalse(find_route(self, "10.99.0.3", 32))
 
     def test_arp_static_replace_dynamic_same_mac(self):
         """ARP Static can replace Dynamic (same mac)"""
