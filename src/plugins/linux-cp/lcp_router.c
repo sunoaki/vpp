@@ -1121,15 +1121,13 @@ lcp_router_neigh_add (struct rtnl_neigh *rn)
 
 	  if (rv)
 	    {
-	      LCP_ROUTER_ERROR (
-		"Failed to create neighbor: %U %U", format_ip_address, &nh,
-		format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index);
+	      LCP_ROUTER_ERROR ("Failed to create neighbor: %U %U", format_ip_address, &nh,
+				format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index);
 	    }
 	  else
 	    {
 	      LCP_ROUTER_DBG ("neighbor add: %U %U", format_ip_address, &nh,
-			      format_vnet_sw_if_index_name, vnet_get_main (),
-			      sw_if_index);
+			      format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index);
 	    }
 	}
       else
@@ -1173,8 +1171,7 @@ lcp_router_neigh_add (struct rtnl_neigh *rn)
 	}
     }
   else
-    LCP_ROUTER_INFO ("ignore neighbour add on: %d",
-		     rtnl_neigh_get_ifindex (rn));
+    LCP_ROUTER_INFO ("ignore neighbour add on: %d", rtnl_neigh_get_ifindex (rn));
 }
 
 /*
