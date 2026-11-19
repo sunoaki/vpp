@@ -847,9 +847,17 @@ lcp_router_address_mark (index_t index, void *ctx)
  * Clear the stale flag on the pool element that a successful delete left
  * behind. The delete frees the slot when the address is the only owner of its
  * prefix, and then one element of the same interface holds the prefix, so the
- * element is looked up again by its fib index, address and length, and the
- * match is confirmed before the flag is touched. A slot reused for another
- * interface fails both tests and is left alone.
+ * element is looked up again by its fib index, address and length and the flag
+ * is cleared only when that element belongs to the swept interface and still
+ * carries the address key recorded before the delete.
+ *
+ * A successful delete removes the element and its key, so the lookup normally
+ * finds nothing and this returns without touching anything. The two tests
+ * guard the remaining case, a slot reused before the lookup: a reused element
+ * is added with its flags zeroed and belongs to the other interface, so
+ * clearing its flag would be harmless and the interface test excludes it
+ * anyway. A key offset is handed out again after a free, so the key alone
+ * would not exclude it; it is the interface that does that.
  */
 static void
 lcp_router_address_sweep_clear (ip_lookup_main_t *lm, void *addr_fib, u32 address_length,
