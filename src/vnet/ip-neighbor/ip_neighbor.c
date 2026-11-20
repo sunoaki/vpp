@@ -553,6 +553,8 @@ ip_neighbor_sw_if_index_has_ethernet_rewrite (u32 sw_if_index)
   return (NULL != ethernet_get_interface (&ethernet_main, hw->hw_if_index));
 }
 
+static adj_walk_rc_t ip_neighbor_mk_complete_walk (adj_index_t ai, void *ctx);
+
 static void
 ip_neighbor_mk_complete (adj_index_t ai, ip_neighbor_t * ipn)
 {
