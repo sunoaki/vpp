@@ -764,11 +764,11 @@ ipsec_tun_protect_del (u32 sw_if_index, const ip_address_t *nh)
 {
   index_t itpi;
 
-  ITP_DBG2 ("delete: %U/%U", format_vnet_sw_if_index_name, vnet_get_main (),
-	    sw_if_index, format_ip_address, nh);
-
   if (NULL == nh)
     nh = &IP_ADDR_ALL_0;
+
+  ITP_DBG2 ("delete: %U/%U", format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index,
+	    format_ip_address, nh);
 
   itpi = ipsec_tun_protect_find (sw_if_index, nh);
 
