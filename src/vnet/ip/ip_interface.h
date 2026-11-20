@@ -25,7 +25,7 @@ clib_error_t *ip_interface_address_del (ip_lookup_main_t * lm,
 __clib_export void *ip_interface_get_first_ip (u32 sw_if_index, u8 is_ip4);
 void ip_interface_address_mark (void);
 __clib_export void ip_interface_address_sweep (void);
-__clib_export u32 ip_interface_address_find (ip_lookup_main_t * lm, void *addr_fib,
+__clib_export u32 ip_interface_address_find (ip_lookup_main_t *lm, void *addr_fib,
 					     u32 address_length);
 __clib_export u8 ip_interface_has_address (u32 sw_if_index, ip46_address_t *ip, u8 is_ip4);
 __clib_export walk_rc_t ip_interface_address_mark_one_interface (vnet_main_t *vnm,
