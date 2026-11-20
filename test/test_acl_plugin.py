@@ -1644,6 +1644,9 @@ class TestACLplugin(VppTestCase):
             self.create_rule(self.IPV4, self.DENY, self.PORTS_ALL, 0),
         ]
 
+    def _deny_rules(self):
+        return [self.create_rule(self.IPV4, self.DENY, self.PORTS_ALL, 0)]
+
     def _show_sessions(self):
         return self.vapi.cli("show acl-plugin sessions")
 
@@ -1671,6 +1674,102 @@ class TestACLplugin(VppTestCase):
     def _sessions_snapshot(self):
         """Record the figures every existing interface shows right now."""
         return self._sessions_by_interface()
+
+    # the timeout lists, in the order of enum acl_timeout_e, for the heads
+    # `show acl-plugin sessions` prints per worker
+    _TIMEOUT_LISTS = ("udp_idle", "tcp_idle", "tcp_transient")
+
+    def _session_lists(self):
+        """Count the sessions the timeout list heads name, by list.
+
+        A head names the session at the head of that list on that worker, and
+        `~0` marks an empty list, so the count is the number of sessions each
+        list holds across the workers. The walk that clears the sessions of a
+        deleted interface reads one list at a time, so only the sessions of one
+        list can sit ahead of a session it is after, and a test that wants that
+        checks the lists here.
+        """
+        output = self._show_sessions()
+        heads = [
+            int(head) for head in re.findall(r"fa_conn_list_head\[\d+\]: (\d+)", output)
+        ]
+        workers = len(re.findall(r"^\s*Thread #\d+:", output, re.M))
+        self.assertGreater(workers, 0, "no worker block in `show acl-plugin sessions`")
+        self.assertEqual(
+            len(heads),
+            workers * len(self._TIMEOUT_LISTS),
+            "unexpected list heads in `show acl-plugin sessions`:\n%s" % output,
+        )
+        lists = {}
+        for list_id, head in enumerate(heads):
+            if head not in (0, 0xFFFFFFFF, -1):
+                lists[list_id % len(self._TIMEOUT_LISTS)] = (
+                    lists.get(list_id % len(self._TIMEOUT_LISTS), 0) + 1
+                )
+        return lists
+
+    def _session_at_list_tail(self, list_id):
+        """Wait for one session on a list and return its index.
+
+        A session joins a list at its tail, so the head of a list names a
+        session that is also its tail once it is the only one on the list.
+        """
+        for _ in range(100):
+            output = self._show_sessions()
+            match = re.search(r"fa_conn_list_head\[%d\]: (\d+)" % list_id, output)
+            if match and int(match.group(1)) not in (0, 0xFFFFFFFF):
+                return int(match.group(1))
+            self.sleep(0.05)
+        self.fail("no session on list %d:\n%s" % (list_id, self._show_sessions()))
+
+    def _session_interfaces(self):
+        """Map every session the list heads name to the interface it belongs to.
+
+        With a session index, `show acl-plugin sessions` prints the session's
+        links and the interface it was created on. The heads name the session
+        at each list head, which is the one a walk from the tail meets last,
+        so the session before it in the links is the one the walk meets before.
+        """
+        output = self._show_sessions()
+        heads = [
+            int(head) for head in re.findall(r"fa_conn_list_head\[\d+\]: (\d+)", output)
+        ]
+        interfaces = {}
+        for head in heads:
+            if head in (0, 0xFFFFFFFF, -1) or head in interfaces:
+                continue
+            for session_index in [head] + self._session_jumps(head):
+                match = re.search(
+                    r"session index %d:.*?sw_if_index: (\d+)" % session_index,
+                    output,
+                    re.S,
+                )
+                if match is not None:
+                    interfaces[session_index] = int(match.group(1))
+        return interfaces
+
+    def _session_jumps(self, session_index, steps=4):
+        """Follow one session's links towards its list head.
+
+        With a session index, `show acl-plugin sessions` prints its next and
+        previous neighbours. The walk that clears a deleted interface's
+        sessions goes from a list tail towards its head, so a session the walk
+        meets first shows up first here.
+        """
+        reached = []
+        for _ in range(steps):
+            match = re.search(
+                r"session index %d:.*?link prev idx: (\d+)" % session_index,
+                self._show_sessions(),
+                re.S,
+            )
+            if match is None:
+                break
+            session_index = int(match.group(1))
+            if session_index in (0, 0xFFFFFFFF):
+                break
+            reached.append(session_index)
+        return reached
 
     def _tcp_packet(self, src_host, dst_host, sport, dport, payload, src_mac=None):
         pkt = (
@@ -1961,6 +2060,127 @@ class TestACLplugin(VppTestCase):
             "has the session of sw_if_index %d ahead of it:\n%s"
             % (deleted, other, self._show_sessions()),
         )
+
+    def test_0402_sessions_cleared_past_a_foreign_session(self):
+        """deleting an interface reaches its session with another one ahead
+
+        The walk that clears the sessions of a deleted interface reads a
+        timeout list from its tail. When the session it is after sits ahead of
+        a session of another interface on that list, it has to step over that
+        one and keep going. The scenario above does not always put the two
+        sessions in that order: a reflected TCP packet leaves the session it
+        reaches on the idle list, since the reverse packet carries SYN|ACK, and
+        the session that received the SYN stays on the transient list, so each
+        session may sit alone on its list with nothing ahead of it.
+
+        This scenario sends traffic in one direction and back into the
+        receiving interface, so its own ACL sees the SYN and the SYN|ACK that
+        the session reflects and the session stays on the transient list. The
+        session of pg0 comes first on that list and the session of pg1 lands
+        after it, nearer the tail, so the walk meets pg1's session first and
+        pg0's after it.
+        """
+        self.logger.info("ACLP_TEST_START_0402")
+
+        pg0_index = self.pg0.sw_if_index
+        pg1_index = self.pg1.sw_if_index
+        pg0_host = self.hosts_by_pg_idx[pg0_index][0]
+        pg1_host = self.hosts_by_pg_idx[pg1_index][0]
+
+        # sessions the suite left active sit at list tails, where the walk
+        # meets them before the session this scenario adds. An interface with
+        # a deny ACL creates no session, and traffic through it after the ACL
+        # is applied takes its old session off the list.
+        self._apply_acl(pg0_index, self._deny_rules(), "pg0")
+        self._apply_acl(pg1_index, self._deny_rules(), "pg1")
+        self._send_packets(
+            self.pg0,
+            [
+                self._tcp_packet(
+                    pg0_host, pg1_host, self.tcp_sport_from, self.tcp_dport_from, "a"
+                )
+            ],
+            self.pg1,
+            forwarded=0,
+        )
+        self._send_packets(
+            self.pg1,
+            [
+                self._tcp_packet(
+                    pg1_host,
+                    pg0_host,
+                    self.tcp_sport_from_2,
+                    self.tcp_dport_from_2,
+                    "a",
+                )
+            ],
+            self.pg0,
+            forwarded=0,
+        )
+        self._wait_for_active_sessions(0)
+
+        # the first session: pg0 reflects the reverse packet into pg1, which
+        # adds SYN|ACK to the session there and puts it on the idle list
+        before = self._sessions_snapshot()
+        self._apply_acl(pg0_index, self._permit_reflect_rules(), "pg0")
+        self._send_packets(
+            self.pg0,
+            [
+                self._tcp_packet(
+                    pg0_host, pg1_host, self.tcp_sport_from, self.tcp_dport_from, "b"
+                )
+            ],
+            self.pg1,
+            forwarded=1,
+        )
+        self.assertEqual(self._session_adds_delta(before, pg0_index), 1)
+
+        # the second session: pg1 reflects the reverse packet into itself, and
+        # its own ACL adds SYN|ACK to the same session, so it stays on the
+        # transient list and joins it last
+        before = self._sessions_snapshot()
+        self._apply_acl(pg1_index, self._permit_reflect_rules(), "pg1")
+        self._send_packets(
+            self.pg1,
+            [
+                self._tcp_packet(
+                    pg1_host,
+                    pg1_host,
+                    self.tcp_sport_from_2,
+                    self.tcp_dport_from_2,
+                    "c",
+                )
+            ],
+            self.pg1,
+            forwarded=1,
+        )
+        self.assertEqual(self._session_adds_delta(before, pg1_index), 1)
+
+        # the list head names pg1's session, which is also the list tail, and
+        # pg0's session sits at the only step behind it
+        self.assertEqual(self._active_sessions(), 2)
+        self.assertEqual(
+            self._session_lists(),
+            {2: 1},
+            "the sessions of the two interfaces are not on the transient list "
+            "alone:\n%s" % self._show_sessions(),
+        )
+        tail_session = self._session_at_list_tail(2)
+        self.assertEqual(self._session_interfaces(), {tail_session: pg1_index})
+        self.assertEqual(len(self._session_jumps(tail_session)), 1)
+
+        pg1_sessions = self._sessions_by_interface()[pg1_index]
+        pg0_sessions = self._sessions_by_interface()[pg0_index]
+        self.pg1.remove_vpp_config()
+        self._forget_acl_interface(pg1_index)
+        type(self).pg_interfaces = [self.pg0]
+        self._wait_for_active_sessions(1)
+
+        self.assertNotIn(pg1_index, self._sessions_by_interface())
+        self.assertEqual(self._sessions_by_interface()[pg0_index], pg0_sessions)
+        self.assertEqual(pg1_sessions[0] - pg1_sessions[1], 0)
+
+        self.logger.info("ACLP_TEST_FINISH_0402")
 
 
 if __name__ == "__main__":
