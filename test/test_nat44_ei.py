@@ -38,7 +38,7 @@ from util import ppp
 from vpp_ip_route import VppIpRoute, VppIpTable, VppRoutePath
 from vpp_neighbor import VppNeighbor
 from vpp_papi import VppEnum
-from vpp_papi_exceptions import UnexpectedApiReturnValueError
+from vpp_papi_exceptions import CliFailedCommandError, UnexpectedApiReturnValueError
 from config import config
 
 
@@ -4203,6 +4203,24 @@ class TestNAT44EI(MethodHolder):
             else:
                 pg_interface.ip4_table_id = 0
 
+    def nat44_ei_record_table(self, pg_interface):
+        """Record the IP4 table VPP reports for the interface, requiring table 0"""
+        # ip4_table_id is the test's copy of the table the interface is in, and
+        # a move made without set_table_ip4, such as one a table delete makes
+        # for an interface still bound to it, leaves the copy naming the table
+        # the interface has left; reading the table back keeps the copy true
+        # and the assertion makes the caller's expectation part of the check
+        table_id = self.vapi.sw_interface_get_table(
+            sw_if_index=pg_interface.sw_if_index
+        ).vrf_id
+        self.assertEqual(
+            table_id,
+            0,
+            "%s did not leave its table: VPP reports table %d"
+            % (pg_interface.name, table_id),
+        )
+        pg_interface.ip4_table_id = table_id
+
     def nat44_ei_remove_interface_features(self):
         """Remove every interface feature the plugin still carries"""
         features = {i.sw_if_index: i.flags for i in self.vapi.nat44_ei_interface_dump()}
@@ -4288,10 +4306,13 @@ class TestNAT44EI(MethodHolder):
             # everything else the plugin holds
             for cycle in range(2):
                 plugin_set(enable=1)
+                # the plugin's own locks go on top of the API lock the table
+                # was created with, so a count of one means the enable added
+                # none and a count of two means it added exactly one
                 for table_id in table_ids:
                     self.assertEqual(
                         self.nat44_ei_hi_fib_locks(table_id),
-                        1,
+                        2,
                         "cycle %d: table %d not locked once" % (cycle, table_id),
                     )
 
@@ -4307,7 +4328,9 @@ class TestNAT44EI(MethodHolder):
                     % (cycle, outside_vrf),
                 )
                 # nat44_ei_add_address answers a second add of the same address
-                # with VALUE_EXIST, and the caller of this helper expects zero
+                # with VALUE_EXIST, and the caller of this helper expects zero.
+                # The refusal runs first in the handler and locks nothing, so it
+                # cannot hide the locks the disable below is read for
                 self.assertRaises(
                     UnexpectedApiReturnValueError,
                     self.nat44_add_address,
@@ -4334,7 +4357,7 @@ class TestNAT44EI(MethodHolder):
                 for table_id in table_ids:
                     self.assertEqual(
                         self.nat44_ei_hi_fib_locks(table_id),
-                        0,
+                        1,
                         "cycle %d: table %d still locked" % (cycle, table_id),
                     )
 
@@ -4365,11 +4388,9 @@ class TestNAT44EI(MethodHolder):
             # is on; nat44_ei_plugin_disable rejects a disabled plugin with
             # -169, which is what this tolerates when a cycle already disabled it
             attempt("disable plugin", self.nat44_ei_plugin_disable_if_enabled)
-            for table_id in table_ids:
-                attempt(
-                    "require table %d unlocked" % table_id,
-                    lambda table_id=table_id: self.nat44_ei_require_unlocked(table_id),
-                )
+            # every pool address and every interface feature is gone, and the
+            # plugin holds one lock fewer on each table than it held while it
+            # was on
             attempt(
                 "require no pool address",
                 lambda: self.assertEqual(self.nat44_ei_pool_addresses(), []),
@@ -4384,23 +4405,63 @@ class TestNAT44EI(MethodHolder):
             # an interface address is deleted in the table the interface is in
             # at that moment, and the move back to table 0 is refused while one
             # is present, so every address is detached first and every
-            # interface moves only after that
+            # interface moves only after that; both are no-ops for an interface
+            # whose address the body already took away, which is why the state
+            # below is read back rather than assumed
             for pg_interface, _, _ in nat_interfaces:
                 attempt("detach %s" % pg_interface.name, pg_interface.unconfig_ip4)
             attempt("leave nat table", self.nat44_ei_leave_nat_tables)
+            # the body recorded the table it moved each interface into, and
+            # the moves above are the only thing that changes it, so both are
+            # set to the table 0 a successful move leaves; the restore below
+            # then puts the addresses back in the table it names rather than
+            # in one the interface has left
+            for pg_interface, _, _ in nat_interfaces:
+                attempt(
+                    "record the table %s left" % pg_interface.name,
+                    lambda pg_interface=pg_interface: self.nat44_ei_record_table(
+                        pg_interface
+                    ),
+                )
+            # the delete reaches fib_table_unlock with FIB_SOURCE_API, which
+            # destroys the table once no source holds a lock, and a source that
+            # still held one would keep the table alive; the count is read
+            # here, while the table is there, because the show that reads it
+            # refuses a deleted table
+            for table_id in table_ids:
+                attempt(
+                    "require table %d without a plugin lock" % table_id,
+                    lambda table_id=table_id: self.assertEqual(
+                        self.nat44_ei_hi_fib_locks(table_id),
+                        1,
+                        "table %d: plugin lock count %d after disable"
+                        % (table_id, self.nat44_ei_hi_fib_locks(table_id)),
+                    ),
+                )
+            for table_id in table_ids:
+                attempt(
+                    "delete table %d" % table_id,
+                    lambda table_id=table_id: VppIpTable(
+                        self, table_id, register=False
+                    ).remove_vpp_config(),
+                )
+                # a deleted table is gone with its lock, so the show that read
+                # the count before the delete has no table to format after it;
+                # every interface left it before the delete, so the delete
+                # meets none to move off it
+                attempt(
+                    "require table %d gone" % table_id,
+                    lambda table_id=table_id: self.assertRaises(
+                        CliFailedCommandError,
+                        self.vapi.cli,
+                        "show ip fib table %d" % table_id,
+                    ),
+                )
+            # the interfaces are in table 0 and their records above say so, so
+            # the addresses go back where setUp had them
             for pg_interface, _, _ in nat_interfaces:
                 attempt("restore %s" % pg_interface.name, pg_interface.config_ip4)
                 attempt("resolve arp %s" % pg_interface.name, pg_interface.resolve_arp)
-            # the tables stay, with the FIB_SOURCE_API lock VppIpTable took, as
-            # tables 10 and 20 do for the life of the class: deleting one frees
-            # its ip4_main.fibs slot, and the pool hands a freed slot to the
-            # next table created, so a later test that creates an IP4 table
-            # would land on the index this test just destroyed
-            for table_id in table_ids:
-                attempt(
-                    "require table %d unlocked again" % table_id,
-                    lambda table_id=table_id: self.nat44_ei_require_unlocked(table_id),
-                )
             # TestNAT44EI.tearDown disables the plugin and expects it enabled,
             # and an enable names no VRFs here, so it locks table 0 like the
             # setUp enable; naming tables 100 and 200 would take the very
