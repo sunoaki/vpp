@@ -1618,9 +1618,59 @@ class TestDET44IdentityMapping(TestDET44):
         self.assertEqual(self.pg1.remote_ip4, p[IP].src)
         self.assertEqual(self.tcp_external_port, p[TCP].sport)
 
+    def create_untouched_udp(self, in_if, src_ip, sport, dst_ip):
+        """Create an inside UDP packet that is only seen untranslated.
+
+        :param in_if: Inside interface
+        :param src_ip: Inside source address
+        :param sport: Inside source port
+        :param dst_ip: Inside destination address
+        """
+        return (
+            Ether(dst=in_if.local_mac, src=in_if.remote_mac)
+            / IP(src=src_ip, dst=dst_ip)
+            / UDP(sport=sport, dport=self.udp_external_port)
+        )
+
+    def det44_forward_port(self, in_addr, in_port, ext_addr, ext_port):
+        """Return the outside port deterministic NAT picks for an inside 5-tuple.
+
+        Mirrors the port loop in det44_in2out.c: a session whose source is
+        already recorded for the same external address and port keeps its
+        outside port, otherwise the first candidate in the range starting at
+        lo_port that no such session holds is used.
+
+        :param in_addr: Inside source address
+        :param in_port: Inside source port
+        :param ext_addr: Destination address of the inside packet
+        :param ext_port: Destination port of the inside packet
+        """
+        dms = self.vapi.det44_map_dump()
+        self.assertEqual(1, len(dms))
+        forwarded = self.vapi.det44_forward(in_addr)
+        self.assertEqual(self.nat_ip, str(forwarded.out_addr))
+        lo_port = forwarded.out_port_lo
+        ports_per_host = dms[0].ports_per_host
+        used = set()
+        existing = None
+        for s in self.vapi.det44_session_dump(in_addr):
+            if str(s.ext_addr) != ext_addr or s.ext_port != ext_port:
+                continue
+            used.add(s.out_port)
+            if s.in_port == in_port:
+                existing = s.out_port
+        if existing is not None:
+            return existing
+        for i in range(ports_per_host):
+            out_port = lo_port + (i + in_port) % ports_per_host
+            if out_port not in used:
+                return out_port
+        raise AssertionError("no free outside port for %d" % in_port)
+
     def test_identity_mapping_first_match_addr_only_first(self):
         """A mapping added before another on the same address is matched first"""
         mapped_port = 6312
+        extra_port = 6313
         mapped_ip = "172.31.0.3"
 
         self.configure_det44(self.pg0.remote_ip4, in_plen=32)
@@ -1637,59 +1687,118 @@ class TestDET44IdentityMapping(TestDET44):
         # instead of falling through to the det map.
         pkts = [
             self.create_untouched_tcp(self.pg0, mapped_ip, mapped_port),
-            self.create_untouched_tcp(self.pg0, mapped_ip, mapped_port + 1),
+            self.create_untouched_tcp(self.pg0, mapped_ip, extra_port),
         ]
         capture = self.send_and_capture(self.pg0, self.pg1, pkts, 2)
 
-        for port, p in zip([mapped_port, mapped_port + 1], capture):
+        for port, p in zip([mapped_port, extra_port], capture):
             self.assert_packet_checksums_valid(p)
             self.assertEqual(mapped_ip, p[IP].src)
             self.assertEqual(port, p[TCP].sport)
 
-        # Removing the address-only mapping leaves the per-port mapping alone,
-        # and the other port is no longer matched.
+        # Removing the address-only mapping leaves the per-port mapping alone.
         self.delete_identity_mapping(mapped_ip)
         self.assertEqual(
             ["%s tcp %d" % (mapped_ip, mapped_port)], self.show_identity_mappings()
         )
 
+        # The mapped port still bypasses, but the extra port now falls
+        # through to the det map. That port is translated rather than
+        # discarded: the packet reaches the outside interface with the NAT
+        # address as its source. A failure here is a wrong source address,
+        # not a missing packet.
         pkts = [
             self.create_untouched_tcp(self.pg0, mapped_ip, mapped_port),
-            self.create_untouched_tcp(self.pg0, mapped_ip, mapped_port + 1),
+            self.create_untouched_tcp(self.pg0, mapped_ip, extra_port),
         ]
-        capture = self.send_and_capture(self.pg0, self.pg1, pkts, 1)
+        capture = self.send_and_capture(self.pg0, self.pg1, pkts, 2)
 
-        self.assert_packet_checksums_valid(capture[0])
-        self.assertEqual(mapped_ip, capture[0][IP].src)
-        self.assertEqual(mapped_port, capture[0][TCP].sport)
+        bypassed = [p for p in capture if p[IP].src == mapped_ip]
+        self.assertEqual(1, len(bypassed))
+        self.assert_packet_checksums_valid(bypassed[0])
+        self.assertEqual(mapped_port, bypassed[0][TCP].sport)
+
+        translated = [p for p in capture if p[IP].src == self.nat_ip]
+        self.assertEqual(1, len(translated))
+        self.assert_packet_checksums_valid(translated[0])
+        self.assertEqual(self.tcp_external_port, translated[0][TCP].dport)
 
     def test_identity_mapping_first_match_port_first(self):
         """A per-port mapping added first is matched before a later one"""
         mapped_port = 6314
-        other_port = 6315
         mapped_ip = "172.31.0.4"
+        reachable_ip = self.pg1.remote_hosts[0].ip4
+        unreachable_ip = "203.0.113.7"
 
         self.configure_det44(self.pg0.remote_ip4, in_plen=32)
-        self.add_identity_mapping(mapped_ip, "tcp", mapped_port)
+        # The address-only entry bypasses every port of this address, so the
+        # two entries only produce different captures if the per-port one is
+        # consulted first for its own port.
+        self.add_identity_mapping(mapped_ip, "udp", mapped_port)
         self.add_identity_mapping(mapped_ip)
 
         listed = self.show_identity_mappings()
         self.assertEqual(
-            ["%s tcp %d" % (mapped_ip, mapped_port), "%s" % mapped_ip], listed
+            ["%s udp %d" % (mapped_ip, mapped_port), "%s" % mapped_ip], listed
         )
 
-        # Every port of this address is bypassed; the per-port mapping added
-        # first is the one that answers for its port.
+        # Ports the address-only entry matches: bypassed, so the packets
+        # reach an address neither FIB can route. Both have to arrive, so a
+        # first match that instead translates them fails on the set of
+        # packets rather than on a timeout.
         pkts = [
-            self.create_untouched_tcp(self.pg0, mapped_ip, mapped_port),
-            self.create_untouched_tcp(self.pg0, mapped_ip, other_port),
+            self.create_untouched_udp(
+                self.pg0, mapped_ip, mapped_port + 1, unreachable_ip
+            ),
+            self.create_untouched_udp(
+                self.pg0, mapped_ip, mapped_port + 2, unreachable_ip
+            ),
         ]
         capture = self.send_and_capture(self.pg0, self.pg1, pkts, 2)
 
-        for port, p in zip([mapped_port, other_port], capture):
+        for port, p in zip([mapped_port + 1, mapped_port + 2], capture):
             self.assert_packet_checksums_valid(p)
             self.assertEqual(mapped_ip, p[IP].src)
-            self.assertEqual(port, p[TCP].sport)
+            self.assertEqual(port, p[UDP].sport)
+
+        # The mapped udp port: no bypass, so the det map translates it and
+        # the packet leaves towards the reachable outside host. If the
+        # address-only entry answered first, this packet would go untranslated
+        # towards an unreachable address and nothing would be captured.
+        p = self.create_untouched_udp(self.pg0, mapped_ip, mapped_port, reachable_ip)
+        capture = self.send_and_capture(self.pg0, self.pg1, [p], 1)
+
+        self.assertEqual(1, len(capture))
+        p = capture[0]
+        self.assert_packet_checksums_valid(p)
+        self.assertEqual(self.nat_ip, p[IP].src)
+        self.assertEqual(reachable_ip, p[IP].dst)
+        expected_port = self.det44_forward_port(
+            mapped_ip, mapped_port, reachable_ip, self.udp_external_port
+        )
+        self.assertEqual(int(expected_port), int(p[UDP].sport))
+
+        # Reversing the order of the same two entries makes the per-port one
+        # irrelevant for every port: an address-only entry now answers first,
+        # so even the mapped udp port bypasses.
+        self.delete_identity_mapping(mapped_ip, "udp", mapped_port)
+        self.delete_identity_mapping(mapped_ip)
+        self.add_identity_mapping(mapped_ip)
+        self.add_identity_mapping(mapped_ip, "udp", mapped_port)
+
+        listed = self.show_identity_mappings()
+        self.assertEqual(
+            ["%s" % mapped_ip, "%s udp %d" % (mapped_ip, mapped_port)], listed
+        )
+
+        p = self.create_untouched_udp(self.pg0, mapped_ip, mapped_port, unreachable_ip)
+        capture = self.send_and_capture(self.pg0, self.pg1, [p], 1)
+
+        self.assertEqual(1, len(capture))
+        self.assert_packet_checksums_valid(capture[0])
+        self.assertEqual(mapped_ip, capture[0][IP].src)
+        self.assertEqual(mapped_port, capture[0][UDP].sport)
+        self.assertEqual(unreachable_ip, capture[0][IP].dst)
 
     def test_identity_mapping_does_not_create_session(self):
         """A bypassed packet leaves the deterministic NAT session table alone"""
