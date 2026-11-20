@@ -204,7 +204,7 @@ send_det44_identity_mapping_details (det44_identity_mapping_t *m, vl_api_registr
   clib_memcpy (rmp->addr, &m->addr, 4);
   if (m->flags & DET44_FLAG_ADDR_ONLY)
     {
-      rmp->flags = NAT_API_IS_ADDR_ONLY;
+      rmp->flags = (vl_api_nat_config_flags_t) NAT_API_IS_ADDR_ONLY;
     }
   else
     {
