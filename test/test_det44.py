@@ -1959,9 +1959,7 @@ class TestDET44PluginState(VppTestCase):
         self.vapi.det44_plugin_enable_disable(enable=0)
 
         self.assertEqual(["  none configured"], self.interface_features(self.inside))
-        self.assertEqual(
-            ["  none configured"], self.interface_features(self.outside)
-        )
+        self.assertEqual(["  none configured"], self.interface_features(self.outside))
         self.assertEqual([], self.det44_interfaces())
 
     def test_reenable_after_disable_translates_again(self):
@@ -1986,12 +1984,8 @@ class TestDET44PluginState(VppTestCase):
                 [self.inside.sw_if_index, self.outside.sw_if_index],
                 self.det44_interfaces(),
             )
-            self.assertEqual(
-                ["  det44-in2out"], self.interface_features(self.inside)
-            )
-            self.assertEqual(
-                ["  det44-out2in"], self.interface_features(self.outside)
-            )
+            self.assertEqual(["  det44-in2out"], self.interface_features(self.inside))
+            self.assertEqual(["  det44-out2in"], self.interface_features(self.outside))
 
             p = self.send_udp()[0]
             self.assert_packet_checksums_valid(p)

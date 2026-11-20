@@ -107,24 +107,23 @@ icmp_match_out2in_det (vlib_node_runtime_t *node, u32 thread_index, vlib_buffer_
   ip4_address_t new_addr0 = { {0} };
   snat_det_session_t *ses0 = 0;
   ip4_address_t out_addr;
+  u8 is_first_fragment;
   *dont_translate = 0;
   *identity = 0;
 
   icmp0 = (icmp46_header_t *) ip4_next_header (ip0);
   echo0 = (icmp_echo_header_t *) (icmp0 + 1);
   sw_if_index0 = vnet_buffer (b0)->sw_if_index[VLIB_RX];
+  is_first_fragment = ip4_get_fragment_offset (ip0) == 0;
 
-  if (!icmp_type_is_error_message (icmp0->type))
+  /* Reassembly wrote the type of the first fragment only, so a later
+     fragment has no ICMP header to read and keeps the key of an ICMP
+     message without an echo header, as it did before. The error branch
+     needs both embedded headers after the ICMP header. */
+  if (is_first_fragment && icmp0->type != ICMP4_echo_reply &&
+      clib_net_to_host_u16 (ip0->length) - ip4_header_bytes (ip0) >= 28)
     {
-      protocol = NAT_PROTOCOL_ICMP;
-      key0.ext_host_addr = ip0->src_address;
-      key0.ext_host_port = 0;
-      key0.out_port = echo0->identifier;
-      out_addr = ip0->dst_address;
-    }
-  else
-    {
-      /* if error message, then it's not fragmented and we can access it */
+      /* an error message carries both headers past the ICMP header */
       inner_ip0 = (ip4_header_t *) (echo0 + 1);
       l4_header = ip4_next_header (inner_ip0);
       protocol = ip_proto_to_nat_proto (inner_ip0->protocol);
@@ -148,6 +147,14 @@ icmp_match_out2in_det (vlib_node_runtime_t *node, u32 thread_index, vlib_buffer_
 	  next0 = DET44_OUT2IN_NEXT_DROP;
 	  goto out;
 	}
+    }
+  else
+    {
+      protocol = NAT_PROTOCOL_ICMP;
+      key0.ext_host_addr = ip0->src_address;
+      key0.ext_host_port = 0;
+      key0.out_port = is_first_fragment ? echo0->identifier : 0;
+      out_addr = ip0->dst_address;
     }
 
   /* An identity mapping keeps the packet untranslated; the caller routes it
@@ -201,7 +208,8 @@ icmp_match_out2in_det (vlib_node_runtime_t *node, u32 thread_index, vlib_buffer_
       goto out;
     }
 
-  if (PREDICT_FALSE (icmp0->type != ICMP4_echo_reply && !icmp_type_is_error_message (icmp0->type)))
+  if (PREDICT_FALSE (is_first_fragment && icmp0->type != ICMP4_echo_reply &&
+		     !icmp_type_is_error_message (icmp0->type)))
     {
       b0->error = node->errors[DET44_OUT2IN_ERROR_BAD_ICMP_TYPE];
       next0 = DET44_OUT2IN_NEXT_DROP;
@@ -382,11 +390,10 @@ VLIB_NODE_FN (det44_out2in_node) (vlib_main_t * vm,
   u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
   vlib_get_buffers (vm, from, b, n_left_from);
 
-  /* The feature stays on the interfaces while the plugin is disabled, so the
-     node has to pass the packets through untranslated on its own. Without a
-     translation there is no other table to send them to, so they keep the
-     table of the interface they arrived on, as an untranslated packet
-     without this feature would. */
+  /* A stale or partly removed feature behaves as if the plugin were not
+     enabled for the packet: the frame is routed untouched through the
+     receiving interface's FIB, without translation or the enabled path's
+     checks. That is what det44_plugin_disable is trying to reach. */
   if (PREDICT_FALSE (!plugin_enabled ()))
     {
       u32 i;
