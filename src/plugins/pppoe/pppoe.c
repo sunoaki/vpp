@@ -8,6 +8,7 @@
 #include <inttypes.h>
 
 #include <vlib/vlib.h>
+#include <vlib/init.h>
 #include <vlib/unix/unix.h>
 #include <vnet/ethernet/ethernet.h>
 #include <vnet/fib/fib_entry.h>
@@ -28,84 +29,58 @@ pppoe_main_t pppoe_main;
 static fib_source_t pppoe_fib_src;
 
 u8 *
-format_pppoe_session (u8 * s, va_list * args)
+format_pppoe_session (u8 *s, va_list *args)
 {
   pppoe_session_t *t = va_arg (*args, pppoe_session_t *);
   pppoe_main_t *pem = &pppoe_main;
 
-  s = format (s, "[%d] sw-if-index %d client-ip %U session-id %d ",
-	      t - pem->sessions, t->sw_if_index,
-	      format_ip46_address, &t->client_ip, IP46_TYPE_ANY,
-	      t->session_id);
+  s = format (s, "[%d] sw-if-index %d session-id %d client-ip %U ", t - pem->sessions,
+	      t->sw_if_index, t->session_id, format_ip46_address, &t->client_ip, IP46_TYPE_ANY);
 
-  s = format (s, "encap-if-index %d decap-fib-index %d\n",
-	      t->encap_if_index, t->decap_fib_index);
+  if (!ip46_address_is_zero (&t->client_ip6))
+    s = format (s, "client-ip6 %U ", format_ip46_address, &t->client_ip6, IP46_TYPE_IP6);
 
-  s = format (s, "    local-mac %U  client-mac %U",
-	      format_ethernet_address, t->local_mac,
+  s = format (s, "encap-if-index %d decap-fib-index %d\n", t->encap_if_index, t->decap_fib_index);
+
+  s = format (s, "    local-mac %U  client-mac %U", format_ethernet_address, t->local_mac,
 	      format_ethernet_address, t->client_mac);
 
   return s;
 }
 
 static u8 *
-format_pppoe_name (u8 * s, va_list * args)
+format_pppoe_name (u8 *s, va_list *args)
 {
   u32 dev_instance = va_arg (*args, u32);
   return format (s, "pppoe_session%d", dev_instance);
 }
 
 static clib_error_t *
-pppoe_interface_admin_up_down (vnet_main_t * vnm, u32 hw_if_index, u32 flags)
+pppoe_interface_admin_up_down (vnet_main_t *vnm, u32 hw_if_index, u32 flags)
 {
-  u32 hw_flags = (flags & VNET_SW_INTERFACE_FLAG_ADMIN_UP) ?
-    VNET_HW_INTERFACE_FLAG_LINK_UP : 0;
+  u32 hw_flags = (flags & VNET_SW_INTERFACE_FLAG_ADMIN_UP) ? VNET_HW_INTERFACE_FLAG_LINK_UP : 0;
   vnet_hw_interface_set_flags (vnm, hw_if_index, hw_flags);
 
   return /* no error */ 0;
 }
 
-VNET_DEVICE_CLASS (pppoe_device_class,static) = {
+VNET_DEVICE_CLASS (pppoe_device_class, static) = {
   .name = "PPPoE",
   .format_device_name = format_pppoe_name,
   .admin_up_down_function = pppoe_interface_admin_up_down,
 };
 
 static u8 *
-format_pppoe_header_with_length (u8 * s, va_list * args)
+format_pppoe_header_with_length (u8 *s, va_list *args)
 {
   u32 dev_instance = va_arg (*args, u32);
   s = format (s, "unimplemented dev %u", dev_instance);
   return s;
 }
 
-/*
- * Find the session that owns a sw_if_index.  The mapping is indexed with
- * the interface the caller was handed, which for a sub-interface is the
- * sub-interface's own index, so it can be one past the end of the mapping
- * and the slot it names can be free or hold the invalid sentinel.
- */
-static pppoe_session_t *
-pppoe_session_find_by_sw_if_index (u32 sw_if_index)
-{
-  pppoe_main_t *pem = &pppoe_main;
-  u32 session_id;
-
-  if (vec_len (pem->session_index_by_sw_if_index) <= sw_if_index)
-    return NULL;
-
-  session_id = pem->session_index_by_sw_if_index[sw_if_index];
-
-  if (session_id == ~0 || pool_is_free_index (pem->sessions, session_id))
-    return NULL;
-
-  return pool_elt_at_index (pem->sessions, session_id);
-}
-
 static u8 *
-pppoe_build_rewrite (vnet_main_t * vnm,
-		     u32 sw_if_index,
-		     vnet_link_t link_type, const void *dst_address)
+pppoe_build_rewrite (vnet_main_t *vnm, u32 sw_if_index, vnet_link_t link_type,
+		     const void *dst_address)
 {
   pppoe_session_t *t;
   vnet_hw_interface_t *hi;
@@ -138,11 +113,9 @@ pppoe_build_rewrite (vnet_main_t * vnm,
       if (si->sub.eth.flags.one_tag == 1)
 	{
 	  eth_hdr->type = clib_host_to_net_u16 (ETHERNET_TYPE_VLAN);
-	  ethernet_vlan_header_t *vlan =
-	    (ethernet_vlan_header_t *) (eth_hdr + 1);
+	  ethernet_vlan_header_t *vlan = (ethernet_vlan_header_t *) (eth_hdr + 1);
 	  vlan->type = clib_host_to_net_u16 (ETHERNET_TYPE_PPPOE_SESSION);
-	  vlan->priority_cfi_and_id =
-	    clib_host_to_net_u16 (si->sub.eth.outer_vlan_id);
+	  vlan->priority_cfi_and_id = clib_host_to_net_u16 (si->sub.eth.outer_vlan_id);
 	  pppoe = (pppoe_header_t *) (vlan + 1);
 	}
       si = vnet_get_sw_interface (vnm, si->sup_sw_if_index);
@@ -156,7 +129,7 @@ pppoe_build_rewrite (vnet_main_t * vnm,
   pppoe->ver_type = PPPOE_VER_TYPE;
   pppoe->code = 0;
   pppoe->session_id = clib_host_to_net_u16 (t->session_id);
-  pppoe->length = 0;		/* To be filled in at run-time */
+  pppoe->length = 0; /* To be filled in at run-time */
 
   switch (link_type)
     {
@@ -177,23 +150,22 @@ pppoe_build_rewrite (vnet_main_t * vnm,
  * @brief Fixup the adj rewrite post encap. Insert the packet's length
  */
 static void
-pppoe_fixup (vlib_main_t * vm,
-	     const ip_adjacency_t * adj, vlib_buffer_t * b0, const void *data)
+pppoe_fixup (vlib_main_t *vm, const ip_adjacency_t *adj, vlib_buffer_t *b0, const void *data)
 {
-  //const pppoe_session_t *t;
+  // const pppoe_session_t *t;
   pppoe_header_t *pppoe0;
   uword len = (uword) data;
 
   /* update the rewrite string */
   pppoe0 = vlib_buffer_get_current (b0) + len;
 
-  pppoe0->length = clib_host_to_net_u16 (vlib_buffer_length_in_chain (vm, b0)
-					 - sizeof (pppoe_header_t)
-					 + sizeof (pppoe0->ppp_proto) - len);
+  pppoe0->length =
+    clib_host_to_net_u16 (vlib_buffer_length_in_chain (vm, b0) - sizeof (pppoe_header_t) +
+			  sizeof (pppoe0->ppp_proto) - len);
 }
 
 static void
-pppoe_update_adj (vnet_main_t * vnm, u32 sw_if_index, adj_index_t ai)
+pppoe_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
 {
   dpo_id_t dpo = DPO_INVALID;
   ip_adjacency_t *adj;
@@ -223,24 +195,17 @@ pppoe_update_adj (vnet_main_t * vnm, u32 sw_if_index, adj_index_t ai)
     case IP_LOOKUP_NEXT_ARP:
     case IP_LOOKUP_NEXT_GLEAN:
     case IP_LOOKUP_NEXT_BCAST:
-      adj_nbr_midchain_update_rewrite (ai, pppoe_fixup, (void *) len,
-				       ADJ_FLAG_NONE,
-				       pppoe_build_rewrite (vnm,
-							    sw_if_index,
-							    adj->ia_link,
-							    NULL));
+      adj_nbr_midchain_update_rewrite (ai, pppoe_fixup, (void *) len, ADJ_FLAG_NONE,
+				       pppoe_build_rewrite (vnm, sw_if_index, adj->ia_link, NULL));
       break;
     case IP_LOOKUP_NEXT_MCAST:
       /*
        * Construct a partial rewrite from the known ethernet mcast dest MAC
        * There's no MAC fixup, so the last 2 parameters are 0
        */
-      adj_mcast_midchain_update_rewrite (ai, pppoe_fixup, (void *) len,
-					 ADJ_FLAG_NONE,
-					 pppoe_build_rewrite (vnm,
-							      sw_if_index,
-							      adj->ia_link,
-							      NULL), 0, 0);
+      adj_mcast_midchain_update_rewrite (ai, pppoe_fixup, (void *) len, ADJ_FLAG_NONE,
+					 pppoe_build_rewrite (vnm, sw_if_index, adj->ia_link, NULL),
+					 0, 0);
       break;
 
     case IP_LOOKUP_NEXT_DROP:
@@ -255,16 +220,14 @@ pppoe_update_adj (vnet_main_t * vnm, u32 sw_if_index, adj_index_t ai)
       break;
     }
 
-  interface_tx_dpo_add_or_lock (vnet_link_to_dpo_proto (adj->ia_link),
-				t->encap_if_index, &dpo);
+  interface_tx_dpo_add_or_lock (vnet_link_to_dpo_proto (adj->ia_link), t->encap_if_index, &dpo);
 
   adj_nbr_midchain_stack (ai, &dpo);
 
   dpo_reset (&dpo);
 }
 
-VNET_HW_INTERFACE_CLASS (pppoe_hw_class) =
-{
+VNET_HW_INTERFACE_CLASS (pppoe_hw_class) = {
   .name = "PPPoE",
   .format_header = format_pppoe_header_with_length,
   .build_rewrite = pppoe_build_rewrite,
@@ -272,15 +235,13 @@ VNET_HW_INTERFACE_CLASS (pppoe_hw_class) =
   .flags = VNET_HW_INTERFACE_CLASS_FLAG_P2P,
 };
 
-#define foreach_copy_field                      \
-_(session_id)                                   \
-_(encap_if_index)                               \
-_(decap_fib_index)                              \
-_(client_ip)
+#define foreach_copy_field                                                                         \
+  _ (session_id)                                                                                   \
+  _ (encap_if_index)                                                                               \
+  _ (decap_fib_index)
 
 static bool
-pppoe_decap_next_is_valid (pppoe_main_t * pem, u32 is_ip6,
-			   u32 decap_fib_index)
+pppoe_decap_next_is_valid (pppoe_main_t *pem, u32 is_ip6, u32 decap_fib_index)
 {
   vlib_main_t *vm = pem->vlib_main;
   u32 input_idx = (!is_ip6) ? ip4_input_node.index : ip6_input_node.index;
@@ -289,15 +250,410 @@ pppoe_decap_next_is_valid (pppoe_main_t * pem, u32 is_ip6,
   return decap_fib_index < r->n_next_nodes;
 }
 
-int vnet_pppoe_add_del_session
-  (vnet_pppoe_add_del_session_args_t * a, u32 * sw_if_indexp)
+/* A path is added while the address is held and removed with it, so a route
+ * that never reached the table is never removed from it either. */
+static void
+pppoe_client_fib_path_add (u32 fib_index, fib_protocol_t proto, const ip46_address_t *addr,
+			   u32 sw_if_index)
+{
+  fib_prefix_t pfx = { 0 };
+
+  if (fib_index == ~0)
+    return;
+
+  clib_memcpy (&pfx.fp_addr, addr, sizeof (pfx.fp_addr));
+  pfx.fp_len = (proto == FIB_PROTOCOL_IP4) ? 32 : 128;
+  pfx.fp_proto = proto;
+
+  fib_table_entry_path_add (fib_index, &pfx, pppoe_fib_src, FIB_ENTRY_FLAG_NONE,
+			    fib_proto_to_dpo (proto), &pfx.fp_addr, sw_if_index, ~0, 1, NULL,
+			    FIB_ROUTE_PATH_FLAG_NONE);
+}
+
+static void
+pppoe_client_fib_path_remove (u32 fib_index, fib_protocol_t proto, const ip46_address_t *addr,
+			      u32 sw_if_index)
+{
+  fib_prefix_t pfx = { 0 };
+
+  if (fib_index == ~0)
+    return;
+
+  clib_memcpy (&pfx.fp_addr, addr, sizeof (pfx.fp_addr));
+  pfx.fp_len = (proto == FIB_PROTOCOL_IP4) ? 32 : 128;
+  pfx.fp_proto = proto;
+
+  fib_table_entry_path_remove (fib_index, &pfx, pppoe_fib_src, fib_proto_to_dpo (proto),
+			       &pfx.fp_addr, sw_if_index, ~0, 1, FIB_ROUTE_PATH_FLAG_NONE);
+}
+
+/* The control plane hands out IPv6 addresses in the default table, and does so
+ * when it runs, which may be before anyone configured IPv6. */
+static u32
+pppoe_ip6_fib_index (void)
+{
+  return fib_table_find (FIB_PROTOCOL_IP6, 0);
+}
+
+static void
+pppoe_session_ip4_route_add (pppoe_session_t *t)
+{
+  pppoe_client_fib_path_add (
+    t->decap_fib_index, ip46_address_is_ip4 (&t->client_ip) ? FIB_PROTOCOL_IP4 : FIB_PROTOCOL_IP6,
+    &t->client_ip, t->sw_if_index);
+}
+
+static void
+pppoe_session_ip4_route_remove (pppoe_session_t *t)
+{
+  pppoe_client_fib_path_remove (
+    t->decap_fib_index, ip46_address_is_ip4 (&t->client_ip) ? FIB_PROTOCOL_IP4 : FIB_PROTOCOL_IP6,
+    &t->client_ip, t->sw_if_index);
+}
+
+static void
+pppoe_session_ip6_route_add (pppoe_session_t *t)
+{
+  u32 fib_index = pppoe_ip6_fib_index ();
+
+  if (fib_index == ~0)
+    return;
+
+  pppoe_client_fib_path_add (fib_index, FIB_PROTOCOL_IP6, &t->client_ip6, t->sw_if_index);
+}
+
+static void
+pppoe_session_ip6_route_remove (pppoe_session_t *t)
+{
+  u32 fib_index = pppoe_ip6_fib_index ();
+
+  if (fib_index == ~0)
+    return;
+
+  pppoe_client_fib_path_remove (fib_index, FIB_PROTOCOL_IP6, &t->client_ip6, t->sw_if_index);
+}
+
+static void
+pppoe_session_ip6_address_set (pppoe_session_t *t, const ip6_address_t *a6)
+{
+  if (t->client_ip6_set)
+    pppoe_session_ip6_route_remove (t);
+
+  ip6_address_copy (&t->client_ip6.ip6, a6);
+  t->client_ip6_set = !ip6_address_is_unspecified (a6);
+
+  if (t->client_ip6_set)
+    pppoe_session_ip6_route_add (t);
+}
+
+static void
+pppoe_session_ip4_address_set (pppoe_session_t *t, const ip46_address_t *addr4)
+{
+  if (t->client_ip4_set)
+    pppoe_session_ip4_route_remove (t);
+
+  ip46_address_copy (&t->client_ip, addr4);
+  t->client_ip4_set = !ip46_address_is_zero (addr4);
+
+  if (t->client_ip4_set)
+    pppoe_session_ip4_route_add (t);
+}
+
+/* The interface identifier takes the low half of the address, and the bits of
+ * the prefix the identifier does not cover come from the prefix. */
+static void
+pppoe_ip6_prefix_complete (ip6_address_t *addr6, const ip6_address_t *prefix, u8 prefix_len,
+			   u64 ip6_ident)
+{
+  ip6_address_copy (addr6, prefix);
+  clib_memcpy (addr6->as_u8 + 8, &ip6_ident, sizeof (ip6_ident));
+
+  if (prefix_len < 128)
+    addr6->as_u8[prefix_len / 8] &= (u8) (0xff << (8 - prefix_len % 8));
+  if (prefix_len < 64)
+    clib_memset (addr6->as_u8 + (prefix_len + 7) / 8, 0, (64 - (prefix_len + 7) / 8));
+}
+
+/*
+ * The IPv6CP interface identifier is the low half of the client's link-local
+ * address, so the client is reachable over the session from the moment the
+ * identifier is known. The global prefix a router advertisement carries
+ * completes that address, and replaces the link-local one.
+ */
+void
+vnet_pppoe_ip6_ident_cb (void *arg)
+{
+  pppoe_ip6_ident_update_t update;
+  pppoe_session_t *t;
+  ip6_address_t addr6;
+  ip6_address_t link_local_prefix = {
+    .as_u64 = { clib_host_to_net_u64 (0xfe80ULL << 48), 0 },
+  };
+
+  clib_memcpy (&update, arg, sizeof (update));
+
+  t = pppoe_session_find_by_hw_if_index (update.hw_if_index, update.session_id, update.generation);
+  if (!t)
+    return;
+
+  t->ip6_ident = update.ip6_ident;
+  t->ip6_ident_set = 1;
+
+  /* fe80::/64 completed with the identifier */
+  pppoe_ip6_prefix_complete (&addr6, &link_local_prefix, 64, t->ip6_ident);
+  pppoe_session_ip6_address_set (t, &addr6);
+}
+
+/* A router advertisement carries the global prefix the control plane handed
+ * to the client. */
+void
+vnet_pppoe_ip6_prefix_cb (void *arg)
+{
+  pppoe_ip6_prefix_t update;
+  pppoe_session_t *t;
+  ip6_address_t addr6;
+
+  clib_memcpy (&update, arg, sizeof (update));
+
+  t = pppoe_session_find_by_hw_if_index (update.hw_if_index, update.session_id, update.generation);
+  if (!t)
+    return;
+
+  /* the advertisement completes what IPv6CP negotiated on this session */
+  if (!t->ip6_ident_set)
+    return;
+
+  pppoe_ip6_prefix_complete (&addr6, &update.prefix, update.prefix_len, t->ip6_ident);
+  pppoe_session_ip6_address_set (t, &addr6);
+}
+
+/* The client addresses outlive the session they were learned for: the
+ * interface is reused without the route that pointed at it being removed, so
+ * a reused interface gets the route back. */
+static void
+pppoe_session_fib_attach (pppoe_session_t *t)
+{
+  if (t->client_ip4_set)
+    pppoe_session_ip4_route_add (t);
+
+  if (t->client_ip6_set)
+    pppoe_session_ip6_route_add (t);
+}
+
+/*
+ * is_admin_up is the session's own view of whether it is up, written only by
+ * the main thread and read by the data plane; the interface flag it mirrors
+ * belongs to the interface, which outlives the session.
+ */
+static void
+pppoe_session_attach (pppoe_main_t *pem, pppoe_session_t *t)
+{
+  vnet_main_t *vnm = pem->vnet_main;
+  vnet_sw_interface_t *si;
+
+  si = vnet_get_sw_interface (vnm, t->sw_if_index);
+  si->flags &= ~VNET_SW_INTERFACE_FLAG_HIDDEN;
+  vnet_sw_interface_set_flags (vnm, t->sw_if_index, VNET_SW_INTERFACE_FLAG_ADMIN_UP);
+  vnet_set_interface_l3_output_node (vnm->vlib_main, t->sw_if_index, (u8 *) "tunnel-output");
+
+  /* the routes belong to the addresses; a session created before its address
+   * is negotiated has none yet, and the address installs its own */
+  if (t->client_ip4_set || t->client_ip6_set)
+    pppoe_session_fib_attach (t);
+
+  /* a slot outlives the session that used it, so the echo ledger starts over
+   * with the session, and the observations queued for the last one are told
+   * apart by the stamp */
+  t->generation++;
+  t->lcp_echo_request_epoch = 0;
+  t->lcp_echo_acked_epoch = 0;
+  t->lcp_echo_outstanding = 0;
+  t->lcp_echo_ended = 0;
+
+  t->is_admin_up = 1;
+}
+
+/* The addresses a session added to its interface, walked from the head of the
+ * per-interface list rather than through foreach_ip_interface_address, which
+ * would follow an unnumbered interface to another interface's addresses. */
+static void
+pppoe_ip4_addresses_clear (vnet_main_t *vnm, u32 sw_if_index)
+{
+  ip_lookup_main_t *lm = &ip4_main.lookup_main;
+  u32 ia_index;
+  ip_interface_address_t *ia;
+
+  if (sw_if_index >= vec_len (lm->if_address_pool_index_by_sw_if_index))
+    return;
+
+  ia_index = lm->if_address_pool_index_by_sw_if_index[sw_if_index];
+
+  while (ia_index != ~0)
+    {
+      ia = pool_elt_at_index (lm->if_address_pool, ia_index);
+
+      ip4_add_del_interface_address (vnm->vlib_main, sw_if_index,
+				     ip_interface_address_get_address (lm, ia), ia->address_length,
+				     1 /* is_del */);
+
+      /* the list shrinks under us, so the walk restarts from the head */
+      ia_index = lm->if_address_pool_index_by_sw_if_index[sw_if_index];
+    }
+}
+
+static void
+pppoe_ip6_addresses_clear (vnet_main_t *vnm, u32 sw_if_index)
+{
+  ip_lookup_main_t *lm = &ip6_main.lookup_main;
+  u32 ia_index;
+  ip_interface_address_t *ia;
+
+  if (sw_if_index >= vec_len (lm->if_address_pool_index_by_sw_if_index))
+    return;
+
+  ia_index = lm->if_address_pool_index_by_sw_if_index[sw_if_index];
+
+  while (ia_index != ~0)
+    {
+      ia = pool_elt_at_index (lm->if_address_pool, ia_index);
+
+      ip6_add_del_interface_address (vnm->vlib_main, sw_if_index,
+				     ip_interface_address_get_address (lm, ia), ia->address_length,
+				     1 /* is_del */);
+
+      ia_index = lm->if_address_pool_index_by_sw_if_index[sw_if_index];
+    }
+}
+
+/* A session interface is never deleted, only brought down and reused, so the
+ * teardown stops at releasing what the session held and at putting back what
+ * a new session must not inherit. */
+static void
+pppoe_session_detach (pppoe_main_t *pem, pppoe_session_t *t)
+{
+  vnet_main_t *vnm = pem->vnet_main;
+  vnet_sw_interface_t *si;
+
+  if (t->client_ip4_set)
+    pppoe_session_ip4_route_remove (t);
+
+  if (t->client_ip6_set)
+    pppoe_session_ip6_route_remove (t);
+
+  vnet_reset_interface_l3_output_node (vnm->vlib_main, t->sw_if_index);
+  pppoe_ip4_addresses_clear (vnm, t->sw_if_index);
+  pppoe_ip6_addresses_clear (vnm, t->sw_if_index);
+
+  si = vnet_get_sw_interface (vnm, t->sw_if_index);
+  si->flags |= VNET_SW_INTERFACE_FLAG_HIDDEN;
+  vnet_sw_interface_set_flags (vnm, t->sw_if_index, 0 /* down */);
+
+  t->is_admin_up = 0;
+  t->ip6_ident_set = 0;
+}
+
+static u32
+pppoe_session_alloc (pppoe_main_t *pem, vnet_pppoe_add_del_session_args_t *a,
+		     vnet_hw_interface_t *encap_hi)
+{
+  vnet_main_t *vnm = pem->vnet_main;
+  vnet_interface_main_t *im = &vnm->interface_main;
+  pppoe_session_t *t;
+  vnet_hw_interface_t *hi;
+  u32 hw_if_index, sw_if_index;
+
+  pool_get_aligned (pem->sessions, t, CLIB_CACHE_LINE_BYTES);
+  clib_memset (t, 0, sizeof (*t));
+
+  /* copy from arg structure */
+#define _(x) t->x = a->x;
+  foreach_copy_field;
+#undef _
+
+  /* the slot counts its own sessions: the count in the argument names the
+   * session an observation was made for, not the one being built here */
+  t->generation = 0;
+
+  clib_memcpy (t->local_mac, encap_hi->hw_address, 6);
+  clib_memcpy (t->client_mac, a->client_mac, 6);
+
+  if (vec_len (pem->free_pppoe_session_hw_if_indices) > 0)
+    {
+      hw_if_index =
+	pem->free_pppoe_session_hw_if_indices[vec_len (pem->free_pppoe_session_hw_if_indices) - 1];
+      vec_dec_len (pem->free_pppoe_session_hw_if_indices, 1);
+
+      hi = vnet_get_hw_interface (vnm, hw_if_index);
+      hi->dev_instance = t - pem->sessions;
+      hi->hw_instance = hi->dev_instance;
+
+      /* clear old stats of freed session before reuse */
+      sw_if_index = hi->sw_if_index;
+      vnet_interface_counter_lock (im);
+      vlib_zero_combined_counter (&im->combined_sw_if_counters[VNET_INTERFACE_COUNTER_TX],
+				  sw_if_index);
+      vlib_zero_combined_counter (&im->combined_sw_if_counters[VNET_INTERFACE_COUNTER_RX],
+				  sw_if_index);
+      vlib_zero_simple_counter (&im->sw_if_counters[VNET_INTERFACE_COUNTER_DROP], sw_if_index);
+      vnet_interface_counter_unlock (im);
+    }
+  else
+    {
+      hw_if_index = vnet_register_interface (vnm, pppoe_device_class.index, t - pem->sessions,
+					     pppoe_hw_class.index, t - pem->sessions);
+      hi = vnet_get_hw_interface (vnm, hw_if_index);
+      sw_if_index = hi->sw_if_index;
+    }
+
+  t->hw_if_index = hw_if_index;
+  t->sw_if_index = sw_if_index;
+
+  vec_validate_init_empty (pem->session_index_by_sw_if_index, sw_if_index, ~0);
+  pem->session_index_by_sw_if_index[sw_if_index] = t - pem->sessions;
+
+  return sw_if_index;
+}
+
+/*
+ * Releases a session and leaves its key in the table naming no session.
+ * Removing the key would leave it absent while the interface it was on is
+ * being handed to the next session, and a client that reconnects would then
+ * find neither its old entry nor a new one; kept as ~0, the add that builds
+ * the new session writes it back.
+ *
+ * A worker that looked the session up by interface is still holding the index
+ * it read, so the slot is released only after the index no longer points at
+ * it: once it is free, the next session to take it is a different client, and
+ * the interface cannot be made to name that one.
+ */
+static void
+pppoe_session_release (pppoe_main_t *pem, pppoe_session_t *t)
+{
+  pppoe_entry_key_t key;
+  pppoe_entry_result_t result;
+  u32 bucket;
+
+  pppoe_session_detach (pem, t);
+
+  result.raw = 0;
+  result.fields.session_index = ~0;
+  pppoe_update_1 (&pem->session_table, t->client_mac, clib_host_to_net_u16 (t->session_id), &key,
+		  &bucket, &result);
+
+  pem->session_index_by_sw_if_index[t->sw_if_index] = ~0;
+  vec_add1 (pem->free_pppoe_session_hw_if_indices, t->hw_if_index);
+  pool_put (pem->sessions, t);
+}
+
+int
+vnet_pppoe_add_del_session (vnet_pppoe_add_del_session_args_t *a, u32 *sw_if_indexp)
 {
   pppoe_main_t *pem = &pppoe_main;
   pppoe_session_t *t = 0;
   vnet_main_t *vnm = pem->vnet_main;
-  u32 hw_if_index = ~0;
   u32 sw_if_index = ~0;
   u32 is_ip6 = a->is_ip6;
+  u32 session_index;
   pppoe_entry_key_t cached_key;
   pppoe_entry_result_t cached_result;
   u32 bucket;
@@ -305,30 +661,26 @@ int vnet_pppoe_add_del_session
   pppoe_entry_result_t result;
   vnet_hw_interface_t *hi;
   vnet_sw_interface_t *si;
-  fib_prefix_t pfx;
 
   cached_key.raw = ~0;
-  cached_result.raw = ~0;	/* warning be gone */
-  clib_memset (&pfx, 0, sizeof (pfx));
+  cached_result.raw = ~0; /* warning be gone */
 
-  if (!is_ip6)
-    {
-      pfx.fp_addr.ip4.as_u32 = a->client_ip.ip4.as_u32;
-      pfx.fp_len = 32;
-      pfx.fp_proto = FIB_PROTOCOL_IP4;
-    }
-  else
-    {
-      pfx.fp_addr.ip6.as_u64[0] = a->client_ip.ip6.as_u64[0];
-      pfx.fp_addr.ip6.as_u64[1] = a->client_ip.ip6.as_u64[1];
-      pfx.fp_len = 128;
-      pfx.fp_proto = FIB_PROTOCOL_IP6;
-    }
+  if (a->session_id == 0)
+    return VNET_API_ERROR_INVALID_ARGUMENT;
 
-  /* Get encap_if_index and local mac address from link_table */
-  pppoe_lookup_1 (&pem->link_table, &cached_key, &cached_result,
-		  a->client_mac, 0, &key, &bucket, &result);
-  a->encap_if_index = result.fields.sw_if_index;
+  /*
+   * The caller may name the data plane port the client is reached on; the
+   * control plane does, because its session is created from a negotiation
+   * frame rather than from a data frame, so the link table has nothing to say
+   * about the client yet. Only a caller that does not name one is resolved
+   * through the link table.
+   */
+  if (a->encap_if_index == ~0)
+    {
+      pppoe_lookup_1 (&pem->link_table, &cached_key, &cached_result, a->client_mac, 0, &key,
+		      &bucket, &result);
+      a->encap_if_index = result.fields.sw_if_index;
+    }
 
   if (a->encap_if_index == ~0)
     return VNET_API_ERROR_INVALID_SW_IF_INDEX;
@@ -337,132 +689,96 @@ int vnet_pppoe_add_del_session
   hi = vnet_get_hw_interface (vnm, si->hw_if_index);
 
   /* lookup session_table */
-  pppoe_lookup_1 (&pem->session_table, &cached_key, &cached_result,
-		  a->client_mac, clib_host_to_net_u16 (a->session_id),
-		  &key, &bucket, &result);
+  pppoe_lookup_1 (&pem->session_table, &cached_key, &cached_result, a->client_mac,
+		  clib_host_to_net_u16 (a->session_id), &key, &bucket, &result);
+
+  /* the session the client already has, which learning must not decide */
+  session_index = result.fields.session_index;
 
   /* learn client session */
-  pppoe_learn_process (&pem->session_table, a->encap_if_index,
-		       &key, &cached_key, &bucket, &result);
+  pppoe_learn_process (&pem->session_table, a->encap_if_index, &key, &cached_key, &bucket, &result);
 
   if (a->is_add)
     {
-      /* adding a session: session must not already exist */
-      if (result.fields.session_index != ~0)
-	return VNET_API_ERROR_TUNNEL_EXIST;
+      /*
+       * A session is built around a client address. IPCP and IPv6CP hand the
+       * address over after the session exists, so an add that names both an
+       * existing session and an address is the address arriving, not a second
+       * session: it is applied to the session the client already has.
+       */
+      if (session_index != ~0)
+	{
+	  if (ip46_address_is_zero (&a->client_ip) && ip46_address_is_zero (&a->client_ip6))
+	    return VNET_API_ERROR_TUNNEL_EXIST;
+
+	  t = pool_elt_at_index (pem->sessions, session_index);
+
+	  /*
+	   * A queued observation names the session it was made for. The slot the
+	   * client's key leads to may have been released and handed to the
+	   * client's next connection since, and the count the slot keeps is what
+	   * tells the two apart; applying the address to the next session would
+	   * be reading a frame for one connection into another.
+	   */
+	  if (a->generation != ~0 && t->generation != a->generation)
+	    return VNET_API_ERROR_NO_SUCH_ENTRY;
+
+	  sw_if_index = t->sw_if_index;
+	  goto address;
+	}
+
+      if (ip46_address_is_zero (&a->client_ip) && ip46_address_is_zero (&a->client_ip6))
+	return VNET_API_ERROR_INVALID_ARGUMENT;
 
       /*if not set explicitly, default to ip4 */
       if (!pppoe_decap_next_is_valid (pem, is_ip6, a->decap_fib_index))
 	return VNET_API_ERROR_INVALID_DECAP_NEXT;
 
-      pool_get_aligned (pem->sessions, t, CLIB_CACHE_LINE_BYTES);
-      clib_memset (t, 0, sizeof (*t));
+      sw_if_index = pppoe_session_alloc (pem, a, hi);
+      t = pppoe_session_find_by_sw_if_index (sw_if_index);
 
-      clib_memcpy (t->local_mac, hi->hw_address, vec_len (hi->hw_address));
-
-      /* copy from arg structure */
-#define _(x) t->x = a->x;
-      foreach_copy_field;
-#undef _
-
-      clib_memcpy (t->client_mac, a->client_mac, 6);
-
-      /* update pppoe fib with session_index */
+      /* the key can already be there with no session behind it, kept by the
+       * delete of an earlier session, so the index of the session that took
+       * the slot is written back whenever one is built */
       result.fields.session_index = t - pem->sessions;
-      pppoe_update_1 (&pem->session_table,
-		      a->client_mac, clib_host_to_net_u16 (a->session_id),
+      pppoe_update_1 (&pem->session_table, a->client_mac, clib_host_to_net_u16 (a->session_id),
 		      &key, &bucket, &result);
 
-      vnet_hw_interface_t *hi;
-      if (vec_len (pem->free_pppoe_session_hw_if_indices) > 0)
+      pppoe_session_attach (pem, t);
+
+    address:
+      if (!ip46_address_is_zero (&a->client_ip))
+	pppoe_session_ip4_address_set (t, &a->client_ip);
+
+      if (!ip46_address_is_zero (&a->client_ip6))
+	pppoe_session_ip6_address_set (t, &a->client_ip6.ip6);
+
+      /* a disabled fib leaves the route of the address to whoever owns it,
+       * but the address itself still belongs to the session */
+      if (a->disable_fib)
 	{
-	  vnet_interface_main_t *im = &vnm->interface_main;
-	  hw_if_index = pem->free_pppoe_session_hw_if_indices
-	    [vec_len (pem->free_pppoe_session_hw_if_indices) - 1];
-	  vec_dec_len (pem->free_pppoe_session_hw_if_indices, 1);
+	  if (t->client_ip4_set)
+	    pppoe_session_ip4_route_remove (t);
 
-	  hi = vnet_get_hw_interface (vnm, hw_if_index);
-	  hi->dev_instance = t - pem->sessions;
-	  hi->hw_instance = hi->dev_instance;
-
-	  /* clear old stats of freed session before reuse */
-	  sw_if_index = hi->sw_if_index;
-	  vnet_interface_counter_lock (im);
-	  vlib_zero_combined_counter
-	    (&im->combined_sw_if_counters[VNET_INTERFACE_COUNTER_TX],
-	     sw_if_index);
-	  vlib_zero_combined_counter (&im->combined_sw_if_counters
-				      [VNET_INTERFACE_COUNTER_RX],
-				      sw_if_index);
-	  vlib_zero_simple_counter (&im->sw_if_counters
-				    [VNET_INTERFACE_COUNTER_DROP],
-				    sw_if_index);
-	  vnet_interface_counter_unlock (im);
+	  if (t->client_ip6_set)
+	    pppoe_session_ip6_route_remove (t);
 	}
-      else
-	{
-	  hw_if_index = vnet_register_interface
-	    (vnm, pppoe_device_class.index, t - pem->sessions,
-	     pppoe_hw_class.index, t - pem->sessions);
-	  hi = vnet_get_hw_interface (vnm, hw_if_index);
-	}
-
-      t->hw_if_index = hw_if_index;
-      t->sw_if_index = sw_if_index = hi->sw_if_index;
-
-      vec_validate_init_empty (pem->session_index_by_sw_if_index, sw_if_index,
-			       ~0);
-      pem->session_index_by_sw_if_index[sw_if_index] = t - pem->sessions;
-
-      vnet_sw_interface_t *si = vnet_get_sw_interface (vnm, sw_if_index);
-      si->flags &= ~VNET_SW_INTERFACE_FLAG_HIDDEN;
-      vnet_sw_interface_set_flags (vnm, sw_if_index,
-				   VNET_SW_INTERFACE_FLAG_ADMIN_UP);
-      vnet_set_interface_l3_output_node (vnm->vlib_main, sw_if_index,
-					 (u8 *) "tunnel-output");
-
-      /* add reverse route for client ip */
-      fib_table_entry_path_add (a->decap_fib_index, &pfx,
-				pppoe_fib_src, FIB_ENTRY_FLAG_NONE,
-				fib_proto_to_dpo (pfx.fp_proto),
-				&pfx.fp_addr, sw_if_index, ~0,
-				1, NULL, FIB_ROUTE_PATH_FLAG_NONE);
-
     }
   else
     {
-      /* deleting a session: session must exist */
-      if (result.fields.session_index == ~0)
-	return VNET_API_ERROR_NO_SUCH_ENTRY;
+      /*
+       * A key that names no session is a client the table knows from its
+       * control plane frames and whose session is already gone, either because
+       * this branch released it earlier or because it never had one. Deleting
+       * it again is what the caller asked for, not an error.
+       */
+      if (session_index == ~0)
+	return 0;
 
-      t = pool_elt_at_index (pem->sessions, result.fields.session_index);
+      t = pool_elt_at_index (pem->sessions, session_index);
       sw_if_index = t->sw_if_index;
 
-      vnet_reset_interface_l3_output_node (vnm->vlib_main, sw_if_index);
-      vnet_sw_interface_set_flags (vnm, t->sw_if_index, 0 /* down */ );
-      vnet_sw_interface_t *si = vnet_get_sw_interface (vnm, t->sw_if_index);
-      si->flags |= VNET_SW_INTERFACE_FLAG_HIDDEN;
-
-      vec_add1 (pem->free_pppoe_session_hw_if_indices, t->hw_if_index);
-
-      pem->session_index_by_sw_if_index[t->sw_if_index] = ~0;
-
-      /* update pppoe fib with session_inde=~0x */
-      result.fields.session_index = ~0;
-      pppoe_update_1 (&pem->session_table,
-		      a->client_mac, clib_host_to_net_u16 (a->session_id),
-		      &key, &bucket, &result);
-
-
-      /* delete reverse route for client ip */
-      fib_table_entry_path_remove (a->decap_fib_index, &pfx,
-				   pppoe_fib_src,
-				   fib_proto_to_dpo (pfx.fp_proto),
-				   &pfx.fp_addr,
-				   sw_if_index, ~0, 1,
-				   FIB_ROUTE_PATH_FLAG_NONE);
-
-      pool_put (pem->sessions, t);
+      pppoe_session_release (pem, t);
     }
 
   if (sw_if_indexp)
@@ -471,10 +787,225 @@ int vnet_pppoe_add_del_session
   return 0;
 }
 
+/* A data plane node hands what it saw to the main thread, which changes the
+ * session table and the interface database under the barrier. */
+void
+vnet_pppoe_add_del_session_cb (void *arg)
+{
+  vnet_pppoe_add_del_session_args_t a;
+
+  clib_memcpy (&a, arg, sizeof (a));
+
+  int rv = vnet_pppoe_add_del_session (&a, NULL);
+  if (rv)
+    clib_warning ("PPPoE session %u for client %U: %U", a.session_id, format_ethernet_address,
+		  a.client_mac, format_vnet_api_errno, rv);
+}
+
+/* A session that can no longer carry traffic is torn down the way a delete
+ * tears it down. Only the threads that are parked may change the table, so the
+ * frame that brings the session down marks it down and a callback tears it
+ * down once the workers are parked. */
+void
+vnet_pppoe_session_teardown (pppoe_session_t *t)
+{
+  pppoe_main_t *pem = &pppoe_main;
+  pppoe_session_teardown_t teardown = {
+    .hw_if_index = t->hw_if_index,
+    .session_id = t->session_id,
+    /* the teardown names the session it was decided for, so it does not land
+     * on the next session the interface is handed to */
+    .generation = t->generation,
+  };
+
+  vnet_sw_interface_set_flags (pem->vnet_main, t->sw_if_index, 0 /* down */);
+  t->is_admin_up = 0;
+
+  if (vlib_worker_thread_barrier_held ())
+    vnet_pppoe_padt_cb (&teardown);
+  else
+    vlib_rpc_call_main_thread (vnet_pppoe_padt_cb, (u8 *) &teardown, sizeof (teardown));
+}
+
+/*
+ * The ledger counts requests the client has not answered: it is the number of
+ * requests since the last one answered, so it is the distance between the
+ * requests seen and the last one a reply named.
+ *
+ * A reply is credited by the epoch it names, which is the request the data
+ * plane last saw counted when it queued the frame, so the reply to request k is
+ * credited to request k whether it is drained before or after request k+1.
+ *
+ * What the credit cannot do is arrive after the request that judges the
+ * session. With PPPOE_LCP_ECHO_MISSES requests allowed to go unanswered, a
+ * client is only torn down once that many requests have been sent and no reply
+ * for any of them has been drained, so a client that answers every request but
+ * whose replies trail the requests by more than the limit's worth is still torn
+ * down. The limit bounds how long a session outlives the concentrator, and only
+ * within it is the outcome independent of drain order.
+ */
+void
+vnet_pppoe_lcp_echo_cb (void *arg)
+{
+  pppoe_lcp_echo_t echo;
+  pppoe_session_t *t;
+  u32 request_epoch;
+
+  clib_memcpy (&echo, arg, sizeof (echo));
+
+  t = pppoe_session_find_by_hw_if_index (echo.hw_if_index, echo.session_id, echo.generation);
+  if (!t || !t->is_admin_up)
+    return;
+
+  /* a reply answers the request it names, and only that one: replies are
+   * queued in the order the concentrator sent them, so the epoch says which
+   * request is answered */
+  if (!echo.is_request)
+    {
+      /* the ledger is judged at the request, so a reply that would only lower
+       * it cannot save a session the last request ended */
+      if (t->lcp_echo_ended)
+	return;
+
+      request_epoch = clib_atomic_load_acq_n (&t->lcp_echo_request_epoch);
+
+      if (echo.request_epoch != t->lcp_echo_acked_epoch && echo.request_epoch <= request_epoch)
+	t->lcp_echo_acked_epoch = echo.request_epoch;
+
+      t->lcp_echo_outstanding =
+	clib_min (request_epoch - t->lcp_echo_acked_epoch, (u32) PPPOE_LCP_ECHO_MISSES);
+      return;
+    }
+
+  if (t->lcp_echo_ended)
+    return;
+
+  request_epoch = ++t->lcp_echo_request_epoch;
+
+  /* the data plane reads this to name the request its reply answers, so it is
+   * published after the count is in place */
+  clib_atomic_store_rel_n (&t->lcp_echo_request_epoch, request_epoch);
+
+  t->lcp_echo_outstanding =
+    clib_min (request_epoch - t->lcp_echo_acked_epoch, (u32) PPPOE_LCP_ECHO_MISSES);
+
+  /* a session that stops answering the echo of the access concentrator is
+   * gone once the requests the client left unanswered reach the limit; the
+   * reply to this request may still be queued, which is what the limit is
+   * for */
+  if (t->lcp_echo_outstanding >= PPPOE_LCP_ECHO_MISSES)
+    {
+      t->lcp_echo_ended = 1;
+      vnet_pppoe_session_teardown (t);
+    }
+}
+
+/* A PADT ends the session it names, whether the control plane asked for it or
+ * the access concentrator did. It also applies the teardown a data plane node
+ * asked for, once the session the request named is confirmed to be the one
+ * still on that interface. */
+void
+vnet_pppoe_padt_cb (void *arg)
+{
+  pppoe_session_teardown_t teardown;
+  pppoe_session_t *t;
+
+  clib_memcpy (&teardown, arg, sizeof (teardown));
+
+  t = pppoe_session_find_by_hw_if_index (teardown.hw_if_index, teardown.session_id,
+					 teardown.generation);
+  if (!t)
+    return;
+
+  pppoe_session_release (&pppoe_main, t);
+}
+
+typedef struct
+{
+  /* the sessions a table walk found, deleted once the walk is over */
+  vnet_pppoe_add_del_session_args_t *sessions;
+
+  u32 deleted;
+  u32 failed;
+} pppoe_delete_walk_ctx_t;
+
+/* Deleting a session rewrites the session table, so the walk only collects and
+ * the deletions happen once it has finished. */
+static int
+pppoe_delete_collect_cb (BVT (clib_bihash_kv) * kvp, void *arg)
+{
+  pppoe_main_t *pem = &pppoe_main;
+  pppoe_delete_walk_ctx_t *ctx = arg;
+  pppoe_entry_key_t key;
+  pppoe_entry_result_t result;
+  pppoe_session_t *t;
+
+  key.raw = kvp->key;
+  result.raw = kvp->value;
+
+  if (result.fields.session_index == ~0 ||
+      pool_is_free_index (pem->sessions, result.fields.session_index))
+    return BIHASH_WALK_CONTINUE;
+
+  t = pool_elt_at_index (pem->sessions, result.fields.session_index);
+
+  vnet_pppoe_add_del_session_args_t a = {
+    .is_add = 0,
+    .session_id = t->session_id,
+    .encap_if_index = t->encap_if_index,
+    .decap_fib_index = t->decap_fib_index,
+    .client_ip = t->client_ip,
+  };
+  clib_memcpy (a.client_mac, key.fields.mac, 6);
+
+  vec_add1 (ctx->sessions, a);
+
+  return BIHASH_WALK_CONTINUE;
+}
+
+static void
+pppoe_delete_all_sessions (void)
+{
+  pppoe_main_t *pem = &pppoe_main;
+  pppoe_delete_walk_ctx_t ctx = { 0 };
+  vnet_pppoe_add_del_session_args_t *a;
+
+  /*
+   * A worker reads a session index and then the slot it names, and one of the
+   * deletions below can release that slot between the two reads, so the walk and
+   * the deletions run with the workers parked. The barrier is held around them
+   * rather than taken by one deletion: a worker blocked on the barrier is not
+   * making the first read.
+   *
+   * Taking the barrier requires the main thread, and the barrier sync asserts
+   * that rather than checking it, so this runs only on the thread the CLI
+   * process runs on; a caller on any other thread has to queue the work the way
+   * vnet_pppoe_session_teardown does.
+   */
+  vlib_worker_thread_barrier_sync (vlib_get_main ());
+
+  BV (clib_bihash_foreach_key_value_pair)
+  (&pem->session_table, pppoe_delete_collect_cb, &ctx);
+
+  vec_foreach (a, ctx.sessions)
+    {
+      if (vnet_pppoe_add_del_session (a, NULL))
+	ctx.failed++;
+      else
+	ctx.deleted++;
+    }
+
+  vlib_worker_thread_barrier_release (vlib_get_main ());
+
+  if (ctx.failed)
+    clib_warning ("%u of %u PPPoE sessions could not be deleted", ctx.failed,
+		  ctx.deleted + ctx.failed);
+
+  vec_free (ctx.sessions);
+}
+
 static clib_error_t *
-pppoe_add_del_session_command_fn (vlib_main_t * vm,
-				  unformat_input_t * input,
-				  vlib_cli_command_t * cmd)
+pppoe_add_del_session_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 {
   unformat_input_t _line_input, *line_input = &_line_input;
   u16 session_id = 0;
@@ -483,7 +1014,10 @@ pppoe_add_del_session_command_fn (vlib_main_t * vm,
   u8 client_ip_set = 0;
   u8 ipv4_set = 0;
   u8 ipv6_set = 0;
-  u32 encap_if_index = 0;
+  u8 disable_fib = 0;
+  /* the command names the client, not the port: the port is resolved through
+   * the link table, the way master resolved every add */
+  u32 encap_if_index = ~0;
   u32 decap_fib_index = 0;
   u8 client_mac[6] = { 0 };
   u8 client_mac_set = 0;
@@ -506,16 +1040,18 @@ pppoe_add_del_session_command_fn (vlib_main_t * vm,
 	{
 	  is_add = 0;
 	}
+      else if (unformat (line_input, "disable-fib"))
+	{
+	  disable_fib = 1;
+	}
       else if (unformat (line_input, "session-id %d", &session_id))
 	;
-      else if (unformat (line_input, "client-ip %U",
-			 unformat_ip4_address, &client_ip.ip4))
+      else if (unformat (line_input, "client-ip %U", unformat_ip4_address, &client_ip.ip4))
 	{
 	  client_ip_set = 1;
 	  ipv4_set = 1;
 	}
-      else if (unformat (line_input, "client-ip %U",
-			 unformat_ip6_address, &client_ip.ip6))
+      else if (unformat (line_input, "client-ip %U", unformat_ip6_address, &client_ip.ip6))
 	{
 	  client_ip_set = 1;
 	  ipv6_set = 1;
@@ -529,28 +1065,22 @@ pppoe_add_del_session_command_fn (vlib_main_t * vm,
 
 	  if (decap_fib_index == ~0)
 	    {
-	      error =
-		clib_error_return (0, "nonexistent decap fib id %d", tmp);
+	      error = clib_error_return (0, "nonexistent decap fib id %d", tmp);
 	      goto done;
 	    }
 	}
-      else
-	if (unformat
-	    (line_input, "client-mac %U", unformat_ethernet_address,
-	     client_mac))
+      else if (unformat (line_input, "client-mac %U", unformat_ethernet_address, client_mac))
 	client_mac_set = 1;
       else
 	{
-	  error = clib_error_return (0, "parse error: '%U'",
-				     format_unformat_error, line_input);
+	  error = clib_error_return (0, "parse error: '%U'", format_unformat_error, line_input);
 	  goto done;
 	}
     }
 
   if (client_ip_set == 0)
     {
-      error =
-	clib_error_return (0, "session client ip address not specified");
+      error = clib_error_return (0, "session client ip address not specified");
       goto done;
     }
 
@@ -568,8 +1098,10 @@ pppoe_add_del_session_command_fn (vlib_main_t * vm,
 
   clib_memset (a, 0, sizeof (*a));
 
+  a->generation = ~0;
   a->is_add = is_add;
   a->is_ip6 = ipv6_set;
+  a->disable_fib = disable_fib;
 
 #define _(x) a->x = x;
   foreach_copy_field;
@@ -577,27 +1109,27 @@ pppoe_add_del_session_command_fn (vlib_main_t * vm,
 
   clib_memcpy (a->client_mac, client_mac, 6);
 
+  if (ipv6_set)
+    ip46_address_copy (&a->client_ip6, &client_ip);
+  else
+    ip46_address_copy (&a->client_ip, &client_ip);
+
   rv = vnet_pppoe_add_del_session (a, &session_sw_if_index);
 
   switch (rv)
     {
     case 0:
       if (is_add)
-	vlib_cli_output (vm, "%U\n", format_vnet_sw_if_index_name,
-			 vnet_get_main (), session_sw_if_index);
+	vlib_cli_output (vm, "%U\n", format_vnet_sw_if_index_name, vnet_get_main (),
+			 session_sw_if_index);
       break;
 
     case VNET_API_ERROR_TUNNEL_EXIST:
       error = clib_error_return (0, "session already exists...");
       goto done;
 
-    case VNET_API_ERROR_NO_SUCH_ENTRY:
-      error = clib_error_return (0, "session does not exist...");
-      goto done;
-
     default:
-      error = clib_error_return
-	(0, "vnet_pppoe_add_del_session returned %d", rv);
+      error = clib_error_return (0, "vnet_pppoe_add_del_session returned %d", rv);
       goto done;
     }
 
@@ -620,27 +1152,49 @@ done:
  ?*/
 VLIB_CLI_COMMAND (create_pppoe_session_command, static) = {
   .path = "create pppoe session",
-  .short_help =
-  "create pppoe session client-ip <client-ip> session-id <nn>"
-  " client-mac <client-mac> [decap-vrf-id <nn>] [del]",
+  .short_help = "create pppoe session client-ip <client-ip> session-id <nn>"
+		" client-mac <client-mac> [decap-vrf-id <nn>] [del] [disable-fib]",
   .function = pppoe_add_del_session_command_fn,
 };
 
 static clib_error_t *
-show_pppoe_session_command_fn (vlib_main_t * vm,
-			       unformat_input_t * input,
-			       vlib_cli_command_t * cmd)
+delete_all_pppoe_sessions_command_fn (vlib_main_t *vm, unformat_input_t *input,
+				      vlib_cli_command_t *cmd)
+{
+  pppoe_delete_all_sessions ();
+
+  return 0;
+}
+
+/*?
+ * Delete every PPPoE session.
+ *
+ * @cliexpar
+ * Example of how to delete all PPPoE sessions:
+ * @cliexcmd{delete pppoe sessions}
+ ?*/
+VLIB_CLI_COMMAND (delete_all_pppoe_sessions_command, static) = {
+  .path = "delete pppoe sessions",
+  .short_help = "delete every pppoe session, with the workers parked",
+  .function = delete_all_pppoe_sessions_command_fn,
+};
+
+static clib_error_t *
+show_pppoe_session_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 {
   pppoe_main_t *pem = &pppoe_main;
   pppoe_session_t *t;
 
   if (pool_elts (pem->sessions) == 0)
-    vlib_cli_output (vm, "No pppoe sessions configured...");
+    {
+      vlib_cli_output (vm, "No pppoe sessions configured...");
+      return 0;
+    }
 
   pool_foreach (t, pem->sessions)
-		 {
-		    vlib_cli_output (vm, "%U",format_pppoe_session, t);
-		}
+    {
+      vlib_cli_output (vm, "%U", format_pppoe_session, t);
+    }
 
   return 0;
 }
@@ -651,20 +1205,20 @@ show_pppoe_session_command_fn (vlib_main_t * vm,
  * @cliexpar
  * Example of how to display the PPPoE Session entries:
  * @cliexstart{show pppoe session}
- * [0] client-ip 10.0.3.1 session_id 13 encap-if-index 0 decap-vrf-id 13 sw_if_index 5
- *     local-mac a0:b0:c0:d0:e0:f0 client-mac 00:01:02:03:04:05
+ * [0] sw-if-index 5 session-id 13 client-ip 10.0.3.1 encap-if-index 0
+ *     decap-fib-index 13
+ *     local-mac a0:b0:c0:d0:e0:f0  client-mac 00:01:02:03:04:05
  * @cliexend
  ?*/
 VLIB_CLI_COMMAND (show_pppoe_session_command, static) = {
-    .path = "show pppoe session",
-    .short_help = "show pppoe session",
-    .function = show_pppoe_session_command_fn,
+  .path = "show pppoe session",
+  .short_help = "show pppoe session",
+  .function = show_pppoe_session_command_fn,
 };
 
 typedef struct pppoe_show_walk_ctx_t_
 {
   vlib_main_t *vm;
-  u8 first_entry;
   u32 total_entries;
 } pppoe_show_walk_ctx_t;
 
@@ -675,49 +1229,43 @@ pppoe_show_walk_cb (BVT (clib_bihash_kv) * kvp, void *arg)
   pppoe_entry_result_t result;
   pppoe_entry_key_t key;
 
-  if (ctx->first_entry)
-    {
-      ctx->first_entry = 0;
-      vlib_cli_output (ctx->vm,
-		       "%=19s%=12s%=13s%=14s",
-		       "Mac-Address", "session_id", "sw_if_index",
-		       "session_index");
-    }
-
   key.raw = kvp->key;
   result.raw = kvp->value;
 
-  vlib_cli_output (ctx->vm,
-		   "%=19U%=12d%=13d%=14d",
-		   format_ethernet_address, key.fields.mac,
+  if (ctx->total_entries == 0)
+    vlib_cli_output (ctx->vm, "  %=19s%=12s%=13s%=14s", "Mac-Address", "session_id", "sw_if_index",
+		     "session_index");
+
+  vlib_cli_output (ctx->vm, "  %=19U%=12d%=13d%=14d", format_ethernet_address, key.fields.mac,
 		   clib_net_to_host_u16 (key.fields.session_id),
-		   result.fields.sw_if_index == ~0
-		   ? -1 : result.fields.sw_if_index,
-		   result.fields.session_index == ~0
-		   ? -1 : result.fields.session_index);
+		   result.fields.sw_if_index == ~0 ? -1 : result.fields.sw_if_index,
+		   result.fields.session_index == ~0 ? -1 : result.fields.session_index);
   ctx->total_entries++;
 
   return (BIHASH_WALK_CONTINUE);
 }
 
-/** Display the contents of the PPPoE Fib. */
-static clib_error_t *
-show_pppoe_fib_command_fn (vlib_main_t * vm,
-			   unformat_input_t * input, vlib_cli_command_t * cmd)
+static void
+pppoe_show_table (vlib_main_t *vm, char *title, BVT (clib_bihash) * table)
 {
-  pppoe_main_t *pem = &pppoe_main;
   pppoe_show_walk_ctx_t ctx = {
-    .first_entry = 1,
     .vm = vm,
   };
 
-  BV (clib_bihash_foreach_key_value_pair)
-    (&pem->session_table, pppoe_show_walk_cb, &ctx);
+  vlib_cli_output (vm, "%s", title);
+  BV (clib_bihash_foreach_key_value_pair) (table, pppoe_show_walk_cb, &ctx);
 
   if (ctx.total_entries == 0)
-    vlib_cli_output (vm, "no pppoe fib entries");
-  else
-    vlib_cli_output (vm, "%lld pppoe fib entries", ctx.total_entries);
+    vlib_cli_output (vm, "  no entries");
+}
+
+/** Display the contents of the PPPoE Fib. */
+static clib_error_t *
+show_pppoe_fib_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  pppoe_main_t *pem = &pppoe_main;
+
+  pppoe_show_table (vm, "pppoe session table", &pem->session_table);
 
   return 0;
 }
@@ -737,13 +1285,64 @@ show_pppoe_fib_command_fn (vlib_main_t * vm,
  * @cliexend
 ?*/
 VLIB_CLI_COMMAND (show_pppoe_fib_command, static) = {
-    .path = "show pppoe fib",
-    .short_help = "show pppoe fib",
-    .function = show_pppoe_fib_command_fn,
+  .path = "show pppoe fib",
+  .short_help = "show pppoe fib",
+  .function = show_pppoe_fib_command_fn,
 };
 
+/*?
+ * Display the control plane and data plane mapping of the PPPoE FIB: the link
+ * table maps a client MAC address to the interface it was seen on, the session
+ * table maps a client MAC address and session ID to the session built for it.
+ *
+ * @cliexpar
+ * Example of how to display the PPPoE mappings:
+ * @cliexstart{show pppoe map}
+ * pppoe link table
+ *   Mac-Address    session_id    sw_if_index    session_index
+ * 52:54:00:53:18:33   0         2              -1
+ * pppoe session table
+ *   Mac-Address    session_id    sw_if_index    session_index
+ * 52:54:00:53:18:33   1         2              0
+ * @cliexend
+ ?*/
+static clib_error_t *
+show_pppoe_map_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  pppoe_main_t *pem = &pppoe_main;
+
+  pppoe_show_table (vm, "pppoe link table", &pem->link_table);
+  pppoe_show_table (vm, "pppoe session table", &pem->session_table);
+
+  return 0;
+}
+
+VLIB_CLI_COMMAND (show_pppoe_map_command, static) = {
+  .path = "show pppoe map",
+  .short_help = "show pppoe map",
+  .function = show_pppoe_map_command_fn,
+};
+
+static clib_error_t *
+pppoe_config (vlib_main_t *vm, unformat_input_t *input)
+{
+  pppoe_main_t *pem = &pppoe_main;
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "enable-auto-discovery"))
+	pem->is_auto_discovery = 1;
+      else
+	return clib_error_return (0, "invalid pppoe option: '%U'", format_unformat_error, input);
+    }
+
+  return 0;
+}
+
+VLIB_CONFIG_FUNCTION (pppoe_config, "pppoe");
+
 clib_error_t *
-pppoe_init (vlib_main_t * vm)
+pppoe_init (vlib_main_t *vm)
 {
   pppoe_main_t *pem = &pppoe_main;
 
@@ -751,21 +1350,17 @@ pppoe_init (vlib_main_t * vm)
   pem->vlib_main = vm;
 
   /* Create the hash table  */
-  BV (clib_bihash_init) (&pem->link_table, "pppoe link table",
-			 PPPOE_NUM_BUCKETS, PPPOE_MEMORY_SIZE);
+  BV (clib_bihash_init) (&pem->link_table, "pppoe link table", PPPOE_NUM_BUCKETS,
+			 PPPOE_MEMORY_SIZE);
 
-  BV (clib_bihash_init) (&pem->session_table, "pppoe session table",
-			 PPPOE_NUM_BUCKETS, PPPOE_MEMORY_SIZE);
+  BV (clib_bihash_init) (&pem->session_table, "pppoe session table", PPPOE_NUM_BUCKETS,
+			 PPPOE_MEMORY_SIZE);
 
-  ethernet_register_input_type (vm, ETHERNET_TYPE_PPPOE_SESSION,
-				pppoe_input_node.index);
+  ethernet_register_input_type (vm, ETHERNET_TYPE_PPPOE_SESSION, pppoe_input_node.index);
 
-  ethernet_register_input_type (vm, ETHERNET_TYPE_PPPOE_DISCOVERY,
-				pppoe_cp_dispatch_node.index);
+  ethernet_register_input_type (vm, ETHERNET_TYPE_PPPOE_DISCOVERY, pppoe_cp_dispatch_node.index);
 
-  pppoe_fib_src = fib_source_allocate ("pppoe",
-				       FIB_SOURCE_PRIORITY_HI,
-				       FIB_SOURCE_BH_API);
+  pppoe_fib_src = fib_source_allocate ("pppoe", FIB_SOURCE_PRIORITY_HI, FIB_SOURCE_BH_API);
 
   return 0;
 }
