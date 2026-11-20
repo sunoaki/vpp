@@ -3338,7 +3338,8 @@ class TestNAT44EI(MethodHolder):
     def test_reass_hairpinning(self):
         """NAT44EI fragments hairpinning"""
 
-        server_addr = self.pg0.remote_hosts[1].ip4
+        server = self.pg0.remote_hosts[1]
+        server_addr = server.ip4
         host_in_port = random.randint(1025, 65535)
         server_in_port = random.randint(1025, 65535)
         server_out_port = random.randint(1025, 65535)
@@ -3351,6 +3352,12 @@ class TestNAT44EI(MethodHolder):
         self.vapi.nat44_ei_interface_add_del_feature(
             sw_if_index=self.pg1.sw_if_index, is_add=1
         )
+        # nat44-ei-hairpinning names the translated address inside the IP
+        # header only for a fragment that does not carry the L4 header, then
+        # sends it to ip4-lookup like every other translated packet. pg0
+        # holds a neighbour only for its first remote host, so the translated
+        # fragments reach ip4-glean without this.
+        self.vapi.ip_neighbor_add_del(self.pg0.sw_if_index, server.mac, server_addr)
         # add static mapping for server
         self.nat44_add_static_mapping(
             server_addr,
@@ -4091,14 +4098,17 @@ class TestNAT44EI(MethodHolder):
         # are part of this helper's contract. The table is present because
         # VppIpTable takes a FIB_SOURCE_API lock on it, and nat44-ei-hi is a
         # plugin source, so its reference is counted with fib_table_lock_inc.
+        # A plugin source the table holds no reference to is left out of the
+        # field, so an absent name is a count of zero.
         table = self.vapi.cli("show ip fib table %d" % table_id)
-        match = re.search(r"locks:\[.*nat44-ei-hi:(\d+)", table)
-        if not match:
+        locks = re.search(r"locks:\[(.*)\]", table)
+        if not locks:
             raise AssertionError(
                 "no nat44-ei-hi lock count in show ip fib table %d output:\n%s"
                 % (table_id, table)
             )
-        return int(match.group(1))
+        match = re.search(r"(?:^|, )nat44-ei-hi:(\d+)", locks.group(1))
+        return int(match.group(1)) if match else 0
 
     def nat44_ei_api_tolerating(self, api_function, ignored_retvals, **kwargs):
         """Call an API whose refused retval means the cleanup has nothing to do"""
