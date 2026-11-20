@@ -54,18 +54,65 @@ typedef struct _vnet_classify_main vnet_classify_main_t;
 
 /* Largest number of 16-byte vectors in a skip or match key.  The limit is
    the size of the table mask below, which holds this many match vectors,
-   and load_mask, a u16 with two bits per vector.  The dataplane also reads
-   the key from the packet, so a table may not move the key any further
-   out. */
+   and of the vector masks an equal check loads by, two bits per vector.
+   The dataplane also reads the key from the packet, so a table may not
+   move the key any further out. */
 #define VNET_CLASSIFY_MAX_N_VECTORS 8
 
-/* The hash reads a full window of VNET_CLASSIFY_MAX_N_VECTORS vectors
-   starting skip_n_vectors into the packet, whatever match_n_vectors is
-   inside that window.  Inserting a session hashes the entry itself by
-   pointing at its key less skip_n_vectors vectors, so the two counts
-   together may not exceed the window: skip + match <= the limit above.
-   Past that the window starts before the key rather than after it. */
+/* A packet is hashed over its match_n_vectors vectors alone, but a session
+   is added by hashing the entry with skip_n_vectors ahead of its key, and
+   the entry itself has only match_n_vectors.  So the two counts may sum to
+   at most VNET_CLASSIFY_MAX_N_VECTORS: past that the entry cannot carry
+   the vectors its own hash starts at, and the session could never be
+   found.  vnet_classify_add_del_session enforces this; a table alone may
+   hold a key further out than that. */
 #define VNET_CLASSIFY_SKIP_MATCH_FIT(skip, match) ((skip) + (match) <= VNET_CLASSIFY_MAX_N_VECTORS)
+
+/* Number of vectors a packet hash loads: its mask, from the current
+   position on. */
+static_always_inline u32
+vnet_classify_match_window (const u32 match_n_vectors)
+{
+  return match_n_vectors;
+}
+
+/* Number of vectors a hash or an equal check loads from an address
+   skip_n_vectors before the one above, where an entry's key starts, so
+   that hashing an entry on insertion reaches the skipped vectors in front
+   of the key, which are zero, and no further. */
+static_always_inline u32
+vnet_classify_entry_window (const u32 match_n_vectors, const u32 skip_n_vectors)
+{
+  return skip_n_vectors + match_n_vectors;
+}
+
+/* Bits of a vector mask, two per vector loaded. */
+static_always_inline u16
+vnet_classify_window_mask (const u32 window)
+{
+  return pow2_mask (window * 2);
+}
+
+/* An equal check loads a vector either side of the key it covers, from an
+   address skip_n_vectors before the packet's key.  The packet side is
+   limited to its match vectors; the entry side may load the skipped
+   vectors in front of the key, and the vector after them, where the entry
+   read would otherwise stop short of those zeros, so move the entry key
+   one vector on and the packet side stops at the first of them. */
+static_always_inline u16
+vnet_classify_packet_compare_mask (const u32 match_n_vectors)
+{
+  return vnet_classify_window_mask (2 * match_n_vectors);
+}
+
+/* Bits of the entry side mask: the skipped vectors and the match vectors,
+   and the one vector after them, all of which an entry has. */
+static_always_inline u16
+vnet_classify_entry_compare_mask (const u32 match_n_vectors, const u32 skip_n_vectors)
+{
+  return vnet_classify_window_mask (vnet_classify_entry_window (match_n_vectors, skip_n_vectors) +
+				    1);
+}
 
 #define foreach_size_in_u32x4                                                                      \
   _ (1)                                                                                            \
@@ -274,7 +321,7 @@ vnet_classify_hash_packet_inline (const vnet_classify_table_t *t, const u8 *h)
 
 #if defined(CLIB_HAVE_VEC512) && defined(CLIB_HAVE_VEC512_MASK_LOAD_STORE)
   u64x8 xor_sum_x8, *mask = (u64x8 *) t->mask;
-  u16 load_mask = t->load_mask;
+  u16 load_mask = vnet_classify_window_mask (vnet_classify_match_window (t->match_n_vectors));
   u64x8u *data = (u64x8u *) h;
 
   xor_sum_x8 = u64x8_mask_load_zero (data, load_mask) & mask[0];
@@ -287,7 +334,7 @@ vnet_classify_hash_packet_inline (const vnet_classify_table_t *t, const u8 *h)
   xor_sum = xor_sum_x8[0] ^ xor_sum_x8[1];
 #elif defined(CLIB_HAVE_VEC256) && defined(CLIB_HAVE_VEC256_MASK_LOAD_STORE)
   u64x4 xor_sum_x4, *mask = (u64x4 *) t->mask;
-  u16 load_mask = t->load_mask;
+  u16 load_mask = vnet_classify_window_mask (vnet_classify_match_window (t->match_n_vectors));
   u64x4u *data = (u64x4u *) h;
 
   xor_sum_x4 = u64x4_mask_load_zero (data, load_mask) & mask[0];
@@ -296,8 +343,7 @@ vnet_classify_hash_packet_inline (const vnet_classify_table_t *t, const u8 *h)
   if (PREDICT_FALSE (load_mask >> 8))
     xor_sum_x4 ^= u64x4_mask_load_zero (data + 2, load_mask >> 8) & mask[2];
 
-  /* Bits 12 to 15 cover the seventh and eighth vectors, where load_mask
-     runs out of its sixteen bits */
+  /* Bits 12 to 15 cover the seventh and eighth vectors. */
   if (PREDICT_FALSE (load_mask >> 12))
     xor_sum_x4 ^= u64x4_mask_load_zero (data + 3, load_mask >> 12) & mask[3];
 
@@ -460,21 +506,26 @@ __clib_export vnet_classify_entry_t *vnet_classify_find_entry (const vnet_classi
 							       u8 *h, u32 hash, f64 now);
 
 static_always_inline int
-vnet_classify_entry_is_equal (vnet_classify_entry_t *v, const u8 *d, u8 *m,
-			      u32 match_n_vectors, u16 load_mask)
+vnet_classify_entry_is_equal (vnet_classify_entry_t *v, const u8 *d, u8 *m, u32 match_n_vectors,
+			      u16 key_mask)
 {
 #if defined(CLIB_HAVE_VEC512) && defined(CLIB_HAVE_VEC512_MASK_LOAD_STORE)
   u64x8 r, *mask = (u64x8 *) m;
   u64x8u *data = (u64x8u *) d;
   u64x8 *key = (u64x8 *) v->key;
+  /* The packet is covered by its match vectors; the key reaches the
+     skipped vectors too, so each chunk of the packet loads the narrower of
+     the two, or none where it covers nothing */
+  u16 data_mask = clib_min (key_mask, vnet_classify_packet_compare_mask (match_n_vectors));
 
-  r = (u64x8_mask_load_zero (data, load_mask) & mask[0]) ^
-      u64x8_mask_load_zero (key, load_mask);
-  load_mask >>= 8;
+  r = ((data_mask ? u64x8_mask_load_zero (data, data_mask) : u64x8_zero ()) & mask[0]) ^
+      u64x8_mask_load_zero (key, key_mask);
+  data_mask >>= 8;
+  key_mask >>= 8;
 
-  if (PREDICT_FALSE (load_mask))
-    r |= (u64x8_mask_load_zero (data + 1, load_mask) & mask[1]) ^
-	 u64x8_mask_load_zero (key + 1, load_mask);
+  if (PREDICT_FALSE (data_mask | key_mask))
+    r |= ((data_mask ? u64x8_mask_load_zero (data + 1, data_mask) : u64x8_zero ()) & mask[1]) ^
+	 u64x8_mask_load_zero (key + 1, key_mask);
 
   if (u64x8_is_all_zero (r))
     return 1;
@@ -483,18 +534,21 @@ vnet_classify_entry_is_equal (vnet_classify_entry_t *v, const u8 *d, u8 *m,
   u64x4 r, *mask = (u64x4 *) m;
   u64x4u *data = (u64x4u *) d;
   u64x4 *key = (u64x4 *) v->key;
+  u16 data_mask = clib_min (key_mask, vnet_classify_packet_compare_mask (match_n_vectors));
 
-  r = (u64x4_mask_load_zero (data, load_mask) & mask[0]) ^
-      u64x4_mask_load_zero (key, load_mask);
-  load_mask >>= 4;
+  r = ((data_mask ? u64x4_mask_load_zero (data, data_mask) : u64x4_zero ()) & mask[0]) ^
+      u64x4_mask_load_zero (key, key_mask);
+  data_mask >>= 4;
+  key_mask >>= 4;
 
-  r |= (u64x4_mask_load_zero (data + 1, load_mask) & mask[1]) ^
-       u64x4_mask_load_zero (key + 1, load_mask);
-  load_mask >>= 4;
+  r |= ((data_mask ? u64x4_mask_load_zero (data + 1, data_mask) : u64x4_zero ()) & mask[1]) ^
+       u64x4_mask_load_zero (key + 1, key_mask);
+  data_mask >>= 4;
+  key_mask >>= 4;
 
-  if (PREDICT_FALSE (load_mask))
-    r |= (u64x4_mask_load_zero (data + 2, load_mask) & mask[2]) ^
-	 u64x4_mask_load_zero (key + 2, load_mask);
+  if (PREDICT_FALSE (data_mask | key_mask))
+    r |= ((data_mask ? u64x4_mask_load_zero (data + 2, data_mask) : u64x4_zero ()) & mask[2]) ^
+	 u64x4_mask_load_zero (key + 2, key_mask);
 
   if (u64x4_is_all_zero (r))
     return 1;
@@ -588,7 +642,7 @@ vnet_classify_find_entry_inline (const vnet_classify_table_t *t, const u8 *h,
   vnet_classify_entry_t *v;
   vnet_classify_bucket_t *b;
   u32 bucket_index, limit, pages, match_n_vectors = t->match_n_vectors;
-  u16 load_mask = t->load_mask;
+  u16 key_mask = vnet_classify_entry_compare_mask (t->match_n_vectors, t->skip_n_vectors);
   u8 *mask = (u8 *) t->mask;
   int i;
 
@@ -616,8 +670,7 @@ vnet_classify_find_entry_inline (const vnet_classify_table_t *t, const u8 *h,
 
   for (i = 0; i < limit; i++)
     {
-      if (vnet_classify_entry_is_equal (v, h, mask, match_n_vectors,
-					load_mask))
+      if (vnet_classify_entry_is_equal (v, h, mask, match_n_vectors, key_mask))
 	{
 	  if (PREDICT_TRUE (now))
 	    {

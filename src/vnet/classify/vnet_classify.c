@@ -145,7 +145,6 @@ vnet_classify_new_table (vnet_classify_main_t *cm, const u8 *mask,
   t->match_n_vectors = match_n_vectors;
   t->skip_n_vectors = skip_n_vectors;
   t->entries_per_page = 2;
-  t->load_mask = pow2_mask (match_n_vectors * 2);
 
   t->mheap = clib_mem_create_heap (0, memory_size, 1 /* locked */ ,
 				   "classify");
@@ -1063,11 +1062,13 @@ vnet_classify_add_del_table (vnet_classify_main_t *cm, const u8 *mask,
 	    return VNET_API_ERROR_INVALID_VALUE;
 
 	  /* The dataplane reads the key at skip_n_vectors * 16 bytes into
-	     the packet over a full VNET_CLASSIFY_MAX_N_VECTORS window, as
-	     the inserting side hashes the entry from skip_n_vectors before
-	     its key; keep the two counts together inside that window so
-	     neither read leaves the key's own vectors. */
-	  if (!VNET_CLASSIFY_SKIP_MATCH_FIT (skip, match))
+	     the packet and the mask holds only the match vectors, so the key
+	     itself may not start past them.  A key that reaches further out
+	     than the mask still holds the sessions programmed at a smaller
+	     skip, each at most VNET_CLASSIFY_MAX_N_VECTORS all told, which
+	     is where skip plus match is bounded.  A table like that takes
+	     the sessions it was created for, so nothing is warned about. */
+	  if (skip > VNET_CLASSIFY_MAX_N_VECTORS)
 	    return VNET_API_ERROR_INVALID_VALUE;
 
 	  t = vnet_classify_new_table (cm, mask, nbuckets, memory_size,
@@ -2373,6 +2374,9 @@ classify_filter_command_fn (vlib_main_t * vm,
 
   vec_free (match_vector);
 
+  if (rv)
+    return clib_error_return (0, "vnet_classify_add_del_session returned %d", rv);
+
   return 0;
 }
 
@@ -3106,12 +3110,13 @@ vnet_classify_add_del_session (vnet_classify_main_t *cm, u32 table_index,
 			       u32 metadata, int is_add)
 {
   vnet_classify_table_t *t;
-  /* The entry with room for the skipped vectors in front of it, so that
-     hashing the entry skip_n_vectors before its key stays inside; the
-     entry is aligned within it because its key must stay on a vector
-     boundary */
-  vnet_classify_entry_t *e, _entry[VNET_CLASSIFY_MAX_N_VECTORS + 2];
-  uword e_offset;
+  /* The work area: the entry with its key and the halves of two more
+     vectors it is aligned within, so that up to a vector of slack before
+     or after the key stays inside */
+  u8 _entry[sizeof (vnet_classify_entry_t) + (VNET_CLASSIFY_MAX_N_VECTORS + 2) * sizeof (u32x4)];
+  vnet_classify_entry_t *e;
+  uword e_offset, key_offset;
+  u32 n_vectors;
   int i, rv;
 
   if (pool_is_free_index (cm->tables, table_index))
@@ -3119,9 +3124,30 @@ vnet_classify_add_del_session (vnet_classify_main_t *cm, u32 table_index,
 
   t = pool_elt_at_index (cm->tables, table_index);
 
-  e_offset = t->skip_n_vectors * sizeof (u32x4);
-  e_offset += (uword) _entry & (sizeof (u32x4) - 1);
-  e = (vnet_classify_entry_t *) ((u8 *) _entry + e_offset);
+  /* An entry is match_n_vectors long.  Its hash starts skip_n_vectors
+     before that, so a skipped vector past the end of the entry would be
+     hashed from whatever lies next to this buffer, and the session could
+     never be found; refuse to add it instead.  The buffer is sized for the
+     limit this checks, so this is also what bounds the reads below. */
+  if (!VNET_CLASSIFY_SKIP_MATCH_FIT (t->skip_n_vectors, t->match_n_vectors))
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  n_vectors = t->skip_n_vectors + t->match_n_vectors;
+
+  clib_memset (_entry, 0, sizeof (_entry));
+  e_offset = (-(uword) _entry) & (sizeof (u32x4) - 1);
+  e = (vnet_classify_entry_t *) (_entry + e_offset);
+
+  /* The equal check reads a vector either side of the key.  Center the
+     key so both stay inside, the two whole vectors from the start of the
+     buffer giving room for a key aligned one vector on */
+  key_offset = ((uword) e + offsetof (vnet_classify_entry_t, key)) & (sizeof (u32x4) - 1);
+  e_offset += (sizeof (u32x4) - key_offset) & (sizeof (u32x4) - 1);
+  e = (vnet_classify_entry_t *) (_entry + e_offset);
+
+  ASSERT (sizeof (_entry) - e_offset >=
+	  sizeof (vnet_classify_entry_t) + n_vectors * sizeof (u32x4));
+  ASSERT (e_offset >= sizeof (u32x4));
 
   e->next_index = hit_next_index;
   e->opaque_index = opaque_index;
@@ -3158,6 +3184,8 @@ vnet_classify_add_del_session (vnet_classify_main_t *cm, u32 table_index,
 
   vnet_classify_entry_release_resource (e);
 
+  /* Only the add or delete itself failing means no such entry; the check
+     above has already returned its own code */
   if (rv)
     return VNET_API_ERROR_NO_SUCH_ENTRY;
   return 0;
