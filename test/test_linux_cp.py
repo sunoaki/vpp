@@ -950,8 +950,9 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
             if entry.phy_sw_if_index == self.lo_interfaces[0].sw_if_index
         )
 
-    def _router(self, arguments):
-        return self.vapi.cli(f"test lcp router {arguments}")
+    def _router(self, action, route):
+        """Run one router command; the action comes before the route it acts on."""
+        return self.vapi.cli(f"test lcp router {action} {route}")
 
     def _mroute(self, group, source=None):
         return self.vapi.cli(
@@ -985,7 +986,7 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
         return int(fields["plugin-low"])
 
     def _table_state(self):
-        output = self._router(f"ip4 table {self.table_id} state")
+        output = self._router("state", f"ip4 table {self.table_id}")
         self.assertNotIn("absent", output, output)
         state = dict(
             field.split(":", 1)
@@ -1009,14 +1010,14 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
         route = self._route(self.group, self.source)
         self.assertEqual(self._entry(self.group, self.source), (False, {}))
         try:
-            self._router(f"{route} add")
+            self._router("add", route)
             present, sources = self._entry(self.group, self.source)
             self.assertTrue(present, "multicast route was not installed")
             plugin_low = self._plugin_low(self.group, self.source)
             self.assertIn(plugin_low, sources)
             self.assertTrue(sources[plugin_low][1] > 0)
             self.assertEqual(self._table_state(), {"refs": 1, "mcast-routes": 1})
-            self._router(f"{route} del")
+            self._router("del", route)
             self.assertEqual(
                 self._entry(self.group, self.source),
                 (False, {}),
@@ -1025,24 +1026,26 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
             # The table held nothing else, so the reference the route held was
             # the last one and the table went with it. Releasing it twice
             # would have freed a table that was gone already.
-            self.assertNotIn("refs:", self._router(f"ip4 table {self.table_id} state"))
+            self.assertNotIn(
+                "refs:", self._router("state", f"ip4 table {self.table_id}")
+            )
             # The kernel repeats deletes; a second one must not fault or
             # change the table.
-            self._router(f"{route} del")
+            self._router("del", route)
             self.assertEqual(self._entry(self.group, self.source), (False, {}))
         finally:
-            self._router(f"{route} del")
+            self._router("del", route)
 
     def test_multicast_sync_drops_routes_the_kernel_no_longer_has(self):
         """A route absent from a synchronization is removed and its reference freed"""
         route = self._route(self.group, self.source)
         stale = self._route(self.other_group, self.source)
         try:
-            self._router(f"{route} add")
-            self._router(f"{stale} add")
+            self._router("add", route)
+            self._router("add", stale)
             self.assertEqual(self._table_state()["mcast-routes"], 2)
             self._router("begin")
-            self._router(f"{route} add")
+            self._router("add", route)
             self._router("end")
             self.assertEqual(
                 self._entry(self.other_group, self.source),
@@ -1059,17 +1062,17 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
                 "reference accounting does not follow the routes left",
             )
         finally:
-            self._router(f"{route} del")
-            self._router(f"{stale} del")
+            self._router("del", route)
+            self._router("del", stale)
 
     def test_multicast_mark_delete_replay(self):
         """A route the kernel deletes and re-adds within one synchronization stays"""
         route = self._route(self.group, self.source)
         try:
             self._router("begin")
-            self._router(f"{route} add")
-            self._router(f"{route} del")
-            self._router(f"{route} add")
+            self._router("add", route)
+            self._router("del", route)
+            self._router("add", route)
             self._router("end")
             present, sources = self._entry(self.group, self.source)
             self.assertTrue(
@@ -1086,16 +1089,16 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
             # nothing can drop the replay on the way.
             self.assertEqual(self._table_state(), {"refs": 1, "mcast-routes": 1})
         finally:
-            self._router(f"{route} del")
+            self._router("del", route)
 
     def test_multicast_empty_replay_drops_the_route(self):
         """A replace that names no nexthop takes the route and its reference away"""
         route = self._route(self.group, self.source)
         empty = self._route(self.group, self.source, vif=False)
         try:
-            self._router(f"{route} add")
+            self._router("add", route)
             self.assertEqual(self._table_state(), {"refs": 1, "mcast-routes": 1})
-            self._router(f"{empty} replace")
+            self._router("replace", empty)
             self.assertEqual(
                 self._entry(self.group, self.source),
                 (False, {}),
@@ -1103,19 +1106,25 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
             )
             # The route's reference went with it, as it does on a delete: the
             # table held nothing else and is gone.
-            self.assertNotIn("refs:", self._router(f"ip4 table {self.table_id} state"))
+            self.assertNotIn(
+                "refs:", self._router("state", f"ip4 table {self.table_id}")
+            )
             # No record is left for the next synchronization to trip over.
             self._router("begin")
             self._router("end")
-            self.assertNotIn("refs:", self._router(f"ip4 table {self.table_id} state"))
+            self.assertNotIn(
+                "refs:", self._router("state", f"ip4 table {self.table_id}")
+            )
 
             # Nor does a second replace act on what is no longer there: it
             # reaches the plugin with no record to find.
-            self._router(f"{empty} replace")
+            self._router("replace", empty)
             self.assertEqual(self._entry(self.group, self.source), (False, {}))
-            self.assertNotIn("refs:", self._router(f"ip4 table {self.table_id} state"))
+            self.assertNotIn(
+                "refs:", self._router("state", f"ip4 table {self.table_id}")
+            )
         finally:
-            self._router(f"{route} del")
+            self._router("del", route)
 
     def test_multicast_empty_add_drops_nothing(self):
         """An add with no nexthop installs nothing and takes nothing away
@@ -1126,21 +1135,23 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
         route = self._route(self.group, self.source)
         empty = self._route(self.group, self.source, vif=False)
         try:
-            self._router(f"{empty} add")
+            self._router("add", empty)
             self.assertEqual(self._entry(self.group, self.source), (False, {}))
-            self.assertNotIn("refs:", self._router(f"ip4 table {self.table_id} state"))
+            self.assertNotIn(
+                "refs:", self._router("state", f"ip4 table {self.table_id}")
+            )
 
             # Nor does it take away a route the plugin holds: the add names no
             # nexthop, so it is not the replace that drops the nexthop list.
-            self._router(f"{route} add")
-            self._router(f"{empty} add")
+            self._router("add", route)
+            self._router("add", empty)
             self.assertTrue(
                 self._entry(self.group, self.source)[0],
                 "add with no nexthop took a held multicast route away",
             )
             self.assertEqual(self._table_state(), {"refs": 1, "mcast-routes": 1})
         finally:
-            self._router(f"{route} del")
+            self._router("del", route)
 
     def test_multicast_empty_add_keeps_the_table_special_route(self):
         """An add with no nexthop leaves the route the table holds for itself
@@ -1155,36 +1166,36 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
             # The plugin creates the table and its special routes together; a
             # command for a table that does not exist yet is dropped before it
             # can touch anything.
-            self._router(f"{route} add")
+            self._router("add", route)
             present, sources = self._entry(self.special_group)
             self.assertTrue(present, "the table has no special multicast route")
             self.assertNotIn(self._plugin_low(self.special_group), sources)
             before = sources
 
-            self._router(f"{empty} add")
-            self._router(f"{empty} replace")
+            self._router("add", empty)
+            self._router("replace", empty)
 
             present, sources = self._entry(self.special_group)
             self.assertTrue(present, "the table lost its special multicast route")
             self.assertEqual(sources, before)
         finally:
-            self._router(f"{route} del")
+            self._router("del", route)
 
     def test_multicast_sync_is_idempotent(self):
         """Replaying the same routes does not leak a table reference each time"""
         route = self._route(self.group, self.source)
         try:
             self._router("begin")
-            self._router(f"{route} add")
+            self._router("add", route)
             self._router("end")
             baseline = self._table_state()
             for _ in range(3):
                 self._router("begin")
-                self._router(f"{route} add")
+                self._router("add", route)
                 self._router("end")
             self.assertEqual(self._table_state(), baseline)
         finally:
-            self._router(f"{route} del")
+            self._router("del", route)
 
 
 @unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
