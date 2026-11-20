@@ -197,10 +197,10 @@ class VPPStats:
 
     def refresh(self, blocking=True):
         """Refresh directory vector cache (epoch changed)"""
-        # The epoch is taken only from a directory read the lock accepted:
-        # taking it before the read would record the segment as read while
-        # the directory is still the previous one, an empty one after a
-        # rejected first read.
+        # last_epoch is set only by the read the lock accepted, after the
+        # directory is stored. Set before the read, it would record the
+        # segment as read while the directory is the previous one, an empty
+        # one after a rejected first read, and no refresh would be due.
         while True:
             directory = {}
             directory_by_idx = {}
@@ -224,23 +224,26 @@ class VPPStats:
     def __getitem__(self, item, blocking=True):
         if not self.connected:
             self.connect()
-        # A key the directory does not hold is read again before it is
-        # reported. A symlink names the entry it links to by that entry's
-        # index, and a directory vector read while the entry was still being
-        # added can leave that index past the end of what was read, with the
-        # epoch it was read at current and so no refresh due. One more read
-        # either reaches the entry or reports the key that names no counter.
+        # A KeyError from the read refreshes the directory and reads again,
+        # once. The read covers both the lookup of item and get_counter,
+        # which for a symlink entry looks up directory_by_idx[index1] and
+        # then the entry it names. A vector that grew while it was read
+        # leaves that index out of the directory_by_idx of the same read,
+        # at the epoch the segment had when the read began, so no refresh
+        # is due. After the second read the KeyError is reported with item,
+        # the path or index the caller asked for.
         retried = False
         while True:
             try:
-                if self.last_epoch != self.epoch:
+                if retried or self.last_epoch != self.epoch:
                     self.refresh(blocking)
                 with self.lock:
-                    if item in self.directory:
-                        return self.directory[item].get_counter(self)
+                    return self.directory[item].get_counter(self)
             except IOError:
                 if not blocking:
                     raise
+            except KeyError:
+                pass
             if retried:
                 raise KeyError(item)
             retried = True
