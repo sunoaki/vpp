@@ -337,11 +337,11 @@ api_gtpu_add_del_tunnel (vat_main_t * vam)
 		    &mp->src_address);
   ip_address_encode(&dst, ipv6_set ? IP46_TYPE_IP6 : IP46_TYPE_IP4,
 		    &mp->dst_address);
-  mp->encap_vrf_id = ntohl (encap_vrf_id);
-  mp->decap_next_index = ntohl (decap_next_index);
-  mp->mcast_sw_if_index = ntohl (mcast_sw_if_index);
-  mp->teid = ntohl (teid);
-  mp->tteid = ntohl (tteid);
+  mp->encap_vrf_id = htonl (encap_vrf_id);
+  mp->decap_next_index = htonl (decap_next_index);
+  mp->mcast_sw_if_index = htonl (mcast_sw_if_index);
+  mp->teid = htonl (teid);
+  mp->tteid = htonl (tteid);
   mp->is_add = is_add;
 
   S (mp);
@@ -505,14 +505,14 @@ api_gtpu_add_del_tunnel_v2 (vat_main_t *vam)
 		     &mp->src_address);
   ip_address_encode (&dst, ipv6_set ? IP46_TYPE_IP6 : IP46_TYPE_IP4,
 		     &mp->dst_address);
-  mp->encap_vrf_id = ntohl (encap_vrf_id);
-  mp->decap_next_index = ntohl (decap_next_index);
-  mp->mcast_sw_if_index = ntohl (mcast_sw_if_index);
-  mp->teid = ntohl (teid);
-  mp->tteid = ntohl (tteid);
+  mp->encap_vrf_id = htonl (encap_vrf_id);
+  mp->decap_next_index = htonl (decap_next_index);
+  mp->mcast_sw_if_index = htonl (mcast_sw_if_index);
+  mp->teid = htonl (teid);
+  mp->tteid = htonl (tteid);
   mp->is_add = is_add;
   mp->pdu_extension = pdu_extension;
-  mp->qfi = ntohl (qfi);
+  mp->qfi = (u8) qfi;
 
   S (mp);
   W (ret);
@@ -567,9 +567,9 @@ api_gtpu_tunnel_update_tteid (vat_main_t * vam)
 
   ip_address_encode(&dst, ipv6_set ? IP46_TYPE_IP6 : IP46_TYPE_IP4,
 		    &mp->dst_address);
-  mp->encap_vrf_id = ntohl (encap_vrf_id);
-  mp->teid = ntohl (teid);
-  mp->tteid = ntohl (tteid);
+  mp->encap_vrf_id = htonl (encap_vrf_id);
+  mp->teid = htonl (teid);
+  mp->tteid = htonl (tteid);
 
   S (mp);
   W (ret);
@@ -774,8 +774,8 @@ api_gtpu_add_del_forward (vat_main_t *vam)
   ip_address_encode (&dst, ipv6_set ? IP46_TYPE_IP6 : IP46_TYPE_IP4,
 		     &mp->dst_address);
   mp->forwarding_type = type;
-  mp->encap_vrf_id = ntohl (encap_vrf_id);
-  mp->decap_next_index = ntohl (decap_next_index);
+  mp->encap_vrf_id = htonl (encap_vrf_id);
+  mp->decap_next_index = htonl (decap_next_index);
 
   S (mp);
   W (ret);

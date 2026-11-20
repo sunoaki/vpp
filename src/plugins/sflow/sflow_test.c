@@ -59,7 +59,7 @@ api_sflow_enable_disable (vat_main_t *vam)
 
   /* Construct the API message */
   M (SFLOW_ENABLE_DISABLE, mp);
-  mp->hw_if_index = ntohl (hw_if_index);
+  mp->hw_if_index = htonl (hw_if_index);
   mp->enable_disable = enable_disable;
 
   /* send it... */
@@ -121,7 +121,7 @@ api_sflow_sampling_rate_set (vat_main_t *vam)
 
   /* Construct the API message */
   M (SFLOW_SAMPLING_RATE_SET, mp);
-  mp->sampling_N = ntohl (sampling_N);
+  mp->sampling_N = htonl (sampling_N);
 
   /* send it... */
   S (mp);
@@ -182,7 +182,7 @@ api_sflow_polling_interval_set (vat_main_t *vam)
 
   /* Construct the API message */
   M (SFLOW_POLLING_INTERVAL_SET, mp);
-  mp->polling_S = ntohl (polling_S);
+  mp->polling_S = htonl (polling_S);
 
   /* send it... */
   S (mp);
@@ -243,7 +243,7 @@ api_sflow_header_bytes_set (vat_main_t *vam)
 
   /* Construct the API message */
   M (SFLOW_HEADER_BYTES_SET, mp);
-  mp->header_B = ntohl (header_B);
+  mp->header_B = htonl (header_B);
 
   /* send it... */
   S (mp);
@@ -293,7 +293,7 @@ api_sflow_direction_set (vat_main_t *vam)
       if (unformat (i, "sampling_D rx"))
 	sampling_D = SFLOW_DIRN_INGRESS;
       else if (unformat (i, "sampling_D tx"))
-	sampling_D = SFLOW_DIRN_INGRESS;
+	sampling_D = SFLOW_DIRN_EGRESS;
       else if (unformat (i, "sampling_D both"))
 	sampling_D = SFLOW_DIRN_BOTH;
       else
@@ -308,7 +308,7 @@ api_sflow_direction_set (vat_main_t *vam)
 
   /* Construct the API message */
   M (SFLOW_DIRECTION_SET, mp);
-  mp->sampling_D = ntohl (sampling_D);
+  mp->sampling_D = htonl (sampling_D);
 
   /* send it... */
   S (mp);
@@ -323,7 +323,7 @@ vl_api_sflow_drop_monitoring_get_reply_t_handler (
   vl_api_sflow_drop_monitoring_get_reply_t *mp)
 {
   vat_main_t *vam = sflow_test_main.vat_main;
-  clib_warning ("sflow drop_M: %d", mp->drop_M);
+  clib_warning ("sflow drop_M: %d", ntohl (mp->drop_M));
   vam->result_ready = 1;
 }
 
@@ -365,7 +365,7 @@ api_sflow_drop_monitoring_set (vat_main_t *vam)
 
   /* Construct the API message */
   M (SFLOW_DROP_MONITORING_SET, mp);
-  mp->drop_M = ntohl (drop_M);
+  mp->drop_M = htonl (drop_M);
 
   /* send it... */
   S (mp);

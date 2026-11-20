@@ -281,10 +281,10 @@ api_geneve_add_del_tunnel (vat_main_t * vam)
       clib_memcpy (&mp->local_address.un.ip4, &src.ip4, sizeof (src.ip4));
       clib_memcpy (&mp->remote_address.un.ip4, &dst.ip4, sizeof (dst.ip4));
     }
-  mp->encap_vrf_id = ntohl (encap_vrf_id);
-  mp->decap_next_index = ntohl (decap_next_index);
-  mp->mcast_sw_if_index = ntohl (mcast_sw_if_index);
-  mp->vni = ntohl (vni);
+  mp->encap_vrf_id = htonl (encap_vrf_id);
+  mp->decap_next_index = htonl (decap_next_index);
+  mp->mcast_sw_if_index = htonl (mcast_sw_if_index);
+  mp->vni = htonl (vni);
   mp->is_add = is_add;
 
   S (mp);
