@@ -12,6 +12,7 @@ from vpp_ip_route import (
     VppRoutePath,
     find_route,
     VppIpTable,
+    find_mroute,
     DpoProto,
     FibPathType,
     VppIpInterfaceAddress,
@@ -187,52 +188,101 @@ class ARPTestCase(VppTestCase):
         return self.statistics["/net/arp/tx/gratuitous"][:, itf.sw_if_index].sum()
 
     def test_arp_adj_fib_unbind(self):
-        """adj-fib is gone once its neighbour is, whatever the binding
+        """deleting a table takes the adj-fibs it holds with it
 
-        The unbind only removes the address, which leaves the dynamic
-        neighbour alone, so it is still there when the interface has moved
-        to the new table and it is the one being deleted at the end. That is
-        what makes the case worth testing: the adj-fib is in a table the
-        binding no longer names.
+        The neighbour is static, so removing the interface address leaves it
+        alone, and it is the binding walk that carries its adj-fib from table
+        0 to table 100. That is what makes the case worth testing: the
+        adj-fib is in the table the interface names now, and the neighbour's
+        FIB_SOURCE_ADJ lock is what keeps that table alive once the API gives
+        up its own lock.
 
-        The table lock the adj-fib keeps cannot be read back, so this pins
-        the entry, which the binding walk alone already removed before the
-        fix, and not the lock that outlived it.
+        The table is then deleted while the interface is still bound to it, in
+        both the unicast FIB and the multicast one. The table has to go from
+        both, the neighbour with it, and the interface has to come off the
+        binding it held rather than stay pointed at a slot that is free for
+        the next table.
         """
         self.pg1.generate_remote_hosts(1)
         nbr_addr = self.pg1.remote_hosts[0].ip4
         table = VppIpTable(self, 100).add_vpp_config()
 
         nbr = VppNeighbor(
-            self, self.pg1.sw_if_index, self.pg1.remote_hosts[0].mac, nbr_addr
+            self,
+            self.pg1.sw_if_index,
+            self.pg1.remote_hosts[0].mac,
+            nbr_addr,
+            is_static=True,
         )
         nbr.add_vpp_config()
-        self.assertTrue(find_nbr(self, self.pg1.sw_if_index, nbr_addr))
+        self.assertTrue(find_nbr(self, self.pg1.sw_if_index, nbr_addr, is_static=1))
 
         #
-        # the neighbour follows the interface into table 100
+        # the neighbour follows the interface into table 100: it moves, it is
+        # not flushed, so its adj-fib is in table 100 and not in table 0
         #
         self.pg1.unconfig_ip4()
         self.pg1.set_table_ip4(100)
 
-        self.assertTrue(find_nbr(self, self.pg1.sw_if_index, nbr_addr))
+        self.assertTrue(find_nbr(self, self.pg1.sw_if_index, nbr_addr, is_static=1))
         self.assertEqual(self.get_adj_sourced_routes(table), [nbr_addr])
         self.assertEqual(
             self.get_adj_sourced_routes(VppIpTable(self, 0, register=False)), []
         )
 
         #
-        # the interface leaves the table before the neighbour goes away. The
-        # adj-fib is in table 100 and the binding no longer says so, which
-        # used to leave the entry and the table lock behind for good
+        # the table goes while the interface is still in it. The neighbour's
+        # lock and the interface's binding are both on it, and neither may
+        # outlive the delete, in the multicast table any more than in the
+        # unicast one
         #
-        self.pg1.set_table_ip4(0)
-        nbr.remove_vpp_config()
+        table.remove_vpp_config()
 
-        self.assertFalse(find_nbr(self, self.pg1.sw_if_index, nbr_addr))
+        self.assertNotIn(100, self.ip_table_ids())
+        self.assertFalse(find_mroute(self, "224.0.0.0", "0.0.0.0", 4, table_id=100))
+        self.assertFalse(find_nbr(self, self.pg1.sw_if_index, nbr_addr, is_static=1))
         self.assertEqual(self.get_adj_sourced_routes(table), [])
 
-        table.remove_vpp_config()
+        #
+        # the interface was moved off the deleted table as part of deleting
+        # it, and it still forwards: given the address back in the default
+        # table, it resolves the neighbour through a route there, which it
+        # only can if the table the neighbour's adj-fib was in is gone from
+        # both the unicast and the multicast side
+        #
+        self.assertEqual(
+            self.vapi.sw_interface_get_table(self.pg1.sw_if_index).vrf_id, 0
+        )
+        self.pg1.config_ip4()
+        self.pg1.remote_hosts[0].resolve_arp()
+
+        VppIpRoute(
+            self,
+            nbr_addr,
+            32,
+            [VppRoutePath(nbr_addr, self.pg1.sw_if_index)],
+            table_id=0,
+        ).add_vpp_config()
+
+        # asked of the FIB rather than of the path list, which reports what
+        # was configured whether or not the route made it into the table
+        self.assertTrue(find_route(self, nbr_addr, 32, table_id=0))
+        self.assertTrue(
+            find_nbr(
+                self,
+                self.pg1.sw_if_index,
+                nbr_addr,
+                is_static=0,
+                mac=self.pg1.remote_hosts[0].mac,
+            )
+        )
+        self.assertEqual(
+            self.get_adj_sourced_routes(VppIpTable(self, 0, register=False)), [nbr_addr]
+        )
+
+    def ip_table_ids(self):
+        """The IPv4 table ids the FIB has a table for"""
+        return [t.table.table_id for t in self.vapi.ip_table_dump() if not t.table.is_ip6]
 
     def get_adj_sourced_routes(self, table):
         """The addresses table holds a route for from the adjacency source"""

@@ -35,6 +35,23 @@ extern int ip_neighbor_get_config (ip_address_family_t af, u32 *limit,
 
 extern void ip_neighbor_del_all (ip_address_family_t af, u32 sw_if_index);
 
+/**
+ * @brief Remove the neighbours that resolve through a table being deleted,
+ * whatever interface they are on. Static entries go too: they are
+ * configuration of an interface bound to that table.
+ *
+ * The caller is expected to hold a lock on the table, so that removing the
+ * last neighbour does not free it under the walk that is still reading it.
+ */
+extern void ip_neighbor_flush_table (fib_protocol_t fproto, u32 fib_index);
+
+/**
+ * @brief Whether a FIB index still names a live table. False for ~0, for an
+ * index past the end of the pool, and for the index of a table that has since
+ * been destroyed.
+ */
+extern bool ip_neighbor_fib_table_exists (ip_address_family_t af, u32 fib_index);
+
 typedef walk_rc_t (*ip_neighbor_walk_cb_t) (index_t ipni, void *ctx);
 __clib_export extern void ip_neighbor_walk (ip_address_family_t af, u32 sw_if_index,
 					    ip_neighbor_walk_cb_t fn, void *ctx);
