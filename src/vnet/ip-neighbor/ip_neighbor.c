@@ -1498,6 +1498,52 @@ ip_neighbor_flush (ip_address_family_t af, u32 sw_if_index,
   vec_free (ipnis);
 }
 
+/*
+ * Everything an interface resolves through a table that is being deleted.
+ *
+ * The entry is configuration for an interface bound to that table: it cannot
+ * resolve through any other one, nothing re-adds it, and its FIB_SOURCE_ADJ
+ * lock is one more reason the table would outlive the delete that lets go of
+ * it. Static entries go with the dynamic ones for the same reason.
+ *
+ * The caller still holds a lock of its own while this runs, so the table is
+ * there for the whole walk and the caller is left with a table to unlock.
+ */
+void
+ip_neighbor_flush_table (fib_protocol_t fproto, u32 fib_index)
+{
+  ip_address_family_t af;
+  index_t *ipnis = NULL, *ipni;
+  ip_neighbor_t *ipn;
+
+  af = ip_address_family_from_fib_proto (fproto);
+
+  IP_NEIGHBOR_DBG ("flush table: %U %u", format_fib_protocol, fproto, fib_index);
+
+  pool_foreach (ipn, ip_neighbor_pool)
+    {
+      if (ip_neighbor_get_af (ipn) == af && ipn->ipn_fib_index == fib_index)
+	vec_add1 (ipnis, ipn - ip_neighbor_pool);
+    }
+
+  vec_foreach (ipni, ipnis)
+    ip_neighbor_destroy (ip_neighbor_get (*ipni));
+  vec_free (ipnis);
+}
+
+bool
+ip_neighbor_fib_table_exists (ip_address_family_t af, u32 fib_index)
+{
+  /*
+   * The index is asked of the FIB pool, not of the table id hash: the table
+   * id is a name an operator chose and says nothing about which pool slot the
+   * table lives in. fib_table_get_or_null answers what is wanted here, whether
+   * this index still names a live table, for ~0, an index past the end of the
+   * pool and one whose table has been destroyed alike.
+   */
+  return (NULL != fib_table_get_or_null (fib_index, ip_address_family_to_fib_proto (af)));
+}
+
 walk_rc_t
 ip_neighbor_mark_one (index_t ipni, void *ctx)
 {
@@ -1780,12 +1826,30 @@ ip_neighbor_walk_table_bind (index_t ipni, void *arg)
 {
   ip_neighbor_table_bind_ctx_t *ctx = arg;
   ip_neighbor_t *ipn;
+  ip_address_family_t af;
 
   ipn = ip_neighbor_get (ipni);
+  af = ip_neighbor_get_af (ipn);
+
   ip_neighbor_adj_fib_remove (ipn);
 
-  if (!(ipn->ipn_flags & IP_NEIGHBOR_FLAG_NO_FIB_ENTRY))
-    ip_neighbor_adj_fib_add (ipn, ctx->new_fib_index);
+  if (ipn->ipn_flags & IP_NEIGHBOR_FLAG_NO_FIB_ENTRY)
+    return (WALK_CONTINUE);
+
+  /*
+   * The interface can name a table the FIB no longer has: a table can be
+   * deleted while its interfaces still point at it. Installing the adj fib
+   * for that index would either fail or land in the slot's next occupant,
+   * and the neighbour would then answer for an address of a network nobody
+   * put it in. The entry goes with the table instead of outliving it.
+   */
+  if (!ip_neighbor_fib_table_exists (af, ctx->new_fib_index))
+    {
+      ip_neighbor_destroy (ipn);
+      return (WALK_CONTINUE);
+    }
+
+  ip_neighbor_adj_fib_add (ipn, ctx->new_fib_index);
 
   return (WALK_CONTINUE);
 }

@@ -27,6 +27,7 @@
 #include <vnet/mfib/mfib_entry.h>
 #include <vnet/mfib/mfib_api.h>
 #include <vnet/ip/ip_source_and_port_range_check.h>
+#include <vnet/ip-neighbor/ip_neighbor.h>
 #include <vnet/fib/fib_path_list.h>
 #include <vnet/ip/ip6_hop_by_hop.h>
 #include <vnet/ip/ip6_link.h>
@@ -553,6 +554,82 @@ call_elf_section_ip_table_callbacks (vnet_main_t * vnm, u32 table_id,
   return error;
 }
 
+typedef struct ip_table_bind_orphan_ctx_t_
+{
+  fib_protocol_t fo_fproto;
+  u32 fo_fib_index;
+  u32 fo_n_moved;
+} ip_table_bind_orphan_ctx_t;
+
+/*
+ * An interface still bound to the table being deleted. Moving it to no
+ * table drops its FIB_SOURCE_INTERFACE lock on this one, which is what lets
+ * the delete free the table, and its MFIB_SOURCE_INTERFACE lock on the
+ * table's multicast counterpart, which would keep that one up.
+ *
+ * The multicast half is moved through mfib_table_bind rather than through
+ * ip_table_bind: the latter resolves its MFIB by table id, so it would take
+ * the interface's lock on the default MFIB while dropping the one it holds
+ * on this table's, and its IP6 branch locks the default MFIB whatever the
+ * interface was on. The unicast index is what the walk matches on, so an
+ * interface that names the table in only one of the two bindings is left
+ * alone.
+ */
+static walk_rc_t
+ip_table_bind_orphan (vnet_main_t *vnm, vnet_sw_interface_t *si, void *arg)
+{
+  ip_table_bind_orphan_ctx_t *ctx = arg;
+  u32 *fib_index_by_sw_if_index;
+
+  fib_index_by_sw_if_index =
+    (FIB_PROTOCOL_IP6 == ctx->fo_fproto ? ip6_main.fib_index_by_sw_if_index :
+					  ip4_main.fib_index_by_sw_if_index);
+
+  if (si->sw_if_index >= vec_len (fib_index_by_sw_if_index))
+    return (WALK_CONTINUE);
+
+  /*
+   * ~0 is what ip4_sw_interface_add_del leaves for an interface it has taken
+   * out of the forwarding tables altogether; it names neither this table nor
+   * one to move to.
+   */
+  if (~0 == fib_index_by_sw_if_index[si->sw_if_index])
+    return (WALK_CONTINUE);
+
+  /*
+   * The interface names this table, so an interface that is bound at all is
+   * bound here in both places: ip4_add_del_interface_address_internal turns
+   * the multicast table on for every interface it gives an address, and only
+   * this table's own delete takes that away.
+   */
+  if (fib_index_by_sw_if_index[si->sw_if_index] == ctx->fo_fib_index)
+    {
+      ctx->fo_n_moved++;
+      fib_table_bind (ctx->fo_fproto, si->sw_if_index, 0);
+      mfib_table_bind (ctx->fo_fproto, si->sw_if_index, 0);
+    }
+
+  return (WALK_CONTINUE);
+}
+
+/*
+ * The interfaces bound to a table that is being deleted are moved off it, to
+ * no table at all in both the unicast and the multicast binding, so that the
+ * delete can free the table and its MFIB. Interfaces that name neither of
+ * the two are left where they are.
+ */
+static void
+ip_table_bind_orphans (fib_protocol_t fproto, u32 fib_index)
+{
+  ip_table_bind_orphan_ctx_t ctx = {
+    .fo_fproto = fproto,
+    .fo_fib_index = fib_index,
+    .fo_n_moved = 0,
+  };
+
+  vnet_sw_interface_walk (vnet_get_main (), ip_table_bind_orphan, &ctx);
+}
+
 void
 ip_table_delete (fib_protocol_t fproto, u32 table_id, u8 is_api)
 {
@@ -580,8 +657,30 @@ ip_table_delete (fib_protocol_t fproto, u32 table_id, u8 is_api)
 	call_elf_section_ip_table_callbacks (vnm, table_id, 0 /* is_add */ ,
 					     vnm->ip_table_add_del_functions);
 
+      /*
+       * Three things can keep the table alive after the API gives up its
+       * lock: a neighbour's FIB_SOURCE_ADJ lock on the table its adj fib went
+       * into, an interface still bound here, and, through those, the table
+       * being the one an interface forwards into. None of them has to outlive
+       * the delete, and the delete reports success either way, so all three
+       * go first:
+       *
+       * - the neighbours of this table are removed, taking their adj fibs and
+       *   their locks with them;
+       * - every interface still bound here is moved to the default table,
+       *   which releases its FIB_SOURCE_INTERFACE lock and points it at a
+       *   table that will still be there.
+       *
+       * The binding move runs after the flush, so its walk finds nothing to
+       * carry over: without that, the neighbours would follow the interface
+       * into the default table instead of leaving with this one.
+       */
       if (~0 != fib_index)
 	{
+	  ip_neighbor_flush_table (fproto, fib_index);
+
+	  ip_table_bind_orphans (fproto, fib_index);
+
 	  fib_table_unlock (fib_index, fproto,
 			    (is_api ? FIB_SOURCE_API : FIB_SOURCE_CLI));
 	}
