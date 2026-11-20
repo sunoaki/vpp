@@ -3338,7 +3338,6 @@ class TestNAT44EI(MethodHolder):
     def test_reass_hairpinning(self):
         """NAT44EI fragments hairpinning"""
 
-        host = self.pg0.remote_hosts[0]
         server = self.pg0.remote_hosts[1]
         server_addr = server.ip4
         host_in_port = random.randint(1025, 65535)
@@ -3353,11 +3352,11 @@ class TestNAT44EI(MethodHolder):
         self.vapi.nat44_ei_interface_add_del_feature(
             sw_if_index=self.pg1.sw_if_index, is_add=1
         )
-        # A fragment that does not carry the L4 header is translated to an
-        # address only, so it cannot land on ip4-local like an entire packet
-        # and leaves through ip4-lookup on the output table instead. The
-        # server lives on pg0, whose FIB only holds the first remote host, so
-        # the translated fragments reach ip4-glean and an ARP without this.
+        # nat44-ei-hairpinning names the translated address inside the IP
+        # header only for a fragment that does not carry the L4 header, then
+        # sends it to ip4-lookup like every other translated packet. pg0
+        # holds a neighbour only for its first remote host, so the translated
+        # fragments reach ip4-glean without this.
         self.vapi.ip_neighbor_add_del(self.pg0.sw_if_index, server.mac, server_addr)
         # add static mapping for server
         self.nat44_add_static_mapping(
