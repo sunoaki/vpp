@@ -1,13 +1,19 @@
-name: Verify pull request
+name: Verify
 
 # yamllint disable-line rule:truthy
 on:
+  # This tree is the production branch, not a fork awaiting upstream review, so
+  # a push to master verifies itself the same way a pull request does. Feature
+  # branches are verified through their pull request, which keeps a push and
+  # the pull request that carries the same commits from building twice.
+  push:
+    branches: [master]
   pull_request:
     branches: [master]
     types: [opened, synchronize, reopened]
-  # A manual run has no pull request, so the steps that read the pull_request
-  # context fall back to comparing the branch tip with its parent, and the
-  # suites input replaces the filter derived from the changed paths.
+  # A push or a manual run has no pull request, so the steps that read the
+  # pull_request context fall back to comparing the branch tip with its parent,
+  # and the suites input replaces the filter derived from the changed paths.
   workflow_dispatch:
     inputs:
       suites:
@@ -20,7 +26,7 @@ on:
 
 # One run per ref: a new push to the same branch cancels the previous run.
 concurrency:
-  group: pr-verify-${{ github.ref }}
+  group: verify-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -85,7 +91,7 @@ jobs:
       - name: Check the Python coding style
         run: make checkstyle-python
 
-      - name: Check the commit messages of the pull request
+      - name: Check the commit messages of the run
         run: |
           set -eu
           base="${{ github.event.pull_request.base.sha }}"
@@ -94,16 +100,17 @@ jobs:
           trap 'git checkout --quiet "${checked_out}"' EXIT
           # A merge commit has no feature id in its subject, and
           # check_commit_msg.sh rejects a subject without one, so only the
-          # commits the pull request author wrote are checked.
+          # commits the run's author wrote are checked.
           if [ -n "${base}" ] && [ -n "${head}" ]; then
             echo "Pull request base ${base}, head ${head}"
             commits=$(git rev-list --reverse --no-merges "${base}..${head}")
           else
-            # A manual run has no pull request context, and its tip is usually a
-            # merge commit, which check_commit_msg.sh rejects. The commits such a
-            # tip carries are the range between its first parent and itself, and
-            # the merge commits inside that range are skipped for the same
-            # reason. A tip with one parent, or a root commit, carries itself.
+            # A push or a manual run has no pull request context, and its tip is
+            # usually a merge commit, which check_commit_msg.sh rejects. The
+            # commits such a tip carries are the range between its first parent
+            # and itself, and the merge commits inside that range are skipped
+            # for the same reason. A tip with one parent, or a root commit,
+            # carries itself.
             head=$(git rev-parse HEAD)
             first_parent=$(git rev-parse --verify --quiet "${head}^1" || true)
             if [ -n "${first_parent}" ]; then
@@ -160,8 +167,8 @@ jobs:
           base = os.environ["PR_BASE"]
           head = os.environ["PR_HEAD"]
           if not base or not head:
-              # A workflow_dispatch run has no pull request context; compare the
-              # branch tip with its parent instead.
+              # A push or a workflow_dispatch run has no pull request context;
+              # compare the branch tip with its parent instead.
               base = subprocess.run(["git", "rev-parse", "HEAD^"], capture_output=True,
                                     text=True).stdout.strip()
               head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
@@ -519,15 +526,16 @@ jobs:
       - name: Derive a test filter from the changed paths
         id: tests
         env:
-          # A workflow_dispatch run may name the suites itself.
+          # A workflow_dispatch run may name the suites itself; a push run
+          # leaves the input empty and derives the suites from its paths.
           MANUAL_SUITES: ${{ inputs.suites }}
         run: |
           set -eu
           . "${RUNNER_TEMP}/derive-suites.sh"
           base="${{ github.event.pull_request.base.sha }}"
           head="${{ github.event.pull_request.head.sha }}"
-          # A workflow_dispatch run has no pull request context; compare the
-          # branch tip with its parent instead.
+          # A push or a workflow_dispatch run has no pull request context;
+          # compare the branch tip with its parent instead.
           if [ -z "${base}" ] || [ -z "${head}" ]; then
             base=$(git rev-parse HEAD^ 2>/dev/null || echo "")
             head=$(git rev-parse HEAD)
@@ -561,8 +569,9 @@ jobs:
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           set -eu
-          # A workflow_dispatch run has no pull request context; report the
-          # branch tip and its parent instead of empty base and head values.
+          # A push or a workflow_dispatch run has no pull request context;
+          # report the branch tip and its parent instead of empty base and head
+          # values.
           if [ -z "${PR_BASE}" ] || [ -z "${PR_HEAD}" ]; then
             PR_BASE=$(git rev-parse HEAD^ 2>/dev/null || echo "")
             PR_HEAD=$(git rev-parse HEAD)

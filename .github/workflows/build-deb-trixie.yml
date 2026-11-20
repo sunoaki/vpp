@@ -1,8 +1,6 @@
 name: Build VPP DEB for Debian 13 (Trixie)
 
 on:
-  push:
-    branches: [master]
   workflow_dispatch:
     inputs:
       release:
@@ -174,8 +172,10 @@ jobs:
           name: vpp-debian13-trixie
           path: build-root/*.deb
 
+      # A manual run is the only run this workflow has, so the release happens
+      # when the run asks for it.
       - name: Publish Release
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+        if: ${{ inputs.release }}
         uses: softprops/action-gh-release@v2
         with:
           files: build-root/*.deb
