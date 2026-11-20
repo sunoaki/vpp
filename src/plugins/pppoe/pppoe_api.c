@@ -172,6 +172,84 @@ vl_api_pppoe_add_del_cp_t_handler (vl_api_pppoe_add_del_cp_t *mp)
   REPLY_MACRO (VL_API_PPPOE_ADD_DEL_CP_REPLY);
 }
 
+typedef struct
+{
+  u32 context;
+  u32 dp_sw_if_index;
+  u32 cp_sw_if_index;
+  i32 rv;
+} pppoe_cp_binding_reply_t;
+
+static void
+send_pppoe_cp_binding_details (vl_api_registration_t *reg, pppoe_cp_binding_reply_t *b)
+{
+  vl_api_pppoe_cp_binding_details_t *rmp;
+  pppoe_main_t *pem = &pppoe_main;
+
+  rmp = vl_msg_api_alloc (sizeof (*rmp));
+  clib_memset (rmp, 0, sizeof (*rmp));
+  rmp->_vl_msg_id = ntohs (pem->msg_id_base + VL_API_PPPOE_CP_BINDING_DETAILS);
+  rmp->context = b->context;
+  rmp->retval = htonl (b->rv);
+  rmp->dp_sw_if_index = htonl (b->dp_sw_if_index);
+  rmp->cp_sw_if_index = htonl (b->cp_sw_if_index);
+
+  vl_api_send_msg (reg, (u8 *) rmp);
+}
+
+static void
+vl_api_pppoe_cp_binding_dump_t_handler (vl_api_pppoe_cp_binding_dump_t *mp)
+{
+  vl_api_registration_t *reg;
+  pppoe_main_t *pem = &pppoe_main;
+  pppoe_cp_binding_reply_t b = {};
+  u32 sw_if_index = ntohl (mp->sw_if_index);
+  u32 dp_sw_if_index, cp_sw_if_index;
+
+  reg = vl_api_client_index_to_registration (mp->client_index);
+  if (!reg)
+    return;
+
+  b.context = mp->context;
+
+  /* every binding: iterate the data plane side of cp_if_index_by_sw_if_index
+   * and send the control plane interface each one is paired with */
+  if (~0 == sw_if_index)
+    {
+      for (dp_sw_if_index = 0; dp_sw_if_index < vec_len (pem->cp_if_index_by_sw_if_index);
+	   dp_sw_if_index++)
+	{
+	  cp_sw_if_index = pppoe_cp_if_index_by_dp (pem, dp_sw_if_index);
+	  if (~0 == cp_sw_if_index)
+	    continue;
+	  b.dp_sw_if_index = dp_sw_if_index;
+	  b.cp_sw_if_index = cp_sw_if_index;
+	  send_pppoe_cp_binding_details (reg, &b);
+	}
+      return;
+    }
+
+  /* one binding: the index may name either side of the pair */
+  cp_sw_if_index = pppoe_cp_if_index_by_dp (pem, sw_if_index);
+  if (~0 == cp_sw_if_index)
+    {
+      cp_sw_if_index = sw_if_index;
+      b.dp_sw_if_index = pppoe_dp_if_index_by_cp (pem, sw_if_index);
+      if (~0 == b.dp_sw_if_index)
+	{
+	  b.cp_sw_if_index = ~0;
+	  b.rv = VNET_API_ERROR_INVALID_INTERFACE;
+	  send_pppoe_cp_binding_details (reg, &b);
+	  return;
+	}
+    }
+  else
+    b.dp_sw_if_index = sw_if_index;
+
+  b.cp_sw_if_index = cp_sw_if_index;
+  send_pppoe_cp_binding_details (reg, &b);
+}
+
 #include <pppoe/pppoe.api.c>
 static clib_error_t *
 pppoe_api_hookup (vlib_main_t *vm)
