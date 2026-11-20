@@ -59,13 +59,42 @@ typedef struct _vnet_classify_main vnet_classify_main_t;
    out. */
 #define VNET_CLASSIFY_MAX_N_VECTORS 8
 
-/* The hash reads a full window of VNET_CLASSIFY_MAX_N_VECTORS vectors
-   starting skip_n_vectors into the packet, whatever match_n_vectors is
-   inside that window.  Inserting a session hashes the entry itself by
-   pointing at its key less skip_n_vectors vectors, so the two counts
-   together may not exceed the window: skip + match <= the limit above.
-   Past that the window starts before the key rather than after it. */
+/* A packet is hashed over its match_n_vectors vectors alone, but a session
+   is added by hashing the entry with skip_n_vectors ahead of its key, and
+   the entry itself has only match_n_vectors.  So the two counts may sum to
+   at most VNET_CLASSIFY_MAX_N_VECTORS: past that the entry cannot carry
+   the vectors its own hash starts at, and the session could never be
+   found.  vnet_classify_add_del_session enforces this; a table alone may
+   hold a key further out than that. */
 #define VNET_CLASSIFY_SKIP_MATCH_FIT(skip, match) ((skip) + (match) <= VNET_CLASSIFY_MAX_N_VECTORS)
+
+/* Number of vectors a packet hash loads: its mask, from the current
+   position on. */
+static_always_inline u32
+vnet_classify_match_window (const u32 match_n_vectors)
+{
+  return match_n_vectors;
+}
+
+/* Number of vectors a hash or an equal check loads from an address
+   skip_n_vectors before the one above.  Hashing a packet that is where the
+   sessions are reaches match_n_vectors ahead of the key; hashing an entry
+   on insertion, and the equal check, reach the skipped vectors in front of
+   the key, which are zero.  A table whose own skip plus match exceeds the
+   limit has no session at its own skip, so the entry read stays inside the
+   key vectors. */
+static_always_inline u32
+vnet_classify_entry_window (const u32 match_n_vectors, const u32 skip_n_vectors)
+{
+  return skip_n_vectors + match_n_vectors;
+}
+
+/* Number of bits a vector mask has, two per vector loaded. */
+static_always_inline u16
+vnet_classify_window_mask (const u32 window)
+{
+  return pow2_mask (window * 2);
+}
 
 #define foreach_size_in_u32x4                                                                      \
   _ (1)                                                                                            \
@@ -274,7 +303,7 @@ vnet_classify_hash_packet_inline (const vnet_classify_table_t *t, const u8 *h)
 
 #if defined(CLIB_HAVE_VEC512) && defined(CLIB_HAVE_VEC512_MASK_LOAD_STORE)
   u64x8 xor_sum_x8, *mask = (u64x8 *) t->mask;
-  u16 load_mask = t->load_mask;
+  u16 load_mask = vnet_classify_window_mask (vnet_classify_match_window (t->match_n_vectors));
   u64x8u *data = (u64x8u *) h;
 
   xor_sum_x8 = u64x8_mask_load_zero (data, load_mask) & mask[0];
@@ -287,7 +316,7 @@ vnet_classify_hash_packet_inline (const vnet_classify_table_t *t, const u8 *h)
   xor_sum = xor_sum_x8[0] ^ xor_sum_x8[1];
 #elif defined(CLIB_HAVE_VEC256) && defined(CLIB_HAVE_VEC256_MASK_LOAD_STORE)
   u64x4 xor_sum_x4, *mask = (u64x4 *) t->mask;
-  u16 load_mask = t->load_mask;
+  u16 load_mask = vnet_classify_window_mask (vnet_classify_match_window (t->match_n_vectors));
   u64x4u *data = (u64x4u *) h;
 
   xor_sum_x4 = u64x4_mask_load_zero (data, load_mask) & mask[0];
@@ -296,8 +325,7 @@ vnet_classify_hash_packet_inline (const vnet_classify_table_t *t, const u8 *h)
   if (PREDICT_FALSE (load_mask >> 8))
     xor_sum_x4 ^= u64x4_mask_load_zero (data + 2, load_mask >> 8) & mask[2];
 
-  /* Bits 12 to 15 cover the seventh and eighth vectors, where load_mask
-     runs out of its sixteen bits */
+  /* Bits 12 to 15 cover the seventh and eighth vectors. */
   if (PREDICT_FALSE (load_mask >> 12))
     xor_sum_x4 ^= u64x4_mask_load_zero (data + 3, load_mask >> 12) & mask[3];
 
@@ -588,7 +616,8 @@ vnet_classify_find_entry_inline (const vnet_classify_table_t *t, const u8 *h,
   vnet_classify_entry_t *v;
   vnet_classify_bucket_t *b;
   u32 bucket_index, limit, pages, match_n_vectors = t->match_n_vectors;
-  u16 load_mask = t->load_mask;
+  u16 load_mask =
+    vnet_classify_window_mask (vnet_classify_entry_window (t->match_n_vectors, t->skip_n_vectors));
   u8 *mask = (u8 *) t->mask;
   int i;
 

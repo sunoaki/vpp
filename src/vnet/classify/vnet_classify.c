@@ -145,7 +145,6 @@ vnet_classify_new_table (vnet_classify_main_t *cm, const u8 *mask,
   t->match_n_vectors = match_n_vectors;
   t->skip_n_vectors = skip_n_vectors;
   t->entries_per_page = 2;
-  t->load_mask = pow2_mask (match_n_vectors * 2);
 
   t->mheap = clib_mem_create_heap (0, memory_size, 1 /* locked */ ,
 				   "classify");
@@ -1063,12 +1062,18 @@ vnet_classify_add_del_table (vnet_classify_main_t *cm, const u8 *mask,
 	    return VNET_API_ERROR_INVALID_VALUE;
 
 	  /* The dataplane reads the key at skip_n_vectors * 16 bytes into
-	     the packet over a full VNET_CLASSIFY_MAX_N_VECTORS window, as
-	     the inserting side hashes the entry from skip_n_vectors before
-	     its key; keep the two counts together inside that window so
-	     neither read leaves the key's own vectors. */
-	  if (!VNET_CLASSIFY_SKIP_MATCH_FIT (skip, match))
+	     the packet and the mask holds only the match vectors, so the key
+	     itself may not start past them.  A key that reaches further out
+	     than the mask still holds the sessions programmed at a smaller
+	     skip, each at most VNET_CLASSIFY_MAX_N_VECTORS all told; the
+	     sessions of this table are bounded where they are added. */
+	  if (skip > VNET_CLASSIFY_MAX_N_VECTORS)
 	    return VNET_API_ERROR_INVALID_VALUE;
+	  if (skip > VNET_CLASSIFY_MAX_N_VECTORS - match)
+	    clib_warning ("classify table skip %u and match %u: a session "
+			  "programmed with this table's skip cannot be found, "
+			  "only sessions added with a smaller skip",
+			  skip, match);
 
 	  t = vnet_classify_new_table (cm, mask, nbuckets, memory_size,
 				       skip, match);
@@ -2373,6 +2378,9 @@ classify_filter_command_fn (vlib_main_t * vm,
 
   vec_free (match_vector);
 
+  if (rv)
+    return clib_error_return (0, "vnet_classify_add_del_session returned %d", rv);
+
   return 0;
 }
 
@@ -3106,11 +3114,12 @@ vnet_classify_add_del_session (vnet_classify_main_t *cm, u32 table_index,
 			       u32 metadata, int is_add)
 {
   vnet_classify_table_t *t;
-  /* The entry with room for the skipped vectors in front of it, so that
-     hashing the entry skip_n_vectors before its key stays inside; the
-     entry is aligned within it because its key must stay on a vector
+  /* The entry, with room ahead of its key for the vectors its hash starts
+     at, and within this buffer for the entry to be aligned on a vector
      boundary */
-  vnet_classify_entry_t *e, _entry[VNET_CLASSIFY_MAX_N_VECTORS + 2];
+  u8 _entry[sizeof (vnet_classify_entry_t) +
+	    VNET_CLASSIFY_MAX_N_VECTORS * sizeof (u32x4) + sizeof (u32x4)];
+  vnet_classify_entry_t *e;
   uword e_offset;
   int i, rv;
 
@@ -3119,9 +3128,18 @@ vnet_classify_add_del_session (vnet_classify_main_t *cm, u32 table_index,
 
   t = pool_elt_at_index (cm->tables, table_index);
 
-  e_offset = t->skip_n_vectors * sizeof (u32x4);
-  e_offset += (uword) _entry & (sizeof (u32x4) - 1);
-  e = (vnet_classify_entry_t *) ((u8 *) _entry + e_offset);
+  /* An entry is match_n_vectors long.  Its hash starts skip_n_vectors
+     before that, so a skipped vector past the end of the entry would be
+     hashed from whatever lies next to this buffer, and the session could
+     never be found; refuse to add it instead. */
+  if (!VNET_CLASSIFY_SKIP_MATCH_FIT (t->skip_n_vectors, t->match_n_vectors))
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  /* Zero the whole buffer, which zeroes the skipped vectors ahead of the
+     key where the hash of the entry reads, and align the entry within it */
+  clib_memset (_entry, 0, sizeof (_entry));
+  e_offset = (-(uword) _entry) & (sizeof (u32x4) - 1);
+  e = (vnet_classify_entry_t *) (_entry + e_offset);
 
   e->next_index = hit_next_index;
   e->opaque_index = opaque_index;
