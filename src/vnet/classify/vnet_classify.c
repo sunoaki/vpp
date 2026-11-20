@@ -3114,11 +3114,10 @@ vnet_classify_add_del_session (vnet_classify_main_t *cm, u32 table_index,
 			       u32 metadata, int is_add)
 {
   vnet_classify_table_t *t;
-  /* The entry, with room ahead of its key for the vectors its hash starts
-     at, and within this buffer for the entry to be aligned on a vector
-     boundary */
-  u8 _entry[sizeof (vnet_classify_entry_t) +
-	    VNET_CLASSIFY_MAX_N_VECTORS * sizeof (u32x4) + sizeof (u32x4)];
+  /* The entry, the vectors its hash may start at ahead of the key, and
+     room to align the key on a vector boundary */
+  u8 _entry[sizeof (vnet_classify_entry_t) + VNET_CLASSIFY_MAX_N_VECTORS * sizeof (u32x4) +
+	    sizeof (u32x4)];
   vnet_classify_entry_t *e;
   uword e_offset;
   int i, rv;
