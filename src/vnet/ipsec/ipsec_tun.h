@@ -151,11 +151,9 @@ __clib_export extern int ipsec_tun_protect_update (u32 sw_if_index, const ip_add
 __clib_export extern int ipsec_tun_protect_del (u32 sw_if_index, const ip_address_t *nh);
 
 typedef walk_rc_t (*ipsec_tun_protect_walk_cb_t) (index_t itpi, void *arg);
-extern void ipsec_tun_protect_walk (ipsec_tun_protect_walk_cb_t fn,
-				    void *cttx);
-extern void ipsec_tun_protect_walk_itf (u32 sw_if_index,
-					ipsec_tun_protect_walk_cb_t fn,
-					void *cttx);
+__clib_export extern void ipsec_tun_protect_walk (ipsec_tun_protect_walk_cb_t fn, void *cttx);
+__clib_export extern void ipsec_tun_protect_walk_itf (u32 sw_if_index,
+						      ipsec_tun_protect_walk_cb_t fn, void *cttx);
 
 extern u8 *format_ipsec_tun_protect (u8 * s, va_list * args);
 extern u8 *format_ipsec_tun_protect_index (u8 * s, va_list * args);
@@ -169,7 +167,7 @@ extern void ipsec_tun_table_init (ip_address_family_t af, uword table_size,
 /*
  * DP API
  */
-extern ipsec_tun_protect_t *ipsec_tun_protect_pool;
+__clib_export extern ipsec_tun_protect_t *ipsec_tun_protect_pool;
 
 always_inline ipsec_tun_protect_t *
 ipsec_tun_protect_get (u32 index)
@@ -177,7 +175,7 @@ ipsec_tun_protect_get (u32 index)
   return (pool_elt_at_index (ipsec_tun_protect_pool, index));
 }
 
-extern index_t *ipsec_tun_protect_sa_by_adj_index;
+__clib_export extern index_t *ipsec_tun_protect_sa_by_adj_index;
 always_inline index_t
 ipsec_tun_protect_get_sa_out (adj_index_t ai)
 {

@@ -87,10 +87,9 @@ typedef struct ipsec_itf_t_
   u32 ii_sw_if_index;
 } __clib_packed ipsec_itf_t;
 
-
-extern int ipsec_itf_create (u32 user_instance,
-			     tunnel_mode_t mode, u32 * sw_if_indexp);
-extern int ipsec_itf_delete (u32 sw_if_index);
+__clib_export extern int ipsec_itf_create (u32 user_instance, tunnel_mode_t mode,
+					   u32 *sw_if_indexp);
+__clib_export extern int ipsec_itf_delete (u32 sw_if_index);
 extern void ipsec_itf_reset_tx_nodes (u32 sw_if_index);
 
 extern void ipsec_itf_adj_stack (adj_index_t ai, u32 sai);
