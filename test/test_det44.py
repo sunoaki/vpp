@@ -1658,8 +1658,8 @@ class TestDET44IdentityMapping(TestDET44):
         used = set()
         existing = None
         for s in self.vapi.det44_session_dump(in_addr):
-            # det44_in2out.c frees a candidate port only when no session of
-            # this user holds it for the same external host address AND the
+            # det44_in2out.c skips a candidate port while a session of this
+            # user still holds it for the same external host address AND the
             # same external host port, so both halves of key0 are filtered on
             # before a port is counted as taken.
             if str(s.ext_addr) != ext_addr:
@@ -1739,6 +1739,7 @@ class TestDET44IdentityMapping(TestDET44):
         mapped_ip = "172.31.0.4"
         reachable_ip = self.pg1.remote_hosts[0].ip4
         unreachable_ip = "203.0.113.7"
+        unreachable_alt_ip = "203.0.113.9"
 
         self.configure_det44(self.pg0.remote_ip4, in_plen=32)
         # The address-only entry bypasses every port of this address, so the
@@ -1783,10 +1784,11 @@ class TestDET44IdentityMapping(TestDET44):
         self.assert_packet_checksums_valid(p)
         self.assertEqual(self.nat_ip, p[IP].src)
         self.assertEqual(reachable_ip, p[IP].dst)
+        self.assertEqual(self.udp_external_port, p[UDP].dport)
         expected_port = self.det44_forward_port(
             mapped_ip, mapped_port, reachable_ip, self.udp_external_port
         )
-        self.assertEqual(int(expected_port), int(p[UDP].sport))
+        self.assertEqual(expected_port, int(p[UDP].sport))
 
         # Reversing the order of the same two entries makes the per-port one
         # irrelevant for every port: an address-only entry now answers first,
@@ -1801,14 +1803,21 @@ class TestDET44IdentityMapping(TestDET44):
             ["%s" % mapped_ip, "%s udp %d" % (mapped_ip, mapped_port)], listed
         )
 
-        p = self.create_untouched_udp(self.pg0, mapped_ip, mapped_port, unreachable_ip)
+        # The mapped port is sent towards the other unreachable address so its
+        # external key differs from the one the first order used: the det map
+        # keeps a port per external host address and port, and sharing the key
+        # across the two orders would make whichever runs second pick a
+        # different outside port than its own prediction.
+        p = self.create_untouched_udp(
+            self.pg0, mapped_ip, mapped_port, unreachable_alt_ip
+        )
         capture = self.send_and_capture(self.pg0, self.pg1, [p], 1)
 
         self.assertEqual(1, len(capture))
         self.assert_packet_checksums_valid(capture[0])
         self.assertEqual(mapped_ip, capture[0][IP].src)
         self.assertEqual(mapped_port, capture[0][UDP].sport)
-        self.assertEqual(unreachable_ip, capture[0][IP].dst)
+        self.assertEqual(unreachable_alt_ip, capture[0][IP].dst)
 
     def test_identity_mapping_does_not_create_session(self):
         """A bypassed packet leaves the deterministic NAT session table alone"""
