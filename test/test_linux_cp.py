@@ -950,23 +950,35 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
             if entry.phy_sw_if_index == self.lo_interfaces[0].sw_if_index
         )
 
-    def _router(self, action, route):
-        """Run one router command; the action comes before the route it acts on."""
+    # Actions that act on every table and name no route.
+    _ROUTER_TABLE_WIDE_ACTIONS = ("begin", "end")
+
+    def _router(self, action, route=None):
+        """Run one router command; the action comes before the route it acts on.
+
+        begin and end act on every table and name no route, so they are the
+        only actions that may leave one out; a route left out of any other
+        action is a mistake in the test, not a command for the plugin.
+        """
+        if route is None:
+            if action not in self._ROUTER_TABLE_WIDE_ACTIONS:
+                raise TypeError(f"test lcp router {action} needs a route")
+            return self.vapi.cli(f"test lcp router {action}")
         return self.vapi.cli(f"test lcp router {action} {route}")
 
-    def _mroute(self, group, source=None):
+    def _mroute(self, group, source=None, table_id=None):
         return self.vapi.cli(
-            f"test lcp mroute table {self.table_id} {group} "
+            f"test lcp mroute table {table_id or self.table_id} {group} "
             + (f"source {source}" if source else "wildcard")
         )
 
-    def _entry(self, group, source=None):
+    def _entry(self, group, source=None, table_id=None):
         """Return (present, {source id: (stale, paths)}) for one MFIB entry.
 
         The fixture prints the id of the plugin's source on the entry line, so
         the test names that source without a constant for its numeric value.
         """
-        lines = self._mroute(group, source).splitlines()
+        lines = self._mroute(group, source, table_id).splitlines()
         fields = dict(field.split(":", 1) for field in lines[0].split())
         sources = {}
         for line in lines[1:]:
@@ -977,16 +989,30 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
             )
         return fields["entry"] == "present", sources
 
-    def _plugin_low(self, group, source=None):
+    def _plugin_low(self, group, source=None, table_id=None):
         """Id of the source the plugin installs multicast routes under."""
         fields = dict(
             field.split(":", 1)
-            for field in self._mroute(group, source).splitlines()[0].split()
+            for field in self._mroute(group, source, table_id).splitlines()[0].split()
         )
         return int(fields["plugin-low"])
 
-    def _table_state(self):
-        output = self._router("state", f"ip4 table {self.table_id}")
+    def _router_record(self, table_id=None):
+        """The plugin's record of a table: absent, or the indices it names."""
+        output = self._router("record", f"ip4 table {table_id or self.table_id}")
+        fields = dict(field.split(":", 1) for field in output.split())
+        if fields["router-record"] == "absent":
+            return {"state": "absent"}
+        return {
+            "state": "present",
+            "fib": int(fields["fib"]),
+            "table-fib": int(fields["table-fib"]),
+            "mfib": int(fields["mfib"]),
+            "table-mfib": int(fields["table-mfib"]),
+        }
+
+    def _table_state(self, table_id=None):
+        output = self._router("state", f"ip4 table {table_id or self.table_id}")
         self.assertNotIn("absent", output, output)
         state = dict(
             field.split(":", 1)
@@ -998,9 +1024,9 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
             "mcast-routes": int(state["mcast-routes"]),
         }
 
-    def _route(self, group, source=None, vif=True):
+    def _route(self, group, source=None, vif=True, table_id=None):
         route = (
-            f"ip4 table {self.table_id} {group}/32 proto 4 multicast "
+            f"ip4 table {table_id or self.table_id} {group}/32 proto 4 multicast "
             f"source {source or '0.0.0.0'}"
         )
         return route + (f" vif {self.pair.vif_index}" if vif else "")
@@ -1178,6 +1204,59 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
             present, sources = self._entry(self.special_group)
             self.assertTrue(present, "the table lost its special multicast route")
             self.assertEqual(sources, before)
+        finally:
+            self._router("del", route)
+
+    def test_multicast_table_delete_and_recreate(self):
+        """A table the API deletes gives up the plugin's record of it
+
+        The api delete unlocks the FIB the plugin locked and frees the MFIB the
+        plugin's record names, so the record has to go with them: a record kept
+        past that point makes the plugin index a table that is gone. The
+        plugin's own lock is what tells the two apart, since the delete clears
+        it and nothing else does.
+        """
+        # A table of its own, deleted and re-created here.
+        table_id = self.table_id - 1
+        route = self._route(self.group, self.source, table_id=table_id)
+        table = VppIpTable(self, table_id, create_mfib=False).add_vpp_config()
+        self.addCleanup(VppIpTable(self, table_id, create_mfib=False).remove_vpp_config)
+        try:
+            self._router("add", route)
+            self.assertTrue(
+                self._entry(self.group, self.source, table_id)[0],
+                "multicast route was not installed",
+            )
+            self.assertEqual(
+                self._table_state(table_id), {"refs": 1, "mcast-routes": 1}
+            )
+            before = self._router_record(table_id)
+            self.assertEqual(before["state"], "present")
+            self.assertEqual(before["fib"], before["table-fib"])
+            self.assertEqual(before["mfib"], before["table-mfib"])
+
+            table.remove_vpp_config()
+            self.assertEqual(
+                self._router_record(table_id),
+                {"state": "absent"},
+                "the plugin kept a record of the deleted table",
+            )
+            # The table is gone for the fixture too, and asking does not fault.
+            self.assertIn("absent", self._router("state", f"ip4 table {table_id}"))
+
+            VppIpTable(self, table_id, create_mfib=False).add_vpp_config()
+            self._router("add", route)
+            after = self._router_record(table_id)
+            self.assertEqual(after["state"], "present")
+            self.assertEqual(after["fib"], after["table-fib"])
+            self.assertEqual(after["mfib"], after["table-mfib"])
+            self.assertEqual(
+                self._table_state(table_id), {"refs": 1, "mcast-routes": 1}
+            )
+            self.assertTrue(
+                self._entry(self.group, self.source, table_id)[0],
+                "multicast route was not installed in the re-created table",
+            )
         finally:
             self._router("del", route)
 

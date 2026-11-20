@@ -354,6 +354,25 @@ VLIB_CLI_COMMAND (test_lcp_router_cross_fib_command, static) = {
   .function = lcp_router_test_cross_fib_cmd,
 };
 
+/*
+ * The address family a command names. An optional match, because the same
+ * words are the first of a prefix: "ip4" reads as an address of the family
+ * nl_addr_parse() is given, so a caller that meant a prefix has to be able to
+ * try the family and go on with "ip4" still in the input when it fails.
+ */
+static fib_protocol_t
+lcp_router_test_family (unformat_input_t *input)
+{
+  if (unformat (input, "ip4"))
+    return FIB_PROTOCOL_IP4;
+  if (unformat (input, "ip6"))
+    return FIB_PROTOCOL_IP6;
+  if (unformat (input, "mpls"))
+    return FIB_PROTOCOL_MPLS;
+
+  return FIB_PROTOCOL_NONE;
+}
+
 static void *
 lcp_router_neigh_step_symbol (unformat_input_t *input)
 {
@@ -363,6 +382,49 @@ lcp_router_neigh_step_symbol (unformat_input_t *input)
     return vlib_get_plugin_symbol ("linux_nl_plugin.so", "lcp_router_neigh_test_end");
 
   return NULL;
+}
+
+/*
+ * What the plugin holds for a table, without touching the table: the record
+ * and the indices it names. The record outlived an API delete before the
+ * plugin learned to notice one, and a path that read it through the MFIB then
+ * indexed a table that the delete freed.
+ */
+static clib_error_t *
+lcp_router_test_table_cmd (vlib_main_t *vm, unformat_input_t *input)
+{
+  int (*get_state) (u32, fib_protocol_t, lcp_router_table_state_t *) =
+    vlib_get_plugin_symbol ("linux_nl_plugin.so", "lcp_router_table_state");
+  lcp_router_table_state_t state;
+  fib_protocol_t proto;
+  u32 table;
+
+  if (!get_state)
+    return clib_error_return (0, "linux_nl router symbols unavailable");
+  proto = lcp_router_test_family (input);
+  if (FIB_PROTOCOL_NONE == proto)
+    return clib_error_return (0, "expected ip4 or ip6");
+  if (!unformat (input, "table %u", &table))
+    return clib_error_return (0, "expected table");
+
+  if (!get_state (table, proto, &state))
+    {
+      vlib_cli_output (vm, "router-record:absent");
+      return 0;
+    }
+
+  /* The state already says whether the record still holds its table: the
+   * lookup a command that installs or removes trades would report the record
+   * absent, and release it instead.
+   *
+   * The record's indices are printed next to the ones the table id resolves to
+   * now, so that a test can require them equal: the two come from different
+   * lookups, the record from its own fields and the table from the FIB and
+   * MFIB. */
+  vlib_cli_output (vm, "router-record:present fib:%u table-fib:%u mfib:%u table-mfib:%u",
+		   state.fib_index, fib_table_find (proto, table), state.mfib_index,
+		   mfib_table_find (proto, table));
+  return 0;
 }
 
 static clib_error_t *
@@ -385,7 +447,7 @@ lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
   int (*get_state) (u32, fib_protocol_t, lcp_router_table_state_t *) =
     vlib_get_plugin_symbol ("linux_nl_plugin.so", "lcp_router_table_state");
   lcp_router_table_state_t state;
-  fib_protocol_t proto;
+  fib_protocol_t proto, base_proto = FIB_PROTOCOL_NONE;
   u32 table, protocol, label;
   int family;
   u8 *destination = NULL;
@@ -409,13 +471,11 @@ lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
   /* The neighbor steps are dispatched before an address family is required. */
   if (unformat (input, "neigh"))
     return lcp_router_test_neigh_sync_cmd (vm, input);
-  if (unformat (input, "ip4"))
-    proto = FIB_PROTOCOL_IP4;
-  else if (unformat (input, "ip6"))
-    proto = FIB_PROTOCOL_IP6;
-  else if (unformat (input, "mpls"))
-    proto = FIB_PROTOCOL_MPLS;
-  else
+  /* So is the record probe: it reads the plugin's record, not the table. */
+  if (unformat (input, "record"))
+    return lcp_router_test_table_cmd (vm, input);
+  proto = lcp_router_test_family (input);
+  if (FIB_PROTOCOL_NONE == proto)
     return clib_error_return (0, "expected ip4, ip6 or mpls");
   if (!unformat (input, "table %u", &table))
     return clib_error_return (0, "expected table");
@@ -434,6 +494,28 @@ lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
 	return clib_error_return (0, "router table absent");
       return lcp_router_test_entry (vm, input, proto, &state);
     }
+
+  /*
+   * The verbs below take the base "<family> table <id>" that state and entry
+   * already require before them, so that a route can be written the way the
+   * tests build it, with the table named once at the front. The base says
+   * nothing new: a route lives in the table of its own family.
+   */
+  base_proto = lcp_router_test_family (input);
+  if (FIB_PROTOCOL_NONE == base_proto)
+    base_proto = proto;
+  else
+    {
+      u32 base_table;
+
+      if (!unformat (input, "table %u", &base_table))
+	return clib_error_return (0, "the base needs table <id>");
+      if (base_table != table || base_proto != proto)
+	return clib_error_return (0, "the base names %U table %u, not %U table %u",
+				  format_fib_protocol, base_proto, base_table, format_fib_protocol,
+				  proto, table);
+    }
+
   if (unformat (input, "del"))
     is_del = 1;
   else if (unformat (input, "replace"))
@@ -452,6 +534,17 @@ lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
     }
   else
     {
+      /*
+       * "%s" reads one word, so it would take the "ip4" of a base written
+       * after the verb and nl_addr_parse() would accept it as an address,
+       * leaving "table <id> ..." behind as unknown input. Say what is wrong
+       * instead of failing further along.
+       */
+      /* A failed match leaves the input where it was, so one attempt is
+       * enough to tell a base from a prefix. */
+      if (FIB_PROTOCOL_NONE != lcp_router_test_family (input))
+	return clib_error_return (0, "the base comes before <verb>, not after it");
+
       if (!unformat (input, "%s", &destination))
 	return clib_error_return (0, "expected prefix");
       int rv = nl_addr_parse ((char *) destination, family, &dst);
@@ -534,7 +627,9 @@ lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
 VLIB_CLI_COMMAND (test_lcp_router_command, static) = {
   .path = "test lcp router",
   .short_help = "test lcp router begin|end|neigh mark|end|"
-		"<ip4|ip6|mpls> table <id> state|entry|add|replace|del ...",
+		"record <ip4|ip6> table <id>|"
+		"<ip4|ip6|mpls> table <id> state|entry|"
+		"[<ip4|ip6|mpls> table <id>] add|replace|del ...",
   .function = lcp_router_test_cmd,
 };
 
