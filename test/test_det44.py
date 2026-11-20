@@ -1838,3 +1838,116 @@ class TestDET44IdentityMapping(TestDET44):
         capture = self.send_and_capture(self.pg0, self.pg1, [bypassed], 1)
         self.assert_not_translated(capture, mapped_ip, mapped_port)
         self.assertEqual([1], [dm.ses_num for dm in self.vapi.det44_map_dump()])
+
+
+class TestDET44PluginState(VppTestCase):
+    """Deterministic NAT plugin enable/disable and interface feature state"""
+
+    nat_addr = "10.0.0.10"
+    inner_port = 6303
+    external_port = 6304
+
+    @classmethod
+    def setUpClass(cls):
+        super(TestDET44PluginState, cls).setUpClass()
+        cls.create_pg_interfaces(range(2))
+        cls.inside, cls.outside = cls.pg_interfaces
+        for i in cls.pg_interfaces:
+            i.admin_up()
+            i.config_ip4()
+            i.resolve_arp()
+
+    def setUp(self):
+        super(TestDET44PluginState, self).setUp()
+        self.vapi.det44_plugin_enable_disable(enable=1)
+        self.vapi.det44_add_del_map(
+            is_add=1,
+            in_addr=self.inside.remote_ip4,
+            in_plen=32,
+            out_addr=socket.inet_aton(self.nat_addr),
+            out_plen=32,
+        )
+
+    def tearDown(self):
+        super(TestDET44PluginState, self).tearDown()
+        if not self.vpp_dead:
+            self.vapi.det44_interface_add_del_feature(
+                sw_if_index=self.inside.sw_if_index, is_add=0, is_inside=1
+            )
+            self.vapi.det44_interface_add_del_feature(
+                sw_if_index=self.outside.sw_if_index, is_add=0, is_inside=0
+            )
+            self.vapi.det44_plugin_enable_disable(enable=0)
+
+    def add_interfaces(self):
+        """Register both interfaces, the inside one first.
+
+        The plugin disable removes the inside interface first, which leaves
+        the outside one for the packet path to be observed on.
+        """
+        self.vapi.det44_interface_add_del_feature(
+            sw_if_index=self.inside.sw_if_index, is_add=1, is_inside=1
+        )
+        self.vapi.det44_interface_add_del_feature(
+            sw_if_index=self.outside.sw_if_index, is_add=1, is_inside=0
+        )
+
+    def send_udp(self):
+        """Send one inside UDP packet and return what left on the outside."""
+        p = (
+            Ether(dst=self.inside.local_mac, src=self.inside.remote_mac)
+            / IP(src=self.inside.remote_ip4, dst=self.outside.remote_ip4)
+            / UDP(sport=self.inner_port, dport=self.external_port)
+        )
+        self.inside.add_stream(p)
+        self.pg_enable_capture(self.pg_interfaces)
+        self.pg_start()
+        return self.outside.get_capture(1)
+
+    def session_count(self):
+        return len(self.vapi.det44_session_dump(self.inside.remote_ip4))
+
+    def test_disable_stops_translation(self):
+        """Traffic is not translated while the plugin is disabled"""
+        self.add_interfaces()
+
+        p = self.send_udp()[0]
+        self.assert_packet_checksums_valid(p)
+        self.assertEqual(self.nat_addr, p[IP].src)
+        self.assertEqual(self.external_port, p[UDP].dport)
+        self.assertEqual(1, self.session_count())
+
+        self.vapi.det44_plugin_enable_disable(enable=0)
+
+        p = self.send_udp()[0]
+        self.assert_packet_checksums_valid(p)
+        self.assertEqual(self.inside.remote_ip4, p[IP].src)
+        self.assertEqual(self.inner_port, p[UDP].sport)
+        self.assertEqual(self.external_port, p[UDP].dport)
+        self.assertEqual(0, self.session_count())
+
+    def test_disable_removes_interface_features(self):
+        """Disabling the plugin removes the det44 features of the interface"""
+        self.add_interfaces()
+        self.send_udp()
+
+        self.vapi.det44_plugin_enable_disable(enable=0)
+
+        output = self.vapi.cli("show features verbose")
+        self.assertNotIn("det44-out2in", output)
+        self.assertNotIn("det44-in2out", output)
+
+    def test_reenable_after_disable_translates_again(self):
+        """A disable and enable cycle restores translation"""
+        self.add_interfaces()
+        self.send_udp()
+
+        self.vapi.det44_plugin_enable_disable(enable=0)
+        self.vapi.det44_plugin_enable_disable(enable=1)
+        self.add_interfaces()
+
+        p = self.send_udp()[0]
+        self.assert_packet_checksums_valid(p)
+        self.assertEqual(self.nat_addr, p[IP].src)
+        self.assertEqual(self.external_port, p[UDP].dport)
+        self.assertEqual(1, self.session_count())

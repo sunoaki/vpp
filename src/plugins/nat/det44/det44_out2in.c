@@ -386,6 +386,19 @@ VLIB_NODE_FN (det44_out2in_node) (vlib_main_t * vm,
   u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
   vlib_get_buffers (vm, from, b, n_left_from);
 
+  /* The feature stays on the interfaces while the plugin is disabled, so the
+     node has to pass the packets through untranslated on its own. */
+  if (PREDICT_FALSE (!plugin_enabled ()))
+    {
+      u32 i;
+
+      for (i = 0; i < frame->n_vectors; i++)
+	nexts[i] = DET44_OUT2IN_NEXT_LOOKUP;
+
+      vlib_buffer_enqueue_to_next (vm, node, from, (u16 *) nexts, frame->n_vectors);
+      return frame->n_vectors;
+    }
+
   while (n_left_from >= 2)
     {
       vlib_buffer_t *b0, *b1;
