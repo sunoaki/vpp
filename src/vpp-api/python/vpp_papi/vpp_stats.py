@@ -159,14 +159,14 @@ class StatsVector:
     def __init__(self, stats, ptr, fmt):
         self.vec_start = ptr - stats.base
         self.vec_len = get_vec_len(stats, ptr - stats.base)
-        self.stats = stats
-        stats.short_read_pins = {"vec_len": self.vec_len, "vec_start": self.vec_start}
         self.struct = Struct(fmt)
         self.fmtlen = len(fmt)
         self.elementsize = self.struct.size
         self.statseg = stats.statseg
+        self.stats = stats
+        stats.short_read_pins = {"vec_len": self.vec_len, "vec_start": self.vec_start}
 
-        if self.vec_start + self.vec_len * self.elementsize > stats.size:
+        if self.vec_start + self.vec_len * self.elementsize >= stats.size:
             raise IOError("Vector overruns stats segment")
 
     def __iter__(self):
@@ -269,7 +269,11 @@ class VPPStats:
         """Get pointer of directory vector"""
         return self.shared_headerfmt.unpack_from(self.statseg)[4]
 
-    elementfmt = "IQ128s"
+    # vlib_stats_entry_t is a 32 bit type, four bytes of padding, a union of
+    # index1 and index2 and of a 64 bit value, and the name, so the union
+    # starts at offset 8 and the name at offset 16. Reading the type and the
+    # union without the padding takes index1 and the padding as the value.
+    elementfmt = "I4xQ128s"
 
     def refresh(self, blocking=True):
         """Refresh directory vector cache (epoch changed)"""
@@ -628,15 +632,21 @@ class StatsEntry:
                 counter.append(get_string(stats, name[0]))
         return counter
 
-    SYMLINK_FMT1 = Struct("II")
-    SYMLINK_FMT2 = Struct("Q")
+    # index1, the directory index of the target, and index2, the target's
+    # vector index, share the union the entry reader takes as value, low
+    # half first.
+    SYMLINK_FMT = Struct("II")
 
     def symlink(self, stats):
         """Symlink counter"""
-        b = self.SYMLINK_FMT2.pack(self.value)
-        index1, index2 = self.SYMLINK_FMT1.unpack(b)
-        name = stats.directory_by_idx[index1]
-        return stats[name][:, index2]
+        index1, index2 = self.SYMLINK_FMT.unpack(self.value.to_bytes(8, "little"))
+        target = stats.directory_by_idx[index1]
+        if target == "":
+            raise KeyError(
+                "symlink names directory index %d, whose slot holds no "
+                "counter" % index1
+            )
+        return stats[target][:, index2]
 
     def ring_buffer(self, stats):
         """Ring buffer counter"""
