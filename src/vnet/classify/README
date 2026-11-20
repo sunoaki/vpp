@@ -88,9 +88,12 @@ prototype:
 
 Pass cm = &vnet_classify_main if calling this routine directly. Mask,
 skip(_n_vectors) and match(_n_vectors) are as described above. Mask
-need not be aligned, but it must be match*16 octets in length. To
-avoid having your head explode, be absolutely certain that '''only'''
-the bits you intend to match on are set.
+need not be aligned, but it must be match*16 octets in length. Match
+must be 1 to VNET_CLASSIFY_MAX_N_VECTORS (8) vectors, and skip plus
+match may not exceed the same limit, because the hash reads a full
+window of that many vectors starting at skip. To avoid having your
+head explode, be absolutely certain that '''only''' the bits you
+intend to match on are set.
 
 The classifier uses thread-safe, no-reader-locking-required
 bounded-index extensible hashing. Nbuckets is the [fixed] size of the
