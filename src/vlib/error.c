@@ -469,11 +469,29 @@ sev2str (enum vl_counter_severity_e s)
     }
 }
 
-/* The counts the report shows and the nodes it shows them under, read while
- * the workers run. Nothing of it is a name or a description: the report reads
- * those in place from counters_heap while it holds the description lock, so a
- * snapshot allocates for the counters it reports, and a counter of it costs a
- * count and a sum, not a copy of its name and its description. */
+/* One counter of the report, copied out of counters_heap while the description
+ * lock is held. The name and the description are the pointers counters_heap
+ * holds, which point into strings the registration owns, not into the entry:
+ * vlib_register_errors copies the table it is given, so the entry holds the
+ * error_strings[i] it was passed, or the name and desc of the counters it was
+ * passed, and those strings normally outlive the node they were registered for.
+ * What the description lock rules out is vlib_unregister_errors deallocating
+ * the counters_heap block the entry lives in, which would leave the copied
+ * pointers themselves unreadable. The report therefore formats the entry once
+ * it holds no lock, and reads only strings the block outlives. */
+typedef struct
+{
+  char *name;
+  char *desc;
+  enum vl_counter_severity_e severity;
+} vlib_error_entry_t;
+
+/* The counts the report shows, the nodes it shows them under, and the entries
+ * of counters_heap the counters are read from. The report copies those entries
+ * into a vector of its own, so that after vlib_error_counts_get returns it
+ * holds no lock and names no block a registration can free, and a counter of it
+ * costs a count, a sum and its own entry, not a copy of its name and of its
+ * description. */
 typedef struct
 {
   /* Count of every error, over the threads, less the count a thread recorded
@@ -486,15 +504,18 @@ typedef struct
   /* Node indices, in node index order. */
   u32 *nodes;
 
-  /* Entry of counters_heap that holds the counters of each node in nodes,
-   * in place. */
-  vlib_error_desc_t **entries;
-
   /* Number of error counters of each node in nodes. */
   u8 *n_errors;
 
   /* Error index of the first error counter of each node in nodes. */
   u32 *error_heap_index;
+
+  /* One entry per counter the report shows, in the order the counters are
+   * listed: the counters of the first node in nodes, then those of the next. */
+  vlib_error_entry_t *entries;
+
+  /* Index in entries of the first counter of each node in nodes. */
+  u32 *entry_index;
 } vlib_error_counts_t;
 
 static void
@@ -503,6 +524,7 @@ vlib_error_counts_free (vlib_error_counts_t *c)
   vec_free (c->counts);
   vec_free (c->sums);
   vec_free (c->entries);
+  vec_free (c->entry_index);
   vec_free (c->nodes);
   vec_free (c->n_errors);
   vec_free (c->error_heap_index);
@@ -523,6 +545,29 @@ static int
 vlib_error_lists (vlib_error_counts_t *c, u32 nj)
 {
   return (u64) c->error_heap_index[nj] + c->n_errors[nj] <= vec_len (c->counts);
+}
+
+/* The entry the report shows for a counter of the node at a position of the
+ * snapshot. The caller has given the position to vlib_error_lists, so the
+ * position is below the length of the vectors indexed by position, which the
+ * list filled together: nodes, entry_index, n_errors and error_heap_index each
+ * take one entry per listed node. The list sets the length of entries to the
+ * last entry it writes, so an offset below the count of the position, added to
+ * the first entry of that node, is below the length of entries. The test is
+ * kept anyway, so that a report leaves a counter out rather than read past a
+ * vector if a path ever breaks that. */
+static vlib_error_entry_t *
+vlib_error_counting_entry (vlib_error_counts_t *c, u32 nj, u32 code)
+{
+  u32 index;
+
+  ASSERT (code < c->n_errors[nj]);
+
+  index = c->entry_index[nj] + code;
+  if (index >= vec_len (c->entries))
+    return 0;
+
+  return vec_elt_at_index (c->entries, index);
 }
 
 /* True when the counter at an error index is one the snapshot holds and whose
@@ -652,9 +697,16 @@ vlib_error_counts_read (vlib_error_counts_t *c)
 /* Lists the nodes the report shows, and counts their errors over the threads.
  * The caller holds the description lock, which excludes the registration and
  * the unregistration of a node, so the entries of counters_heap cannot be
- * freed while they are read. Neither a name nor a description is copied:
- * the counters_heap entry holds both, and the report reads it in place while
- * it holds the description lock.
+ * freed while they are read. The entry of every listed counter is copied into
+ * entries, the vector of the snapshot, and entry_index records where the
+ * counters of each listed node begin in it, so the report holds the entries it
+ * shows once it is done with the lock, and only the strings they point into
+ * stay in counters_heap.
+ *
+ * The room of the vectors is taken by phase 1, under the segment lock, so the
+ * lock held here covers the copies and the counts, and no allocation. A
+ * registration that grows the heap between the phases needs more room than
+ * phase 1 took, and the grow is repeated here for that case only.
  *
  * A node is listed with the counters whose counters_heap entry names them, up
  * to the first one that does not, and is left out when it has none. An entry
@@ -664,8 +716,13 @@ vlib_error_counts_read (vlib_error_counts_t *c)
 static void
 vlib_error_counts_list (vlib_error_counts_t *c, vlib_node_main_t *nm, vlib_error_main_t *em)
 {
+  vlib_error_desc_t *cd;
+  vlib_error_entry_t *entry;
   vlib_node_t **node, *n;
-  u32 code, i;
+  u32 code, i, at, n_listed, room;
+
+  at = 0;
+  room = vec_max_len (c->entries);
 
   vec_foreach (node, nm->nodes)
     {
@@ -681,26 +738,71 @@ vlib_error_counts_list (vlib_error_counts_t *c, vlib_node_main_t *nm, vlib_error
       if (code == 0)
 	continue;
 
+      /* The room of the vectors is that of the heap, and the counters the list
+       * shows are disjoint ranges of it, so a listed node finds the room it
+       * needs taken already. It needs more only when a registration grew the
+       * heap between the phases, which the walk cannot prevent; that grow
+       * happens under this lock, and it is the fallback the phase 1 sizing
+       * leaves. */
+      if (at + code > room)
+	{
+	  n_listed = vec_len (c->nodes);
+	  room = at + code;
+
+	  vec_validate (c->entries, room - 1);
+	  vec_validate (c->entry_index, room - 1);
+	  vec_validate (c->nodes, room - 1);
+	  vec_validate (c->n_errors, room - 1);
+	  vec_validate (c->error_heap_index, room - 1);
+
+	  /* The room past the entries taken is not part of the report. The
+	   * length of c->entries is not cut back here: the copy below writes
+	   * up to at + code, and the length is raised to that before it. */
+	  vec_set_len (c->entry_index, n_listed);
+	  vec_set_len (c->nodes, n_listed);
+	  vec_set_len (c->n_errors, n_listed);
+	  vec_set_len (c->error_heap_index, n_listed);
+	}
+
+      cd = em->counters_heap + n->error_heap_index;
+
+      /* vec_elt_at_index asserts the index it is given is below the length, so
+       * the length has to reach the last entry the copy writes. Phase 1 left
+       * it at zero, and the fallback above left it at the room it took, so this
+       * sets it in both cases. */
+      if (at + code > vec_len (c->entries))
+	vec_set_len (c->entries, at + code);
+
       vec_add1 (c->nodes, n->index);
-      vec_add1 (c->entries, vec_elt_at_index (em->counters_heap, n->error_heap_index));
+      vec_add1 (c->entry_index, at);
       vec_add1 (c->n_errors, code);
       vec_add1 (c->error_heap_index, n->error_heap_index);
 
       for (i = 0; i < code; i++)
-	c->sums[n->error_heap_index + i] += c->counts[n->error_heap_index + i];
+	{
+	  entry = vec_elt_at_index (c->entries, at + i);
+	  entry->name = cd[i].name;
+	  entry->desc = cd[i].desc;
+	  entry->severity = cd[i].severity;
+
+	  c->sums[n->error_heap_index + i] += c->counts[n->error_heap_index + i];
+	}
+
+      at += code;
     }
 }
 
 /* Reads the counters the report shows: their counts over the threads, the
- * nodes they belong to, and their sums over the threads. The caller reads the
- * descriptions of them from counters_heap after this returns, and holds the
- * description lock until it has formatted them, so that no registration can
- * free an entry the report names.
+ * nodes they belong to, their sums over the threads, and the entries of
+ * counters_heap the counters are named by. It holds the locks it reads under
+ * for no longer than the walk, and returns holding none: the report formats
+ * and prints what it read afterwards, with nothing held.
  *
  * The read is split into two phases that never hold both locks:
  *
  * 1. the counters of the threads, under the stats segment lock alone;
- * 2. the nodes and their sums, under the description lock alone.
+ * 2. the nodes, their sums and their entries, under the description lock
+ *    alone.
  *
  * Both locks are not held at once because their takers disagree on the order:
  * vlib_register_errors takes the segment lock and then the description lock,
@@ -712,7 +814,13 @@ vlib_error_counts_list (vlib_error_counts_t *c, vlib_node_main_t *nm, vlib_error
  *
  * The segment lock is re-entrant for one thread, so a registration made on the
  * thread that runs the report nests safely; the two phases are what covers two
- * threads. */
+ * threads.
+ *
+ * Phase 1 also takes the room phase 2 fills out of it, from the length of
+ * counters_heap it reads, so that the description lock covers the copies rather
+ * than their allocation. Both phases read that length under a lock that
+ * vlib_register_errors holds from its first step to its last, so it cannot
+ * change between them. */
 static void
 vlib_error_counts_get (vlib_error_counts_t *c)
 {
@@ -744,6 +852,26 @@ vlib_error_counts_get (vlib_error_counts_t *c)
     {
       vec_validate (c->counts, n_counters - 1);
       vec_validate (c->sums, n_counters - 1);
+
+      /* The room the list fills under the description lock, so that the lock
+       * covers the copies rather than their allocation. The counters the list
+       * shows are disjoint ranges of the heap, and a listed node holds at least
+       * one of them, so the vectors need room for the heap and no more. The
+       * lengths are reset, not the vectors, so the list adds to room that is
+       * taken already, and nothing is sized here when there is no heap. */
+      if (n_heap)
+	{
+	  vec_validate (c->entries, n_heap - 1);
+	  vec_validate (c->entry_index, n_heap - 1);
+	  vec_validate (c->nodes, n_heap - 1);
+	  vec_validate (c->n_errors, n_heap - 1);
+	  vec_validate (c->error_heap_index, n_heap - 1);
+	  vec_reset_length (c->entries);
+	  vec_reset_length (c->entry_index);
+	  vec_reset_length (c->nodes);
+	  vec_reset_length (c->n_errors);
+	  vec_reset_length (c->error_heap_index);
+	}
 
       vlib_error_counts_read (c);
     }
@@ -831,34 +959,109 @@ vlib_error_thread_name (u32 thread_index)
   return vlib_worker_threads[thread_index].name;
 }
 
-/* Formats one counter of the report from its entry in counters_heap. The entry
- * is read in place while the caller holds the description lock, and it holds
- * the name and the description of the counter, so reporting a counter
- * allocates nothing for either. */
-static void
-vlib_error_format (vlib_main_t *vm, vlib_error_desc_t *cd, u32 index, u64 count, int verbose,
-		   int total)
+/* One thread of the report: its name, which is not locked, and an output
+ * vector that carries the lines it has formatted and not printed. */
+typedef struct
 {
+  u8 *name;
+  u8 *text;
+} vlib_error_thread_t;
+
+/* Number of formatted lines a thread formats between two prints, before the
+ * line the next print follows. */
+#define VLIB_ERROR_FORMAT_BATCH 256
+
+/* What one line of the report is allowed to add to the vector before a print:
+ * a count of twenty digits, two columns of 35, a severity of ten and a total
+ * of ten, the blank between two of them, and the newline. It is not a bound on
+ * the line: the line is cut at the padding below in places, so a longer count
+ * or a longer name makes it longer, and the print that follows it is the one
+ * that ends it. */
+#define VLIB_ERROR_FORMAT_LINE_BYTES 128
+
+/* Room the thread line keeps for the name of a thread, past its fixed part. */
+#define VLIB_ERROR_FORMAT_THREAD_BYTES 256
+
+/* Room the output vector of a thread holds, so that formatting a line of the
+ * report adds no allocation. A print happens only after a line is written and
+ * ends the vector there, so the vector holds BATCH lines, the line the print
+ * follows, and the first line of the next batch, each within
+ * VLIB_ERROR_FORMAT_LINE_BYTES before it is printed; a line longer than that
+ * makes the print that follows it earlier rather than leave the line room. The
+ * thread line is written first, and the name of its thread is not bounded
+ * above, so it takes a margin of its own. */
+#define VLIB_ERROR_FORMAT_ROOM                                                                     \
+  ((VLIB_ERROR_FORMAT_BATCH + 1) * VLIB_ERROR_FORMAT_LINE_BYTES + VLIB_ERROR_FORMAT_THREAD_BYTES)
+
+/* Prints the lines a thread has formatted and not printed. Every line of the
+ * vector ends one already, and vlib_cli_output ends only a line that does
+ * not. */
+static void
+vlib_error_format_flush (vlib_main_t *vm, vlib_error_thread_t *t)
+{
+  u8 *s = t->text;
+
+  if (vec_len (s) == 0)
+    return;
+
+  vlib_cli_output (vm, "%v", s);
+  vec_reset_length (s);
+}
+
+/* Starts the lines of a thread with room for a batch of them and for its
+ * thread line, which is what a thread that shows a counter formats first. */
+static void
+vlib_error_format_start (vlib_error_thread_t *t, u32 thread_index)
+{
+  vec_validate (t->text, VLIB_ERROR_FORMAT_ROOM - 1);
+  vec_reset_length (t->text);
+
+  format (t->text, "Thread %u (%v):\n", thread_index, t->name);
+}
+
+/* Formats one counter of the report from the entry the snapshot copied. The
+ * report holds no lock here: the line is added to the output vector of the
+ * thread it shows, and the vector is printed once it holds a batch of lines,
+ * so the lines reach vlib_cli_output in a few large pieces rather than one
+ * piece each. The output is read when the command is done, so the batching
+ * delays nothing that a reader waits for. */
+static void
+vlib_error_format (vlib_main_t *vm, vlib_error_thread_t *t, vlib_error_entry_t *entry, u32 index,
+		   u64 count, int verbose, int total)
+{
+  u8 *s = t->text;
+
   if (total)
     {
       if (verbose)
-	vlib_cli_output (vm, "%10lu%=40s%=20s%=10d", count, cd->name, cd->desc, index);
+	format (s, "%10lu%=40s%=20s%=10d\n", count, entry->name, entry->desc, index);
       return;
     }
 
   if (verbose)
-    vlib_cli_output (vm, "%10lu%=35s%=35s%=10s%=6d", count, cd->name, cd->desc,
-		     sev2str (cd->severity), index);
+    format (s, "%10lu%=35s%=35s%=10s%=6d\n", count, entry->name, entry->desc,
+	    sev2str (entry->severity), index);
   else
-    vlib_cli_output (vm, "%10lu%=35s%=35s%=10s", count, cd->name, cd->desc, sev2str (cd->severity));
+    format (s, "%10lu%=35s%=35s%=10s\n", count, entry->name, entry->desc,
+	    sev2str (entry->severity));
+
+  if (vec_len (s) < VLIB_ERROR_FORMAT_BATCH * VLIB_ERROR_FORMAT_LINE_BYTES)
+    return;
+
+  /* The room of the vector is this much, and a line of the next batch past
+   * it, which every line that reaches here has. */
+  vlib_cli_output (vm, "%v", s);
+  vec_reset_length (s);
 }
 
 /* Formats the counters of the node at a position of the snapshot as one
  * thread counted them, leaving out the counters that thread read as zero
  * unless verbose 2 asks for them. */
 static void
-vlib_error_format_thread (vlib_main_t *vm, vlib_error_counts_t *c, u32 nj, int verbose)
+vlib_error_format_thread (vlib_main_t *vm, vlib_error_thread_t *t, vlib_error_counts_t *c, u32 nj,
+			  int verbose)
 {
+  vlib_error_entry_t *entry;
   u32 code, index;
 
   for (code = 0; code < c->n_errors[nj]; code++)
@@ -868,14 +1071,19 @@ vlib_error_format_thread (vlib_main_t *vm, vlib_error_counts_t *c, u32 nj, int v
       if (c->counts[index] == 0 && verbose < 2)
 	continue;
 
-      vlib_error_format (vm, &c->entries[nj][code], index, c->counts[index], verbose, 0);
+      entry = vlib_error_counting_entry (c, nj, code);
+      if (entry)
+	vlib_error_format (vm, t, entry, index, c->counts[index], verbose, 0);
     }
 }
 
-/* Formats the count of the counters of every thread. */
+/* Formats the count of the counters of every thread. They all go to the
+ * vector of the last thread, under the total line. */
 static void
-vlib_error_format_total (vlib_main_t *vm, vlib_error_counts_t *c, int verbose)
+vlib_error_format_total (vlib_main_t *vm, vlib_error_thread_t *t, vlib_error_counts_t *c,
+			 int verbose)
 {
+  vlib_error_entry_t *entry;
   u64 sum;
   u32 code, index;
 
@@ -888,54 +1096,75 @@ vlib_error_format_total (vlib_main_t *vm, vlib_error_counts_t *c, int verbose)
 	{
 	  index = c->error_heap_index[nj] + code;
 	  sum = c->sums[index];
-	  if (sum)
-	    vlib_error_format (vm, &c->entries[nj][code], index, sum, verbose, 1);
+	  entry = vlib_error_counting_entry (c, nj, code);
+
+	  if (sum && entry)
+	    vlib_error_format (vm, t, entry, index, sum, verbose, 1);
 	}
     }
+}
+
+/* Formats the counters of one thread. A thread that shows no counter formats
+ * no line, so it allocates nothing for one, and so does every thread of a
+ * report that shows no node, which is the report of a VPP that registered no
+ * error. */
+static void
+vlib_error_report_thread (vlib_main_t *vm, vlib_error_counts_t *c, u32 thread_index, int verbose)
+{
+  vlib_error_thread_t t = { .name = vlib_error_thread_name (thread_index) };
+
+  for (u32 nj = 0; nj < vec_len (c->nodes); nj++)
+    {
+      if (!vlib_error_lists (c, nj))
+	continue;
+
+      if (verbose && t.text == 0)
+	vlib_error_format_start (&t, thread_index);
+
+      vlib_error_format_thread (vm, &t, c, nj, verbose);
+    }
+
+  vlib_error_format_flush (vm, &t);
+  vec_free (t.text);
 }
 
 static clib_error_t *
 show_errors (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 {
-  int verbose = 0;
+  vlib_error_thread_t total = {};
   vlib_error_counts_t c = {};
+  int verbose = 0;
 
   if (unformat (input, "verbose %d", &verbose))
     ;
   else if (unformat (input, "verbose"))
     verbose = 1;
 
+  /* The walk copies the entry of every counter it shows into a vector of its
+   * own, and returns with no lock held. The report formats and prints those
+   * copies, so a registration that runs while it prints waits on no lock of
+   * this command, and frees nothing the report reads. */
   vlib_error_counts_get (&c);
 
-  /* The entries of counters_heap the report names are read after the lock the
-   * counters were read under is released, and a registration or unregistration
-   * in between would free them. The lock is therefore held across the whole
-   * report: nothing here copies a name or a description, and nothing has to.
-   * The names of the threads it prints are not locked. */
-  vlib_error_desc_lock_get ();
-
   if (verbose)
-    vlib_cli_output (vm, "%=10s%=35s%=35s%=10s%=6s", "Count", "Node",
-		     "Reason", "Severity", "Index");
+    vlib_cli_output (vm, "%=10s%=35s%=35s%=10s%=6s", "Count", "Node", "Reason", "Severity",
+		     "Index");
   else
     vlib_cli_output (vm, "%=10s%=35s%=35s%=10s", "Count", "Node", "Reason", "Severity");
 
   for (u32 t = 0; t < vlib_get_n_threads (); t++)
-    {
-      if (verbose)
-	vlib_cli_output (vm, "Thread %u (%v):", t, vlib_error_thread_name (t));
+    vlib_error_report_thread (vm, &c, t, verbose);
 
-      for (u32 nj = 0; nj < vec_len (c.nodes); nj++)
-	if (vlib_error_lists (&c, nj))
-	  vlib_error_format_thread (vm, &c, nj, verbose);
-    }
+  vec_validate (total.text, VLIB_ERROR_FORMAT_ROOM - 1);
+  vec_reset_length (total.text);
 
   if (verbose)
-    vlib_cli_output (vm, "Total:");
+    format (total.text, "Total:\n");
 
-  vlib_error_format_total (vm, &c, verbose);
+  vlib_error_format_total (vm, &total, &c, verbose);
 
-  vlib_error_desc_lock_put ();
+  vlib_error_format_flush (vm, &total);
+  vec_free (total.text);
 
   vlib_error_counts_free (&c);
 
