@@ -2,8 +2,10 @@
 
 import ipaddress
 import random
+import re
 import socket
 import struct
+import sys
 import unittest
 from io import BytesIO
 
@@ -33,7 +35,7 @@ from scapy.packet import Raw
 from syslog_rfc5424_parser import SyslogMessage, ParseError
 from syslog_rfc5424_parser.constants import SyslogSeverity
 from util import ppp
-from vpp_ip_route import VppIpRoute, VppRoutePath
+from vpp_ip_route import VppIpRoute, VppIpTable, VppRoutePath
 from vpp_neighbor import VppNeighbor
 from vpp_papi import VppEnum
 from config import config
@@ -78,6 +80,15 @@ class HANATStateSync(Packet):
 
 class MethodHolder(VppTestCase):
     """NAT create capture and verify method holder"""
+
+    # src/vnet/error.h: the retvals a cleanup step treats as already done
+    VNET_API_ERROR_NO_SUCH_ENTRY = -6
+    VNET_API_ERROR_FEATURE_ALREADY_DISABLED = -169
+    VNET_API_ERROR_FEATURE_ALREADY_ENABLED = -170
+    NAT44_EI_GONE_RETVALS = (
+        VNET_API_ERROR_NO_SUCH_ENTRY,
+        VNET_API_ERROR_FEATURE_ALREADY_DISABLED,
+    )
 
     @property
     def config_flags(self):
@@ -4070,6 +4081,275 @@ class TestNAT44EI(MethodHolder):
         nat44_ei_config = self.vapi.nat44_ei_show_running_config()
         # a nonzero default should be reported for user_sessions
         self.assertNotEqual(nat44_ei_config.user_sessions, 0)
+
+    def nat44_ei_hi_fib_locks(self, table_id):
+        """Return the nat44-ei-hi FIB lock count of the given IP4 table"""
+        # The count is parsed from the "locks:[...]" field that
+        # format_ip4_fib_table in src/vnet/fib/ip4_fib.c prints for every
+        # nonzero lock source of the table, so the field names printed there
+        # are part of this helper's contract. The table is present because
+        # VppIpTable takes a FIB_SOURCE_API lock on it, and nat44-ei-hi is a
+        # plugin source, so its reference is counted with fib_table_lock_inc.
+        table = self.vapi.cli("show ip fib table %d" % table_id)
+        match = re.search(r"locks:\[.*nat44-ei-hi:(\d+)", table)
+        if not match:
+            raise AssertionError(
+                "no nat44-ei-hi lock count in show ip fib table %d output:\n%s"
+                % (table_id, table)
+            )
+        return int(match.group(1))
+
+    def nat44_ei_api_tolerating(self, api_function, ignored_retvals, **kwargs):
+        """Call an API whose refused retval means the cleanup has nothing to do"""
+        # inside a cleanup the state is whatever the failed test left, so a
+        # retval saying the feature is already gone must not abort the rest
+        reply = api_function(**kwargs)
+        retval = getattr(reply, "retval", 0)
+        if retval not in ignored_retvals:
+            self.assertEqual(
+                retval, 0, "%s returned %d" % (api_function.__name__, retval)
+            )
+
+    def nat44_ei_plugin_disable_if_enabled(self):
+        """Disable the plugin, treating an already disabled plugin as done"""
+        self.nat44_ei_api_tolerating(
+            self.vapi.nat44_ei_plugin_enable_disable,
+            (self.VNET_API_ERROR_FEATURE_ALREADY_DISABLED,),
+            sessions=self.max_translations,
+            users=self.max_users,
+            enable=0,
+        )
+
+    def nat44_ei_require_unlocked(self, table_id):
+        """Log the nat44-ei-hi lock count of the table, then require it zero"""
+        # the count is read before it is asserted so the CI log names the
+        # table and how many references the plugin left behind
+        locks = self.nat44_ei_hi_fib_locks(table_id)
+        if locks:
+            self.logger.info(
+                "table %d retains %d nat44-ei-hi FIB lock(s)" % (table_id, locks)
+            )
+        self.assertEqual(
+            locks, 0, "table %d retains %d nat44-ei-hi FIB lock(s)" % (table_id, locks)
+        )
+
+    def nat44_ei_leave_nat_tables(self):
+        """Move the two test interfaces back to the default IP4 table"""
+        # ip_table_bind refuses the move while an interface still carries an
+        # address, so this runs after the addresses are detached; ip4_table_id
+        # is cleared only on a successful move, so an interface that stayed in
+        # its table keeps that table from being released below
+        for pg_interface in (self.pg0, self.pg1):
+            reply = self.vapi.sw_interface_set_table(
+                sw_if_index=pg_interface.sw_if_index, vrf_id=0
+            )
+            # anything but a clean move leaves the interface where it is, so a
+            # table that still carries its address is not released below
+            if getattr(reply, "retval", 0):
+                self.logger.info(
+                    "%s stays in table %d: move returned %d"
+                    % (
+                        pg_interface.name,
+                        pg_interface.ip4_table_id,
+                        getattr(reply, "retval", 0),
+                    )
+                )
+            else:
+                pg_interface.ip4_table_id = 0
+
+    def nat44_ei_remove_interface_features(self):
+        """Remove every interface feature the plugin still carries"""
+        features = {i.sw_if_index: i.flags for i in self.vapi.nat44_ei_interface_dump()}
+        for details in self.vapi.vpp.details_iter(
+            self.vapi.nat44_ei_output_interface_get
+        ):
+            self.nat44_ei_api_tolerating(
+                self.vapi.nat44_ei_add_del_output_interface,
+                self.NAT44_EI_GONE_RETVALS,
+                sw_if_index=details.sw_if_index,
+                is_add=0,
+            )
+        for sw_if_index, flags in features.items():
+            self.nat44_ei_api_tolerating(
+                self.vapi.nat44_ei_interface_add_del_feature,
+                self.NAT44_EI_GONE_RETVALS,
+                sw_if_index=sw_if_index,
+                flags=flags,
+                is_add=0,
+            )
+
+    def test_plugin_enable_disable_fib_locks(self):
+        """NAT44EI enable and disable release the inside and outside FIB locks"""
+
+        inside_vrf = 100
+        outside_vrf = 200
+        inside_flags = self.config_flags.NAT44_EI_IF_INSIDE
+        outside_flags = self.config_flags.NAT44_EI_IF_OUTSIDE
+        table_ids = (inside_vrf, outside_vrf)
+        nat_interfaces = (
+            (self.pg0, inside_vrf, inside_flags),
+            (self.pg1, outside_vrf, outside_flags),
+        )
+        # the plugin reports its state rather than refusing a repeat request
+        plugin_state_retvals = (
+            self.VNET_API_ERROR_FEATURE_ALREADY_DISABLED,
+            self.VNET_API_ERROR_FEATURE_ALREADY_ENABLED,
+        )
+
+        def plugin_set(enable):
+            # the VRFs are explicit because defaultmapping in
+            # vpp_papi_provider.py has no entry for this message, so a call
+            # without them would enable the plugin on table 0 for both sides
+            self.nat44_ei_api_tolerating(
+                self.vapi.nat44_ei_plugin_enable_disable,
+                plugin_state_retvals,
+                sessions=self.max_translations,
+                users=self.max_users,
+                inside_vrf=inside_vrf,
+                outside_vrf=outside_vrf,
+                enable=enable,
+            )
+
+        try:
+            # setUp enables the plugin on VRFs 0 and 0, which would answer the
+            # first enable below with FEATURE_ALREADY_ENABLED and leave tables
+            # 100 and 200 never locked by the plugin
+            plugin_set(enable=0)
+            for table_id in table_ids:
+                VppIpTable(self, table_id, register=False).add_vpp_config()
+
+            # the enable resolves its inside and outside VRFs, and translation
+            # needs the interfaces configured before it, so move them once
+            for pg_interface, table_id, _ in nat_interfaces:
+                pg_interface.unconfig_ip4()
+                pg_interface.set_table_ip4(table_id)
+                # set_table_ip4 records the table whether the move succeeded;
+                # the table read back from VPP decides what ip4_table_id holds
+                pg_interface.ip4_table_id = self.vapi.sw_interface_get_table(
+                    sw_if_index=pg_interface.sw_if_index
+                ).vrf_id
+                self.assertEqual(
+                    pg_interface.ip4_table_id,
+                    table_id,
+                    "%s not in table %d" % (pg_interface.name, table_id),
+                )
+                pg_interface.config_ip4()
+                pg_interface.resolve_arp()
+            # an address cannot be added twice and survives a disable
+            self.nat44_add_address(self.nat_addr)
+
+            for cycle in range(2):
+                plugin_set(enable=1)
+                for table_id in table_ids:
+                    self.assertEqual(
+                        self.nat44_ei_hi_fib_locks(table_id),
+                        1,
+                        "cycle %d: table %d not locked once" % (cycle, table_id),
+                    )
+
+                for pg_interface, _, flags in nat_interfaces:
+                    self.vapi.nat44_ei_interface_add_del_feature(
+                        sw_if_index=pg_interface.sw_if_index, flags=flags, is_add=1
+                    )
+                # translated while both tables are locked, not after
+                pkts = self.create_stream_in(self.pg0, self.pg1)
+                self.pg0.add_stream(pkts)
+                self.pg_enable_capture([self.pg1])
+                self.pg_start()
+                capture = self.pg1.get_capture(len(pkts))
+                self.verify_capture_out(capture, nat_ip=self.nat_addr)
+
+                # nat44_ei_del_interface rejects a disabled plugin, so the
+                # features go first; the disable then still has the addresses
+                # configured, so its loops run before the tables are unlocked
+                self.nat44_ei_remove_interface_features()
+                plugin_set(enable=0)
+                for table_id in table_ids:
+                    self.assertEqual(
+                        self.nat44_ei_hi_fib_locks(table_id),
+                        0,
+                        "cycle %d: table %d still locked" % (cycle, table_id),
+                    )
+
+            # TestNAT44EI.tearDown disables the plugin and expects it enabled,
+            # and an enable names no VRFs here, so it locks table 0 like the
+            # setUp enable; naming tables 100 and 200 would take the very
+            # references this test has just proved released
+            self.plugin_enable()
+
+        finally:
+            # the cleanup runs after an arbitrary failure, so each step runs
+            # even when an earlier one raises, and the first problem is only
+            # raised when the test body itself passed, so it cannot mask it
+            problem = []
+            # sys.exc_info() still holds the propagating exception while
+            # finally runs after the test body raised, and is empty when the
+            # body returned normally
+            body_failed = sys.exc_info()[0] is not None
+
+            def attempt(step, action):
+                try:
+                    action()
+                except Exception as e:  # noqa: BLE001 - reported at the end
+                    problem.append("%s: %r" % (step, e))
+
+            attempt("remove features", self.nat44_ei_remove_interface_features)
+            # a cycle that failed before its disable leaves the plugin enabled
+            # and the tables locked, which makes the next enable lock them
+            # again and abort a debug build, so the plugin is disabled first
+            attempt("disable plugin", self.nat44_ei_plugin_disable_if_enabled)
+            # an interface address is deleted in the table the interface is in
+            # at that moment, and the move back to table 0 is refused while one
+            # is present, so every address is detached first and every
+            # interface moves only after that
+            for pg_interface, _, _ in nat_interfaces:
+                attempt("detach %s" % pg_interface.name, pg_interface.unconfig_ip4)
+            # the NAT address is deleted before any interface moves: its
+            # nat44-ei-low /32 is deleted through
+            # ip4_fib_table_get_index_for_sw_if_index, which reads the table
+            # the outside interface is in at that moment, so while pg1 is
+            # still in table 200 a delete that runs with the plugin enabled
+            # removes the /32 from table 200 instead of looking for it in
+            # table 0; a delete refused because the plugin is already
+            # disabled leaves that /32 on the table, which stays
+            attempt(
+                "remove address",
+                lambda: self.nat44_ei_api_tolerating(
+                    self.vapi.nat44_ei_add_del_address_range,
+                    self.NAT44_EI_GONE_RETVALS,
+                    first_ip_address=self.nat_addr,
+                    last_ip_address=self.nat_addr,
+                    is_add=0,
+                ),
+            )
+            attempt("leave nat table", self.nat44_ei_leave_nat_tables)
+            for pg_interface, _, _ in nat_interfaces:
+                attempt("restore %s" % pg_interface.name, pg_interface.config_ip4)
+                attempt("resolve arp %s" % pg_interface.name, pg_interface.resolve_arp)
+            # the tables stay, with the FIB_SOURCE_API lock VppIpTable took, as
+            # tables 10 and 20 do for the life of the class: deleting one frees
+            # its ip4_main.fibs slot, and the pool hands a freed slot to the
+            # next table created, so a later test that creates an IP4 table
+            # would land on the index this test just destroyed
+            moved_interfaces = {
+                table_id: pg_interface for pg_interface, table_id, _ in nat_interfaces
+            }
+            for table_id in table_ids:
+                attempt(
+                    "require table %d" % table_id,
+                    lambda table_id=table_id: self.nat44_ei_require_unlocked(table_id),
+                )
+                if moved_interfaces[table_id].ip4_table_id:
+                    self.logger.info(
+                        "table %d kept with %s in it"
+                        % (table_id, moved_interfaces[table_id].name)
+                    )
+            if problem:
+                message = "cleanup failed: %s" % "; ".join(problem)
+                if body_failed:
+                    self.logger.error(message)
+                else:
+                    raise AssertionError(message)
 
     def test_delete_interface(self):
         """NAT44EI delete nat interface"""

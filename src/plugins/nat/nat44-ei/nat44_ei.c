@@ -1306,6 +1306,9 @@ nat44_ei_plugin_disable ()
   nm->forwarding_enabled = 0;
   nm->enabled = 0;
 
+  fib_table_unlock (nm->outside_fib_index, FIB_PROTOCOL_IP4, nm->fib_src_hi);
+  fib_table_unlock (nm->inside_fib_index, FIB_PROTOCOL_IP4, nm->fib_src_hi);
+
   return error;
 }
 
