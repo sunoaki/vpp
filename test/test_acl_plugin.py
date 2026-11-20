@@ -1630,6 +1630,13 @@ class TestACLplugin(VppTestCase):
 
     PERMIT_REFLECT = 2
 
+    # fa_conn_list_head[] is printed for every index of enum acl_timeout_e
+    # (src/plugins/acl/acl.h): 1 is UDP_IDLE, 2 is TCP_IDLE, 3 is
+    # TCP_TRANSIENT
+    _TCP_TRANSIENT_LIST = 3
+    # FA_SESSION_BOGUS_INDEX, which ends a list and fills an empty one
+    _BOGUS_SESSION = 0xFFFFFFFF
+
     def _apply_acl(self, sw_if_index, rules, tag):
         """Apply an ACL to the input of an interface."""
         acl = VppAcl(self, rules, tag=tag)
@@ -1647,8 +1654,17 @@ class TestACLplugin(VppTestCase):
     def _deny_rules(self):
         return [self.create_rule(self.IPV4, self.DENY, self.PORTS_ALL, 0)]
 
-    def _show_sessions(self):
-        return self.vapi.cli("show acl-plugin sessions")
+    def _show_sessions(self, thread_index=None, session_index=None):
+        """Show the session table, or one session's detail block.
+
+        `show acl-plugin sessions` prints a `session index` block with the
+        interface and the links of a session only for the worker named with
+        `thread %u index %u`, and for no worker when that argument is absent.
+        """
+        command = "show acl-plugin sessions"
+        if thread_index is not None and session_index is not None:
+            command += " thread %d index %d" % (thread_index, session_index)
+        return self.vapi.cli(command)
 
     def _sessions_by_interface(self):
         """Sum the add and del figures every worker printed, per interface.
@@ -1679,41 +1695,70 @@ class TestACLplugin(VppTestCase):
         """Wait for one session on a list and return its index.
 
         The head of a list names the session that joined it first, and the
-        clear walk from the tail reaches it last.
+        clear walk from the tail reaches it last. An empty head prints as -1.
         """
         for _ in range(100):
             output = self._show_sessions()
             match = re.search(r"fa_conn_list_head\[%d\]: (\d+)" % list_id, output)
-            if match and int(match.group(1)) not in (0, 0xFFFFFFFF):
+            if match:
                 return int(match.group(1))
             self.sleep(0.05)
         self.fail("no session on list %d:\n%s" % (list_id, self._show_sessions()))
 
-    def _session_behind(self, session_index):
-        """Return the session the given one has towards its list head."""
-        match = re.search(
-            r"session index %d:.*?link prev index: (\d+)" % session_index,
-            self._show_sessions(),
-            re.S,
+    def _session_detail(self, session_index):
+        """Return the detail block `show acl-plugin sessions` prints for one session.
+
+        The block appears under the worker that owns the session, and only
+        when that worker is named in the command. Ask each worker in turn and
+        keep the first block that names the session.
+        """
+        asked = []
+        for thread_index in range(100):
+            asked.append(self._show_sessions(thread_index, session_index))
+            match = re.search(r"^  session index %d:$" % session_index, asked[-1], re.M)
+            if match:
+                return asked[-1]
+        self.fail(
+            "no worker printed a detail block for session %d, last answer:\n%s"
+            % (session_index, asked[-1])
         )
+
+    def _session_link(self, session_index, label):
+        """Return the index the given session's detail block prints after `label`."""
+        block = self._session_detail(session_index)
+        match = re.search(r"^\s+%s: (\d+)$" % label, block, re.M)
         self.assertIsNotNone(
             match,
-            "no link for session %d:\n%s" % (session_index, self._show_sessions()),
+            "no `%s` for session %d in its block:\n%s" % (label, session_index, block),
         )
         return int(match.group(1))
 
-    def _session_interface(self, session_index):
-        """Return the interface the given session was created on."""
-        match = re.search(
-            r"session index %d:.*?sw_if_index: (\d+)" % session_index,
-            self._show_sessions(),
-            re.S,
-        )
-        self.assertIsNotNone(
-            match,
-            "no interface for session %d:\n%s" % (session_index, self._show_sessions()),
-        )
-        return int(match.group(1))
+    def _list_sessions(self, list_id):
+        """Return the sessions one list head is followed by, in list order.
+
+        Every worker prints `fa_conn_list_head[]` for each of its lists, so
+        walk from that head along `link next index` towards the tail until the
+        list ends. The link counts only for a session whose detail block names
+        the same list, which keeps another worker's head from being read as
+        this list's.
+        """
+        head = self._session_at_list_head(list_id)
+        sessions = [head]
+        while True:
+            if self._session_link(head, "link list id") != list_id:
+                self.fail(
+                    "session %d is not on list %d:\n%s"
+                    % (head, list_id, self._session_detail(head))
+                )
+            following = self._session_link(head, "link next index")
+            if following == self._BOGUS_SESSION:
+                return sessions
+            sessions.append(following)
+            head = following
+
+    def _session_behind(self, session_index):
+        """Return the session the given one has towards its list head."""
+        return self._session_link(session_index, "link prev index")
 
     def _tcp_packet(self, src_host, dst_host, sport, dport, payload, src_mac=None):
         pkt = (
@@ -1948,10 +1993,8 @@ class TestACLplugin(VppTestCase):
         every worker prints them, so `add - del` for pg0 stays at one until a
         worker wipes that session, whichever worker owned it, and the
         assertion fails on the walk that stops at pg1's session. The count of
-        active sessions covers the whole process, and test_0315_del_intf
-        deletes a loopback whose session nothing exercises, so that count can
-        differ from the number this scenario expects by time alone; it is
-        compared once, to place a baseline.
+        active sessions covers the whole process, so the scenario pins it
+        with a baseline and compares it once.
         """
         self.logger.info("ACLP_TEST_START_0402")
 
@@ -1992,7 +2035,8 @@ class TestACLplugin(VppTestCase):
             forwarded=0,
         )
         # the count has to reach zero here: this waits only while a worker
-        # still has to act, so a graph holding sessions of a deleted
+        # still has to act, and the deny ACL clears what the suite left on
+        # these two interfaces, so a graph holding their sessions of a deleted
         # interface fails this wait rather than the comparisons below
         self._wait_for_active_sessions(0)
         baseline = self._active_sessions()
@@ -2012,17 +2056,19 @@ class TestACLplugin(VppTestCase):
         )
         self.assertEqual(self._session_adds_delta(before, pg0_index), 1)
         # pg0 sends no more, which keeps its session from seeing the SYN|ACK
-        # that would move it to the idle list (number 2 of the three user
-        # lists, in the order of enum acl_timeout_e)
+        # that would move it to the idle list
         self.pg0.admin_down()
-        pg0_session = self._session_at_list_head(2)
-        self.assertEqual(self._session_interface(pg0_session), pg0_index)
+        # pg0's session is the only one on the transient list, so it is both
+        # its head and its tail
+        sessions = self._list_sessions(self._TCP_TRANSIENT_LIST)
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(self._session_link(sessions[0], "sw_if_index"), pg0_index)
 
         # the surviving interface's session last, so it is the tail the walk
         # meets first. pg1 sends into itself, so the packet it reflects comes
         # back through the bridge domain into its own ACL, which sees the SYN
         # and the SYN|ACK of the same session and leaves it on the transient
-        # list (number 3)
+        # list
         before = self._sessions_snapshot()
         self._apply_acl(pg1_index, self._permit_reflect_rules(), "pg1")
         self._send_packets(
@@ -2041,11 +2087,12 @@ class TestACLplugin(VppTestCase):
         )
         self.assertEqual(self._session_adds_delta(before, pg1_index), 1)
 
-        # both sessions are on the transient list: pg0's first, towards the
-        # head, and pg1's last, which is its tail and the list head, with
-        # pg0's session one step behind it
-        pg1_session = self._session_at_list_head(2)
-        self.assertEqual(self._session_interface(pg1_session), pg1_index)
+        # both sessions are on the transient list, pg0's first towards the
+        # head and pg1's last, which is its tail; pg1's session has pg0's one
+        # step behind it
+        pg0_session, pg1_session = self._list_sessions(self._TCP_TRANSIENT_LIST)
+        self.assertEqual(self._session_link(pg0_session, "sw_if_index"), pg0_index)
+        self.assertEqual(self._session_link(pg1_session, "sw_if_index"), pg1_index)
         self.assertEqual(self._session_behind(pg1_session), pg0_session)
         self.assertEqual(self._active_sessions(), baseline + 2)
 
