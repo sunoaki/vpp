@@ -1636,6 +1636,10 @@ class TestACLplugin(VppTestCase):
     _TCP_TRANSIENT_LIST = 3
     # FA_SESSION_BOGUS_INDEX, which ends a list and fills an empty one
     _BOGUS_SESSION = 0xFFFFFFFF
+    # how many workers the search for a session's detail block tries before
+    # giving up; a worker past the last one rejects the command
+    _MAX_WORKERS = 100
+    _session_blocks = {}
 
     def _apply_acl(self, sw_if_index, rules, tag):
         """Apply an ACL to the input of an interface."""
@@ -1710,17 +1714,20 @@ class TestACLplugin(VppTestCase):
 
         The block appears under the worker that owns the session, and only
         when that worker is named in the command. Ask each worker in turn and
-        keep the first block that names the session.
+        keep the first block that names the session. The block is kept, so
+        the labels of one session are read from the same answer.
         """
-        asked = []
-        for thread_index in range(100):
-            asked.append(self._show_sessions(thread_index, session_index))
-            match = re.search(r"^  session index %d:$" % session_index, asked[-1], re.M)
-            if match:
-                return asked[-1]
+        block = self._session_blocks.get(session_index)
+        if block is not None:
+            return block
+        for thread_index in range(self._MAX_WORKERS):
+            block = self._show_sessions(thread_index, session_index)
+            if re.search(r"^  session index %d:$" % session_index, block, re.M):
+                self._session_blocks[session_index] = block
+                return block
         self.fail(
             "no worker printed a detail block for session %d, last answer:\n%s"
-            % (session_index, asked[-1])
+            % (session_index, block)
         )
 
     def _session_link(self, session_index, label):
@@ -1798,10 +1805,11 @@ class TestACLplugin(VppTestCase):
 
         `show acl-plugin sessions` reports this process-wide figure, so it
         covers every worker and every interface, including the ones that no
-        longer exist. Wiping a session takes it out of the lookup hashes right
-        away and parks it for the reclaim that waits for the purge timeout, so
-        this figure drops as soon as the worker wiped it. A session of a
-        deleted interface that nothing wiped keeps the figure up.
+        longer exist. Deactivating a session takes it out of the lookup hashes
+        right away and keeps it, with its list slot held, until the reclaim
+        that waits for the purge timeout, so this figure drops as soon as the
+        worker deactivated it. A session of a deleted interface that nothing
+        deactivated keeps the figure up.
         """
         output = output if output is not None else self._show_sessions()
         match = re.search(r"Sessions active: add \d+ - deact \d+ = (\d+)", output)
@@ -1812,10 +1820,10 @@ class TestACLplugin(VppTestCase):
     def _wait_for_active_sessions(self, expected, timeout=5.0):
         """Wait until no more than `expected` sessions are active.
 
-        Deleting an interface only asks the workers to wipe its sessions; each
-        of them does so on the interrupt that follows. Poll instead of
-        sleeping for a fixed time, and report what the table still holds when
-        the timeout passes.
+        Deleting an interface only asks the workers to deactivate its
+        sessions; each of them does so on the interrupt that follows. Poll
+        instead of sleeping for a fixed time, and report what the table still
+        holds when the timeout passes.
         """
         deadline = time.time() + timeout
         while True:
@@ -1988,13 +1996,19 @@ class TestACLplugin(VppTestCase):
         exists, so a packet pg0 reflects cannot come back to it and move that
         session to another list.
 
-        The figures per interface are what decide whether the walk reached
-        pg0's session. They are cumulative for the lifetime of the run and
-        every worker prints them, so `add - del` for pg0 stays at one until a
-        worker wipes that session, whichever worker owned it, and the
-        assertion fails on the walk that stops at pg1's session. The count of
-        active sessions covers the whole process, so the scenario pins it
-        with a baseline and compares it once.
+        Two assertions follow the deletion. The count of active sessions
+        drops when a worker deactivates a session, and deactivation keeps the
+        session, with its list slot held, until the reclaim that waits for
+        the purge timeout; the unfixed walk never reaches pg0's session, so
+        that count stays one above the baseline this scenario took until the
+        wait gives up. That is the assertion that fails first. The figures
+        per interface are cumulative for the lifetime of the run, every
+        worker prints them, and they move only at the reclaim that follows
+        deactivation, so `add - del` for pg0 reads one until the session is
+        reclaimed and zero afterwards, whichever worker owned it. That is the
+        figure that tells the two walks apart, and it still reports the
+        defect when the count of active sessions happens to reach the value
+        the wait expects.
         """
         self.logger.info("ACLP_TEST_START_0402")
 
