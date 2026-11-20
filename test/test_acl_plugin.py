@@ -1641,6 +1641,31 @@ class TestACLplugin(VppTestCase):
     _MAX_WORKERS = 100
     _session_blocks = {}
 
+    def _ensure_pg0(self):
+        """Re-create pg0 unless the interface of that name is still configured.
+
+        The scenarios that delete pg0 leave the class without one, and the
+        ones that follow read `self.pg0.sw_if_index`; a request naming the
+        closed index of the deleted interface is rejected with
+        `VNET_API_ERROR_INVALID_SW_IF_INDEX`. `client_index` survives the
+        deletion, and the pool hands out its lowest free slot, so a re-created
+        pg0 takes the index the deleted one had.
+        """
+        pg0 = self.pg0
+        if pg0.query_vpp_config():
+            return pg0
+        pg0 = self.create_pg_interfaces([pg0.pg_index])[0]
+        # the class setup puts pg0 up and into the bridge domain, and a frame
+        # on an interface that is down never reaches the ACL node
+        pg0.admin_up()
+        self.vapi.sw_interface_set_l2_bridge(
+            rx_sw_if_index=pg0.sw_if_index, bd_id=self.bd_id
+        )
+        type(self).pg_interfaces = [pg0] + [
+            pg_if for pg_if in self.pg_interfaces if pg_if is not pg0
+        ]
+        return pg0
+
     def _apply_acl(self, sw_if_index, rules, tag):
         """Apply an ACL to the input of an interface."""
         acl = VppAcl(self, rules, tag=tag)
@@ -1917,6 +1942,7 @@ class TestACLplugin(VppTestCase):
         """
         self.logger.info("ACLP_TEST_START_0401")
 
+        self._ensure_pg0()
         pg0_index = self.pg0.sw_if_index
         pg1_index = self.pg1.sw_if_index
         pg0_host = self.hosts_by_pg_idx[pg0_index][0]
@@ -2012,6 +2038,7 @@ class TestACLplugin(VppTestCase):
         """
         self.logger.info("ACLP_TEST_START_0402")
 
+        self._ensure_pg0()
         pg0_index = self.pg0.sw_if_index
         pg1_index = self.pg1.sw_if_index
         pg0_host = self.hosts_by_pg_idx[pg0_index][0]
