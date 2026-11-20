@@ -377,6 +377,7 @@ det44_plugin_disable ()
 {
   det44_main_t *dm = &det44_main;
   det44_interface_t *i, *interfaces;
+  det44_identity_mapping_t *identity_mapping;
   snat_det_map_t *mp;
   int rv = 0;
 
@@ -390,7 +391,7 @@ det44_plugin_disable ()
 
   // DET44 cleanup (order dependent)
   // 1) remove interfaces (det44_interface_add_del) removes map ranges from fib
-  // 2) free sessions
+  // 2) free sessions and identity mappings
   // 3) free maps
 
   interfaces = vec_dup (dm->interfaces);
@@ -425,6 +426,12 @@ det44_plugin_disable ()
    {
     vec_free (mp->sessions);
   }
+
+  vec_foreach (identity_mapping, dm->identity_mappings)
+    {
+      vec_free (identity_mapping->tag);
+    }
+  vec_free (dm->identity_mappings);
 
   det44_reset_timeouts ();
 
