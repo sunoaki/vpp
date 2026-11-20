@@ -573,6 +573,22 @@ ip_neighbor_mk_complete (adj_index_t ai, ip_neighbor_t * ipn)
 						  ipn->ipn_mac.bytes));
 }
 
+/*
+ * Write the MAC and point the adjacencies of the neighbour at it.
+ *
+ * The MAC is the only input of the rewrite, so whoever writes it rebuilds the
+ * rewrites, and the entry is what says which of them belong to the neighbour.
+ */
+static void
+ip_neighbor_update_mac (ip_neighbor_t *ipn, const mac_address_t *mac)
+{
+  mac_address_copy (&ipn->ipn_mac, mac);
+
+  adj_nbr_walk_nh (ipn->ipn_key->ipnk_sw_if_index,
+		   ip_address_family_to_fib_proto (ip_neighbor_get_af (ipn)),
+		   &ip_addr_46 (&ipn->ipn_key->ipnk_ip), ip_neighbor_mk_complete_walk, ipn);
+}
+
 static void
 ip_neighbor_mk_incomplete (adj_index_t ai)
 {
@@ -687,15 +703,13 @@ ip_neighbor_alloc (const ip_neighbor_key_t * key,
   ipn->ipn_flags = flags;
   ipn->ipn_elt = ~0;
 
+  /* the entry carries its MAC before the db or an adjacency can name it */
   mac_address_copy (&ipn->ipn_mac, mac);
 
   ip_neighbor_db_add (ipn);
 
   /* ensure the adjacencies are complete before the adj-fib is created */
-  adj_nbr_walk_nh (
-    ipn->ipn_key->ipnk_sw_if_index,
-    ip_address_family_to_fib_proto (ip_addr_version (&ipn->ipn_key->ipnk_ip)),
-    &ip_addr_46 (&ipn->ipn_key->ipnk_ip), ip_neighbor_mk_complete_walk, ipn);
+  ip_neighbor_update_mac (ipn, mac);
 
   /* create the adj-fib. the entry in the FIB table for the peer's interface */
   if (!(ipn->ipn_flags & IP_NEIGHBOR_FLAG_NO_FIB_ENTRY))
@@ -794,11 +808,7 @@ ip_neighbor_add (const ip_address_t * ip,
 	  goto check_customers;
 	}
 
-      mac_address_copy (&ipn->ipn_mac, mac);
-
-      adj_nbr_walk_nh (ipn->ipn_key->ipnk_sw_if_index, fproto,
-		       &ip_addr_46 (&ipn->ipn_key->ipnk_ip),
-		       ip_neighbor_mk_complete_walk, ipn);
+      ip_neighbor_update_mac (ipn, mac);
     }
   else
     {
