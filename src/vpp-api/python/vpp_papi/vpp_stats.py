@@ -363,17 +363,21 @@ class StatsLock:
     def __exit__(self, exc_type=None, exc_value=None, traceback=None):
         self.release()
 
+    # Wait between readings of in_progress when blocking, and between
+    # readings of a timeout that has not expired yet.
+    poll_interval = 0.01
+
     def acquire(self, blocking=True, timeout=-1):
         """Acquire the lock. Await in progress to go false. Record epoch."""
         self.epoch = self.stats.epoch
         if timeout > 0:
-            start = time.monotonic()
+            deadline = time.monotonic() + timeout
         while self.stats.in_progress:
+            if timeout > 0 and time.monotonic() >= deadline:
+                return False
             if not blocking:
-                time.sleep(0.01)
-                if timeout > 0:
-                    if start + time.monotonic() > timeout:
-                        return False
+                return False
+            time.sleep(self.poll_interval)
         return True
 
     def release(self):
