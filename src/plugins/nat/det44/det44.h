@@ -86,6 +86,8 @@ typedef struct
   snat_det_out_key_t out;
   /* Session state */
   u8 state;
+  /* IP protocol of the first packet of the session */
+  u8 proto;
   /* Expire timeout */
   u32 expire;
 } snat_det_session_t;
@@ -233,16 +235,14 @@ u32 icmp_match_out2in_det (vlib_node_runtime_t * node,
 			   u16 * port, u32 * fib_index,
 			   nat_protocol_t * proto, void *d, void *e,
 			   u8 * dont_translate);
-u32 icmp_match_in2out_det (vlib_node_runtime_t * node,
-			   u32 thread_index, vlib_buffer_t * b0,
-			   ip4_header_t * ip0, ip4_address_t * addr,
-			   u16 * port, u32 * fib_index,
-			   nat_protocol_t * proto, void *d, void *e,
-			   u8 * dont_translate);
-u32 det44_icmp_in2out (vlib_buffer_t * b0, ip4_header_t * ip0,
-		       icmp46_header_t * icmp0, u32 sw_if_index0,
-		       u32 rx_fib_index0, vlib_node_runtime_t * node,
-		       u32 next0, u32 thread_index, void *d, void *e);
+u32 icmp_match_in2out_det (vlib_node_runtime_t *node, u32 thread_index, vlib_buffer_t *b0,
+			   ip4_header_t *ip0, ip4_address_t *addr, u16 *port, u32 *fib_index,
+			   nat_protocol_t *proto, void *d, void *e, u8 *dont_translate, u8 *created,
+			   ip4_address_t *created_addr);
+u32 det44_icmp_in2out (vlib_buffer_t *b0, ip4_header_t *ip0, icmp46_header_t *icmp0,
+		       u32 sw_if_index0, u32 rx_fib_index0, vlib_node_runtime_t *node, u32 next0,
+		       u32 thread_index, void *d, void *e, u8 *session_accepted,
+		       ip4_address_t *created_addr);
 u32 det44_icmp_out2in (vlib_buffer_t * b0, ip4_header_t * ip0,
 		       icmp46_header_t * icmp0, u32 sw_if_index0,
 		       u32 rx_fib_index0, vlib_node_runtime_t * node,
@@ -357,10 +357,27 @@ snat_det_find_ses_by_in (snat_det_map_t * dm, ip4_address_t * in_addr,
   return 0;
 }
 
+static_always_inline void
+snat_det_session_addresses (snat_det_map_t *dm, snat_det_session_t *ses, ip4_address_t *in_addr,
+			    ip4_address_t *out_addr)
+{
+  u32 user_index = (ses - dm->sessions) / DET44_SES_PER_USER;
+  u32 in_offset, out_offset;
+
+  in_addr->as_u32 = clib_host_to_net_u32 (clib_net_to_host_u32 (dm->in_addr.as_u32) + user_index);
+  in_offset = clib_net_to_host_u32 (in_addr->as_u32) - clib_net_to_host_u32 (dm->in_addr.as_u32);
+  out_offset = in_offset / dm->sharing_ratio;
+  out_addr->as_u32 = clib_host_to_net_u32 (clib_net_to_host_u32 (dm->out_addr.as_u32) + out_offset);
+}
+
+/*
+ * The state alone does not identify the protocol because a TCP and a UDP
+ * session both hold the state of a fresh session before a packet sets it.
+ * Record it from the first packet instead.
+ */
 static_always_inline snat_det_session_t *
-snat_det_ses_create (u32 thread_index, snat_det_map_t * dm,
-		     ip4_address_t * in_addr, u16 in_port,
-		     snat_det_out_key_t * out)
+snat_det_ses_create (u32 thread_index, snat_det_map_t *dm, ip4_address_t *in_addr,
+		     ip_protocol_t proto, u16 in_port, snat_det_out_key_t *out)
 {
   u32 user_offset;
   u16 i;
@@ -376,6 +393,7 @@ snat_det_ses_create (u32 thread_index, snat_det_map_t * dm,
 	    {
 	      dm->sessions[i + user_offset].out.as_u64 = out->as_u64;
 	      dm->sessions[i + user_offset].state = DET44_SESSION_UNKNOWN;
+	      dm->sessions[i + user_offset].proto = proto;
 	      dm->sessions[i + user_offset].expire = 0;
 	      clib_atomic_add_fetch (&dm->ses_num, 1);
 	      return &dm->sessions[i + user_offset];
@@ -390,13 +408,36 @@ snat_det_ses_create (u32 thread_index, snat_det_map_t * dm,
 }
 
 static_always_inline void
-snat_det_ses_close (snat_det_map_t * dm, snat_det_session_t * ses)
+snat_det_ses_close (u32 thread_index, snat_det_map_t *dm, snat_det_session_t *ses)
 {
-  if (clib_atomic_bool_cmp_and_swap (&ses->in_port, ses->in_port, 0))
-    {
-      ses->out.as_u64 = 0;
-      clib_atomic_add_fetch (&dm->ses_num, -1);
-    }
+  det44_main_t *dmain = &det44_main;
+  ip4_address_t in_addr, out_addr;
+  ip_protocol_t proto;
+  u16 in_port;
+
+  if (!clib_atomic_bool_cmp_and_swap (&ses->in_port, ses->in_port, 0))
+    return;
+
+  in_port = clib_net_to_host_u16 (ses->in_port);
+  proto = ses->proto;
+  snat_det_session_addresses (dm, ses, &in_addr, &out_addr);
+  nat_ipfix_logging_nat44_ses_delete (thread_index, in_addr.as_u32, out_addr.as_u32, proto, in_port,
+				      clib_net_to_host_u16 (ses->out.out_port),
+				      dmain->outside_fib_index);
+
+  ses->out.as_u64 = 0;
+  clib_atomic_add_fetch (&dm->ses_num, -1);
+}
+
+/*
+ * For close requests handled on the main thread: the CLI and the API
+ * handlers. The index is read rather than assumed so an event always lands
+ * in the per-thread buffer of the thread that closes the session.
+ */
+static_always_inline void
+snat_det_ses_close_local (snat_det_map_t *dm, snat_det_session_t *ses)
+{
+  snat_det_ses_close (vlib_get_thread_index (), dm, ses);
 }
 
 clib_error_t *det44_api_hookup (vlib_main_t * vm);
