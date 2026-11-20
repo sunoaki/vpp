@@ -6,6 +6,13 @@ import unittest
 import importlib
 
 
+def defining_module(cls):
+    module = sys.modules.get(cls.__module__)
+    if module is not None:
+        return module
+    return cls.__module__
+
+
 def discover_tests(directory, callback):
     do_insert = True
     for _f in os.listdir(directory):
@@ -27,6 +34,11 @@ def discover_tests(directory, callback):
             if not isinstance(cls, type):
                 continue
             if not issubclass(cls, unittest.TestCase):
+                continue
+            # A class imported into this module is not a suite defined here:
+            # it is a base for the suites below, and collecting it would run
+            # its test methods without the setUp of the module's templates.
+            if defining_module(cls) is not module:
                 continue
             if (
                 name == "VppTestCase"
