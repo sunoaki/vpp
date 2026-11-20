@@ -1502,6 +1502,20 @@ ip4_local_check_src (vlib_buffer_t *b, ip4_header_t *ip0, ip4_local_last_check_t
     vnet_buffer (b)->sw_if_index[VLIB_TX] != ~0 ?
     vnet_buffer (b)->sw_if_index[VLIB_TX] : vnet_buffer (b)->ip.fib_index;
 
+  /*
+   * ip4_fib_forwarding_lookup () indexes the ip4_fibs pool with this
+   * value without checking it. The packet is handled like one whose
+   * source route is missing, and first = 1 stops the next packet from
+   * reusing the last check.
+   */
+  if (PREDICT_FALSE (pool_is_free_index (ip4_main.fibs, vnet_buffer (b)->ip.fib_index)))
+    {
+      *error0 = IP4_ERROR_SRC_LOOKUP_MISS;
+      last_check->lbi = ~0;
+      last_check->first = 1;
+      return;
+    }
+
   vnet_buffer (b)->ip.rx_sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_RX];
   if (is_receive_dpo)
     {
@@ -1576,6 +1590,7 @@ ip4_local_check_src_x2 (vlib_buffer_t **b, ip4_header_t **ip, ip4_local_last_che
   load_balance_t *lb[2];
   u32 not_last_hit;
   u32 lbi[2];
+  u8 bad_fib[2];
 
   not_last_hit = last_check->first;
   not_last_hit |= ip[0]->src_address.as_u32 ^ last_check->src.as_u32;
@@ -1593,6 +1608,28 @@ ip4_local_check_src_x2 (vlib_buffer_t **b, ip4_header_t **ip, ip4_local_last_che
 
   not_last_hit |= vnet_buffer (b[0])->ip.fib_index ^ last_check->fib_index;
   not_last_hit |= vnet_buffer (b[1])->ip.fib_index ^ last_check->fib_index;
+
+  /*
+   * A packet whose table index is not live is handled by the single
+   * packet path, which applies the same guard, so neither of them uses
+   * this pair lookup.
+   */
+  bad_fib[0] = pool_is_free_index (ip4_main.fibs, vnet_buffer (b[0])->ip.fib_index);
+  bad_fib[1] = pool_is_free_index (ip4_main.fibs, vnet_buffer (b[1])->ip.fib_index);
+  if (PREDICT_FALSE (bad_fib[0] | bad_fib[1]))
+    {
+      if (bad_fib[0] == 0)
+	ip4_local_check_src (b[0], ip[0], last_check, &error[0], is_receive_dpo);
+      else if (error[0] == IP4_ERROR_UNKNOWN_PROTOCOL)
+	error[0] = IP4_ERROR_SRC_LOOKUP_MISS;
+
+      if (bad_fib[1] == 0)
+	ip4_local_check_src (b[1], ip[1], last_check, &error[1], is_receive_dpo);
+      else if (error[1] == IP4_ERROR_UNKNOWN_PROTOCOL)
+	error[1] = IP4_ERROR_SRC_LOOKUP_MISS;
+
+      return;
+    }
 
   vnet_buffer (b[0])->ip.rx_sw_if_index =
     vnet_buffer (b[0])->sw_if_index[VLIB_RX];
