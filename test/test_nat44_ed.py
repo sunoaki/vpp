@@ -4367,6 +4367,78 @@ class TestNAT44EDMW(TestNAT44ED):
         sessions = self.vapi.nat44_user_session_dump(self.pg0.remote_ip4, 0)
         self.assertEqual(len(sessions) - session_n, 1)
 
+    def nat44_ed_nat_hi_locks(self, table_id):
+        """Return the nat-hi lock count of a FIB table, 0 if it has none"""
+        nat_hi = re.compile(r"\b(nat-hi):(\d+)")
+        for line in self.vapi.cli("show ip fib table %d" % table_id).splitlines():
+            if not line.startswith("ipv4-"):
+                continue
+            locks = nat_hi.search(line)
+            return int(locks.group(2)) if locks else 0
+        self.fail("FIB table %d not found" % table_id)
+
+    def run_nat44_ed_plugin_cycle(self, inside_vrf, outside_vrf):
+        """Lock the two tables for the plugin, check translation, unlock them"""
+        self.vapi.nat44_ed_plugin_enable_disable(
+            sessions=self.max_sessions,
+            inside_vrf=inside_vrf,
+            outside_vrf=outside_vrf,
+            enable=1,
+        )
+        try:
+            self.assertEqual(self.nat44_ed_nat_hi_locks(inside_vrf), 1)
+            self.assertEqual(self.nat44_ed_nat_hi_locks(outside_vrf), 1)
+
+            self.nat_add_address(self.nat_addr)
+            self.nat_add_inside_interface(self.pg0)
+            self.nat_add_outside_interface(self.pg1)
+
+            pkts = self.create_stream_in(self.pg0, self.pg1)
+            self.pg0.add_stream(pkts)
+            self.pg_enable_capture(self.pg_interfaces)
+            self.pg_start()
+            capture = self.pg1.get_capture(len(pkts))
+            self.verify_capture_out(capture, ignore_port=True)
+
+            pkts = self.create_stream_out(self.pg1)
+            self.pg1.add_stream(pkts)
+            self.pg_enable_capture(self.pg_interfaces)
+            self.pg_start()
+            capture = self.pg0.get_capture(len(pkts))
+            self.verify_capture_in(capture, self.pg0)
+
+            # Inside the try: a failing assertion above leaves the plugin
+            # enabled, and the test's ip_table_add_del_v2 needs it disabled.
+            self.plugin_disable()
+
+            self.assertEqual(self.nat44_ed_nat_hi_locks(inside_vrf), 0)
+            self.assertEqual(self.nat44_ed_nat_hi_locks(outside_vrf), 0)
+        finally:
+            if self.vapi.nat44_ed_plugin_enable_disable(enable=0):
+                self.logger.error("nat44-ed plugin left enabled")
+
+    def test_plugin_enable_disable_cycle(self):
+        """NAT44ED plugin enable/disable cycle releases its FIB table locks"""
+        inside_vrf = 130
+        outside_vrf = 131
+
+        # The default table stays locked by pg0 and pg1 after the disable, so
+        # it cannot show whether the plugin released its own lock. VRFs 130
+        # and 131 have no interface, and the plugin's enable is then the only
+        # reference that shows up in the lock list of their tables.
+        try:
+            # The plugin creates these tables with its own source only, so the
+            # API lock is what lets the delete below release them.
+            for vrf_id in (inside_vrf, outside_vrf):
+                self.vapi.ip_table_add_del_v2(is_add=1, table={"table_id": vrf_id})
+
+            self.run_nat44_ed_plugin_cycle(inside_vrf, outside_vrf)
+            self.run_nat44_ed_plugin_cycle(inside_vrf, outside_vrf)
+        finally:
+            for vrf_id in (inside_vrf, outside_vrf):
+                self.vapi.ip_table_flush(table={"table_id": vrf_id})
+                self.vapi.ip_table_add_del_v2(is_add=0, table={"table_id": vrf_id})
+
     def test_dynamic_vrf(self):
         """NAT44ED dynamic translation test: different VRF"""
 

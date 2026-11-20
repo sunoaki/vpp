@@ -2692,6 +2692,9 @@ nat44_plugin_disable ()
   if (rc)
     error = VNET_API_ERROR_BUG;
 
+  fib_table_unlock (sm->inside_fib_index, FIB_PROTOCOL_IP4, sm->fib_src_hi);
+  fib_table_unlock (sm->outside_fib_index, FIB_PROTOCOL_IP4, sm->fib_src_hi);
+
   nat44_ed_del_vrf_tables ();
 
   vec_free (sm->max_translations_per_fib);
