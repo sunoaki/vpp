@@ -167,8 +167,7 @@ main ()
       unsigned ipip_sw_if_index;
       {
 	// create ipip tunnel src 10.10.10.1 dst 10.20.20.20 outer-table-id 2
-	vapi::Ipip_add_tunnel ipip (
-	  con); // cf. src/vnet/ipip/ipip.api:ipip_add_tunnel
+	vapi::Ipip_add_tunnel ipip (con); // cf. src/plugins/ipip/ipip.api:ipip_add_tunnel
 	auto &mp = ipip.get_request ().get_payload ();
 	mp.tunnel.instance = ~0;
 	mp.tunnel.src.af = ADDRESS_IP4;
