@@ -351,11 +351,11 @@ det44_plugin_enable (det44_config_t c)
 
   if (plugin_enabled () == 1)
     {
-      det44_log_err ("plugin already enabled!");
+      det44_log_info ("plugin already enabled, skipping");
       return 1;
     }
 
-  det44_log_err ("inside %u, outside %u", c.inside_vrf_id, c.outside_vrf_id);
+  det44_log_info ("inside %u, outside %u", c.inside_vrf_id, c.outside_vrf_id);
 
   dm->outside_fib_index = fib_table_find_or_create_and_lock (FIB_PROTOCOL_IP4,
 							     c.outside_vrf_id,
