@@ -469,24 +469,26 @@ sev2str (enum vl_counter_severity_e s)
     }
 }
 
-/* Error counters and the node data used to report them, copied while the
- * workers run, so that formatting reads nothing which a worker or an error
- * registration can change. */
+/* The counts the report shows and the nodes it shows them under, read while
+ * the workers run. Nothing of it is a name or a description: the report reads
+ * those in place from counters_heap while it holds the description lock, so a
+ * snapshot allocates for the counters it reports, and a counter of it costs a
+ * count and a sum, not a copy of its name and its description. */
 typedef struct
 {
-  /* Error count indexed by error index, less the count recorded at the last
-   * clear of its thread. */
+  /* Count of every error, over the threads, less the count a thread recorded
+   * at its last counter clear, indexed by error index. */
   u64 *counts;
 
-  /* Name and description of each entry, indexed by error index. */
-  char **names;
-  char **descs;
-
-  /* Severity indexed by error index. */
-  enum vl_counter_severity_e *severities;
+  /* Count of every error over the threads, indexed by error index. */
+  u64 *sums;
 
   /* Node indices, in node index order. */
   u32 *nodes;
+
+  /* Entry of counters_heap that holds the counters of each node in nodes,
+   * in place. */
+  vlib_error_desc_t **entries;
 
   /* Number of error counters of each node in nodes. */
   u8 *n_errors;
@@ -498,90 +500,320 @@ typedef struct
 static void
 vlib_error_counts_free (vlib_error_counts_t *c)
 {
-  char **d;
-
-  vec_foreach (d, c->names)
-    vec_free (*d);
-  vec_foreach (d, c->descs)
-    vec_free (*d);
   vec_free (c->counts);
-  vec_free (c->names);
-  vec_free (c->descs);
-  vec_free (c->severities);
+  vec_free (c->sums);
+  vec_free (c->entries);
   vec_free (c->nodes);
   vec_free (c->n_errors);
   vec_free (c->error_heap_index);
 }
 
-/* Counters are indexed by error index, so each thread contributes its own
- * counter less the value it recorded at the last counter clear. */
-static void
-vlib_error_counts_get (vlib_main_t *vm, vlib_error_counts_t *c)
+/* True when every counter of the node at a position of the snapshot lies
+ * within the vectors indexed by error index. A node whose counters lie past
+ * them registered a table between the size of the snapshot and its list, which
+ * the description lock lets through, so the report leaves its counters out
+ * rather than read past the snapshot.
+ *
+ * A report whose size was skipped, because nothing measured a counter, is the
+ * same condition rather than a path of its own: the skip leaves every vector
+ * it would have sized empty, so the positions the walk is given all fall past
+ * them and answer false, and a vector of length zero can name no counter to
+ * read. */
+static int
+vlib_error_lists (vlib_error_counts_t *c, u32 nj)
 {
-  vlib_main_t *main_vm = vlib_get_first_main ();
-  vlib_error_main_t *em = &main_vm->error_main;
-  char *name;
-  u32 i, index;
+  return (u64) c->error_heap_index[nj] + c->n_errors[nj] <= vec_len (c->counts);
+}
 
-  vec_validate (c->counts, vec_len (em->counters) - 1);
-  vec_validate (c->names, vec_len (em->counters) - 1);
-  vec_validate (c->descs, vec_len (em->counters) - 1);
-  vec_validate (c->severities, vec_len (em->counters) - 1);
+/* True when the counter at an error index is one the snapshot holds and whose
+ * counters_heap entry names it. The bound check is a proof: a node's error
+ * index is its error_heap_index plus its code, and the vectors are at least as
+ * long as counters_heap, so the list never names an index past either.
+ *
+ * The name test is not a proof that the entry is live. heap_dealloc does not
+ * clear the block it frees, so an entry that a registration freed can keep a
+ * non-zero name until something writes over it. What the test rules out is an
+ * entry that no registration of the node ever set, and what the description
+ * lock rules out is the publication of a node's table: the fields the walk
+ * selects a node by and the entries it names are written under it. It does not
+ * cover the stats_entry_index that vlib_register_errors writes after it
+ * releases the lock, so a re-registration running then can have the report
+ * show one counter of the node with the index before that write and another
+ * with the one after it. That is a torn line of the report, not a free and not
+ * a read past anything: together the lock and the test leave the description
+ * of a counter of the node, or the stale copy of one, and both are strings the
+ * heap still holds. A stale one is shown only when the node still holds the
+ * counter, and such an entry costs no read past what the locks bound. */
+static int
+vlib_error_lists_at (vlib_error_main_t *em, u32 index)
+{
+  return index < vec_len (em->counters_heap) && em->counters_heap[index].name != 0;
+}
 
-  /* Counter vectors in the stats segment are re-allocated under the segment
-   * lock when they grow, so take the counts with the lock held. */
-  vlib_stats_segment_lock ();
+/* True when the node holds a counter the report reads from counters_heap: it
+ * registered a table of counters, rather than error strings, and its first
+ * entry names one. The size of the snapshot and its list are both taken from
+ * this test, so the two cannot disagree about which nodes are reported. */
+static int
+vlib_error_holds_counters (vlib_error_main_t *em, vlib_node_t *n)
+{
+  return n->n_errors != 0 && n->error_counters != 0 &&
+	 vlib_error_lists_at (em, n->error_heap_index);
+}
+
+/* Number of the two vectors indexed by error index: the error index the
+ * highest counter reaches, over the nodes whose counters the report lists.
+ * The caller holds the description lock, so a registration cannot change the
+ * fields it reads.
+ *
+ * A node is counted when vlib_error_holds_counters says it holds a counter, and
+ * it reaches the error index of its whole table. A node whose table has since
+ * gone out of scope still reaches that index, and its counters past the end of
+ * the table are left out by the list, which names only the entries the heap
+ * holds. The size is therefore the upper bound of everything the list can
+ * name, not the exact set. */
+static u32
+vlib_error_counts_size (vlib_node_main_t *nm, vlib_error_main_t *em)
+{
+  vlib_node_t **node, *n;
+  u32 index, n_counters = 0;
+
+  vec_foreach (node, nm->nodes)
+    {
+      n = *node;
+
+      if (!vlib_error_holds_counters (em, n))
+	continue;
+
+      index = n->error_heap_index + n->n_errors;
+      if (index > n_counters)
+	n_counters = index;
+    }
+
+  return n_counters;
+}
+
+/* Length of the longest counter vector of the threads, which is the number of
+ * error indices the counters of the threads hold. The caller holds the stats
+ * segment lock, which keeps the vectors from being re-allocated while they are
+ * measured. A thread binds its counter vector inside vlib_register_errors,
+ * which cannot run while its lock is held. */
+static u32
+vlib_error_counts_measure (void)
+{
+  u32 n_counters, n;
+
+  n_counters = 0;
+
+  for (u32 t = 0; t < vlib_get_n_threads (); t++)
+    {
+      n = vec_len (vlib_get_main_by_index (t)->error_main.counters);
+      if (n > n_counters)
+	n_counters = n;
+    }
+
+  return n_counters;
+}
+
+/* Reads the counter of every thread, less the count it recorded at its last
+ * counter clear, into a snapshot that already holds the index of every counter
+ * the threads have: the caller has sized it for vlib_error_counts_measure and
+ * for the counters the nodes hold. The read is bounded by the length of that
+ * snapshot and of the vector of the thread, so it writes nothing past either.
+ * The caller holds the stats segment lock, which keeps the counter vectors
+ * from being re-allocated under the read. A thread whose counter vector is
+ * empty has registered no error, and counts nothing. */
+static void
+vlib_error_counts_read (vlib_error_counts_t *c)
+{
+  vlib_error_main_t *em;
+  u32 n_last_clear, i, i_max;
 
   for (u32 t = 0; t < vlib_get_n_threads (); t++)
     {
       em = &vlib_get_main_by_index (t)->error_main;
 
-      for (i = 0; i < vec_len (em->counters); i++)
-	{
-	  c->counts[i] += em->counters[i];
-	  if (i < vec_len (em->counters_last_clear))
-	    c->counts[i] -= em->counters_last_clear[i];
-	}
+      i_max = vec_len (em->counters);
+      if (i_max > vec_len (c->counts))
+	i_max = vec_len (c->counts);
+
+      for (i = 0; i < i_max; i++)
+	c->counts[i] += em->counters[i];
+
+      n_last_clear = vec_len (em->counters_last_clear);
+      if (n_last_clear > i_max)
+	n_last_clear = i_max;
+
+      for (i = 0; i < n_last_clear; i++)
+	c->counts[i] -= em->counters_last_clear[i];
+    }
+}
+
+/* Lists the nodes the report shows, and counts their errors over the threads.
+ * The caller holds the description lock, which excludes the registration and
+ * the unregistration of a node, so the entries of counters_heap cannot be
+ * freed while they are read. Neither a name nor a description is copied:
+ * the counters_heap entry holds both, and the report reads it in place while
+ * it holds the description lock.
+ *
+ * A node is listed with the counters whose counters_heap entry names them, up
+ * to the first one that does not, and is left out when it has none. An entry
+ * past the end of counters_heap names nothing, so the list stops where the heap
+ * does, and an entry past the end of the snapshot is not reachable: the
+ * snapshot is at least as long as the heap. */
+static void
+vlib_error_counts_list (vlib_error_counts_t *c, vlib_node_main_t *nm, vlib_error_main_t *em)
+{
+  vlib_node_t **node, *n;
+  u32 code, i;
+
+  vec_foreach (node, nm->nodes)
+    {
+      n = *node;
+
+      if (!vlib_error_holds_counters (em, n))
+	continue;
+
+      for (code = 0; code < n->n_errors; code++)
+	if (!vlib_error_lists_at (em, n->error_heap_index + code))
+	  break;
+
+      if (code == 0)
+	continue;
+
+      vec_add1 (c->nodes, n->index);
+      vec_add1 (c->entries, vec_elt_at_index (em->counters_heap, n->error_heap_index));
+      vec_add1 (c->n_errors, code);
+      vec_add1 (c->error_heap_index, n->error_heap_index);
+
+      for (i = 0; i < code; i++)
+	c->sums[n->error_heap_index + i] += c->counts[n->error_heap_index + i];
+    }
+}
+
+/* Reads the counters the report shows: their counts over the threads, the
+ * nodes they belong to, and their sums over the threads. The caller reads the
+ * descriptions of them from counters_heap after this returns, and holds the
+ * description lock until it has formatted them, so that no registration can
+ * free an entry the report names.
+ *
+ * The read is split into two phases that never hold both locks:
+ *
+ * 1. the counters of the threads, under the stats segment lock alone;
+ * 2. the nodes and their sums, under the description lock alone.
+ *
+ * Both locks are not held at once because their takers disagree on the order:
+ * vlib_register_errors takes the segment lock and then the description lock,
+ * while vlib_unregister_errors takes the description lock and then reaches the
+ * segment lock through vlib_stats_remove_entry. A reader that held both in
+ * either order would wait for a holder of the other, and the two would
+ * deadlock. Master releases the segment lock before it takes the description
+ * lock for the same reason, and this keeps that shape.
+ *
+ * The segment lock is re-entrant for one thread, so a registration made on the
+ * thread that runs the report nests safely; the two phases are what covers two
+ * threads. */
+static void
+vlib_error_counts_get (vlib_error_counts_t *c)
+{
+  vlib_main_t *main_vm = vlib_get_first_main ();
+  vlib_node_main_t *nm = &main_vm->node_main;
+  vlib_error_main_t *em = &main_vm->error_main;
+  u32 n_counters, n_heap;
+
+  /* Phase 1, the segment lock alone: the counters of the threads. The vector of
+   * a thread lives in the stats segment, and vlib_register_errors grows it under
+   * this lock, so the measure and the read below cannot race a grow of it.
+   * counters_heap is a vector of the main VM, which vlib_register_errors grows
+   * under the same lock, so its length is stable here too.
+   *
+   * The read is given a snapshot that already holds every index it writes: the
+   * read is bounded by the length of the snapshot, so it would write nothing
+   * at all into a vector the size had not allocated yet. A thread whose counter
+   * vector is shorter than the longest one leaves its entries past that length
+   * at zero. */
+  vlib_stats_segment_lock ();
+
+  n_counters = vlib_error_counts_measure ();
+
+  n_heap = vec_len (em->counters_heap);
+  if (n_counters < n_heap)
+    n_counters = n_heap;
+
+  if (n_counters)
+    {
+      vec_validate (c->counts, n_counters - 1);
+      vec_validate (c->sums, n_counters - 1);
+
+      vlib_error_counts_read (c);
     }
 
   vlib_stats_segment_unlock ();
 
-  /* Unregistering a node frees its entries in counters_heap, and registering
-   * one replaces them, so read them under the description lock. The node name
-   * is copied under the same lock, and vlib_node_rename takes the lock to
-   * exchange it, rather than replacing it under the reader. */
+  /* Phase 2, the description lock alone: the nodes that report a counter, and
+   * the sum of each over the threads. This is the lock vlib_register_errors and
+   * vlib_unregister_errors take to replace and free the entries of
+   * counters_heap, so the entries read here are held for the whole phase.
+   *
+   * The lock also excludes a half-registered node from the walk.
+   * vlib_register_errors takes it before it publishes n_errors and
+   * error_counters, and its heap index and counters_heap entries are written
+   * inside the section, so a node the walk reaches either has none of them or
+   * has all of them, and an entry it reads names what the node holds. One
+   * write of vlib_register_errors falls outside the section, the
+   * stats_entry_index of each of its counters, so a re-registration of a node
+   * the walk has already passed can leave a counter of that node printed with
+   * the index it had before the write and another with the one after it. That
+   * is a torn line of the report, not a free and not a read past the vectors:
+   * the lock still holds the entries it names, and the node still holds the
+   * counters. Master held the description lock across its whole walk and had
+   * no such window; closing it here would mean holding the lock across the
+   * rest of vlib_register_errors, which takes the stats segment lock inside
+   * that region and would bring back the deadlock the two phases exist to
+   * avoid.
+   *
+   * This phase writes no counter vector, reads no counter value of a thread and
+   * re-measures no vector of a thread: it runs with the stats segment lock
+   * released, and vlib_stats_validate may re-allocate the counters of a thread
+   * under that lock. Its input is the c->counts that phase 1 read, and the only
+   * thing it takes from it is its length. It writes only c->sums, its own
+   * vector, grown here to the length of the counts it sums. A node that
+   * registered after phase 1 sums the zero that phase 1 validated its index
+   * to, and a node whose index lies past those vectors is left out by
+   * vlib_error_lists. A report whose phase 1 was skipped, because nothing
+   * measured a counter, validated neither vector; c->sums stays empty here and
+   * vlib_error_lists leaves out every node, so no count is summed at all.
+   *
+   * The size is taken again here rather than kept from phase 1, because a
+   * registration may have added a node between the phases, and this is the
+   * answer that the listing below is checked against. The vectors are grown to
+   * the highest error index a node reaches, and to the length of counters_heap,
+   * so every index the list can name is held: the index is a node's
+   * error_heap_index plus its code, it lies below the heap, and a node that
+   * registered an entry of the heap and then did not reach the end of
+   * vlib_register_errors is still within the heap. vec_validate only grows a
+   * vector, so the counts the read wrote are kept.
+   *
+   * The bound this phase reaches is therefore the bound phase 1 reached, which
+   * was the longest counter vector of the threads raised to the length of
+   * counters_heap: this phase takes the highest error index of the nodes,
+   * raises it to the same heap length, and a node never registers past the end
+   * of the heap. The two can differ only when the heap is empty, where both
+   * are zero. The size is taken again for the nodes, not to size the report
+   * differently, so that the walk is checked against what the lock it holds
+   * sees. */
   vlib_error_desc_lock_get ();
 
-  vec_foreach_pointer (n, main_vm->node_main.nodes)
-    {
-      if (n->n_errors == 0)
-	continue;
+  n_counters = vlib_error_counts_size (nm, em);
 
-      vec_add1 (c->nodes, n->index);
-      vec_add1 (c->n_errors, n->n_errors);
-      vec_add1 (c->error_heap_index, n->error_heap_index);
+  n_heap = vec_len (em->counters_heap);
+  if (n_counters < n_heap)
+    n_counters = n_heap;
 
-      name = (char *) vec_dup (n->name);
-      for (u32 code = 0; code < n->n_errors; code++)
-	{
-	  index = n->error_heap_index + code;
-	  c->names[index] = (char *) vec_dup (name);
+  if (n_counters)
+    vec_validate (c->sums, n_counters - 1);
 
-	  if (n->error_counters)
-	    {
-	      c->descs[index] = (char *) vec_dup (n->error_counters[code].desc);
-	      c->severities[index] = n->error_counters[code].severity;
-	    }
-	  else
-	    {
-	      /* Legacy nodes register an error string, which stays the
-	       * description of the counter after the node is renamed. */
-	      c->descs[index] = (char *) vec_dup (em->counters_heap[index].desc);
-	      c->severities[index] = VL_COUNTER_SEVERITY_ERROR;
-	    }
-	}
-      vec_free (name);
-    }
+  vlib_error_counts_list (c, nm, em);
 
   vlib_error_desc_lock_put ();
 }
@@ -599,13 +831,73 @@ vlib_error_thread_name (u32 thread_index)
   return vlib_worker_threads[thread_index].name;
 }
 
+/* Formats one counter of the report from its entry in counters_heap. The entry
+ * is read in place while the caller holds the description lock, and it holds
+ * the name and the description of the counter, so reporting a counter
+ * allocates nothing for either. */
+static void
+vlib_error_format (vlib_main_t *vm, vlib_error_desc_t *cd, u32 index, u64 count, int verbose,
+		   int total)
+{
+  if (total)
+    {
+      if (verbose)
+	vlib_cli_output (vm, "%10lu%=40s%=20s%=10d", count, cd->name, cd->desc, index);
+      return;
+    }
+
+  if (verbose)
+    vlib_cli_output (vm, "%10lu%=35s%=35s%=10s%=6d", count, cd->name, cd->desc,
+		     sev2str (cd->severity), index);
+  else
+    vlib_cli_output (vm, "%10lu%=35s%=35s%=10s", count, cd->name, cd->desc, sev2str (cd->severity));
+}
+
+/* Formats the counters of the node at a position of the snapshot as one
+ * thread counted them, leaving out the counters that thread read as zero
+ * unless verbose 2 asks for them. */
+static void
+vlib_error_format_thread (vlib_main_t *vm, vlib_error_counts_t *c, u32 nj, int verbose)
+{
+  u32 code, index;
+
+  for (code = 0; code < c->n_errors[nj]; code++)
+    {
+      index = c->error_heap_index[nj] + code;
+
+      if (c->counts[index] == 0 && verbose < 2)
+	continue;
+
+      vlib_error_format (vm, &c->entries[nj][code], index, c->counts[index], verbose, 0);
+    }
+}
+
+/* Formats the count of the counters of every thread. */
+static void
+vlib_error_format_total (vlib_main_t *vm, vlib_error_counts_t *c, int verbose)
+{
+  u64 sum;
+  u32 code, index;
+
+  for (u32 nj = 0; nj < vec_len (c->nodes); nj++)
+    {
+      if (!vlib_error_lists (c, nj))
+	continue;
+
+      for (code = 0; code < c->n_errors[nj]; code++)
+	{
+	  index = c->error_heap_index[nj] + code;
+	  sum = c->sums[index];
+	  if (sum)
+	    vlib_error_format (vm, &c->entries[nj][code], index, sum, verbose, 1);
+	}
+    }
+}
+
 static clib_error_t *
 show_errors (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 {
-  u32 code, i;
-  u64 sum;
   int verbose = 0;
-  u64 *sums = 0;
   vlib_error_counts_t c = {};
 
   if (unformat (input, "verbose %d", &verbose))
@@ -613,14 +905,20 @@ show_errors (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
   else if (unformat (input, "verbose"))
     verbose = 1;
 
+  vlib_error_counts_get (&c);
+
+  /* The entries of counters_heap the report names are read after the lock the
+   * counters were read under is released, and a registration or unregistration
+   * in between would free them. The lock is therefore held across the whole
+   * report: nothing here copies a name or a description, and nothing has to.
+   * The names of the threads it prints are not locked. */
+  vlib_error_desc_lock_get ();
+
   if (verbose)
     vlib_cli_output (vm, "%=10s%=35s%=35s%=10s%=6s", "Count", "Node",
 		     "Reason", "Severity", "Index");
   else
     vlib_cli_output (vm, "%=10s%=35s%=35s%=10s", "Count", "Node", "Reason", "Severity");
-
-  vlib_error_counts_get (vm, &c);
-  vec_validate (sums, vec_len (c.counts) - 1);
 
   for (u32 t = 0; t < vlib_get_n_threads (); t++)
     {
@@ -628,43 +926,17 @@ show_errors (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 	vlib_cli_output (vm, "Thread %u (%v):", t, vlib_error_thread_name (t));
 
       for (u32 nj = 0; nj < vec_len (c.nodes); nj++)
-	{
-	  for (code = 0; code < c.n_errors[nj]; code++)
-	    {
-	      i = c.error_heap_index[nj] + code;
-	      sums[i] += c.counts[i];
-
-	      if (c.counts[i] == 0 && verbose < 2)
-		continue;
-
-	      if (verbose)
-		vlib_cli_output (vm, "%10lu%=35v%=35s%=10s%=6d", c.counts[i], c.names[i],
-				 c.descs[i], sev2str (c.severities[i]), i);
-	      else
-		vlib_cli_output (vm, "%10lu%=35v%=35s%=10s", c.counts[i], c.names[i], c.descs[i],
-				 sev2str (c.severities[i]));
-	    }
-	}
+	if (vlib_error_lists (&c, nj))
+	  vlib_error_format_thread (vm, &c, nj, verbose);
     }
 
   if (verbose)
     vlib_cli_output (vm, "Total:");
 
-  for (u32 nj = 0; nj < vec_len (c.nodes); nj++)
-    {
-      for (code = 0; code < c.n_errors[nj]; code++)
-	{
-	  i = c.error_heap_index[nj] + code;
-	  sum = sums[i];
-	  if (sum)
-	    {
-	      if (verbose)
-		vlib_cli_output (vm, "%10lu%=40v%=20s%=10d", sum, c.names[i], c.descs[i], i);
-	    }
-	}
-    }
+  vlib_error_format_total (vm, &c, verbose);
 
-  vec_free (sums);
+  vlib_error_desc_lock_put ();
+
   vlib_error_counts_free (&c);
 
   return 0;
@@ -685,8 +957,7 @@ VLIB_CLI_COMMAND (cli_show_node_counters, static) = {
 };
 
 static clib_error_t *
-clear_error_counters (vlib_main_t * vm,
-		      unformat_input_t * input, vlib_cli_command_t * cmd)
+clear_error_counters (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 {
   vlib_error_main_t *em;
   u32 i;
@@ -694,6 +965,13 @@ clear_error_counters (vlib_main_t * vm,
   foreach_vlib_main ()
     {
       em = &this_vlib_main->error_main;
+
+      /* A thread that has registered no error has no counter vector, and its
+       * length less one is ~0, which vec_validate would ask the allocator for
+       * as a 4 billion entry vector. It has nothing to clear either. */
+      if (vec_len (em->counters) == 0)
+	continue;
+
       vec_validate (em->counters_last_clear, vec_len (em->counters) - 1);
       for (i = 0; i < vec_len (em->counters); i++)
 	em->counters_last_clear[i] = em->counters[i];
