@@ -42,6 +42,8 @@ show_threads_fn (vlib_main_t * vm,
   table_t table = {};
   int col;
   int i;
+  u32 main_loop_count;
+  u64 epoll_waits, sleep_count, sleep_fd_event_count, wakeup_request_count, wakeup_count;
 
   table_add_hdr_row (&table, 11, "ID", "Name", "LWP", "CPU", "Sched", "Loops", "Epolls", "Sleeps",
 		     "FdWakeups", "WakeReq", "Wakeups");
@@ -52,6 +54,16 @@ show_threads_fn (vlib_main_t * vm,
       w = vlib_worker_threads + i;
       thread_vm = vlib_get_main_by_index (i);
 
+      /* Read each counter once: the owning thread updates them while this
+	 command runs, and format arguments can be evaluated more than once. */
+      main_loop_count = thread_vm->main_loop_count;
+      epoll_waits = thread_vm->epoll_waits;
+      sleep_count = thread_vm->sleep_count;
+      sleep_fd_event_count = thread_vm->sleep_fd_event_count;
+      /* Written with __atomic_fetch_add (), must be read atomically. */
+      wakeup_request_count = __atomic_load_n (&thread_vm->wakeup_request_count, __ATOMIC_RELAXED);
+      wakeup_count = __atomic_load_n (&thread_vm->wakeup_count, __ATOMIC_RELAXED);
+
       col = 0;
       table_format_cell (&table, i, col++, "%d", i);
       table_format_cell (&table, i, col, "%s", w->name ? w->name : (u8 *) "");
@@ -60,12 +72,12 @@ show_threads_fn (vlib_main_t * vm,
       table_format_cell (&table, i, col++, "%d", w->cpu_id);
       table_format_cell (&table, i, col, "%U", format_sched_policy_and_priority, w->lwp);
       table_set_cell_align (&table, i, col++, TTAA_LEFT);
-      table_format_cell (&table, i, col++, "%u", thread_vm->main_loop_count);
-      table_format_cell (&table, i, col++, "%llu", thread_vm->epoll_waits);
-      table_format_cell (&table, i, col++, "%llu", thread_vm->sleep_count);
-      table_format_cell (&table, i, col++, "%llu", thread_vm->sleep_fd_event_count);
-      table_format_cell (&table, i, col++, "%llu", thread_vm->wakeup_request_count);
-      table_format_cell (&table, i, col++, "%llu", thread_vm->wakeup_count);
+      table_format_cell (&table, i, col++, "%u", main_loop_count);
+      table_format_cell (&table, i, col++, "%llu", epoll_waits);
+      table_format_cell (&table, i, col++, "%llu", sleep_count);
+      table_format_cell (&table, i, col++, "%llu", sleep_fd_event_count);
+      table_format_cell (&table, i, col++, "%llu", wakeup_request_count);
+      table_format_cell (&table, i, col++, "%llu", wakeup_count);
     }
 #endif
 
@@ -79,4 +91,5 @@ VLIB_CLI_COMMAND (show_threads_command, static) = {
   .path = "show threads",
   .short_help = "Show threads",
   .function = show_threads_fn,
+  .is_mp_safe = 1,
 };
