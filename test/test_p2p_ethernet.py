@@ -182,40 +182,22 @@ class P2PEthernetIPV6(VppTestCase):
             count = len(packets)
         return dst_if.get_capture(count)
 
-    def await_p2p_ethernet_input(self, dst_if, replays, burst):
-        """Wait for the counter to grow by the replayed packets and no more.
+    def received_count(self, ifaces):
+        """The counts the packets that reached p2p-ethernet-input stand at.
 
-        p2p-ethernet-input counts a packet in its loop and writes the count to
-        the node counter only after the loop, so a frame still on the node
-        when the counter is read leaves the packets it handled uncounted. Send
-        the burst again, and the packets counted before it are visible once
-        the replayed ones reach dst_if: the node counted them before writing
-        the counter that came after. Re-read the counter until it shows this
-        many more and no more, which the second read of an unchanged value
-        confirms.
+        A packet reaches the node when its source MAC is the MAC of one of the
+        subinterfaces of the parent interface it arrived on, and the node
+        matches on both. Every packet the class sends to the parent interface
+        is one such packet, one the node counts, or one it passes on without
+        counting, so the count is one of these. A frame the node has not
+        finished with when the counter is read leaves the packets it handled
+        uncounted, and a frame after it commits them, so the count waits for
+        that frame or does not.
         """
-        counter = self.get_node_counter(
-            "p2p-ethernet-input", "P2P ethernet incoming packets processed"
-        )
-        before = self.statistics[counter].sum()
-        expected = before + replays * len(burst)
-
-        self.send_packets(self.pg0, dst_if, burst)
-
-        for _ in range(10):
-            self.sleep(0.1)
-            if self.statistics[counter].sum() == expected:
-                self.sleep(0.1)
-                self.assert_equal(
-                    self.statistics[counter].sum(),
-                    expected,
-                    "packet counter `%s'" % counter,
-                )
-                return
-
-        self.assert_equal(
-            self.statistics[counter].sum(), expected, "packet counter `%s'" % counter
-        )
+        sent = len(self.packets)
+        if ifaces is not None:
+            sent += len(ifaces)
+        return {sent, 2 * sent}
 
     def test_no_p2p_subif(self):
         """standard routing without p2p subinterfaces"""
@@ -265,7 +247,12 @@ class P2PEthernetIPV6(VppTestCase):
         )
 
         self.send_packets(self.pg0, self.pg1, self.packets)
-        self.await_p2p_ethernet_input(self.pg1, replays=1, burst=self.packets)
+        self.assert_packet_counter_equal(
+            self.get_node_counter_path(
+                "p2p-ethernet-input", "P2P ethernet incoming packets processed"
+            ),
+            self.received_count(None),
+        )
 
         route_9001.remove_vpp_config()
         self.logger.info("FFP_TEST_FINISH_0002")
@@ -505,7 +492,12 @@ class P2PEthernetIPV4(VppTestCase):
 
         self.send_packets(self.pg0, self.pg1, self.packets)
 
-        self.await_p2p_ethernet_input(self.pg1, replays=1, burst=self.packets)
+        self.assert_packet_counter_equal(
+            self.get_node_counter_path(
+                "p2p-ethernet-input", "P2P ethernet incoming packets processed"
+            ),
+            self.received_count(self.pg1._remote_hosts),
+        )
 
         route_9000.remove_vpp_config()
         self.logger.info("FFP_TEST_FINISH_0002")
