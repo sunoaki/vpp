@@ -40,6 +40,7 @@ import "vnet/interface_types.api";
             if there is no vlan tag.
             This is valid only if current_data_flag is set to 1.
     @param mask_len - length of match mask, should be equal to match_n_vectors * sizeof (u32x4)
+            skip_n_vectors plus match_n_vectors may not exceed 8
     @param mask - match mask
 */
 define classify_add_del_table

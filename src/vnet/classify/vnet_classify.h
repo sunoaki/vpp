@@ -52,17 +52,30 @@ typedef enum vnet_classify_action_t_
 struct _vnet_classify_main;
 typedef struct _vnet_classify_main vnet_classify_main_t;
 
-/* Largest number of 16-byte vectors in a skip or match key.  The mask
-   holds this many match vectors and the dataplane reads the key from the
-   packet, so a table may not move the key any further out. */
-#define VNET_CLASSIFY_MAX_N_VECTORS 5
+/* Largest number of 16-byte vectors in a skip or match key.  The limit is
+   the size of the table mask below, which holds this many match vectors,
+   and load_mask, a u16 with two bits per vector.  The dataplane also reads
+   the key from the packet, so a table may not move the key any further
+   out. */
+#define VNET_CLASSIFY_MAX_N_VECTORS 8
 
-#define foreach_size_in_u32x4                   \
-_(1)                                            \
-_(2)                                            \
-_(3)                                            \
-_(4)                                            \
-_(5)
+/* The hash reads a full window of VNET_CLASSIFY_MAX_N_VECTORS vectors
+   starting skip_n_vectors into the packet, whatever match_n_vectors is
+   inside that window.  Inserting a session hashes the entry itself by
+   pointing at its key less skip_n_vectors vectors, so the two counts
+   together may not exceed the window: skip + match <= the limit above.
+   Past that the window starts before the key rather than after it. */
+#define VNET_CLASSIFY_SKIP_MATCH_FIT(skip, match) ((skip) + (match) <= VNET_CLASSIFY_MAX_N_VECTORS)
+
+#define foreach_size_in_u32x4                                                                      \
+  _ (1)                                                                                            \
+  _ (2)                                                                                            \
+  _ (3)                                                                                            \
+  _ (4)                                                                                            \
+  _ (5)                                                                                            \
+  _ (6)                                                                                            \
+  _ (7)                                                                                            \
+  _ (8)
 
 typedef struct _vnet_classify_entry
 {
@@ -283,6 +296,11 @@ vnet_classify_hash_packet_inline (const vnet_classify_table_t *t, const u8 *h)
   if (PREDICT_FALSE (load_mask >> 8))
     xor_sum_x4 ^= u64x4_mask_load_zero (data + 2, load_mask >> 8) & mask[2];
 
+  /* Bits 12 to 15 cover the seventh and eighth vectors, where load_mask
+     runs out of its sixteen bits */
+  if (PREDICT_FALSE (load_mask >> 12))
+    xor_sum_x4 ^= u64x4_mask_load_zero (data + 3, load_mask >> 12) & mask[3];
+
   xor_sum_x4 ^= u64x4_align_right (xor_sum_x4, xor_sum_x4, 2);
   xor_sum = xor_sum_x4[0] ^ xor_sum_x4[1];
 #elif defined(CLIB_HAVE_VEC128)
@@ -294,6 +312,15 @@ vnet_classify_hash_packet_inline (const vnet_classify_table_t *t, const u8 *h)
 
   switch (t->match_n_vectors)
     {
+    case 8:
+      xor_sum_x2 ^= data[7] & mask[7];
+      /* FALLTHROUGH */
+    case 7:
+      xor_sum_x2 ^= data[6] & mask[6];
+      /* FALLTHROUGH */
+    case 6:
+      xor_sum_x2 ^= data[5] & mask[5];
+      /* FALLTHROUGH */
     case 5:
       xor_sum_x2 ^= data[4] & mask[4];
       /* FALLTHROUGH */
@@ -320,6 +347,15 @@ vnet_classify_hash_packet_inline (const vnet_classify_table_t *t, const u8 *h)
 
   switch (t->match_n_vectors)
     {
+    case 8:
+      xor_sum ^= (data[14] & mask[14]) ^ (data[15] & mask[15]);
+      /* FALLTHROUGH */
+    case 7:
+      xor_sum ^= (data[12] & mask[12]) ^ (data[13] & mask[13]);
+      /* FALLTHROUGH */
+    case 6:
+      xor_sum ^= (data[10] & mask[10]) ^ (data[11] & mask[11]);
+      /* FALLTHROUGH */
     case 5:
       xor_sum ^= (data[8] & mask[8]) ^ (data[9] & mask[9]);
       /* FALLTHROUGH */
@@ -472,6 +508,15 @@ vnet_classify_entry_is_equal (vnet_classify_entry_t *v, const u8 *d, u8 *m,
   r = (data[0] & mask[0]) ^ key[0];
   switch (match_n_vectors)
     {
+    case 8:
+      r |= (data[7] & mask[7]) ^ key[7];
+      /* fall through */
+    case 7:
+      r |= (data[6] & mask[6]) ^ key[6];
+      /* fall through */
+    case 6:
+      r |= (data[5] & mask[5]) ^ key[5];
+      /* fall through */
     case 5:
       r |= (data[4] & mask[4]) ^ key[4];
       /* fall through */
@@ -502,6 +547,15 @@ vnet_classify_entry_is_equal (vnet_classify_entry_t *v, const u8 *d, u8 *m,
   r = ((data[0] & mask[0]) ^ key[0]) | ((data[1] & mask[1]) ^ key[1]);
   switch (match_n_vectors)
     {
+    case 8:
+      r |= ((data[14] & mask[14]) ^ key[14]) | ((data[15] & mask[15]) ^ key[15]);
+      /* fall through */
+    case 7:
+      r |= ((data[12] & mask[12]) ^ key[12]) | ((data[13] & mask[13]) ^ key[13]);
+      /* fall through */
+    case 6:
+      r |= ((data[10] & mask[10]) ^ key[10]) | ((data[11] & mask[11]) ^ key[11]);
+      /* fall through */
     case 5:
       r |= ((data[8] & mask[8]) ^ key[8]) | ((data[9] & mask[9]) ^ key[9]);
       /* fall through */

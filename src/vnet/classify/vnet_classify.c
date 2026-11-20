@@ -1059,13 +1059,15 @@ vnet_classify_add_del_table (vnet_classify_main_t *cm, const u8 *mask,
 	  if (nbuckets == 0)
 	    return VNET_API_ERROR_INVALID_VALUE;
 
-	  /* The dataplane reads the key at skip_n_vectors * 16 bytes into
-	     the packet; keep both counts inside the mask/key limit so the
-	     read stays within the buffer rather than running far past it. */
-	  if (skip > VNET_CLASSIFY_MAX_N_VECTORS)
+	  if (match < 1 || match > VNET_CLASSIFY_MAX_N_VECTORS)
 	    return VNET_API_ERROR_INVALID_VALUE;
 
-	  if (match < 1 || match > VNET_CLASSIFY_MAX_N_VECTORS)
+	  /* The dataplane reads the key at skip_n_vectors * 16 bytes into
+	     the packet over a full VNET_CLASSIFY_MAX_N_VECTORS window, as
+	     the inserting side hashes the entry from skip_n_vectors before
+	     its key; keep the two counts together inside that window so
+	     neither read leaves the key's own vectors. */
+	  if (!VNET_CLASSIFY_SKIP_MATCH_FIT (skip, match))
 	    return VNET_API_ERROR_INVALID_VALUE;
 
 	  t = vnet_classify_new_table (cm, mask, nbuckets, memory_size,
@@ -3104,8 +3106,12 @@ vnet_classify_add_del_session (vnet_classify_main_t *cm, u32 table_index,
 			       u32 metadata, int is_add)
 {
   vnet_classify_table_t *t;
-  vnet_classify_entry_5_t _max_e __attribute__ ((aligned (16)));
-  vnet_classify_entry_t *e;
+  /* The entry with room for the skipped vectors in front of it, so that
+     hashing the entry skip_n_vectors before its key stays inside; the
+     entry is aligned within it because its key must stay on a vector
+     boundary */
+  vnet_classify_entry_t *e, _entry[VNET_CLASSIFY_MAX_N_VECTORS + 2];
+  uword e_offset;
   int i, rv;
 
   if (pool_is_free_index (cm->tables, table_index))
@@ -3113,7 +3119,10 @@ vnet_classify_add_del_session (vnet_classify_main_t *cm, u32 table_index,
 
   t = pool_elt_at_index (cm->tables, table_index);
 
-  e = (vnet_classify_entry_t *) & _max_e;
+  e_offset = t->skip_n_vectors * sizeof (u32x4);
+  e_offset += (uword) _entry & (sizeof (u32x4) - 1);
+  e = (vnet_classify_entry_t *) ((u8 *) _entry + e_offset);
+
   e->next_index = hit_next_index;
   e->opaque_index = opaque_index;
   e->advance = advance;
