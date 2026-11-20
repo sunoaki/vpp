@@ -263,7 +263,6 @@ class TestIPv4Reassembly(VppTestCase):
 
     def test_5737(self):
         """fragment length + ip header size > 65535"""
-        self.vapi.cli("clear errors")
         raw = b"""E\x00\x00\x88,\xf8\x1f\xfe@\x01\x98\x00\xc0\xa8\n-\xc0\xa8\n\
 \x01\x08\x00\xf0J\xed\xcb\xf1\xf5Test-group: IPv4.IPv4.ipv4-message.\
 Ethernet-Payload.IPv4-Packet.IPv4-Header.Fragment-Offset; Test-case: 5737"""
@@ -339,7 +338,6 @@ Ethernet-Payload.IPv4-Packet.IPv4-Header.Fragment-Offset; Test-case: 5737"""
 
     def test_frag_1(self):
         """fragment of size 1"""
-        self.vapi.cli("clear errors")
         malformed_packets = [
             (
                 Ether(dst=self.src_if.local_mac, src=self.src_if.remote_mac)
@@ -376,15 +374,19 @@ Ethernet-Payload.IPv4-Packet.IPv4-Header.Fragment-Offset; Test-case: 5737"""
         )
         valid_fragments = fragment_rfc791(p, 400)
 
+        counter = "/err/ip4-full-reassembly-feature/reass_malformed_packet"
+        malformed_before = self.statistics.get_err_counter(counter)
+
         self.pg_enable_capture()
         self.src_if.add_stream(malformed_packets + valid_fragments)
         self.pg_start()
 
         self.dst_if.get_capture(1)
 
-        self.assert_packet_counter_equal(
-            "/err/ip4-full-reassembly-feature/reass_malformed_packet", 1
-        )
+        # Only the first packet is malformed: it is a fragment of one byte with
+        # the more fragments flag set, below the eight bytes RFC 791 sets as the
+        # minimum. The second is a legal last fragment at offset 8.
+        self.assert_packet_counter_equal(counter, malformed_before + 1)
 
     def test_random(self):
         """random order reassembly"""
