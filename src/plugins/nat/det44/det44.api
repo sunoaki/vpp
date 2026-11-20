@@ -155,6 +155,56 @@ define det44_map_dump {
   u32 context;
 };
 
+/** \brief Add/delete DET44 identity mapping
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+    @param is_add - true if add, false if delete
+    @param addr - inside IPv4 address
+    @param protocol - IP protocol, ignored when flags contains
+       NAT_API_IS_ADDR_ONLY
+    @param port - inside port, ignored when flags contains
+       NAT_API_IS_ADDR_ONLY
+    @param flags - NAT_API_IS_ADDR_ONLY for a whole-address mapping,
+       0 for a mapping of one protocol and port
+    @param tag - opaque string tag, truncated to 63 characters when stored
+*/
+autoreply define det44_add_del_identity_mapping {
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  vl_api_ip4_address_t addr;
+  u8 protocol;
+  u16 port;
+  vl_api_nat_config_flags_t flags;
+  string tag[64];
+};
+
+/** \brief Dump DET44 identity mappings
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+*/
+define det44_identity_mapping_dump {
+  u32 client_index;
+  u32 context;
+};
+
+/** \brief DET44 identity mapping details response
+    @param context - sender context, to match reply w/ request
+    @param addr - inside IPv4 address
+    @param protocol - IP protocol, 0 for an address-only mapping
+    @param port - inside port, 0 for an address-only mapping
+    @param flags - NAT_API_IS_ADDR_ONLY for a whole-address mapping
+    @param tag - opaque string tag
+*/
+define det44_identity_mapping_details {
+  u32 context;
+  vl_api_ip4_address_t addr;
+  u8 protocol;
+  u16 port;
+  vl_api_nat_config_flags_t flags;
+  string tag[64];
+};
+
 /** \brief DET44 users response
     @param context - sender context, to match reply w/ request
     @param in_addr - inside IPv4 address
