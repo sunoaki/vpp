@@ -63,12 +63,85 @@ def recv_fd(sock):
     return list(fds)[0]
 
 
-VEC_LEN_FMT = Struct("I")
+# Temporary diagnostic for the ipsec_ah KeyError. It prints the first
+# miss of a directory index in each process and nothing after that.
+_SHORTREAD_PRINTED = False
 
 
 def get_vec_len(stats, vector_offset):
     """Equivalent to VPP vec_len()"""
     return VEC_LEN_FMT.unpack_from(stats.statseg, vector_offset - 8)[0]
+
+
+class ShortReadReport:
+    """Explain a read that missed an item, from the numbers in the segment"""
+
+    def __init__(self, stats, item, retried, read_pins):
+        self.stats = stats
+        self.item = item
+        self.retried = retried
+        self.read_pins = read_pins
+
+    def line(self):
+        """One-line report of the read and the segment as it is now"""
+        stats = self.stats
+        line = {
+            "item": repr(self.item),
+            "int": isinstance(self.item, int),
+            "retried": self.retried,
+        }
+        line.update(self.read_pins or {})
+        slot = (self.read_pins or {}).get("last_slot")
+        line["read_last_index"], line["read_last_name"] = slot or (None, None)
+        del line["last_slot"]
+        line["directory_len"] = len(stats.directory_by_idx)
+        line["directory_max"] = (
+            max(stats.directory_by_idx) if stats.directory_by_idx else None
+        )
+        line["by_name_len"] = len(stats.directory)
+        line["item_in_by_name"] = self.item in stats.directory
+        line["last_epoch"] = stats.last_epoch
+        line["now_epoch"] = stats.epoch
+        line["now_vec_len"] = get_vec_len(stats, stats.directory_vector - stats.base)
+        line["now_vec_start"] = stats.directory_vector - stats.base
+        missing = sorted(set(range(line["now_vec_len"])) - set(stats.directory_by_idx))
+        line["missing_count"] = len(missing)
+        line["missing_first"] = missing[:16]
+        line["built"] = repr(stats.statseg[-20:])
+        return line
+
+    def print_once(self):
+        """Print the report and the index probe, for the first index miss"""
+        global _SHORTREAD_PRINTED
+        if _SHORTREAD_PRINTED:
+            return
+        if not isinstance(self.item, int) or not 0 <= self.item < 4096:
+            return
+        _SHORTREAD_PRINTED = True
+        try:
+            line = self.line()
+        except Exception as error:  # the report must not change the failure
+            line = {"item": repr(self.item), "report_error": repr(error)}
+        print(f"SHORTREAD {line!r}", flush=True)
+        self.name_probe()
+
+    def name_probe(self):
+        """Name the index from a fresh read and read that name the slow way"""
+        stats = self.stats
+        try:
+            read = StatsVector(stats, stats.directory_vector, stats.elementfmt)
+            direntry = read[self.item]
+        except (IOError, KeyError) as error:
+            print(f"SHORTREAD index probe raised {error!r}", flush=True)
+            return
+        path = direntry[2][: direntry[2].find(b"\x00")].decode("ascii")
+        print(
+            "SHORTREAD index %r names %r type %r" % (self.item, path, direntry[0]),
+            flush=True,
+        )
+
+
+VEC_LEN_FMT = Struct("I")
 
 
 def get_string(stats, ptr):
@@ -86,13 +159,14 @@ class StatsVector:
     def __init__(self, stats, ptr, fmt):
         self.vec_start = ptr - stats.base
         self.vec_len = get_vec_len(stats, ptr - stats.base)
+        self.stats = stats
+        stats.short_read_pins = {"vec_len": self.vec_len, "vec_start": self.vec_start}
         self.struct = Struct(fmt)
         self.fmtlen = len(fmt)
         self.elementsize = self.struct.size
         self.statseg = stats.statseg
-        self.stats = stats
 
-        if self.vec_start + self.vec_len * self.elementsize >= stats.size:
+        if self.vec_start + self.vec_len * self.elementsize > stats.size:
             raise IOError("Vector overruns stats segment")
 
     def __iter__(self):
@@ -132,6 +206,8 @@ class VPPStats:
         self.size = 0
         self.last_epoch = 0
         self.statseg = 0
+        self.directory_by_idx = {}
+        self.short_read_pins = {}
 
     def connect(self):
         """Connect to stats segment"""
@@ -213,6 +289,8 @@ class VPPStats:
                         path = direntry[2][:path_raw].decode("ascii")
                         directory[path] = StatsEntry(direntry[0], direntry[1])
                         directory_by_idx[i] = path
+                        self.short_read_pins["last_slot"] = (i, path)
+                        self.short_read_pins["epoch"] = self.lock.epoch
                     self.directory = directory
                     self.directory_by_idx = directory_by_idx
                     self.last_epoch = self.epoch
@@ -252,6 +330,7 @@ class VPPStats:
             except KeyError:
                 pass
             if retried:
+                ShortReadReport(self, item, retried, self.short_read_pins).print_once()
                 if io_error is not None:
                     raise IOError("Optimistic lock failed, retry") from io_error
                 raise KeyError(item)
