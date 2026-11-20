@@ -1646,12 +1646,14 @@ class TestACLplugin(VppTestCase):
 
         The scenarios that delete pg0 give its index back to the pool, and the
         pool hands out its lowest free slot, so the next packet-generator
-        interface takes the same index. `setUpClass` keys `hosts_by_pg_idx` and
-        `flows` by `sw_if_index`, and those maps still describe that index,
-        which is what the scenarios read for their hosts; the packet sizes are
-        the same for every interface, so they carry over as they are. The
-        interface is put up and back into the bridge domain, since a frame on
-        a down interface never reaches the ACL node.
+        interface takes the same index. `setUpClass` keys `hosts_by_pg_idx` by
+        `sw_if_index`, and that map still describes the index, which is what
+        the scenarios read for their hosts. `flows` is keyed by the interface
+        object instead, so a re-created pg0 is not found there; no scenario on
+        these paths reads it. The packet sizes are the same for every
+        interface, so `pg_if_packet_sizes` carries over as it is. The interface
+        is put up and back into the bridge domain, since a frame on a down
+        interface never reaches the ACL node.
         """
         pg0 = self.create_pg_interfaces([self.pg0.pg_index])[0]
         pg0.admin_up()
