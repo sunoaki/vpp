@@ -2427,6 +2427,7 @@ nat44_ei_add_static_mapping_internal (ip4_address_t l_addr,
   nat44_ei_static_mapping_t *m;
   u32 fib_index = ~0;
   u32 worker_index;
+  u32 record_flags = flags;
 
   fail_if_disabled ();
 
@@ -2493,6 +2494,15 @@ nat44_ei_add_static_mapping_internal (ip4_address_t l_addr,
       init_nat_k (&kv, l_addr, l_port, fib_index, proto);
       if (!clib_bihash_search_8_8 (&nm->static_mapping_by_local, &kv, &value))
 	{
+	  /* the external key names an address-only record and the local key
+	   * did not, so the external key was built with a port and protocol
+	   * the record zeroed; the record keeps the flags it was added with,
+	   * so a delete can tell what to take away */
+	  if (is_sm_addr_only (pool_elt_at_index (nm->static_mappings, value.value)->flags))
+	    {
+	      record_flags |= NAT44_EI_SM_FLAG_ADDR_ONLY;
+	    }
+	  fib_table_unlock (fib_index, FIB_PROTOCOL_IP4, nm->fib_src_low);
 	  return VNET_API_ERROR_VALUE_EXIST;
 	}
     }
@@ -2507,6 +2517,7 @@ nat44_ei_add_static_mapping_internal (ip4_address_t l_addr,
 	      nat44_ei_del_resolve_record (l_addr, l_port, e_port, proto,
 					   vrf_id, sw_if_index, flags);
 	    }
+	  fib_table_unlock (fib_index, FIB_PROTOCOL_IP4, nm->fib_src_low);
 	  return VNET_API_ERROR_NO_SUCH_ENTRY;
 	}
     }
@@ -2514,7 +2525,7 @@ nat44_ei_add_static_mapping_internal (ip4_address_t l_addr,
   pool_get (nm->static_mappings, m);
   clib_memset (m, 0, sizeof (*m));
 
-  m->flags = flags;
+  m->flags = record_flags;
   m->local_addr = l_addr;
   m->external_addr = e_addr;
 
@@ -2583,6 +2594,7 @@ nat44_ei_del_static_mapping_internal (ip4_address_t l_addr,
   nat44_ei_lb_addr_port_t *local;
   nat44_ei_static_mapping_t *m;
   u32 fib_index = ~0;
+  u32 record_flags;
   nat44_ei_user_key_t u_key;
 
   fail_if_disabled ();
@@ -2611,6 +2623,10 @@ nat44_ei_del_static_mapping_internal (ip4_address_t l_addr,
     }
 
   m = pool_elt_at_index (nm->static_mappings, value.value);
+  /* the external key is built from every field the caller gives, while an
+   * address-only record zeroes its port and protocol and a delete that omits
+   * them meets it all the same, so the record decides what it carried */
+  record_flags = m->flags;
 
   if (is_sm_identity_nat (flags))
     {
@@ -2627,8 +2643,12 @@ nat44_ei_del_static_mapping_internal (ip4_address_t l_addr,
 	    {
 	      local = pool_elt_at_index (m->locals, local - m->locals);
 	      fib_index = local->fib_index;
+	      /* the walk has to be over before the slot goes: the pool
+	       * hands a freed slot to the next elt, so a foreach that
+	       * went on would read the record after this one out of it */
 	      pool_put (m->locals, local);
 	      found = 1;
+	      break;
 	    }
 	}
       if (!found)
@@ -2663,8 +2683,8 @@ nat44_ei_del_static_mapping_internal (ip4_address_t l_addr,
       u_key.addr = m->local_addr;
       u_key.fib_index = fib_index;
       kv.key = u_key.as_u64;
-      nat44_ei_static_mapping_del_sessions (
-	nm, tnm, u_key, is_sm_addr_only (flags), e_addr, e_port);
+      nat44_ei_static_mapping_del_sessions (nm, tnm, u_key, is_sm_addr_only (record_flags), e_addr,
+					    e_port);
     }
 
   fib_table_unlock (fib_index, FIB_PROTOCOL_IP4, nm->fib_src_low);
@@ -2680,7 +2700,7 @@ nat44_ei_del_static_mapping_internal (ip4_address_t l_addr,
       vec_free (m->workers);
       pool_put (nm->static_mappings, m);
 
-      if (is_sm_addr_only (flags) && !is_sm_identity_nat (flags))
+      if (is_sm_addr_only (record_flags) && !is_sm_identity_nat (record_flags))
 	{
 	  nat44_ei_add_del_addr_to_fib_foreach_out_if (&e_addr, 0);
 	}
@@ -2996,8 +3016,17 @@ nat44_ei_add_address (ip4_address_t *addr, u32 vrf_id)
   nat44_ei_main_t *nm = &nat44_ei_main;
   vlib_thread_main_t *tm = vlib_get_thread_main ();
   nat44_ei_address_t *ap;
+  u32 fib_index;
 
   fail_if_disabled ();
+
+  /* the address is looked up before it is added, and the tenant's table is
+   * locked before the lookup, so the refusal below has a lock to release */
+  fib_index = ~0;
+  if (vrf_id != ~0)
+    {
+      fib_index = fib_table_find_or_create_and_lock (FIB_PROTOCOL_IP4, vrf_id, nm->fib_src_low);
+    }
 
   /* Check if address already exists */
   vec_foreach (ap, nm->addresses)
@@ -3005,20 +3034,15 @@ nat44_ei_add_address (ip4_address_t *addr, u32 vrf_id)
       if (ap->addr.as_u32 == addr->as_u32)
 	{
 	  nat44_ei_log_err ("address exist");
+	  fib_table_unlock (fib_index, FIB_PROTOCOL_IP4, nm->fib_src_low);
 	  return VNET_API_ERROR_VALUE_EXIST;
 	}
     }
 
   vec_add2 (nm->addresses, ap, 1);
 
-  ap->fib_index = ~0;
+  ap->fib_index = fib_index;
   ap->addr = *addr;
-
-  if (vrf_id != ~0)
-    {
-      ap->fib_index = fib_table_find_or_create_and_lock (
-	FIB_PROTOCOL_IP4, vrf_id, nm->fib_src_low);
-    }
 
   nat_protocol_t proto;
   for (proto = 0; proto < NAT_N_PROTOCOLS; ++proto)
