@@ -282,7 +282,9 @@ class ARPTestCase(VppTestCase):
 
     def ip_table_ids(self):
         """The IPv4 table ids the FIB has a table for"""
-        return [t.table.table_id for t in self.vapi.ip_table_dump() if not t.table.is_ip6]
+        return [
+            t.table.table_id for t in self.vapi.ip_table_dump() if not t.table.is_ip6
+        ]
 
     def get_adj_sourced_routes(self, table):
         """The addresses table holds a route for from the adjacency source"""
