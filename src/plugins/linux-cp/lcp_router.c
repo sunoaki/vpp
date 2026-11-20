@@ -66,6 +66,8 @@ typedef struct lcp_router_table_t_
 {
   uint32_t nlt_id;
   fib_protocol_t nlt_proto;
+  /* the source whose lock holds nlt_fib_index, and which the unlock uses */
+  fib_source_t nlt_fib_src;
   u32 nlt_fib_index;
   u32 nlt_mfib_index;
   u32 nlt_refs;
@@ -1267,17 +1269,98 @@ lcp_router_neigh_test_end (void)
   lcp_router_neigh_sync_end ();
 }
 
+/* The record's own reference, and the lock it holds on the FIB table. */
+#define LCP_ROUTER_TABLE_RECORD_LOCKS 2
+
+/*
+ * Whether the FIB table a record names still holds the lock the record took
+ * on it. ip_table_delete() unlocks the table under every source it can name,
+ * the plugin's own included, so a table the API deleted no longer counts the
+ * record's lock.
+ *
+ * fib_table_find() cannot answer the question: it reads the table id hash of
+ * the protocol, and ip4_fib_table_destroy() unsets an entry only for a table
+ * whose id is not ~0, so table 0 keeps its stale index there. The lock count
+ * is read from the pool element the index still names, which a freed element
+ * or a reused one both fail.
+ */
+static bool
+lcp_router_table_fib_bound (const lcp_router_table_t *nlt)
+{
+  const fib_table_t *table = fib_table_get_or_null (nlt->nlt_fib_index, nlt->nlt_proto);
+
+  if (NULL == table || nlt->nlt_fib_src >= vec_len (table->ft_locks))
+    return false;
+
+  return table->ft_locks[nlt->nlt_fib_src] >= LCP_ROUTER_TABLE_RECORD_LOCKS;
+}
+
+static void lcp_router_table_special_punt_add_del (lcp_router_table_t *nlt, u8 is_add);
+static void lcp_router_table_special_mfibs_add_del (lcp_router_table_t *nlt, u8 is_add);
+static void lcp_router_table_special_routes_del (lcp_router_table_t *nlt);
+static void lcp_router_table_mcast_release (lcp_router_table_t *nlt);
+
+/*
+ * Take a record out of the database after giving up everything it holds. The
+ * API deleted its table, which flushed the plugin's entries and freed the
+ * MFIB the record names, so what the record still holds is its own: the
+ * multicast routes' references, the special routes of the table, the table
+ * reference, and the two locks. They are released as the last release of a
+ * record's references releases them, so nothing outlives the record.
+ */
+static void
+lcp_router_table_forget (lcp_router_table_t *nlt)
+{
+  ASSERT (nlt->nlt_refs >= 1 + vec_len (nlt->nlt_mcast_entries));
+
+  lcp_router_table_mcast_release (nlt);
+  lcp_router_table_special_routes_del (nlt);
+  nlt->nlt_refs -= 1 + vec_len (nlt->nlt_mcast_entries);
+
+  fib_table_unlock (nlt->nlt_fib_index, nlt->nlt_proto, nlt->nlt_fib_src);
+  if (nlt->nlt_mfib_index != ~0)
+    mfib_table_unlock (nlt->nlt_mfib_index, nlt->nlt_proto, MFIB_SOURCE_PLUGIN_LOW);
+
+  vec_free (nlt->nlt_onlink_routes);
+  hash_unset (lcp_router_table_db[nlt->nlt_proto], nlt->nlt_id);
+  pool_put (lcp_router_table_pool, nlt);
+}
+
+/*
+ * Look a record up, dropping it when the API deleted its FIB table. The
+ * delete unlocks the table, which goes when nothing else holds it, and the
+ * record is never told: the MFIB index it names was freed with the table, and
+ * the FIB index may name a table created since. Whatever the record holds
+ * went with the table, so the record is dropped, and the next route for the
+ * table creates it again.
+ *
+ * A table the API deleted is found by its lock count, not by its id: the id
+ * still resolves to the index the table had, so a record kept for it would
+ * install into a table that is gone or, worse, into the element of the pool
+ * that the delete freed.
+ *
+ * The record found here is the caller's, and the caller releases it, so a
+ * record dropped instead comes back as absent rather than as a freed one.
+ */
 static lcp_router_table_t *
 lcp_router_table_find (uint32_t id, fib_protocol_t fproto)
 {
+  lcp_router_table_t *nlt;
   uword *p;
 
   p = hash_get (lcp_router_table_db[fproto], id);
+  if (NULL == p)
+    return NULL;
 
-  if (p)
-    return pool_elt_at_index (lcp_router_table_pool, p[0]);
+  nlt = pool_elt_at_index (lcp_router_table_pool, p[0]);
+  if (lcp_router_table_fib_bound (nlt))
+    return nlt;
 
-  return (NULL);
+  LCP_ROUTER_INFO ("drop the record of %U table %u, whose fib table the api deleted",
+		   format_fib_protocol, fproto, id);
+
+  lcp_router_table_forget (nlt);
+  return NULL;
 }
 
 static uint32_t
@@ -1289,21 +1372,37 @@ lcp_router_table_k2f (uint32_t k)
   return k;
 }
 
+/*
+ * The all 1s address of an IPv4 table. Installed under the plugin's own
+ * unswept source: it must survive the route sweep at the end of a
+ * synchronization, and it ranks below a learned static route at the same
+ * prefix but above a learned dynamic one.
+ */
 static void
-lcp_router_table_add_del_special_routes (lcp_router_table_t *nlt, u8 is_add)
+lcp_router_table_special_punt_add_del (lcp_router_table_t *nlt, u8 is_add)
 {
+  if (FIB_PROTOCOL_IP4 != nlt->nlt_proto)
+    return;
+
+  if (is_add)
+    fib_table_entry_special_add (nlt->nlt_fib_index, &pfx_all1s, lcp_rt_fib_src_special,
+				 FIB_ENTRY_FLAG_LOCAL);
+  else
+    fib_table_entry_special_remove (nlt->nlt_fib_index, &pfx_all1s, lcp_rt_fib_src_special);
+}
+
+/*
+ * The (*,224.0.0.0)/24 and (*,ff00::)/8 routes of the table, installed in its
+ * MFIB under MFIB_SOURCE_SPECIAL rather than the plugin's own source.
+ */
+static void
+lcp_router_table_special_mfibs_add_del (lcp_router_table_t *nlt, u8 is_add)
+{
+  if (nlt->nlt_mfib_index == ~0)
+    return;
+
   if (FIB_PROTOCOL_IP4 == nlt->nlt_proto)
     {
-      /* Set the all 1s address in this table to punt. Installed under the
-       * plugin's own unswept source: it must survive the route sweep at the
-       * end of a synchronization, and it ranks below a learned static route
-       * at the same prefix but above a learned dynamic one. */
-      if (is_add)
-	fib_table_entry_special_add (nlt->nlt_fib_index, &pfx_all1s, lcp_rt_fib_src_special,
-				     FIB_ENTRY_FLAG_LOCAL);
-      else
-	fib_table_entry_special_remove (nlt->nlt_fib_index, &pfx_all1s, lcp_rt_fib_src_special);
-
       const fib_route_path_t path = {
 	.frp_proto = DPO_PROTO_IP4,
 	.frp_addr = zero_addr,
@@ -1350,6 +1449,65 @@ lcp_router_table_add_del_special_routes (lcp_router_table_t *nlt, u8 is_add)
     }
 }
 
+/*
+ * Both sets of special routes, for a record whose table is one the plugin
+ * created and still holds.
+ */
+static void
+lcp_router_table_add_del_special_routes (lcp_router_table_t *nlt, u8 is_add)
+{
+  lcp_router_table_special_punt_add_del (nlt, is_add);
+  lcp_router_table_special_mfibs_add_del (nlt, is_add);
+}
+
+/*
+ * Give up the special routes of a record whose table the API deleted. The
+ * delete took the plugin's entries with it, so only a removal that finds
+ * nothing is left; taking them back while the plugin still holds the table
+ * would leave a table it created without the routes every new table gets.
+ */
+static void
+lcp_router_table_special_routes_del (lcp_router_table_t *nlt)
+{
+  lcp_router_table_special_punt_add_del (nlt, 0);
+  lcp_router_table_special_mfibs_add_del (nlt, 0);
+}
+
+/*
+ * One multicast route the record holds: its paths, under the plugin's own
+ * source, and its reference. A group or source pair is one MFIB entry, so the
+ * paths are removed before the entry, which takes the source with it.
+ */
+static void
+lcp_router_table_mcast_route_release (lcp_router_table_t *nlt, const mfib_prefix_t *prefix)
+{
+  if (FIB_NODE_INDEX_INVALID == mfib_table_lookup_exact_match (nlt->nlt_mfib_index, prefix))
+    return;
+
+  mfib_table_entry_delete (nlt->nlt_mfib_index, prefix, MFIB_SOURCE_PLUGIN_LOW);
+  mfib_table_entry_paths_remove (nlt->nlt_mfib_index, prefix, MFIB_SOURCE_PLUGIN_LOW, NULL);
+}
+
+/*
+ * Give up the multicast routes recorded for a table the API deleted, and the
+ * MFIB the record names. The MFIB index is one the delete freed, so it is
+ * left unreferenced, and the record forgets it.
+ */
+static void
+lcp_router_table_mcast_release (lcp_router_table_t *nlt)
+{
+  lcp_router_mcast_entry_t *entry;
+
+  if (nlt->nlt_mfib_index == ~0)
+    return;
+
+  vec_foreach (entry, nlt->nlt_mcast_entries)
+    lcp_router_table_mcast_route_release (nlt, &entry->lcme_prefix);
+
+  mfib_table_unlock (nlt->nlt_mfib_index, nlt->nlt_proto, MFIB_SOURCE_PLUGIN_LOW);
+  nlt->nlt_mfib_index = ~0;
+}
+
 static lcp_router_table_t *
 lcp_router_table_add_or_lock (uint32_t id, fib_protocol_t fproto)
 {
@@ -1365,8 +1523,9 @@ lcp_router_table_add_or_lock (uint32_t id, fib_protocol_t fproto)
       nlt->nlt_id = id;
       nlt->nlt_proto = fproto;
 
-      nlt->nlt_fib_index = fib_table_find_or_create_and_lock (
-	nlt->nlt_proto, nlt->nlt_id, lcp_rt_fib_src);
+      nlt->nlt_fib_src = lcp_rt_fib_src;
+      nlt->nlt_fib_index =
+	fib_table_find_or_create_and_lock (nlt->nlt_proto, nlt->nlt_id, nlt->nlt_fib_src);
       nlt->nlt_mfib_index = mfib_table_find_or_create_and_lock (
 	nlt->nlt_proto, nlt->nlt_id, MFIB_SOURCE_PLUGIN_LOW);
 
@@ -1773,9 +1932,12 @@ lcp_router_table_mcast_sync_end (lcp_router_table_t *nlt)
 static u32
 lcp_router_table_source_count (const lcp_router_table_t *nlt, fib_source_t source)
 {
-  const fib_table_t *table = fib_table_get (nlt->nlt_fib_index, nlt->nlt_proto);
+  const fib_table_t *table = fib_table_get_or_null (nlt->nlt_fib_index, nlt->nlt_proto);
 
-  return source < vec_len (table->ft_src_route_counts) ? table->ft_src_route_counts[source] : 0;
+  if (NULL == table || source >= vec_len (table->ft_src_route_counts))
+    return 0;
+
+  return table->ft_src_route_counts[source];
 }
 
 static void
@@ -2165,27 +2327,21 @@ lcp_router_route_mk_entry_flags (uint8_t rtype, int table_id, uint8_t rproto)
 }
 
 /*
- * Remove what a multicast route added. Both calls act in the MFIB table,
- * which is where lcp_router_route_add installs a multicast route; the unicast
- * table of the same table id never holds it.
+ * Remove what a multicast route added: the entry of the plugin's source and
+ * the paths it carried, both in the MFIB table, which is where
+ * lcp_router_route_add installs a multicast route; the unicast table of the
+ * same table id never holds it.
  *
- * mfib_table_entry_delete drops the source together with its entry flags and
- * every path the source carries, which is the whole of the route the plugin
- * installed. Removing the paths first and the flags afterwards cannot do that
- * any better: MFIB drops the flags of a source once its last path is gone, so
- * the second call would then have no source left to act on.
- *
- * The paths still go in, as mfib_table_entry_paths_remove leaves untouched a
- * path the source no longer has. They cover an entry another source keeps
- * alive: MFIB may leave the paths of a removed source in place, and the call
- * takes them out along with the source that held them.
+ * The paths go after the entry, which drops the source together with its
+ * entry flags and the paths it carries. What the call then takes out are the
+ * paths MFIB left behind for another source that keeps the entry alive; it
+ * leaves untouched a path the source no longer has.
  *
  * The table is taken for the call and released again, so a caller that holds
  * no reference of its own can drop a route too.
  */
 static void
-lcp_router_route_mcast_del (u32 table_id, fib_protocol_t proto, const mfib_prefix_t *prefix,
-			    const fib_route_path_t *paths)
+lcp_router_route_mcast_del (u32 table_id, fib_protocol_t proto, const mfib_prefix_t *prefix)
 {
   lcp_router_mcast_entry_t *entry;
   lcp_router_table_t *nlt;
@@ -2204,15 +2360,7 @@ lcp_router_route_mcast_del (u32 table_id, fib_protocol_t proto, const mfib_prefi
     }
 
   nlt->nlt_refs++;
-  /* The source may have lost every path already, which takes the entry's
-   * last path with it; MFIB warns about a removal of what is not there and
-   * would take the entry away from a source that still has paths. */
-  if (FIB_NODE_INDEX_INVALID != mfib_table_lookup_exact_match (nlt->nlt_mfib_index, prefix))
-    {
-      mfib_table_entry_delete (nlt->nlt_mfib_index, prefix, MFIB_SOURCE_PLUGIN_LOW);
-      if (paths)
-	mfib_table_entry_paths_remove (nlt->nlt_mfib_index, prefix, MFIB_SOURCE_PLUGIN_LOW, paths);
-    }
+  lcp_router_table_mcast_route_release (nlt, prefix);
   lcp_router_table_mcast_forget (nlt, entry);
   lcp_router_table_unlock (nlt);
 }
@@ -2298,7 +2446,7 @@ lcp_router_route_del (struct rtnl_route *rr)
 	  /* The route's own reference goes with the call, and the copy of the
 	   * table taken above is released after it, as on the unicast side. */
 	  nlt->nlt_refs++;
-	  lcp_router_route_mcast_del (table_id, pfx.fp_proto, &mpfx, np.paths);
+	  lcp_router_route_mcast_del (table_id, pfx.fp_proto, &mpfx);
 	  lcp_router_table_unlock (nlt);
 	}
       else
@@ -2615,7 +2763,7 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
        * one, and the prefix may be one another source owns, such as the
        * table's own (*,224.0.0.1) and (*,224.0.0.2). */
       if (RTN_MULTICAST == rtype && is_replace)
-	lcp_router_route_mcast_del (table_id, pfx.fp_proto, &mpfx, NULL);
+	lcp_router_route_mcast_del (table_id, pfx.fp_proto, &mpfx);
       /* A replace that names no nexthop no longer holds the gateways of the
        * route it replaces. Nothing was taken out of the FIB, so what it
        * still holds decides: a prefix another message left in place keeps
