@@ -548,6 +548,8 @@ class VppIpRoute(VppObject):
             self.encoded_paths.append(path.encode())
 
     def __eq__(self, other):
+        if not isinstance(other, VppIpRoute):
+            return NotImplemented
         if self.table_id == other.table_id and self.prefix == other.prefix:
             return True
         return False
@@ -656,6 +658,8 @@ class VppIpRouteV2(VppObject):
             self.encoded_paths.append(path.encode())
 
     def __eq__(self, other):
+        if not isinstance(other, VppIpRoute):
+            return NotImplemented
         if self.table_id == other.table_id and self.prefix == other.prefix:
             return True
         return False

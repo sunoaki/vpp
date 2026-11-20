@@ -87,7 +87,12 @@ class VppObjectRegistry:
         """
         obj = self._object_dict.pop(object_id, None)
         if obj is not None:
-            self._object_registry.remove(obj)
+            # remove the entry that was registered, not the first one that
+            # compares equal to it: two registered routes of the same prefix
+            # in different tables must each leave only their own entry
+            self._object_registry = [
+                entry for entry in self._object_registry if entry is not obj
+            ]
             logger.debug("REG: unregistering %s" % obj)
 
     def unregister_all(self, logger) -> None:
