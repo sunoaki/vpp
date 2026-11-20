@@ -2098,7 +2098,7 @@ class IpsecTra6ExtTests(IpsecTra6):
         self.verify_tra_66_ext_hdrs(self.params[socket.AF_INET6])
 
 
-class IpsecTra46Tests(IpsecTra4Tests, IpsecTra6Tests):
+class IpsecTra46Tests(TemplateIpsec, IpsecTra4Tests, IpsecTra6Tests):
     """UT test methods for Transport v6 and v4"""
 
     pass
@@ -2732,7 +2732,7 @@ class IpsecTun4HandoffTests(IpsecTun4):
         self.verify_counters4(p, 4 * N_PKTS, worker=0)
 
 
-class IpsecTun46Tests(IpsecTun4Tests, IpsecTun6Tests):
+class IpsecTun46Tests(TemplateIpsec, IpsecTun4Tests, IpsecTun6Tests):
     """UT test methods for Tunnel v6 & v4"""
 
     pass
