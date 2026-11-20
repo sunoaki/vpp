@@ -108,11 +108,9 @@ api_l2tpv3_create_tunnel (vat_main_t * vam)
 
   M (L2TPV3_CREATE_TUNNEL, mp);
 
-  clib_memcpy (mp->client_address.un.ip6, client_address.as_u8,
-	       sizeof (ip6_address_t));
+  clib_memcpy (mp->client_address.un.ip6, client_address.as_u8, sizeof (ip6_address_t));
 
-  clib_memcpy (mp->our_address.un.ip6, our_address.as_u8,
-	       sizeof (ip6_address_t));
+  clib_memcpy (mp->our_address.un.ip6, our_address.as_u8, sizeof (ip6_address_t));
 
   mp->local_session_id = htonl (local_session_id);
   mp->remote_session_id = htonl (remote_session_id);
