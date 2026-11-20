@@ -197,12 +197,15 @@ class VPPStats:
 
     def refresh(self, blocking=True):
         """Refresh directory vector cache (epoch changed)"""
-        directory = {}
-        directory_by_idx = {}
+        # The epoch is taken only from a directory read the lock accepted:
+        # taking it before the read would record the segment as read while
+        # the directory is still the previous one, an empty one after a
+        # rejected first read.
         while True:
+            directory = {}
+            directory_by_idx = {}
             try:
                 with self.lock:
-                    self.last_epoch = self.epoch
                     for i, direntry in enumerate(
                         StatsVector(self, self.directory_vector, self.elementfmt)
                     ):
@@ -212,6 +215,7 @@ class VPPStats:
                         directory_by_idx[i] = path
                     self.directory = directory
                     self.directory_by_idx = directory_by_idx
+                    self.last_epoch = self.epoch
                     return
             except IOError:
                 if not blocking:
@@ -220,15 +224,26 @@ class VPPStats:
     def __getitem__(self, item, blocking=True):
         if not self.connected:
             self.connect()
+        # A key the directory does not hold is read again before it is
+        # reported. A symlink names the entry it links to by that entry's
+        # index, and a directory vector read while the entry was still being
+        # added can leave that index past the end of what was read, with the
+        # epoch it was read at current and so no refresh due. One more read
+        # either reaches the entry or reports the key that names no counter.
+        retried = False
         while True:
             try:
                 if self.last_epoch != self.epoch:
                     self.refresh(blocking)
                 with self.lock:
-                    return self.directory[item].get_counter(self)
+                    if item in self.directory:
+                        return self.directory[item].get_counter(self)
             except IOError:
                 if not blocking:
                     raise
+            if retried:
+                raise KeyError(item)
+            retried = True
 
     def __iter__(self):
         return iter(self.directory.items())
