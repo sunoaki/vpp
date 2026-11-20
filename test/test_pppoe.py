@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
+import signal
 import socket
 import unittest
 
+import pexpect
 from scapy.packet import Raw
 from scapy.layers.l2 import Ether
 from scapy.layers.ppp import PPPoE, PPPoED, PPP
@@ -886,6 +888,49 @@ class TestPPPoE(VppTestCase):
             session.remove_vpp_config()
         for loop in loops:
             loop.remove_vpp_config()
+
+    def run_vat_command(self, vat_path, command):
+        """Run one vat command against the running VPP and return its output"""
+        api_sock_path = self.__class__.get_api_sock_path()
+        vat = pexpect.spawn(vat_path, ["socket-name", api_sock_path])
+        try:
+            vat.expect("vat# ", timeout=30)
+            vat.sendline(command)
+            vat.expect("vat# ", timeout=30)
+        finally:
+            vat.kill(signal.SIGKILL)
+            vat.wait()
+        output = vat.before.decode(errors="replace")
+        self.logger.info("%s: %s", command, output)
+        return output
+
+    def test_PPPoE_Vat_Session(self):
+        """vat must reject a session add that names no client mac"""
+        #
+        # vat opens its own API socket next to the one the test framework
+        # holds, so one vpp_api_test per command can reach the same VPP.
+        #
+        pexpect_path = config.vpp + "_api_test"
+
+        #
+        # vat refuses the command itself and prints why (pppoe_test.c:145-149
+        # returns -99, src/vat/main.c:167-169 prints it), so this covers the
+        # error path of the command that carries the byte order fix. The
+        # success path is not covered by any test on this branch: a session
+        # add over the API cannot succeed, because vat names no interface and
+        # the handler falls back to a link table that only learns a client MAC
+        # from a frame received on a port paired with a control plane port
+        # (pppoe_cp_node.c:424-432, pppoe.c:683-686).
+        #
+        # errmsg carries no newline, so both parts of the reason share a line.
+        # the return value is printed through the error text table, which
+        # names 99 "Misc" (src/vat/main.c:53, :201), not as a bare number.
+        #
+        reply = self.run_vat_command(
+            pexpect_path, "pppoe_add_del_session client-ip 192.0.2.1 session_id 0x1234"
+        )
+        self.assertIn("client mac not specified", reply)
+        self.assertIn("error: Misc", reply)
 
 
 if __name__ == "__main__":
