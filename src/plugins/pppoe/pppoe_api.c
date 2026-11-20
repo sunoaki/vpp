@@ -14,7 +14,6 @@
 #include <vppinfra/byte_order.h>
 #include <vlibmemory/api.h>
 
-
 #include <pppoe/pppoe.h>
 
 #include <vnet/format_fns.h>
@@ -24,8 +23,8 @@
 #define REPLY_MSG_ID_BASE pem->msg_id_base
 #include <vlibapi/api_helper_macros.h>
 
-static void vl_api_pppoe_add_del_session_t_handler
-  (vl_api_pppoe_add_del_session_t * mp)
+static void
+vl_api_pppoe_add_del_session_t_handler (vl_api_pppoe_add_del_session_t *mp)
 {
   vl_api_pppoe_add_del_session_reply_t *rmp;
   int rv = 0;
@@ -34,6 +33,14 @@ static void vl_api_pppoe_add_del_session_t_handler
   ip4_main_t *im = &ip4_main;
   pppoe_main_t *pem = &pppoe_main;
 
+  /*
+   * The data plane interface is resolved from the client's MAC, which the
+   * binding learns only from a frame the client sent: the add names no
+   * interface and the binding cannot be given one here, so an add for a MAC
+   * with no binding is rejected as an invalid interface index. The control
+   * plane path learns the MAC before it adds the session, so it meets the
+   * requirement by construction; this message cannot.
+   */
   uword *p = hash_get (im->fib_index_by_table_id, ntohl (mp->decap_vrf_id));
   if (!p)
     {
@@ -44,8 +51,12 @@ static void vl_api_pppoe_add_del_session_t_handler
 
   vnet_pppoe_add_del_session_args_t a = {
     .is_add = mp->is_add,
+    .encap_if_index = ~0,
     .decap_fib_index = decap_fib_index,
     .session_id = ntohs (mp->session_id),
+    /* the API names the session by its ID and address, not by a session a
+     * queued observation was made for */
+    .generation = ~0,
   };
   ip_address_decode (&mp->client_ip, &a.client_ip);
   clib_memcpy (a.client_mac, mp->client_mac, 6);
@@ -53,14 +64,11 @@ static void vl_api_pppoe_add_del_session_t_handler
   rv = vnet_pppoe_add_del_session (&a, &sw_if_index);
 
 out:
-  REPLY_MACRO2(VL_API_PPPOE_ADD_DEL_SESSION_REPLY,
-  ({
-    rmp->sw_if_index = ntohl (sw_if_index);
-  }));
+  REPLY_MACRO2 (VL_API_PPPOE_ADD_DEL_SESSION_REPLY, ({ rmp->sw_if_index = ntohl (sw_if_index); }));
 }
 
-static void send_pppoe_session_details
-  (pppoe_session_t * t, vl_api_registration_t * reg, u32 context)
+static void
+send_pppoe_session_details (pppoe_session_t *t, vl_api_registration_t *reg, u32 context)
 {
   vl_api_pppoe_session_details_t *rmp;
   ip4_main_t *im4 = &ip4_main;
@@ -70,8 +78,7 @@ static void send_pppoe_session_details
   rmp = vl_msg_api_alloc (sizeof (*rmp));
   clib_memset (rmp, 0, sizeof (*rmp));
   rmp->_vl_msg_id = ntohs (VL_API_PPPOE_SESSION_DETAILS);
-  ip_address_encode (&t->client_ip, is_ipv6 ? IP46_TYPE_IP6 : IP46_TYPE_IP4,
-		     &rmp->client_ip);
+  ip_address_encode (&t->client_ip, is_ipv6 ? IP46_TYPE_IP6 : IP46_TYPE_IP4, &rmp->client_ip);
 
   if (is_ipv6)
     {
@@ -92,7 +99,7 @@ static void send_pppoe_session_details
 }
 
 static void
-vl_api_pppoe_session_dump_t_handler (vl_api_pppoe_session_dump_t * mp)
+vl_api_pppoe_session_dump_t_handler (vl_api_pppoe_session_dump_t *mp)
 {
   vl_api_registration_t *reg;
   pppoe_main_t *pem = &pppoe_main;
@@ -108,37 +115,66 @@ vl_api_pppoe_session_dump_t_handler (vl_api_pppoe_session_dump_t * mp)
   if (~0 == sw_if_index)
     {
       pool_foreach (t, pem->sessions)
-       {
-        send_pppoe_session_details(t, reg, mp->context);
-      }
+	{
+	  send_pppoe_session_details (t, reg, mp->context);
+	}
     }
   else
     {
-      if ((sw_if_index >= vec_len (pem->session_index_by_sw_if_index)) ||
-	  (~0 == pem->session_index_by_sw_if_index[sw_if_index]))
-	{
-	  return;
-	}
-      t = &pem->sessions[pem->session_index_by_sw_if_index[sw_if_index]];
-      send_pppoe_session_details (t, reg, mp->context);
+      t = pppoe_session_find_by_sw_if_index (sw_if_index);
+      if (t)
+	send_pppoe_session_details (t, reg, mp->context);
     }
 }
 
+/*
+ * The message names one interface while the binding needs two, and pppoe.api
+ * may not change yet, so the handler cannot express what the binding needs:
+ *
+ *  - the message index is read as the control plane interface, and the data
+ *    plane interface is the one it is already bound to;
+ *  - with no binding to look up, an add has no data plane interface and is
+ *    rejected as an invalid argument, so a binding can only be created from
+ *    the CLI;
+ *  - for a delete the message index stands in for the data plane interface
+ *    too, which only matches when it is the same index, so an unbind fails as
+ *    well.
+ *
+ * In short, every add_del_cp message over the API fails until the message
+ * carries both indexes; see the follow-up noted on the plugin.
+ */
+static u32
+pppoe_api_dp_peer (u32 cp_sw_if_index, u8 is_add)
+{
+  pppoe_main_t *pem = &pppoe_main;
+  u32 dp_sw_if_index;
+
+  dp_sw_if_index = pppoe_dp_if_index_by_cp (pem, cp_sw_if_index);
+  if (dp_sw_if_index != ~0)
+    return dp_sw_if_index;
+
+  /* an add cannot guess the peer, and a delete has no pairing to fall back
+   * on: the single index names one interface, which cannot be both */
+  return is_add ? ~0 : cp_sw_if_index;
+}
+
 static void
-vl_api_pppoe_add_del_cp_t_handler (vl_api_pppoe_add_del_cp_t * mp)
+vl_api_pppoe_add_del_cp_t_handler (vl_api_pppoe_add_del_cp_t *mp)
 {
   vl_api_pppoe_add_del_cp_reply_t *rmp;
+  u32 cp_sw_if_index = ntohl (mp->sw_if_index);
   i32 rv = 0;
   pppoe_main_t *pem = &pppoe_main;
 
-  rv = pppoe_add_del_cp (ntohl (mp->sw_if_index), mp->is_add);
+  rv =
+    pppoe_add_del_cp (cp_sw_if_index, pppoe_api_dp_peer (cp_sw_if_index, mp->is_add), mp->is_add);
 
-  REPLY_MACRO(VL_API_PPPOE_ADD_DEL_CP_REPLY);
+  REPLY_MACRO (VL_API_PPPOE_ADD_DEL_CP_REPLY);
 }
 
 #include <pppoe/pppoe.api.c>
 static clib_error_t *
-pppoe_api_hookup (vlib_main_t * vm)
+pppoe_api_hookup (vlib_main_t *vm)
 {
   pppoe_main_t *pem = &pppoe_main;
 
