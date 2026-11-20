@@ -322,7 +322,7 @@ det44_expire_walk_fn (vlib_main_t * vm, vlib_node_runtime_t * rt,
 	      // close expired sessions
 	      if (ses->in_port && (ses->expire < now))
 		{
-		  snat_det_ses_close (mp, ses);
+		  snat_det_ses_close_local (mp, ses);
 		}
 	    }
 	}
