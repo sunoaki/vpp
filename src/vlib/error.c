@@ -989,7 +989,12 @@ typedef struct
  * VLIB_ERROR_FORMAT_LINE_BYTES before it is printed; a line longer than that
  * makes the print that follows it earlier rather than leave the line room. The
  * thread line is written first, and the name of its thread is not bounded
- * above, so it takes a margin of its own. */
+ * above, so it takes a margin of its own.
+ *
+ * The vector of the totals is not printed at a batch boundary: it takes the
+ * total line of every counter the walk shows, up to the counters a node
+ * registers, so it can outgrow this room. It grows by an allocation then,
+ * which the format calls that fill it return and their caller keeps. */
 #define VLIB_ERROR_FORMAT_ROOM                                                                     \
   ((VLIB_ERROR_FORMAT_BATCH + 1) * VLIB_ERROR_FORMAT_LINE_BYTES + VLIB_ERROR_FORMAT_THREAD_BYTES)
 
@@ -1009,14 +1014,22 @@ vlib_error_format_flush (vlib_main_t *vm, vlib_error_thread_t *t)
 }
 
 /* Starts the lines of a thread with room for a batch of them and for its
- * thread line, which is what a thread that shows a counter formats first. */
+ * thread line, which is what a thread that shows a counter formats first. The
+ * thread line belongs to the verbose report alone, so without verbose the
+ * lines start empty and the first counter formats the first one. The space is
+ * taken for both, because a report that formats a counter needs it either
+ * way. The total line the command passes here is the header of its own vector,
+ * which holds it in that room until a total line outgrows it. */
 static void
-vlib_error_format_start (vlib_error_thread_t *t, u32 thread_index)
+vlib_error_format_start (vlib_error_thread_t *t, u32 thread_index, int verbose, const char *line)
 {
   vec_validate (t->text, VLIB_ERROR_FORMAT_ROOM - 1);
   vec_reset_length (t->text);
 
-  format (t->text, "Thread %u (%v):\n", thread_index, t->name);
+  if (line)
+    t->text = format (t->text, "%s", line);
+  else if (verbose)
+    t->text = format (t->text, "Thread %u (%v):\n", thread_index, t->name);
 }
 
 /* Formats one counter of the report from the entry the snapshot copied. The
@@ -1024,26 +1037,36 @@ vlib_error_format_start (vlib_error_thread_t *t, u32 thread_index)
  * thread it shows, and the vector is printed once it holds a batch of lines,
  * so the lines reach vlib_cli_output in a few large pieces rather than one
  * piece each. The output is read when the command is done, so the batching
- * delays nothing that a reader waits for. */
+ * delays nothing that a reader waits for. A total line, which verbose alone
+ * asks for, goes to the vector the caller prints once, so it is not printed
+ * here. */
 static void
 vlib_error_format (vlib_main_t *vm, vlib_error_thread_t *t, vlib_error_entry_t *entry, u32 index,
 		   u64 count, int verbose, int total)
 {
   u8 *s = t->text;
 
+  /* format returns the vector it grew, which is another one when it had to
+   * allocate for the line, so the result is what the thread keeps. */
   if (total)
     {
+      /* The total line is part of the verbose report alone, and the caller
+       * prints the vector once with the header it started, so nothing is
+       * printed here. */
       if (verbose)
-	format (s, "%10lu%=40s%=20s%=10d\n", count, entry->name, entry->desc, index);
+	t->text = format (s, "%10lu%=40s%=20s%=10d\n", count, entry->name, entry->desc, index);
+
       return;
     }
 
   if (verbose)
-    format (s, "%10lu%=35s%=35s%=10s%=6d\n", count, entry->name, entry->desc,
-	    sev2str (entry->severity), index);
+    s = format (s, "%10lu%=35s%=35s%=10s%=6d\n", count, entry->name, entry->desc,
+		sev2str (entry->severity), index);
   else
-    format (s, "%10lu%=35s%=35s%=10s\n", count, entry->name, entry->desc,
-	    sev2str (entry->severity));
+    s = format (s, "%10lu%=35s%=35s%=10s\n", count, entry->name, entry->desc,
+		sev2str (entry->severity));
+
+  t->text = s;
 
   if (vec_len (s) < VLIB_ERROR_FORMAT_BATCH * VLIB_ERROR_FORMAT_LINE_BYTES)
     return;
@@ -1118,8 +1141,8 @@ vlib_error_report_thread (vlib_main_t *vm, vlib_error_counts_t *c, u32 thread_in
       if (!vlib_error_lists (c, nj))
 	continue;
 
-      if (verbose && t.text == 0)
-	vlib_error_format_start (&t, thread_index);
+      if (t.text == 0)
+	vlib_error_format_start (&t, thread_index, verbose, 0);
 
       vlib_error_format_thread (vm, &t, c, nj, verbose);
     }
@@ -1155,11 +1178,11 @@ show_errors (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
   for (u32 t = 0; t < vlib_get_n_threads (); t++)
     vlib_error_report_thread (vm, &c, t, verbose);
 
-  vec_validate (total.text, VLIB_ERROR_FORMAT_ROOM - 1);
-  vec_reset_length (total.text);
-
+  /* The total header starts the vector of the totals, and holds the room of a
+   * thread, which the format calls of the totals grow past when they need to
+   * and return the grown vector. */
   if (verbose)
-    format (total.text, "Total:\n");
+    vlib_error_format_start (&total, 0, 0, "Total:\n");
 
   vlib_error_format_total (vm, &total, &c, verbose);
 
