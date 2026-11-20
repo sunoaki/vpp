@@ -110,7 +110,7 @@ api_sw_interface_set_geneve_bypass (vat_main_t * vam)
   /* Construct the API message */
   M (SW_INTERFACE_SET_GENEVE_BYPASS, mp);
 
-  mp->sw_if_index = ntohl (sw_if_index);
+  mp->sw_if_index = htonl (sw_if_index);
   mp->enable = is_enable;
   mp->is_ipv6 = is_ipv6;
 

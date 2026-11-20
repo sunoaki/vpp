@@ -124,7 +124,7 @@ api_sw_interface_set_gtpu_bypass (vat_main_t * vam)
   /* Construct the API message */
   M (SW_INTERFACE_SET_GTPU_BYPASS, mp);
 
-  mp->sw_if_index = ntohl (sw_if_index);
+  mp->sw_if_index = htonl (sw_if_index);
   mp->enable = is_enable;
   mp->is_ipv6 = is_ipv6;
 
@@ -194,8 +194,8 @@ api_gtpu_offload_rx (vat_main_t * vam)
     }
 
   M (GTPU_OFFLOAD_RX, mp);
-  mp->hw_if_index = ntohl (hw_if_index);
-  mp->sw_if_index = ntohl (rx_sw_if_index);
+  mp->hw_if_index = htonl (hw_if_index);
+  mp->sw_if_index = htonl (rx_sw_if_index);
   mp->enable = is_add;
 
   S (mp);
@@ -676,7 +676,7 @@ static int
 api_gtpu_tunnel_v2_dump (vat_main_t *vam)
 {
   unformat_input_t *i = vam->input;
-  vl_api_gtpu_tunnel_dump_t *mp;
+  vl_api_gtpu_tunnel_v2_dump_t *mp;
   u32 sw_if_index;
   u8 sw_if_index_set = 0;
 
@@ -703,7 +703,7 @@ api_gtpu_tunnel_v2_dump (vat_main_t *vam)
     }
 
   /* Get list of gtpu-tunnel interfaces */
-  M (GTPU_TUNNEL_DUMP, mp);
+  M (GTPU_TUNNEL_V2_DUMP, mp);
 
   mp->sw_if_index = htonl (sw_if_index);
 
@@ -773,7 +773,7 @@ api_gtpu_add_del_forward (vat_main_t *vam)
   mp->is_add = is_add;
   ip_address_encode (&dst, ipv6_set ? IP46_TYPE_IP6 : IP46_TYPE_IP4,
 		     &mp->dst_address);
-  mp->forwarding_type = type;
+  mp->forwarding_type = htonl (type);
   mp->encap_vrf_id = htonl (encap_vrf_id);
   mp->decap_next_index = htonl (decap_next_index);
 
@@ -805,8 +805,8 @@ api_gtpu_get_transfer_counts (vat_main_t *vam)
     }
 
   M (GTPU_GET_TRANSFER_COUNTS, mp);
-  mp->sw_if_index_start = start_index;
-  mp->capacity = capacity;
+  mp->sw_if_index_start = htonl (start_index);
+  mp->capacity = htonl (capacity);
 
   S (mp); // TODO: Handle the prints somehow. But how is it done??
   W (ret);

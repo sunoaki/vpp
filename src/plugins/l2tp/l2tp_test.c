@@ -66,6 +66,7 @@ api_l2tpv3_create_tunnel (vat_main_t * vam)
   u64 local_cookie = 0;
   u64 remote_cookie = 0;
   u8 l2_sublayer_present = 0;
+  u32 encap_vrf_id = ~0;
   vl_api_l2tpv3_create_tunnel_t *mp;
   int ret;
 
@@ -87,6 +88,8 @@ api_l2tpv3_create_tunnel (vat_main_t * vam)
 	;
       else if (unformat (i, "l2-sublayer-present"))
 	l2_sublayer_present = 1;
+      else if (unformat (i, "encap_vrf_id %d", &encap_vrf_id))
+	;
       else
 	break;
     }
@@ -111,11 +114,12 @@ api_l2tpv3_create_tunnel (vat_main_t * vam)
   clib_memcpy (mp->our_address.un.ip6, our_address.as_u8,
 	       sizeof (ip6_address_t));
 
-  mp->local_session_id = ntohl (local_session_id);
-  mp->remote_session_id = ntohl (remote_session_id);
+  mp->local_session_id = htonl (local_session_id);
+  mp->remote_session_id = htonl (remote_session_id);
   mp->local_cookie = clib_host_to_net_u64 (local_cookie);
   mp->remote_cookie = clib_host_to_net_u64 (remote_cookie);
   mp->l2_sublayer_present = l2_sublayer_present;
+  mp->encap_vrf_id = htonl (encap_vrf_id);
 
   S (mp);
   W (ret);
@@ -155,7 +159,7 @@ api_l2tpv3_set_tunnel_cookies (vat_main_t * vam)
 
   M (L2TPV3_SET_TUNNEL_COOKIES, mp);
 
-  mp->sw_if_index = ntohl (sw_if_index);
+  mp->sw_if_index = htonl (sw_if_index);
   mp->new_local_cookie = clib_host_to_net_u64 (new_local_cookie);
   mp->new_remote_cookie = clib_host_to_net_u64 (new_remote_cookie);
 
@@ -196,7 +200,7 @@ api_l2tpv3_interface_enable_disable (vat_main_t * vam)
 
   M (L2TPV3_INTERFACE_ENABLE_DISABLE, mp);
 
-  mp->sw_if_index = ntohl (sw_if_index);
+  mp->sw_if_index = htonl (sw_if_index);
   mp->enable_disable = enable_disable;
 
   S (mp);
