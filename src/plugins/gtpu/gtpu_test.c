@@ -771,8 +771,7 @@ api_gtpu_add_del_forward (vat_main_t *vam)
   M (GTPU_ADD_DEL_FORWARD, mp);
 
   mp->is_add = is_add;
-  ip_address_encode (&dst, ipv6_set ? IP46_TYPE_IP6 : IP46_TYPE_IP4,
-		     &mp->dst_address);
+  ip_address_encode (&dst, ipv6_set ? IP46_TYPE_IP6 : IP46_TYPE_IP4, &mp->dst_address);
   mp->forwarding_type = htonl (type);
   mp->encap_vrf_id = htonl (encap_vrf_id);
   mp->decap_next_index = htonl (decap_next_index);
