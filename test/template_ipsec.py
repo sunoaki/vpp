@@ -308,7 +308,7 @@ class TemplateIpsec(VppTestCase):
         ]
 
 
-class IpsecTcp(object):
+class IpsecTcp(VppTestCase):
     def verify_tcp_checksum(self):
         # start http cli server listener on http://0.0.0.0:80
         self.vapi.cli("http cli server")
@@ -335,7 +335,7 @@ class IpsecTcpTests(IpsecTcp):
         self.verify_tcp_checksum()
 
 
-class IpsecTra4(object):
+class IpsecTra4(VppTestCase):
     """verify methods for Transport v4"""
 
     def get_replay_counts(self, p):
@@ -1917,7 +1917,7 @@ class IpsecTra4Tests(IpsecTra4):
         self.verify_tra_basic4(count=257)
 
 
-class IpsecTra6(object):
+class IpsecTra6(VppTestCase):
     """verify methods for Transport v6"""
 
     def verify_tra_basic6(self, count=1, payload_size=54):
@@ -2104,7 +2104,7 @@ class IpsecTra46Tests(IpsecTra4Tests, IpsecTra6Tests):
     pass
 
 
-class IpsecTun4(object):
+class IpsecTun4(VppTestCase):
     """verify methods for Tunnel v4"""
 
     def verify_counters4(self, p, count, n_frags=None, worker=None):
@@ -2385,7 +2385,7 @@ class IpsecTun4Tests(IpsecTun4):
         self.verify_tun_44(self.params[socket.AF_INET], count=127)
 
 
-class IpsecTun6(object):
+class IpsecTun6(VppTestCase):
     """verify methods for Tunnel v6"""
 
     def verify_counters6(self, p_in, p_out, count, worker=None):
