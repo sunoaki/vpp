@@ -125,12 +125,11 @@ icmp_match_in2out_det (vlib_node_runtime_t *node, u32 thread_index, vlib_buffer_
   sw_if_index0 = vnet_buffer (b0)->sw_if_index[VLIB_RX];
   rx_fib_index0 = ip4_fib_table_get_index_for_sw_if_index (sw_if_index0);
 
-  if (!icmp_type_is_error_message
-      (vnet_buffer (b0)->ip.reass.icmp_type_or_tcp_flags))
+  if (!icmp_type_is_error_message (icmp0->type))
     {
       protocol = NAT_PROTOCOL_ICMP;
       in_addr = ip0->src_address;
-      in_port = vnet_buffer (b0)->ip.reass.l4_src_port;
+      in_port = echo0->identifier;
     }
   else
     {
@@ -225,10 +224,8 @@ icmp_match_in2out_det (vlib_node_runtime_t *node, u32 thread_index, vlib_buffer_
 	}
     }
 
-  if (PREDICT_FALSE
-      (vnet_buffer (b0)->ip.reass.icmp_type_or_tcp_flags != ICMP4_echo_request
-       && !icmp_type_is_error_message (vnet_buffer (b0)->ip.
-				       reass.icmp_type_or_tcp_flags)))
+  if (PREDICT_FALSE (icmp0->type != ICMP4_echo_request &&
+		     !icmp_type_is_error_message (icmp0->type)))
     {
       b0->error = node->errors[DET44_IN2OUT_ERROR_BAD_ICMP_TYPE];
       next0 = DET44_IN2OUT_NEXT_DROP;
@@ -321,7 +318,8 @@ det44_icmp_in2out (vlib_buffer_t *b0, ip4_header_t *ip0, icmp46_header_t *icmp0,
 			 src_address /* changed member */ );
   ip0->checksum = ip_csum_fold (sum0);
 
-  if (!vnet_buffer (b0)->ip.reass.is_non_first_fragment)
+  /* A non-first fragment has no ICMP header to rewrite. */
+  if (ip4_get_fragment_offset (ip0) == 0)
     {
       if (icmp0->checksum == 0)
 	icmp0->checksum = 0xffff;
@@ -434,15 +432,25 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
   vlib_get_buffers (vm, from, b, n_left_from);
 
   /* The feature stays on the interfaces while the plugin is disabled, so the
-     node has to pass the packets through untranslated on its own. */
+     node has to pass the packets through untranslated on its own. Without a
+     translation there is no other table to send them to, so they keep the
+     table of the interface they arrived on, as an untranslated packet
+     without this feature would. */
   if (PREDICT_FALSE (!plugin_enabled ()))
     {
       u32 i;
+      vlib_buffer_t **b0 = b;
+      vlib_buffer_t *buf;
 
       for (i = 0; i < frame->n_vectors; i++)
-	nexts[i] = DET44_IN2OUT_NEXT_LOOKUP;
+	{
+	  buf = b0[i];
+	  vnet_buffer (buf)->sw_if_index[VLIB_TX] =
+	    ip4_fib_table_get_index_for_sw_if_index (vnet_buffer (buf)->sw_if_index[VLIB_RX]);
+	  nexts[i] = DET44_IN2OUT_NEXT_LOOKUP;
+	}
 
-      vlib_buffer_enqueue_to_next (vm, node, from, (u16 *) nexts, frame->n_vectors);
+      vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
       return frame->n_vectors;
     }
 

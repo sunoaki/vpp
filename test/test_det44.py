@@ -1860,13 +1860,6 @@ class TestDET44PluginState(VppTestCase):
     def setUp(self):
         super(TestDET44PluginState, self).setUp()
         self.vapi.det44_plugin_enable_disable(enable=1)
-        self.vapi.det44_add_del_map(
-            is_add=1,
-            in_addr=self.inside.remote_ip4,
-            in_plen=32,
-            out_addr=socket.inet_aton(self.nat_addr),
-            out_plen=32,
-        )
 
     def tearDown(self):
         super(TestDET44PluginState, self).tearDown()
@@ -1879,18 +1872,34 @@ class TestDET44PluginState(VppTestCase):
             )
             self.vapi.det44_plugin_enable_disable(enable=0)
 
+    def add_map(self):
+        """Map the inside host; the plugin adds the range to the outside FIB."""
+        self.vapi.det44_add_del_map(
+            is_add=1,
+            in_addr=self.inside.remote_ip4,
+            in_plen=32,
+            out_addr=socket.inet_aton(self.nat_addr),
+            out_plen=32,
+        )
+
+    def add_inside(self):
+        self.vapi.det44_interface_add_del_feature(
+            sw_if_index=self.inside.sw_if_index, is_add=1, is_inside=1
+        )
+
+    def add_outside(self):
+        self.vapi.det44_interface_add_del_feature(
+            sw_if_index=self.outside.sw_if_index, is_add=1, is_inside=0
+        )
+
     def add_interfaces(self):
         """Register both interfaces, the inside one first.
 
         The plugin disable removes the inside interface first, which leaves
         the outside one for the packet path to be observed on.
         """
-        self.vapi.det44_interface_add_del_feature(
-            sw_if_index=self.inside.sw_if_index, is_add=1, is_inside=1
-        )
-        self.vapi.det44_interface_add_del_feature(
-            sw_if_index=self.outside.sw_if_index, is_add=1, is_inside=0
-        )
+        self.add_inside()
+        self.add_outside()
 
     def send_udp(self):
         """Send one inside UDP packet and return what left on the outside."""
@@ -1907,9 +1916,22 @@ class TestDET44PluginState(VppTestCase):
     def session_count(self):
         return len(self.vapi.det44_session_dump(self.inside.remote_ip4))
 
+    def interface_features(self, pg_interface):
+        """Return the non-empty lines of the interface's ip4-unicast section."""
+        output = self.vapi.cli("show interface %s features" % pg_interface.name)
+        section = output.split("ip4-unicast:", 1)
+        if len(section) < 2:
+            return []
+        return [line for line in section[1].split("\n\n", 1)[0].split("\n") if line]
+
+    def det44_interfaces(self):
+        """Return the sw_if_index values the plugin reports as registered."""
+        return [i.sw_if_index for i in self.vapi.det44_interface_dump()]
+
     def test_disable_stops_translation(self):
         """Traffic is not translated while the plugin is disabled"""
         self.add_interfaces()
+        self.add_map()
 
         p = self.send_udp()[0]
         self.assert_packet_checksums_valid(p)
@@ -1927,27 +1949,52 @@ class TestDET44PluginState(VppTestCase):
         self.assertEqual(0, self.session_count())
 
     def test_disable_removes_interface_features(self):
-        """Disabling the plugin removes the det44 features of the interface"""
+        """Disabling the plugin removes the features from both interfaces"""
         self.add_interfaces()
-        self.send_udp()
+        self.add_map()
+
+        self.assertEqual(["  det44-in2out"], self.interface_features(self.inside))
+        self.assertEqual(["  det44-out2in"], self.interface_features(self.outside))
 
         self.vapi.det44_plugin_enable_disable(enable=0)
 
-        output = self.vapi.cli("show features verbose")
-        self.assertNotIn("det44-out2in", output)
-        self.assertNotIn("det44-in2out", output)
+        self.assertEqual(["  none configured"], self.interface_features(self.inside))
+        self.assertEqual(
+            ["  none configured"], self.interface_features(self.outside)
+        )
+        self.assertEqual([], self.det44_interfaces())
 
     def test_reenable_after_disable_translates_again(self):
         """A disable and enable cycle restores translation"""
         self.add_interfaces()
+        self.add_map()
         self.send_udp()
 
-        self.vapi.det44_plugin_enable_disable(enable=0)
-        self.vapi.det44_plugin_enable_disable(enable=1)
-        self.add_interfaces()
+        # Two cycles, so that a feature left installed by the first disable
+        # would be installed a second time by the second registration.
+        for _ in range(2):
+            self.vapi.det44_plugin_enable_disable(enable=0)
+            self.assertEqual([], self.det44_interfaces())
+            self.assertEqual(
+                ["  none configured"], self.interface_features(self.inside)
+            )
 
-        p = self.send_udp()[0]
-        self.assert_packet_checksums_valid(p)
-        self.assertEqual(self.nat_addr, p[IP].src)
-        self.assertEqual(self.external_port, p[UDP].dport)
-        self.assertEqual(1, self.session_count())
+            self.vapi.det44_plugin_enable_disable(enable=1)
+            self.add_interfaces()
+            self.add_map()
+            self.assertEqual(
+                [self.inside.sw_if_index, self.outside.sw_if_index],
+                self.det44_interfaces(),
+            )
+            self.assertEqual(
+                ["  det44-in2out"], self.interface_features(self.inside)
+            )
+            self.assertEqual(
+                ["  det44-out2in"], self.interface_features(self.outside)
+            )
+
+            p = self.send_udp()[0]
+            self.assert_packet_checksums_valid(p)
+            self.assertEqual(self.nat_addr, p[IP].src)
+            self.assertEqual(self.external_port, p[UDP].dport)
+            self.assertEqual(1, self.session_count())

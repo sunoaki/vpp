@@ -379,6 +379,7 @@ det44_plugin_disable ()
   det44_interface_t *i, *interfaces;
   det44_identity_mapping_t *identity_mapping;
   snat_det_map_t *mp;
+  const char *feature_name;
   int rv = 0;
 
   if (plugin_enabled () == 0)
@@ -421,6 +422,16 @@ det44_plugin_disable ()
       }
   }
   vec_free (interfaces);
+
+  /* A delete that stopped early leaves its feature installed while the
+     interface entry is gone, and a later add would install a second copy of
+     it. Unset the feature each remaining interface still carries. */
+  pool_foreach (i, dm->interfaces)
+    {
+      feature_name = (i->flags & DET44_INTERFACE_FLAG_IS_INSIDE) ? "det44-in2out" : "det44-out2in";
+      if (vnet_feature_is_enabled ("ip4-unicast", feature_name, i->sw_if_index) == 1)
+	vnet_feature_enable_disable ("ip4-unicast", feature_name, i->sw_if_index, 0, 0, 0);
+    }
 
   pool_foreach (mp, dm->det_maps)
    {
