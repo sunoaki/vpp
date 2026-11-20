@@ -107,8 +107,8 @@ api_dhcp_proxy_config (vat_main_t * vam)
   M (DHCP_PROXY_CONFIG, mp);
 
   mp->is_add = is_add;
-  mp->rx_vrf_id = ntohl (rx_vrf_id);
-  mp->server_vrf_id = ntohl (server_vrf_id);
+  mp->rx_vrf_id = htonl (rx_vrf_id);
+  mp->server_vrf_id = htonl (server_vrf_id);
   if (v6_address_set)
     {
       clib_memcpy (&mp->dhcp_server.un, &v6address, sizeof (v6address));
@@ -249,15 +249,15 @@ api_dhcp_proxy_set_vss (vat_main_t * vam)
     }
 
   M (DHCP_PROXY_SET_VSS, mp);
-  mp->tbl_id = ntohl (tbl_id);
-  mp->vss_type = vss_type;
+  mp->tbl_id = htonl (tbl_id);
+  mp->vss_type = htonl (vss_type);
   if (vpn_ascii_id)
     {
       clib_memcpy (mp->vpn_ascii_id, vpn_ascii_id, vec_len (vpn_ascii_id));
       mp->vpn_ascii_id[vec_len (vpn_ascii_id)] = 0;
     }
-  mp->vpn_index = ntohl (fib_id);
-  mp->oui = ntohl (oui);
+  mp->vpn_index = htonl (fib_id);
+  mp->oui = htonl (oui);
   mp->is_ipv6 = is_ipv6;
   mp->is_add = is_add;
 

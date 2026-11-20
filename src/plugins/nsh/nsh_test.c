@@ -269,10 +269,10 @@ static int api_nsh_add_del_map (vat_main_t * vam)
     M(NSH_ADD_DEL_MAP, nsh_add_del_map);
     /* set args structure */
     mp->is_add = is_add;
-    mp->nsp_nsi = (nsp<< NSH_NSP_SHIFT) | nsi;
-    mp->mapped_nsp_nsi = (mapped_nsp<< NSH_NSP_SHIFT) | mapped_nsi;
-    mp->sw_if_index = sw_if_index;
-    mp->next_node = next_node;
+    mp->nsp_nsi = htonl ((nsp << NSH_NSP_SHIFT) | nsi);
+    mp->mapped_nsp_nsi = htonl ((mapped_nsp << NSH_NSP_SHIFT) | mapped_nsi);
+    mp->sw_if_index = htonl (sw_if_index);
+    mp->next_node = htonl (next_node);
 
     /* send it... */
     S;
