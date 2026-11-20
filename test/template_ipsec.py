@@ -1067,10 +1067,10 @@ class IpsecTra4(VppTestCase):
         self.assertEqual(p.tra_sa_in.get_err("lost"), 0)
 
         self.assert_packet_counter_equal(
-            self.get_node_counter(self.tra4_encrypt_node_name, "rx_pkts"), count
+            self.get_node_counter_path(self.tra4_encrypt_node_name, "rx_pkts"), count
         )
         self.assert_packet_counter_equal(
-            self.get_node_counter(self.tra4_decrypt_node_name[0], "rx_pkts"), count
+            self.get_node_counter_path(self.tra4_decrypt_node_name[0], "rx_pkts"), count
         )
 
     def _verify_tra_anti_replay_algorithm_esn(self):
@@ -1956,10 +1956,10 @@ class IpsecTra6(VppTestCase):
             pkts, count, "incorrect SA out counts: expected %d != %d" % (count, pkts)
         )
         self.assert_packet_counter_equal(
-            self.get_node_counter(self.tra6_encrypt_node_name, "rx_pkts"), count
+            self.get_node_counter_path(self.tra6_encrypt_node_name, "rx_pkts"), count
         )
         self.assert_packet_counter_equal(
-            self.get_node_counter(self.tra6_decrypt_node_name[0], "rx_pkts"), count
+            self.get_node_counter_path(self.tra6_decrypt_node_name[0], "rx_pkts"), count
         )
 
     def gen_encrypt_pkts_ext_hdrs6(
@@ -2131,10 +2131,10 @@ class IpsecTun4(VppTestCase):
             )
 
         self.assert_packet_counter_equal(
-            self.get_node_counter(self.tun4_encrypt_node_name, "rx_pkts"), n_frags
+            self.get_node_counter_path(self.tun4_encrypt_node_name, "rx_pkts"), n_frags
         )
         self.assert_packet_counter_equal(
-            self.get_node_counter(self.tun4_decrypt_node_name[0], "rx_pkts"), count
+            self.get_node_counter_path(self.tun4_decrypt_node_name[0], "rx_pkts"), count
         )
 
     def verify_decrypted(self, p, rxs):
@@ -2402,10 +2402,10 @@ class IpsecTun6(VppTestCase):
                 "incorrect SA out counts: expected %d != %d" % (count, pkts),
             )
         self.assert_packet_counter_equal(
-            self.get_node_counter(self.tun6_encrypt_node_name, "rx_pkts"), count
+            self.get_node_counter_path(self.tun6_encrypt_node_name, "rx_pkts"), count
         )
         self.assert_packet_counter_equal(
-            self.get_node_counter(self.tun6_decrypt_node_name[0], "rx_pkts"), count
+            self.get_node_counter_path(self.tun6_decrypt_node_name[0], "rx_pkts"), count
         )
 
     def verify_decrypted6(self, p, rxs):
