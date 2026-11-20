@@ -232,19 +232,28 @@ class VPPStats:
         # at the epoch the segment had when the read began, so no refresh
         # is due. After the second read the KeyError is reported with item,
         # the path or index the caller asked for.
+        #
+        # An IOError is a refused read, not a missing counter, so it takes
+        # the same second read that a KeyError takes, and only then is it
+        # reported: a blocking caller whose read was refused is told the
+        # read failed, not that the item names no counter.
         retried = False
+        io_error = None
         while True:
             try:
                 if retried or self.last_epoch != self.epoch:
                     self.refresh(blocking)
                 with self.lock:
                     return self.directory[item].get_counter(self)
-            except IOError:
+            except IOError as e:
                 if not blocking:
                     raise
+                io_error = e
             except KeyError:
                 pass
             if retried:
+                if io_error is not None:
+                    raise IOError("Optimistic lock failed, retry") from io_error
                 raise KeyError(item)
             retried = True
 
