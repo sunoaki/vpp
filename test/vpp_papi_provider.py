@@ -157,6 +157,13 @@ defaultmapping = {
     "pppoe_add_del_session": {
         "is_add": 1,
     },
+    "pppoe_add_del_session_v2": {
+        "is_add": 1,
+        "encap_if_index": 4294967295,
+    },
+    "pppoe_session_dump": {
+        "sw_if_index": 4294967295,
+    },
     "policer_add_del": {
         "is_add": 1,
         "conform_action": {"type": 1},
@@ -798,6 +805,43 @@ class VppPapiProvider(object):
             {"table": {"table_id": table_id, "is_ip6": is_ip6}},
         )
 
+    def pppoe_add_del_session_v2(
+        self,
+        client_ip,
+        client_mac,
+        session_id=0,
+        is_add=1,
+        decap_vrf_id=0,
+        encap_if_index=0xFFFFFFFF,
+        disable_fib=0,
+    ):
+        """
+
+        :param is_add:  (Default value = 1)
+        :param is_ipv6:  (Default value = 0)
+        :param client_ip:
+        :param session_id:  (Default value = 0)
+        :param client_mac:
+        :param decap_vrf_id:  (Default value = 0)
+        :param encap_if_index: interface towards the client, 0xFFFFFFFF to
+            learn it from the client's own frames (Default value = 0xFFFFFFFF)
+        :param disable_fib: leave the reverse route for the IPv4 client
+            address to whoever owns it (Default value = 0)
+
+        """
+        return self.api(
+            self.papi.pppoe_add_del_session_v2,
+            {
+                "is_add": is_add,
+                "session_id": session_id,
+                "client_ip": client_ip,
+                "decap_vrf_id": decap_vrf_id,
+                "client_mac": client_mac,
+                "encap_if_index": encap_if_index,
+                "disable_fib": disable_fib,
+            },
+        )
+
     def pppoe_add_del_session(
         self, client_ip, client_mac, session_id=0, is_add=1, decap_vrf_id=0
     ):
@@ -821,6 +865,15 @@ class VppPapiProvider(object):
                 "client_mac": client_mac,
             },
         )
+
+    def pppoe_session_dump(self, sw_if_index=0xFFFFFFFF):
+        """
+
+        :param sw_if_index: interface of one session, 0xFFFFFFFF for every
+            session (Default value = 0xFFFFFFFF)
+
+        """
+        return self.api(self.papi.pppoe_session_dump, {"sw_if_index": sw_if_index})
 
     def sr_mpls_policy_add(self, bsid, weight, type, segments):
         return self.api(
