@@ -1636,9 +1636,10 @@ class TestDET44IdentityMapping(TestDET44):
         """Return the outside port deterministic NAT picks for an inside 5-tuple.
 
         Mirrors the port loop in det44_in2out.c: a session whose source is
-        already recorded for the same external address and port keeps its
+        already recorded for the same external host address and port keeps its
         outside port, otherwise the first candidate in the range starting at
-        lo_port that no such session holds is used.
+        lo_port that no session of the same user holds for that external host
+        address and port is used.
 
         :param in_addr: Inside source address
         :param in_port: Inside source port
@@ -1649,16 +1650,25 @@ class TestDET44IdentityMapping(TestDET44):
         self.assertEqual(1, len(dms))
         forwarded = self.vapi.det44_forward(in_addr)
         self.assertEqual(self.nat_ip, str(forwarded.out_addr))
-        lo_port = forwarded.out_port_lo
+        # The handler stores ntohs (lo_port) in the reply field
+        # (det44_api.c), and the binding decodes the u16 as network order, so
+        # the value needs one more swap to read back as the host port.
+        lo_port = socket.ntohs(forwarded.out_port_lo)
         ports_per_host = dms[0].ports_per_host
         used = set()
         existing = None
         for s in self.vapi.det44_session_dump(in_addr):
-            if str(s.ext_addr) != ext_addr or s.ext_port != ext_port:
+            # det44_in2out.c frees a candidate port only when no session of
+            # this user holds it for the same external host address AND the
+            # same external host port, so both halves of key0 are filtered on
+            # before a port is counted as taken.
+            if str(s.ext_addr) != ext_addr:
                 continue
-            used.add(s.out_port)
+            if s.ext_port != ext_port:
+                continue
+            used.add(int(s.out_port))
             if s.in_port == in_port:
-                existing = s.out_port
+                existing = int(s.out_port)
         if existing is not None:
             return existing
         for i in range(ports_per_host):
