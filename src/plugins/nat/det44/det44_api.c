@@ -129,6 +129,114 @@ vl_api_det44_map_dump_t_handler (vl_api_det44_map_dump_t * mp)
 }
 
 static void
+vl_api_det44_add_del_identity_mapping_t_handler (vl_api_det44_add_del_identity_mapping_t *mp)
+{
+  det44_main_t *dm = &det44_main;
+  vl_api_det44_add_del_identity_mapping_reply_t *rmp;
+  ip4_address_t addr;
+  nat_protocol_t proto = NAT_PROTOCOL_OTHER;
+  u16 port = 0;
+  u32 flags = 0;
+  u8 *tag = 0;
+  int rv = 0;
+
+  if (!dm->enabled)
+    {
+      rv = VNET_API_ERROR_FEATURE_DISABLED;
+      goto send_reply;
+    }
+
+  clib_memcpy (&addr, mp->addr, 4);
+  if (mp->flags & NAT_API_IS_ADDR_ONLY)
+    {
+      flags |= DET44_FLAG_ADDR_ONLY;
+    }
+  else
+    {
+      proto = ip_proto_to_nat_proto (mp->protocol);
+      /* The packet path never passes NAT_PROTOCOL_OTHER, so a mapping
+	 added with it could never match. A delete must still reach the
+	 store, which finds the entry by the stored protocol, so the CLI
+	 can delete what it created with "other". */
+      if (proto == NAT_PROTOCOL_OTHER && mp->is_add)
+	{
+	  rv = VNET_API_ERROR_UNSUPPORTED;
+	  goto send_reply;
+	}
+      port = mp->port;
+    }
+
+  mp->tag[sizeof (mp->tag) - 1] = 0;
+  if (mp->tag[0])
+    tag = format (0, "%s%c", mp->tag, 0);
+
+  switch (det44_add_del_identity_mapping (addr, proto, port, mp->is_add, flags, tag))
+    {
+    case DET44_IDENTITY_MAPPING_ADDED:
+    case DET44_IDENTITY_MAPPING_DELETED:
+      break;
+    case DET44_IDENTITY_MAPPING_NOT_FOUND:
+      rv = VNET_API_ERROR_NO_SUCH_ENTRY;
+      break;
+    case DET44_IDENTITY_MAPPING_ALREADY_EXISTS:
+      rv = VNET_API_ERROR_VALUE_EXIST;
+      break;
+    }
+
+  if (tag)
+    vec_free (tag);
+
+send_reply:
+  REPLY_MACRO (VL_API_DET44_ADD_DEL_IDENTITY_MAPPING_REPLY);
+}
+
+static void
+send_det44_identity_mapping_details (det44_identity_mapping_t *m, vl_api_registration_t *reg,
+				     u32 context)
+{
+  det44_main_t *dm = &det44_main;
+  vl_api_det44_identity_mapping_details_t *rmp;
+  u8 tag_len;
+
+  rmp = vl_msg_api_alloc (sizeof (*rmp));
+  clib_memset (rmp, 0, sizeof (*rmp));
+  rmp->_vl_msg_id = ntohs (VL_API_DET44_IDENTITY_MAPPING_DETAILS + dm->msg_id_base);
+  clib_memcpy (rmp->addr, &m->addr, 4);
+  if (m->flags & DET44_FLAG_ADDR_ONLY)
+    {
+      rmp->flags = NAT_API_IS_ADDR_ONLY;
+    }
+  else
+    {
+      rmp->protocol = nat_proto_to_ip_proto (m->proto);
+      rmp->port = m->port;
+    }
+  if (m->tag)
+    {
+      tag_len = clib_min (vec_len (m->tag), sizeof (rmp->tag) - 1);
+      clib_memcpy (rmp->tag, m->tag, tag_len);
+    }
+  rmp->context = context;
+
+  vl_api_send_msg (reg, (u8 *) rmp);
+}
+
+static void
+vl_api_det44_identity_mapping_dump_t_handler (vl_api_det44_identity_mapping_dump_t *mp)
+{
+  det44_main_t *dm = &det44_main;
+  vl_api_registration_t *reg;
+  det44_identity_mapping_t *m;
+
+  reg = vl_api_client_index_to_registration (mp->client_index);
+  if (!reg)
+    return;
+
+  vec_foreach (m, dm->identity_mappings)
+    send_det44_identity_mapping_details (m, reg, mp->context);
+}
+
+static void
 vl_api_det44_close_session_out_t_handler (vl_api_det44_close_session_out_t
 					  * mp)
 {

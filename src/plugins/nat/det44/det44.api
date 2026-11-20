@@ -155,6 +155,84 @@ define det44_map_dump {
   u32 context;
 };
 
+/** \brief Add/delete DET44 identity mapping
+
+    The store compares addr and flags first, then protocol and port
+    unless flags carries NAT_API_IS_ADDR_ONLY. A delete therefore has to
+    name the same addr and flags as the mapping it removes: an
+    address-only mapping is only deleted by a request that also sets
+    NAT_API_IS_ADDR_ONLY, and a delete that omits it fails with
+    VNET_API_ERROR_NO_SUCH_ENTRY.
+
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+    @param is_add - true if add, false if delete
+    @param addr - inside IPv4 address
+    @param protocol - IP protocol number, ignored when flags contains
+       NAT_API_IS_ADDR_ONLY. Adding accepts only 6, 17, 1 or 58, the
+       protocols the packet path matches, with 58 stored as ICMP; any
+       other value fails with VNET_API_ERROR_UNSUPPORTED, so this message
+       cannot create a mapping that stores some other protocol. A delete
+       is not checked, so that it can still remove a mapping the CLI
+       stored with "other"; such a mapping cannot be created by this
+       message, so use the CLI to recreate one
+    @param port - inside port, ignored when flags contains
+       NAT_API_IS_ADDR_ONLY
+    @param flags - NAT_API_IS_ADDR_ONLY for a whole-address mapping,
+       0 for a mapping of one protocol and port
+    @param tag - opaque string tag, truncated to 63 characters when stored
+*/
+autoreply define det44_add_del_identity_mapping {
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  vl_api_ip4_address_t addr;
+  u8 protocol;
+  u16 port;
+  vl_api_nat_config_flags_t flags;
+  string tag[64];
+};
+
+/** \brief Dump DET44 identity mappings
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+*/
+define det44_identity_mapping_dump {
+  u32 client_index;
+  u32 context;
+};
+
+/** \brief DET44 identity mapping details response
+
+    addr and flags, together with protocol and port for a mapping that
+    is not address-only, identify the mapping for a delete. Use these
+    values with is_add set to false; NAT_API_IS_ADDR_ONLY must be passed
+    back for an address-only mapping or the delete fails.
+
+    The sender zeroes protocol and port for an address-only mapping, so
+    zero there means "not reported", not a stored value. A protocol
+    stored as ICMP, including one added as 58, is reported as 1. A
+    mapping stored with any other protocol, such as one the CLI created
+    with "other", is reported as 255, and a delete naming 255 then
+    refers to that mapping. 255 is accepted only on a delete; use the
+    CLI to recreate a mapping the CLI created.
+
+    @param context - sender context, to match reply w/ request
+    @param addr - inside IPv4 address
+    @param protocol - IP protocol number, 0 for an address-only mapping
+    @param port - inside port, 0 for an address-only mapping
+    @param flags - NAT_API_IS_ADDR_ONLY for a whole-address mapping
+    @param tag - opaque string tag
+*/
+define det44_identity_mapping_details {
+  u32 context;
+  vl_api_ip4_address_t addr;
+  u8 protocol;
+  u16 port;
+  vl_api_nat_config_flags_t flags;
+  string tag[64];
+};
+
 /** \brief DET44 users response
     @param context - sender context, to match reply w/ request
     @param in_addr - inside IPv4 address
