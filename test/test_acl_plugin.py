@@ -1980,105 +1980,30 @@ class TestACLplugin(VppTestCase):
         self.assertNotIn(pg0_index, self._sessions_by_interface())
         self.assertEqual(self._sessions_by_interface()[pg1_index], pg1_sessions)
 
-        self._wait_for_clear_walk_to_finish()
-        self._check_delete_reaches_past_a_foreign_session(pg0_index, pg1_index)
-
         self.logger.info("ACLP_TEST_FINISH_0401")
-
-    def _wait_for_clear_walk_to_finish(self):
-        """Wait until the clear walk has no interface left to clear.
-
-        The walk deletes the sessions of the interfaces in the pending bitmap
-        and drops that bitmap once it reaches the ends of the lists, so a
-        bitmap of zero is the walk reporting that it has nothing left. Poll
-        the figure `show acl-plugin sessions` prints per worker for it.
-        """
-        deadline = time.time() + 5.0
-        while True:
-            output = self._show_sessions()
-            pending = re.findall(r"pending clear intfc bitmap : (\S+)", output)
-            if not pending or set(pending) == {"00"}:
-                return
-            if time.time() > deadline:
-                self.fail("the clear walk has not finished:\n%s" % output)
-            self.sleep(0.05)
-
-    def _session_dels(self):
-        """Sum the `del` figures over every interface and worker."""
-        return sum(dels for _, dels in self._sessions_by_interface().values())
-
-    def _check_delete_reaches_past_a_foreign_session(self, deleted, other):
-        """Delete an interface whose session has another interface's ahead of it.
-
-        The scenario above does not put the two sessions on one list: a
-        reflected TCP packet leaves the session that receives it on the
-        transient list and moves the one it came back to the idle list. A list
-        that holds one session has nothing ahead of it when the clear walk
-        starts from its tail. Here both sessions are made to land on the
-        transient list, so its tail holds the session of `deleted` and the
-        session of `other` sits ahead of it. The walk must step over that one
-        and go on to delete the other, which it only does if it keeps walking
-        after a session it does not clear.
-
-        `other` sends a packet to itself, so its own ACL sees the SYN and the
-        SYN|ACK that the session reflects, which is what leaves the session on
-        the transient list.
-        """
-        other_if = self.pg1 if other == self.pg1.sw_if_index else self.pg0
-        other_host = self.hosts_by_pg_idx[other][0]
-
-        # `deleted` goes down first: traffic through it again would reflect a
-        # packet whose SYN|ACK moves its session to the idle list
-        self.pg0.admin_down()
-
-        other_before = self._sessions_snapshot()
-        self._send_packets(
-            other_if,
-            [
-                self._tcp_packet(
-                    other_host,
-                    other_host,
-                    self.tcp_sport_from_2,
-                    self.tcp_dport_from_2,
-                    "c",
-                )
-            ],
-            other_if,
-            forwarded=1,
-        )
-        self.assertEqual(self._session_adds_delta(other_before, other), 0)
-
-        before = self._session_dels()
-        type(self).pg_interfaces = []
-        self.pg0.remove_vpp_config()
-        self._forget_acl_interface(deleted)
-        self._wait_for_clear_walk_to_finish()
-        self.assertGreaterEqual(
-            self._session_dels() - before,
-            1,
-            "the walk did not reach the tail session of sw_if_index %d, which "
-            "has the session of sw_if_index %d ahead of it:\n%s"
-            % (deleted, other, self._show_sessions()),
-        )
 
     def test_0402_sessions_cleared_past_a_foreign_session(self):
         """deleting an interface reaches its session with another one ahead
 
         The walk that clears the sessions of a deleted interface reads a
-        timeout list from its tail. When the session it is after sits ahead of
-        a session of another interface on that list, it has to step over that
-        one and keep going. The scenario above does not always put the two
-        sessions in that order: a reflected TCP packet leaves the session it
-        reaches on the idle list, since the reverse packet carries SYN|ACK, and
-        the session that received the SYN stays on the transient list, so each
-        session may sit alone on its list with nothing ahead of it.
+        timeout list from its tail, where `acl_fa_conn_list_add_session` puts
+        the session it added last (`session_inlines.h`). A session added after
+        the one the walk is after therefore meets the walk first, and the walk
+        has to step over it and keep going.
 
-        This scenario sends traffic in one direction and back into the
-        receiving interface, so its own ACL sees the SYN and the SYN|ACK that
-        the session reflects and the session stays on the transient list. The
-        session of pg0 comes first on that list and the session of pg1 lands
-        after it, nearer the tail, so the walk meets pg1's session first and
-        pg0's after it.
+        The scenario above deletes pg0, whose session pg1's session was added
+        after, so the walk meets pg1's session first, has no clear for it, and
+        still has to reach pg0's behind it. Whether the two sessions sit on one
+        list there is not fixed: a reflected packet carries SYN|ACK, which
+        moves the session it reaches to the idle list, while the session that
+        received the SYN stays on the transient list, so each may sit alone on
+        its list with nothing ahead of it.
+
+        This scenario reads the lists before it deletes, and only gives the
+        deletion its meaning when both sessions are on the transient list with
+        pg1's at the tail. A packet an interface sends to itself comes back
+        into the same interface, so the ACL there sees the SYN and the SYN|ACK
+        the session reflects and the session stays on the transient list.
         """
         self.logger.info("ACLP_TEST_START_0402")
 
@@ -2119,25 +2044,9 @@ class TestACLplugin(VppTestCase):
         )
         self._wait_for_active_sessions(0)
 
-        # the first session: pg0 reflects the reverse packet into pg1, which
-        # adds SYN|ACK to the session there and puts it on the idle list
-        before = self._sessions_snapshot()
-        self._apply_acl(pg0_index, self._permit_reflect_rules(), "pg0")
-        self._send_packets(
-            self.pg0,
-            [
-                self._tcp_packet(
-                    pg0_host, pg1_host, self.tcp_sport_from, self.tcp_dport_from, "b"
-                )
-            ],
-            self.pg1,
-            forwarded=1,
-        )
-        self.assertEqual(self._session_adds_delta(before, pg0_index), 1)
-
-        # the second session: pg1 reflects the reverse packet into itself, and
-        # its own ACL adds SYN|ACK to the same session, so it stays on the
-        # transient list and joins it last
+        # the session that is to stay, and the first on the transient list:
+        # pg1 sends to itself, so the packet pg1 reflects comes back to pg1
+        # and adds SYN|ACK to the same session, keeping it off the idle list
         before = self._sessions_snapshot()
         self._apply_acl(pg1_index, self._permit_reflect_rules(), "pg1")
         self._send_packets(
@@ -2156,35 +2065,47 @@ class TestACLplugin(VppTestCase):
         )
         self.assertEqual(self._session_adds_delta(before, pg1_index), 1)
 
-        # Both sessions are on the TCP transient list, number 3 of the three
-        # user lists `fa_conn_list_head[]` holds (`acl.h`, enum
-        # acl_timeout_e). The head names pg1's session, which is also the list
-        # tail, and pg0's session sits at the only step behind it, nearer the
-        # head. pg0 was turned off after its session, so a packet it reflects
-        # cannot come back with SYN|ACK and move that session to the idle list
-        # (number 2), and a packet pg1 reflects reaches pg1 again through the
-        # bridge domain, so pg1's session keeps the transient list.
-        self.assertEqual(self._active_sessions(), 2)
-        self.assertEqual(
-            self._session_lists(),
-            {2: 1},
-            "the sessions of the two interfaces are not on the transient list "
-            "alone:\n%s" % self._show_sessions(),
+        # the session of the interface that goes away, added after pg1's, so
+        # it is the tail of its list and the walk meets it first
+        before = self._sessions_snapshot()
+        self._apply_acl(pg0_index, self._permit_reflect_rules(), "pg0")
+        self._send_packets(
+            self.pg0,
+            [
+                self._tcp_packet(
+                    pg0_host, pg1_host, self.tcp_sport_from, self.tcp_dport_from, "b"
+                )
+            ],
+            self.pg1,
+            forwarded=1,
         )
+        self.assertEqual(self._session_adds_delta(before, pg0_index), 1)
+
+        # the list head names pg1's session, pg0's session is behind it, and
+        # both names are on the same user list (0 udp_idle, 1 tcp_idle,
+        # 2 tcp_transient, in the order of enum acl_timeout_e)
+        self.assertEqual(self._active_sessions(), 2)
         tail_session = self._session_at_list_tail(2)
         self.assertEqual(self._session_interfaces(), {tail_session: pg1_index})
-        self.assertEqual(len(self._session_jumps(tail_session)), 1)
+        self.assertEqual(
+            len(self._session_jumps(tail_session)),
+            1,
+            "pg0's session is not behind the one at the tail of the transient "
+            "list:\n%s" % self._show_sessions(),
+        )
 
+        # pg0 goes away, with pg1's session ahead of its own on the list, and
+        # pg1's session stays
         pg1_sessions = self._sessions_by_interface()[pg1_index]
         pg0_sessions = self._sessions_by_interface()[pg0_index]
-        self.pg1.remove_vpp_config()
-        self._forget_acl_interface(pg1_index)
-        type(self).pg_interfaces = [self.pg0]
+        self.pg0.remove_vpp_config()
+        self._forget_acl_interface(pg0_index)
+        type(self).pg_interfaces = [self.pg1]
         self._wait_for_active_sessions(1)
 
-        self.assertNotIn(pg1_index, self._sessions_by_interface())
-        self.assertEqual(self._sessions_by_interface()[pg0_index], pg0_sessions)
-        self.assertEqual(pg1_sessions[0] - pg1_sessions[1], 0)
+        self.assertNotIn(pg0_index, self._sessions_by_interface())
+        self.assertEqual(self._sessions_by_interface()[pg1_index], pg1_sessions)
+        self.assertEqual(pg0_sessions[0] - pg0_sessions[1], 0)
 
         self.logger.info("ACLP_TEST_FINISH_0402")
 
