@@ -1111,20 +1111,12 @@ class VppAsfTestCase(CPUInterface, unittest.TestCase):
             )
         self.assertTrue(expected_min <= real_value <= expected_max, msg)
 
-    def get_counter(self, counter):
-        if counter.startswith("/"):
-            # A path names one counter, and every thread counts it separately.
-            # The caller sums the column it wants, over all the threads or over
-            # the one it names.
-            return self.statistics.get_counter(counter)
-
-        raise ValueError(
-            "counter `%s' names no /err/<node>/<counter> path: show errors "
-            "prints the counters each thread counted above zero, so its text "
-            "holds neither a counter at zero nor the sum over the threads" % counter
+    def get_node_counter(self, node, counter):
+        return self.statistics.get_err_counter(
+            self.get_node_counter_path(node, counter)
         )
 
-    def get_node_counter(self, node, counter):
+    def get_node_counter_path(self, node, counter):
         if "/" in counter:
             # The name of a counter holds no separator, so a name with one
             # names no counter of the node and would only fail as a missing
@@ -1133,43 +1125,11 @@ class VppAsfTestCase(CPUInterface, unittest.TestCase):
                 "counter name `%s' holds a `/'; name the counter, not a path" % counter
             )
 
-        return self.get_counter("/err/%s/%s" % (node, counter))
+        return "/err/%s/%s" % (node, counter)
 
     def assert_error_counter_equal(self, counter, expected_value):
         counter_value = self.statistics[counter].sum()
         self.assert_equal(counter_value, expected_value, "error counter `%s'" % counter)
-
-    def assert_counter_in_range(
-        self, counter, expected_min, expected_max, thread=None, index=0
-    ):
-        c = self.get_counter(counter)
-        if thread is not None:
-            c = c[thread][index]
-        else:
-            c = sum(x[index] for x in c)
-        if expected_min == expected_max:
-            expected_value = expected_min
-            self.logger.debug(
-                "validate counter `%s[%s]', expected: %s, real value: %s"
-                % (counter, index, expected_value, c)
-            )
-            self.assert_equal(c, expected_value, "counter `%s[%s]'" % (counter, index))
-        else:
-            assert (
-                expected_min < expected_max
-            ), f"invalid range: expected {expected_min} < {expected_max}"
-            self.logger.debug(
-                "validate counter `%s[%s]', expected: [%s-%s], real value: %s"
-                % (counter, index, expected_min, expected_max, c)
-            )
-            self.assert_in_range(
-                c, expected_min, expected_max, "counter `%s[%s]'" % (counter, index)
-            )
-
-    def assert_counter_equal(self, counter, expected_value, thread=None, index=0):
-        return self.assert_counter_in_range(
-            counter, expected_value, expected_value, thread, index
-        )
 
     @classmethod
     def sleep(cls, timeout, remark=None):
