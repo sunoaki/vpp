@@ -1066,8 +1066,12 @@ class IpsecTra4(object):
         self.assertEqual(p.tra_sa_out.get_err("lost"), 0)
         self.assertEqual(p.tra_sa_in.get_err("lost"), 0)
 
-        self.assert_packet_counter_equal(self.tra4_encrypt_node_name, count)
-        self.assert_packet_counter_equal(self.tra4_decrypt_node_name[0], count)
+        self.assert_packet_counter_equal(
+            self.get_node_counter(self.tra4_encrypt_node_name, "rx_pkts"), count
+        )
+        self.assert_packet_counter_equal(
+            self.get_node_counter(self.tra4_decrypt_node_name[0], "rx_pkts"), count
+        )
 
     def _verify_tra_anti_replay_algorithm_esn(self):
         def seq_num(seqh, seql):
@@ -1951,8 +1955,12 @@ class IpsecTra6(object):
         self.assertEqual(
             pkts, count, "incorrect SA out counts: expected %d != %d" % (count, pkts)
         )
-        self.assert_packet_counter_equal(self.tra6_encrypt_node_name, count)
-        self.assert_packet_counter_equal(self.tra6_decrypt_node_name[0], count)
+        self.assert_packet_counter_equal(
+            self.get_node_counter(self.tra6_encrypt_node_name, "rx_pkts"), count
+        )
+        self.assert_packet_counter_equal(
+            self.get_node_counter(self.tra6_decrypt_node_name[0], "rx_pkts"), count
+        )
 
     def gen_encrypt_pkts_ext_hdrs6(
         self, sa, sw_intf, src, dst, count=1, payload_size=54
@@ -2122,8 +2130,12 @@ class IpsecTun4(object):
                 "incorrect SA out counts: expected %d != %d" % (count, pkts),
             )
 
-        self.assert_packet_counter_equal(self.tun4_encrypt_node_name, n_frags)
-        self.assert_packet_counter_equal(self.tun4_decrypt_node_name[0], count)
+        self.assert_packet_counter_equal(
+            self.get_node_counter(self.tun4_encrypt_node_name, "rx_pkts"), n_frags
+        )
+        self.assert_packet_counter_equal(
+            self.get_node_counter(self.tun4_decrypt_node_name[0], "rx_pkts"), count
+        )
 
     def verify_decrypted(self, p, rxs):
         for rx in rxs:
@@ -2389,8 +2401,12 @@ class IpsecTun6(object):
                 count,
                 "incorrect SA out counts: expected %d != %d" % (count, pkts),
             )
-        self.assert_packet_counter_equal(self.tun6_encrypt_node_name, count)
-        self.assert_packet_counter_equal(self.tun6_decrypt_node_name[0], count)
+        self.assert_packet_counter_equal(
+            self.get_node_counter(self.tun6_encrypt_node_name, "rx_pkts"), count
+        )
+        self.assert_packet_counter_equal(
+            self.get_node_counter(self.tun6_decrypt_node_name[0], "rx_pkts"), count
+        )
 
     def verify_decrypted6(self, p, rxs):
         for rx in rxs:

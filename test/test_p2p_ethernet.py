@@ -182,6 +182,41 @@ class P2PEthernetIPV6(VppTestCase):
             count = len(packets)
         return dst_if.get_capture(count)
 
+    def await_p2p_ethernet_input(self, dst_if, replays, burst):
+        """Wait for the counter to grow by the replayed packets and no more.
+
+        p2p-ethernet-input counts a packet in its loop and writes the count to
+        the node counter only after the loop, so a frame still on the node
+        when the counter is read leaves the packets it handled uncounted. Send
+        the burst again, and the packets counted before it are visible once
+        the replayed ones reach dst_if: the node counted them before writing
+        the counter that came after. Re-read the counter until it shows this
+        many more and no more, which the second read of an unchanged value
+        confirms.
+        """
+        counter = self.get_node_counter(
+            "p2p-ethernet-input", "P2P ethernet incoming packets processed"
+        )
+        before = self.statistics[counter].sum()
+        expected = before + replays * len(burst)
+
+        self.send_packets(self.pg0, dst_if, burst)
+
+        for _ in range(10):
+            self.sleep(0.1)
+            if self.statistics[counter].sum() == expected:
+                self.sleep(0.1)
+                self.assert_equal(
+                    self.statistics[counter].sum(),
+                    expected,
+                    "packet counter `%s'" % counter,
+                )
+                return
+
+        self.assert_equal(
+            self.statistics[counter].sum(), expected, "packet counter `%s'" % counter
+        )
+
     def test_no_p2p_subif(self):
         """standard routing without p2p subinterfaces"""
         self.logger.info("FFP_TEST_START_0001")
@@ -230,7 +265,7 @@ class P2PEthernetIPV6(VppTestCase):
         )
 
         self.send_packets(self.pg0, self.pg1, self.packets)
-        self.assert_packet_counter_equal("p2p-ethernet-input", 1)
+        self.await_p2p_ethernet_input(self.pg1, replays=1, burst=self.packets)
 
         route_9001.remove_vpp_config()
         self.logger.info("FFP_TEST_FINISH_0002")
@@ -470,7 +505,7 @@ class P2PEthernetIPV4(VppTestCase):
 
         self.send_packets(self.pg0, self.pg1, self.packets)
 
-        self.assert_packet_counter_equal("p2p-ethernet-input", 1)
+        self.await_p2p_ethernet_input(self.pg1, replays=1, burst=self.packets)
 
         route_9000.remove_vpp_config()
         self.logger.info("FFP_TEST_FINISH_0002")

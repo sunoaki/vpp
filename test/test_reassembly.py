@@ -382,11 +382,9 @@ Ethernet-Payload.IPv4-Packet.IPv4-Header.Fragment-Offset; Test-case: 5737"""
 
         self.dst_if.get_capture(1)
 
-        self.assert_packet_counter_equal("ip4-full-reassembly-feature", 1)
-        # TODO remove above, uncomment below once clearing of counters
-        # is supported
-        # self.assert_packet_counter_equal(
-        #     "/err/ip4-full-reassembly-feature/reass_malformed_packet", 1)
+        self.assert_packet_counter_equal(
+            "/err/ip4-full-reassembly-feature/reass_malformed_packet", 1
+        )
 
     def test_random(self):
         """random order reassembly"""
