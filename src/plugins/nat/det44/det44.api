@@ -174,7 +174,8 @@ define det44_map_dump {
        other value fails with VNET_API_ERROR_UNSUPPORTED, so this message
        cannot create a mapping that stores some other protocol. A delete
        is not checked, so that it can still remove a mapping the CLI
-       stored with "other"
+       stored with "other"; such a mapping cannot be created by this
+       message, so use the CLI to recreate one
     @param port - inside port, ignored when flags contains
        NAT_API_IS_ADDR_ONLY
     @param flags - NAT_API_IS_ADDR_ONLY for a whole-address mapping,
@@ -213,7 +214,8 @@ define det44_identity_mapping_dump {
     stored as ICMP, including one added as 58, is reported as 1. A
     mapping stored with any other protocol, such as one the CLI created
     with "other", is reported as 255, and a delete naming 255 then
-    refers to that mapping.
+    refers to that mapping. 255 is accepted only on a delete; use the
+    CLI to recreate a mapping the CLI created.
 
     @param context - sender context, to match reply w/ request
     @param addr - inside IPv4 address
