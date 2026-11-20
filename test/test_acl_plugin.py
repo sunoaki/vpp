@@ -2156,8 +2156,14 @@ class TestACLplugin(VppTestCase):
         )
         self.assertEqual(self._session_adds_delta(before, pg1_index), 1)
 
-        # the list head names pg1's session, which is also the list tail, and
-        # pg0's session sits at the only step behind it
+        # Both sessions are on the TCP transient list, number 3 of the three
+        # user lists `fa_conn_list_head[]` holds (`acl.h`, enum
+        # acl_timeout_e). The head names pg1's session, which is also the list
+        # tail, and pg0's session sits at the only step behind it, nearer the
+        # head. pg0 was turned off after its session, so a packet it reflects
+        # cannot come back with SYN|ACK and move that session to the idle list
+        # (number 2), and a packet pg1 reflects reaches pg1 again through the
+        # bridge domain, so pg1's session keeps the transient list.
         self.assertEqual(self._active_sessions(), 2)
         self.assertEqual(
             self._session_lists(),

@@ -424,11 +424,11 @@ aclp_swap_wip_and_pending_session_change_requests (acl_main_t *am, u32 target_th
  * does not read them again. A list the walk reached the end of holds none, and
  * its next pass starts at its tail.
  *
- * An interrupt that stops on a list returns from the walk, so the lists below
- * it go unread. A list the walk reached the end of leaves no cursor, and an
- * empty one cannot say whether this pass read it, which is why the walk
- * reports work left while a list below the one it stopped at may still hold a
- * cursor from an earlier pass. See acl_fa_clear_pending_interfaces.
+ * A list the walk reached the end of leaves no cursor, and an empty one cannot
+ * say whether this pass read it. That is why a list the walk steps over a
+ * session on keeps a cursor when it had one from an earlier pass, and why the
+ * walk reports work left until a pass reads that list from its tail and steps
+ * over no session. See acl_fa_clear_pending_interfaces.
  *
  * A worker's lists and pool are changed by that worker's own thread alone;
  * another thread posts a session change request, and the owning worker runs
@@ -507,26 +507,30 @@ acl_fa_clear_resume (acl_main_t *am, clib_thread_index_t thread_index, u8 list_i
  * every other step moves on to the session before it.
  *
  * The walk stops after the per-cycle limit, like the idle scan it shares its
- * interrupt with, and reports that as work left. Each list remembers the
- * session the walk is to look at first the next time, and only the two places
- * where the walk stops write that cursor: at the limit, and at the end of a
- * list it stepped over a session on while that list still held a cursor from
- * an earlier pass, which makes the next pass start at its tail. Steps that are
- * not stops do not touch the cursor.
+ * interrupt with, and reports that as work left. A pass that reaches the limit
+ * stops that list and goes on with the lists after it, which may hold the
+ * sessions of the same interfaces and are read from their tails like any
+ * other.
+ *
+ * Each list remembers the session the walk is to look at first the next time,
+ * and only the two places a list stops write that cursor: at the limit, and at
+ * the head of the list while the pass stepped over a session and the list had
+ * a cursor from an earlier pass, where the cursor is cleared so the next pass
+ * starts at the tail. Steps that are not stops do not touch the cursor.
  *
  * A list adds a session, its own or one that it takes back from the purgatory,
  * at its tail. A waiting session added after a pass went past a list's tail
  * therefore sits behind the point the next pass starts from, and the walk
  * reports work left for that: it does so while it steps over a session and the
- * list still holds a cursor from an earlier pass, which is the case in which a
- * list's tail was last read by an earlier pass. A pass that steps over no
+ * list still holds a cursor from an earlier pass, which is the case in which
+ * the list's tail was last read by an earlier pass. A pass that steps over no
  * session leaves every waiting session where it was when it read it.
  *
  * The report of no work left is what makes the caller drop the bitmap of
  * interfaces to clear, so it holds only when every session of a waiting
- * interface is off the lists. A pass that steps over a session reads it from
- * the tail of its list, so that session is either deleted by this pass or
- * behind a tail that a later pass reads again.
+ * interface is off the lists. A list that holds one is read from its tail by
+ * some pass, and that pass either deletes the session or steps over it, and
+ * stepping over it keeps the clear coming back.
  */
 static int
 acl_fa_clear_pending_interfaces (acl_main_t *am, clib_thread_index_t thread_index, u64 now)
@@ -535,7 +539,6 @@ acl_fa_clear_pending_interfaces (acl_main_t *am, clib_thread_index_t thread_inde
   u32 *cursor = acl_fa_clear_cursor_of (thread_index);
   fa_full_session_id_t fsid;
   int n_cleared = 0;
-  int skipped = 0;
   int work_left = 0;
   u8 tt;
 
@@ -546,6 +549,7 @@ acl_fa_clear_pending_interfaces (acl_main_t *am, clib_thread_index_t thread_inde
       u32 saved = cursor[tt];
       u32 session_index = saved;
       fa_session_t *sess = 0;
+      int skipped = 0;
 
       /* a list this pass reaches keeps a new position or none at all */
       cursor[tt] = FA_SESSION_BOGUS_INDEX;
@@ -560,10 +564,7 @@ acl_fa_clear_pending_interfaces (acl_main_t *am, clib_thread_index_t thread_inde
 
       while (FA_SESSION_BOGUS_INDEX != session_index)
 	{
-	  /*
-	   * Read the link now: deleting the session unlinks it, and parking it
-	   * moves it to the purgatory list with the links rewritten.
-	   */
+	  /* read the link now: parking the session rewrites it */
 	  u32 prev_session_index;
 
 	  if (sess == 0)
@@ -587,11 +588,14 @@ acl_fa_clear_pending_interfaces (acl_main_t *am, clib_thread_index_t thread_inde
 	   * The limit is reached only after a deletion, so the session before
 	   * this one is where the next pass starts. Saving this one instead
 	   * would return to it without deleting it and hit the limit again.
+	   * This list stops and the pass goes on with the lists after it,
+	   * which hold sessions of their own to clear.
 	   */
 	  if (n_cleared >= am->fa_max_deleted_sessions_per_interval)
 	    {
 	      cursor[tt] = prev_session_index;
-	      return 1;
+	      work_left = 1;
+	      break;
 	    }
 	  fsid.session_index = session_index;
 	  acl_fa_conn_list_delete_session (am, fsid, now);
@@ -608,18 +612,19 @@ acl_fa_clear_pending_interfaces (acl_main_t *am, clib_thread_index_t thread_inde
 	  session_index = prev_session_index;
 	}
       /*
-       * The pass has done all it can for this list, so it ends the walk here
-       * if it stepped over a session and the list's next pass would not start
-       * at its tail. Clearing the cursor makes it start at the tail, so the
-       * clear keeps coming back until the list holds no such session.
+       * A list the pass stepped over a session on and that had a cursor from
+       * an earlier pass starts its next pass at the tail, so that pass reads
+       * any session added there since. The pass carries on with the other
+       * lists, and the clear keeps coming back until a pass over this list
+       * steps over no session.
        */
       if (skipped && FA_SESSION_BOGUS_INDEX != saved)
 	{
 	  cursor[tt] = FA_SESSION_BOGUS_INDEX;
-	  return 1;
+	  work_left = 1;
 	}
     }
-  return 0;
+  return work_left;
 }
 
 static int
