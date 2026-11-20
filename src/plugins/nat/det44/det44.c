@@ -449,6 +449,9 @@ det44_plugin_disable ()
   pool_free (dm->interfaces);
   pool_free (dm->det_maps);
 
+  fib_table_unlock (dm->outside_fib_index, FIB_PROTOCOL_IP4, dm->fib_src_hi);
+  fib_table_unlock (dm->inside_fib_index, FIB_PROTOCOL_IP4, dm->fib_src_hi);
+
   return rv;
 }
 
