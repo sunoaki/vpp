@@ -38,6 +38,7 @@ from util import ppp
 from vpp_ip_route import VppIpRoute, VppIpTable, VppRoutePath
 from vpp_neighbor import VppNeighbor
 from vpp_papi import VppEnum
+from vpp_papi_exceptions import UnexpectedApiReturnValueError
 from config import config
 
 
@@ -4120,6 +4121,41 @@ class TestNAT44EI(MethodHolder):
             enable=0,
         )
 
+    def nat44_ei_plugin_enable_if_disabled(
+        self, inside_vrf=0, outside_vrf=0, plugin_state_retvals=None
+    ):
+        """Enable the plugin on the given tables, treating an enabled one as done"""
+        # the tables handed to the enable are the ones its later disable
+        # releases, so an enable that finds the plugin running is the one
+        # whose tables are already locked and needs no new pair
+        if plugin_state_retvals is None:
+            plugin_state_retvals = (
+                self.VNET_API_ERROR_FEATURE_ALREADY_DISABLED,
+                self.VNET_API_ERROR_FEATURE_ALREADY_ENABLED,
+            )
+        self.nat44_ei_api_tolerating(
+            self.vapi.nat44_ei_plugin_enable_disable,
+            plugin_state_retvals,
+            sessions=self.max_translations,
+            users=self.max_users,
+            inside_vrf=inside_vrf,
+            outside_vrf=outside_vrf,
+            enable=1,
+        )
+
+    def nat44_ei_pool_addresses(self):
+        """Return the (address, table id) pairs the plugin holds as pool addresses"""
+        # show nat44 ei addresses prints each address followed by its table
+        # id, or "tenant VRF independent" for one bound to no table, so the
+        # output names the table nat44_ei_add_address bound the address to
+        output = self.vapi.cli("show nat44 ei addresses")
+        return re.findall(
+            r"^(\d+\.\d+\.\d+\.\d+)\n"
+            r"(?:  tenant VRF: (\d+)|  tenant VRF independent)",
+            output,
+            re.MULTILINE,
+        )
+
     def nat44_ei_require_unlocked(self, table_id):
         """Log the nat44-ei-hi lock count of the table, then require it zero"""
         # the count is read before it is asserted so the CI log names the
@@ -4235,9 +4271,11 @@ class TestNAT44EI(MethodHolder):
                 )
                 pg_interface.config_ip4()
                 pg_interface.resolve_arp()
-            # an address cannot be added twice and survives a disable
-            self.nat44_add_address(self.nat_addr)
 
+            # the plugin is disabled here and nat44_ei_add_address refuses that
+            # state, so the address is added after each cycle's enable and is
+            # gone after each cycle's disable, which deletes it along with
+            # everything else the plugin holds
             for cycle in range(2):
                 plugin_set(enable=1)
                 for table_id in table_ids:
@@ -4246,6 +4284,25 @@ class TestNAT44EI(MethodHolder):
                         1,
                         "cycle %d: table %d not locked once" % (cycle, table_id),
                     )
+
+                # nat44_ei_plugin_disable deletes every pool address through
+                # nat44_ei_del_addresses, so each cycle adds its own; the
+                # table is named because the helper's default leaves the
+                # address tenant VRF independent instead of binding it
+                self.nat44_add_address(self.nat_addr, vrf_id=outside_vrf)
+                self.assertEqual(
+                    self.nat44_ei_pool_addresses(),
+                    [(self.nat_addr, str(outside_vrf))],
+                    "cycle %d: pool address missing or not in table %d"
+                    % (cycle, outside_vrf),
+                )
+                # nat44_ei_add_address answers a second add of the same address
+                # with VALUE_EXIST, and the caller of this helper expects zero
+                self.assertRaises(
+                    UnexpectedApiReturnValueError,
+                    self.nat44_add_address,
+                    self.nat_addr,
+                )
 
                 for pg_interface, _, flags in nat_interfaces:
                     self.vapi.nat44_ei_interface_add_del_feature(
@@ -4260,8 +4317,8 @@ class TestNAT44EI(MethodHolder):
                 self.verify_capture_out(capture, nat_ip=self.nat_addr)
 
                 # nat44_ei_del_interface rejects a disabled plugin, so the
-                # features go first; the disable then still has the addresses
-                # configured, so its loops run before the tables are unlocked
+                # features go first; each cycle's disable then deletes the
+                # address this cycle added and unlocks the two tables
                 self.nat44_ei_remove_interface_features()
                 plugin_set(enable=0)
                 for table_id in table_ids:
@@ -4293,35 +4350,33 @@ class TestNAT44EI(MethodHolder):
                 except Exception as e:  # noqa: BLE001 - reported at the end
                     problem.append("%s: %r" % (step, e))
 
-            attempt("remove features", self.nat44_ei_remove_interface_features)
-            # a cycle that failed before its disable leaves the plugin enabled
-            # and the tables locked, which makes the next enable lock them
-            # again and abort a debug build, so the plugin is disabled first
+            # a disable deletes every pool address and every interface feature
+            # and releases the two table locks, so it runs whenever the plugin
+            # is on; nat44_ei_plugin_disable rejects a disabled plugin with
+            # -169, which is what this tolerates when a cycle already disabled it
             attempt("disable plugin", self.nat44_ei_plugin_disable_if_enabled)
+            for table_id in table_ids:
+                attempt(
+                    "require table %d unlocked" % table_id,
+                    lambda table_id=table_id: self.nat44_ei_require_unlocked(table_id),
+                )
+            attempt(
+                "require no pool address",
+                lambda: self.assertEqual(self.nat44_ei_pool_addresses(), []),
+            )
+            attempt(
+                "require no interface feature",
+                lambda: self.assertEqual(list(self.vapi.nat44_ei_interface_dump()), []),
+            )
+            # the plugin is off and holds nothing, so the steps below reach no
+            # API that the disabled plugin would answer with -169
+
             # an interface address is deleted in the table the interface is in
             # at that moment, and the move back to table 0 is refused while one
             # is present, so every address is detached first and every
             # interface moves only after that
             for pg_interface, _, _ in nat_interfaces:
                 attempt("detach %s" % pg_interface.name, pg_interface.unconfig_ip4)
-            # the NAT address is deleted before any interface moves: its
-            # nat44-ei-low /32 is deleted through
-            # ip4_fib_table_get_index_for_sw_if_index, which reads the table
-            # the outside interface is in at that moment, so while pg1 is
-            # still in table 200 a delete that runs with the plugin enabled
-            # removes the /32 from table 200 instead of looking for it in
-            # table 0; a delete refused because the plugin is already
-            # disabled leaves that /32 on the table, which stays
-            attempt(
-                "remove address",
-                lambda: self.nat44_ei_api_tolerating(
-                    self.vapi.nat44_ei_add_del_address_range,
-                    self.NAT44_EI_GONE_RETVALS,
-                    first_ip_address=self.nat_addr,
-                    last_ip_address=self.nat_addr,
-                    is_add=0,
-                ),
-            )
             attempt("leave nat table", self.nat44_ei_leave_nat_tables)
             for pg_interface, _, _ in nat_interfaces:
                 attempt("restore %s" % pg_interface.name, pg_interface.config_ip4)
@@ -4331,19 +4386,28 @@ class TestNAT44EI(MethodHolder):
             # its ip4_main.fibs slot, and the pool hands a freed slot to the
             # next table created, so a later test that creates an IP4 table
             # would land on the index this test just destroyed
-            moved_interfaces = {
-                table_id: pg_interface for pg_interface, table_id, _ in nat_interfaces
-            }
             for table_id in table_ids:
                 attempt(
-                    "require table %d" % table_id,
+                    "require table %d unlocked again" % table_id,
                     lambda table_id=table_id: self.nat44_ei_require_unlocked(table_id),
                 )
-                if moved_interfaces[table_id].ip4_table_id:
-                    self.logger.info(
-                        "table %d kept with %s in it"
-                        % (table_id, moved_interfaces[table_id].name)
-                    )
+            # TestNAT44EI.tearDown disables the plugin and expects it enabled,
+            # and an enable names no VRFs here, so it locks table 0 like the
+            # setUp enable; naming tables 100 and 200 would take the very
+            # references this test has just proved released
+            attempt(
+                "enable plugin",
+                lambda: self.nat44_ei_plugin_enable_if_disabled(
+                    plugin_state_retvals=(self.VNET_API_ERROR_FEATURE_ALREADY_ENABLED,)
+                ),
+            )
+            attempt(
+                "require plugin enabled",
+                lambda: self.assertEqual(
+                    self.vapi.nat44_ei_show_running_config().flags,
+                    self.config_flags.NAT44_EI_IF_INSIDE,
+                ),
+            )
             if problem:
                 message = "cleanup failed: %s" % "; ".join(problem)
                 if body_failed:
