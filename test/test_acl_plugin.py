@@ -1881,7 +1881,86 @@ class TestACLplugin(VppTestCase):
         self.assertNotIn(pg0_index, self._sessions_by_interface())
         self.assertEqual(self._sessions_by_interface()[pg1_index], pg1_sessions)
 
+        self._wait_for_clear_walk_to_finish()
+        self._check_delete_reaches_past_a_foreign_session(pg0_index, pg1_index)
+
         self.logger.info("ACLP_TEST_FINISH_0401")
+
+    def _wait_for_clear_walk_to_finish(self):
+        """Wait until the clear walk has no interface left to clear.
+
+        The walk deletes the sessions of the interfaces in the pending bitmap
+        and drops that bitmap once it reaches the ends of the lists, so a
+        bitmap of zero is the walk reporting that it has nothing left. Poll
+        the figure `show acl-plugin sessions` prints per worker for it.
+        """
+        deadline = time.time() + 5.0
+        while True:
+            output = self._show_sessions()
+            pending = re.findall(r"pending clear intfc bitmap : (\S+)", output)
+            if not pending or set(pending) == {"00"}:
+                return
+            if time.time() > deadline:
+                self.fail("the clear walk has not finished:\n%s" % output)
+            self.sleep(0.05)
+
+    def _session_dels(self):
+        """Sum the `del` figures over every interface and worker."""
+        return sum(dels for _, dels in self._sessions_by_interface().values())
+
+    def _check_delete_reaches_past_a_foreign_session(self, deleted, other):
+        """Delete an interface whose session has another interface's ahead of it.
+
+        The scenario above does not put the two sessions on one list: a
+        reflected TCP packet leaves the session that receives it on the
+        transient list and moves the one it came back to the idle list. A list
+        that holds one session has nothing ahead of it when the clear walk
+        starts from its tail. Here both sessions are made to land on the
+        transient list, so its tail holds the session of `deleted` and the
+        session of `other` sits ahead of it. The walk must step over that one
+        and go on to delete the other, which it only does if it keeps walking
+        after a session it does not clear.
+
+        `other` sends a packet to itself, so its own ACL sees the SYN and the
+        SYN|ACK that the session reflects, which is what leaves the session on
+        the transient list.
+        """
+        other_if = self.pg1 if other == self.pg1.sw_if_index else self.pg0
+        other_host = self.hosts_by_pg_idx[other][0]
+
+        # `deleted` goes down first: traffic through it again would reflect a
+        # packet whose SYN|ACK moves its session to the idle list
+        self.pg0.admin_down()
+
+        other_before = self._sessions_snapshot()
+        self._send_packets(
+            other_if,
+            [
+                self._tcp_packet(
+                    other_host,
+                    other_host,
+                    self.tcp_sport_from_2,
+                    self.tcp_dport_from_2,
+                    "c",
+                )
+            ],
+            other_if,
+            forwarded=1,
+        )
+        self.assertEqual(self._session_adds_delta(other_before, other), 0)
+
+        before = self._session_dels()
+        type(self).pg_interfaces = []
+        self.pg0.remove_vpp_config()
+        self._forget_acl_interface(deleted)
+        self._wait_for_clear_walk_to_finish()
+        self.assertGreaterEqual(
+            self._session_dels() - before,
+            1,
+            "the walk did not reach the tail session of sw_if_index %d, which "
+            "has the session of sw_if_index %d ahead of it:\n%s"
+            % (deleted, other, self._show_sessions()),
+        )
 
 
 if __name__ == "__main__":
