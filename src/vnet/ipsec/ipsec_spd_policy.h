@@ -98,10 +98,9 @@ extern u8 *format_ipsec_policy (u8 * s, va_list * args);
 extern u8 *format_ipsec_policy_action (u8 * s, va_list * args);
 __clib_export extern uword unformat_ipsec_policy_action (unformat_input_t *input, va_list *args);
 
-extern int ipsec_policy_mk_type (bool is_outbound,
-				 bool is_ipv6,
-				 ipsec_policy_action_t action,
-				 ipsec_spd_policy_type_t * type);
+__clib_export extern int ipsec_policy_mk_type (bool is_outbound, bool is_ipv6,
+					       ipsec_policy_action_t action,
+					       ipsec_spd_policy_type_t *type);
 
 /* A 5-tuple used to calculate the bihash entry  */
 typedef union
