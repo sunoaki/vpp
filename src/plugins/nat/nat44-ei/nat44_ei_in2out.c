@@ -795,7 +795,9 @@ nat44_ei_icmp_hairpinning (nat44_ei_main_t *nm, vlib_buffer_t *b0,
 				  &value0))
 	{
 	  icmp_echo_header_t *echo0 = (icmp_echo_header_t *) (icmp0 + 1);
-	  u16 icmp_id0 = echo0->identifier;
+	  int is_non_first_fragment = vnet_buffer (b0)->ip.reass.is_non_first_fragment;
+	  u16 icmp_id0 =
+	    is_non_first_fragment ? vnet_buffer (b0)->ip.reass.l4_src_port : echo0->identifier;
 	  init_nat_k (&kv0, ip0->dst_address, icmp_id0, nm->outside_fib_index,
 		      NAT_PROTOCOL_ICMP);
 	  int rv = clib_bihash_search_8_8 (&nm->out2in, &kv0, &value0);
@@ -811,11 +813,14 @@ nat44_ei_icmp_hairpinning (nat44_ei_main_t *nm, vlib_buffer_t *b0,
 	      s0 = pool_elt_at_index (nm->per_thread_data[ti].sessions, si);
 	      new_dst_addr0 = s0->in2out.addr.as_u32;
 	      vnet_buffer (b0)->sw_if_index[VLIB_TX] = s0->in2out.fib_index;
-	      echo0->identifier = s0->in2out.port;
-	      sum0 = icmp0->checksum;
-	      sum0 = ip_csum_update (sum0, icmp_id0, s0->in2out.port,
-				     icmp_echo_header_t, identifier);
-	      icmp0->checksum = ip_csum_fold (sum0);
+	      if (!is_non_first_fragment)
+		{
+		  echo0->identifier = s0->in2out.port;
+		  sum0 = icmp0->checksum;
+		  sum0 = ip_csum_update (sum0, icmp_id0, s0->in2out.port, icmp_echo_header_t,
+					 identifier);
+		  icmp0->checksum = ip_csum_fold (sum0);
+		}
 	      goto change_addr;
 	    }
 
@@ -1112,10 +1117,14 @@ nat44_ei_hairpinning (vlib_main_t *vm, vlib_node_runtime_t *node,
   u32 sm0_fib_index;
   u32 old_sw_if_index = vnet_buffer (b0)->sw_if_index[VLIB_TX];
 
+  /* Only the first fragment carries the L4 header, the rest is payload. */
+  int is_non_first_fragment = vnet_buffer (b0)->ip.reass.is_non_first_fragment;
+  u16 dst_port0 = is_non_first_fragment ? vnet_buffer (b0)->ip.reass.l4_dst_port : udp0->dst_port;
+
   /* Check if destination is static mappings */
-  if (!nat44_ei_static_mapping_match (
-	ip0->dst_address, udp0->dst_port, nm->outside_fib_index, proto0,
-	&sm0_addr, &sm0_port, &sm0_fib_index, 1 /* by external */, 0, 0))
+  if (!nat44_ei_static_mapping_match (ip0->dst_address, dst_port0, nm->outside_fib_index, proto0,
+				      &sm0_addr, &sm0_port, &sm0_fib_index, 1 /* by external */, 0,
+				      0))
     {
       new_dst_addr0 = sm0_addr.as_u32;
       new_dst_port0 = sm0_port;
@@ -1124,8 +1133,7 @@ nat44_ei_hairpinning (vlib_main_t *vm, vlib_node_runtime_t *node,
   /* or active session */
   else
     {
-      init_nat_k (&kv0, ip0->dst_address, udp0->dst_port,
-		  nm->outside_fib_index, proto0);
+      init_nat_k (&kv0, ip0->dst_address, dst_port0, nm->outside_fib_index, proto0);
       rv = clib_bihash_search_8_8 (&nm->out2in, &kv0, &value0);
       if (rv)
 	{
@@ -1151,7 +1159,7 @@ nat44_ei_hairpinning (vlib_main_t *vm, vlib_node_runtime_t *node,
      nat44-hairpinning-->ip4-lookup-->ip4-local, in case nothing has
      changed. */
   old_dst_addr0 = ip0->dst_address.as_u32;
-  old_dst_port0 = tcp0->dst;
+  old_dst_port0 = dst_port0;
   if (new_dst_addr0 == old_dst_addr0 && new_dst_port0 == old_dst_port0 &&
       vnet_buffer (b0)->sw_if_index[VLIB_TX] == old_sw_if_index)
     return 0;
@@ -1165,6 +1173,13 @@ nat44_ei_hairpinning (vlib_main_t *vm, vlib_node_runtime_t *node,
       sum0 = ip_csum_update (sum0, old_dst_addr0, new_dst_addr0, ip4_header_t,
 			     dst_address);
       ip0->checksum = ip_csum_fold (sum0);
+
+      /* The L4 header is only in the first fragment */
+      if (is_non_first_fragment)
+	{
+	  rv = 1;
+	  goto trace;
+	}
 
       old_dst_port0 = tcp0->dst;
       if (PREDICT_TRUE (new_dst_port0 != old_dst_port0))
