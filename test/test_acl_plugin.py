@@ -1692,7 +1692,7 @@ class TestACLplugin(VppTestCase):
     def _session_behind(self, session_index):
         """Return the session the given one has towards its list head."""
         match = re.search(
-            r"session index %d:.*?link prev idx: (\d+)" % session_index,
+            r"session index %d:.*?link prev index: (\d+)" % session_index,
             self._show_sessions(),
             re.S,
         )
@@ -1937,11 +1937,21 @@ class TestACLplugin(VppTestCase):
         sessions ahead of it.
 
         This scenario gives pg1, which stays, the session that joined last,
-        and pg0, which is deleted, the session that joined first, one step
-        towards the head. The walk meets pg1's session, has no clear for it,
-        and has to go on to pg0's. pg0's session comes first, and pg0 stops
-        sending in between so that a packet pg0 reflects cannot come back to
-        it and move that session to another list.
+        and pg0, which is deleted, the session that joined before it, one
+        step towards the head. The walk meets pg1's session, has no clear for
+        it, and has to go on to pg0's. pg0 stops sending once its session
+        exists, so a packet pg0 reflects cannot come back to it and move that
+        session to another list.
+
+        The figures per interface are what decide whether the walk reached
+        pg0's session. They are cumulative for the lifetime of the run and
+        every worker prints them, so `add - del` for pg0 stays at one until a
+        worker wipes that session, whichever worker owned it, and the
+        assertion fails on the walk that stops at pg1's session. The count of
+        active sessions covers the whole process, and test_0315_del_intf
+        deletes a loopback whose session nothing exercises, so that count can
+        differ from the number this scenario expects by time alone; it is
+        compared once, to place a baseline.
         """
         self.logger.info("ACLP_TEST_START_0402")
 
@@ -1950,10 +1960,11 @@ class TestACLplugin(VppTestCase):
         pg0_host = self.hosts_by_pg_idx[pg0_index][0]
         pg1_host = self.hosts_by_pg_idx[pg1_index][0]
 
-        # sessions the suite left active sit at list tails, where the walk
-        # meets them before the session this scenario adds. An interface with
-        # a deny ACL creates no session, and traffic through it after the ACL
-        # is applied takes its old session off the list.
+        # a session the suite left behind on one of these two interfaces sits
+        # at a list tail, where the walk meets it before the sessions this
+        # scenario adds. An interface with a deny ACL creates no session, and
+        # traffic through it after the ACL is applied takes its old session
+        # off the list.
         self._apply_acl(pg0_index, self._deny_rules(), "pg0")
         self._apply_acl(pg1_index, self._deny_rules(), "pg1")
         self._send_packets(
@@ -1980,6 +1991,9 @@ class TestACLplugin(VppTestCase):
             self.pg0,
             forwarded=0,
         )
+        # the count has to reach zero here: this waits only while a worker
+        # still has to act, so a graph holding sessions of a deleted
+        # interface fails this wait rather than the comparisons below
         self._wait_for_active_sessions(0)
         baseline = self._active_sessions()
 
