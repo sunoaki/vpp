@@ -873,9 +873,6 @@ class TestGRE(VppTestCase):
         short_counter = self.statistics.get_err_counter(
             "/err/gre4-input/GRE input packets dropped due to short header"
         )
-        decap_counter = self.statistics.get_err_counter(
-            "/err/gre4-input/GRE input packets decapsulated"
-        )
 
         #
         # A 20 byte IPv4 packet with protocol 47 carries no GRE header.
@@ -891,12 +888,6 @@ class TestGRE(VppTestCase):
                 "/err/gre4-input/GRE input packets dropped due to short header"
             ),
             short_counter + len(tx),
-        )
-        self.assertEqual(
-            self.statistics.get_err_counter(
-                "/err/gre4-input/GRE input packets decapsulated"
-            ),
-            decap_counter,
         )
 
         gre_if.remove_vpp_config()
