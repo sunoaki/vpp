@@ -96,12 +96,12 @@ class TestArping(VppTestCase):
             self.pg_start()
 
             ping_cmd = (
-                "arping gratuitous" + self.pg1.local_ip4 + "pg1 repeat 5 interval 0.1"
+                "arping gratuitous " + self.pg1.local_ip4 + " pg1 repeat 5 interval 0.1"
             )
             ret = self.vapi.cli(ping_cmd)
             self.logger.info(ret)
 
-            ping_cmd = "arping gratuitous" + self.pg1.local_ip4 + "pg1"
+            ping_cmd = "arping gratuitous " + self.pg1.local_ip4 + " pg1"
             ret = self.vapi.cli(ping_cmd)
             self.logger.info(ret)
 
@@ -219,12 +219,12 @@ class TestArping(VppTestCase):
             self.pg_start()
 
             ping_cmd = (
-                "arping gratuitous" + self.pg1.local_ip6 + "pg1 repeat 5 interval 0.1"
+                "arping gratuitous " + self.pg1.local_ip6 + " pg1 repeat 5 interval 0.1"
             )
             ret = self.vapi.cli(ping_cmd)
             self.logger.info(ret)
 
-            ping_cmd = "arping gratuitous" + self.pg1.local_ip6 + "pg1"
+            ping_cmd = "arping gratuitous " + self.pg1.local_ip6 + " pg1"
             ret = self.vapi.cli(ping_cmd)
             self.logger.info(ret)
 

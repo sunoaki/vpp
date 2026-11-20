@@ -51,7 +51,8 @@ icmp6_send_neighbor_advertisement (
   eth_if = ethernet_get_interface (&ethernet_main, sw_if->hw_if_index);
   if (eth_if && icmp6_nd_ell_addr)
     {
-      clib_memcpy (icmp6_nd_ell_addr->ethernet_address, &eth_if->address, 6);
+      clib_memcpy (icmp6_nd_ell_addr->ethernet_address, &eth_if->address.mac,
+		   sizeof (icmp6_nd_ell_addr->ethernet_address));
       icmp6_nd_ell_addr->header.type =
 	ICMP6_NEIGHBOR_DISCOVERY_OPTION_target_link_layer_address;
     }

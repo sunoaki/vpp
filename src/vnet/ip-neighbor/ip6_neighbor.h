@@ -37,7 +37,6 @@ ip6_neighbor_probe (vlib_main_t *vm, vnet_main_t *vnm, u32 sw_if_index,
   vlib_buffer_t *b0;
   int bogus_length;
   u32 bi0 = 0;
-  uword hw_address_len;
 
   /* if the interface has been disabled for ip6, later steps to retrieve
    * an adjacency will result in a segv.
@@ -73,12 +72,11 @@ ip6_neighbor_probe (vlib_main_t *vm, vnet_main_t *vnm, u32 sw_if_index,
 
   h0->neighbor.target_address = *dst;
 
-  /* Clamp to the option's 6 byte field and zero any leftover bytes. */
-  hw_address_len =
-    clib_min (vec_len (hw_if0->hw_address), sizeof (h0->link_layer_option.ethernet_address));
+  /* The option carries this interface's MAC in its 6 byte field. */
   clib_memset (h0->link_layer_option.ethernet_address, 0,
 	       sizeof (h0->link_layer_option.ethernet_address));
-  clib_memcpy (h0->link_layer_option.ethernet_address, hw_if0->hw_address, hw_address_len);
+  clib_memcpy (h0->link_layer_option.ethernet_address, hw_if0->hw_address,
+	       sizeof (h0->link_layer_option.ethernet_address));
 
   /* $$$$ appears we need this; why is the checksum non-zero? */
   h0->neighbor.icmp.checksum = 0;
