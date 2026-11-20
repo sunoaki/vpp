@@ -182,6 +182,29 @@ class P2PEthernetIPV6(VppTestCase):
             count = len(packets)
         return dst_if.get_capture(count)
 
+    def assert_p2p_ethernet_input_grew_by(self, before):
+        """The count of p2p-ethernet-input grew by the packets the test sent.
+
+        A packet reaches the node when its source MAC is the MAC of one of the
+        subinterfaces of the parent interface it arrived on, and the node
+        matches on both. Every packet a test sends to the parent interface is
+        one such packet, so the count grows by the packets the test sent since
+        it read before. The node writes the count of a frame when the frame
+        ends, and the caller reads the count after the last frame reached the
+        other port, so nothing the test sent waits uncounted. A count a test
+        before this one left higher stays in before and does not reach the
+        difference.
+        """
+        counter = self.get_node_counter_path(
+            "p2p-ethernet-input", "P2P ethernet incoming packets processed"
+        )
+        sent = len(self.packets)
+        self.assert_equal(
+            self.statistics.get_err_counter(counter) - before,
+            sent,
+            "packets p2p-ethernet-input counted of the %d sent" % sent,
+        )
+
     def test_no_p2p_subif(self):
         """standard routing without p2p subinterfaces"""
         self.logger.info("FFP_TEST_START_0001")
@@ -229,8 +252,13 @@ class P2PEthernetIPV6(VppTestCase):
             )
         )
 
+        before = self.statistics.get_err_counter(
+            self.get_node_counter_path(
+                "p2p-ethernet-input", "P2P ethernet incoming packets processed"
+            )
+        )
         self.send_packets(self.pg0, self.pg1, self.packets)
-        self.assert_packet_counter_equal("p2p-ethernet-input", 1)
+        self.assert_p2p_ethernet_input_grew_by(before)
 
         route_9001.remove_vpp_config()
         self.logger.info("FFP_TEST_FINISH_0002")
@@ -442,6 +470,29 @@ class P2PEthernetIPV4(VppTestCase):
         p2p.config_ip4()
         return p2p
 
+    def assert_p2p_ethernet_input_grew_by(self, before):
+        """The count of p2p-ethernet-input grew by the packets the test sent.
+
+        A packet reaches the node when its source MAC is the MAC of one of the
+        subinterfaces of the parent interface it arrived on, and the node
+        matches on both. Every packet a test sends to the parent interface is
+        one such packet, so the count grows by the packets the test sent since
+        it read before. The node writes the count of a frame when the frame
+        ends, and the caller reads the count after the last frame reached the
+        other port, so nothing the test sent waits uncounted. A count a test
+        before this one left higher stays in before and does not reach the
+        difference.
+        """
+        counter = self.get_node_counter_path(
+            "p2p-ethernet-input", "P2P ethernet incoming packets processed"
+        )
+        sent = len(self.packets)
+        self.assert_equal(
+            self.statistics.get_err_counter(counter) - before,
+            sent,
+            "packets p2p-ethernet-input counted of the %d sent" % sent,
+        )
+
     def delete_p2p_ethernet(self, p2p):
         p2p.unconfig_ip4()
         p2p.admin_down()
@@ -468,9 +519,13 @@ class P2PEthernetIPV4(VppTestCase):
             )
         )
 
+        before = self.statistics.get_err_counter(
+            self.get_node_counter_path(
+                "p2p-ethernet-input", "P2P ethernet incoming packets processed"
+            )
+        )
         self.send_packets(self.pg0, self.pg1, self.packets)
-
-        self.assert_packet_counter_equal("p2p-ethernet-input", 1)
+        self.assert_p2p_ethernet_input_grew_by(before)
 
         route_9000.remove_vpp_config()
         self.logger.info("FFP_TEST_FINISH_0002")

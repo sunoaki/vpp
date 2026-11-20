@@ -308,7 +308,7 @@ class TemplateIpsec(VppTestCase):
         ]
 
 
-class IpsecTcp(object):
+class IpsecTcp(VppTestCase):
     def verify_tcp_checksum(self):
         # start http cli server listener on http://0.0.0.0:80
         self.vapi.cli("http cli server")
@@ -335,7 +335,7 @@ class IpsecTcpTests(IpsecTcp):
         self.verify_tcp_checksum()
 
 
-class IpsecTra4(object):
+class IpsecTra4(VppTestCase):
     """verify methods for Transport v4"""
 
     def get_replay_counts(self, p):
@@ -1066,8 +1066,12 @@ class IpsecTra4(object):
         self.assertEqual(p.tra_sa_out.get_err("lost"), 0)
         self.assertEqual(p.tra_sa_in.get_err("lost"), 0)
 
-        self.assert_packet_counter_equal(self.tra4_encrypt_node_name, count)
-        self.assert_packet_counter_equal(self.tra4_decrypt_node_name[0], count)
+        self.assert_packet_counter_equal(
+            self.get_node_counter(self.tra4_encrypt_node_name, "rx_pkts"), count
+        )
+        self.assert_packet_counter_equal(
+            self.get_node_counter(self.tra4_decrypt_node_name[0], "rx_pkts"), count
+        )
 
     def _verify_tra_anti_replay_algorithm_esn(self):
         def seq_num(seqh, seql):
@@ -1913,7 +1917,7 @@ class IpsecTra4Tests(IpsecTra4):
         self.verify_tra_basic4(count=257)
 
 
-class IpsecTra6(object):
+class IpsecTra6(VppTestCase):
     """verify methods for Transport v6"""
 
     def verify_tra_basic6(self, count=1, payload_size=54):
@@ -1951,8 +1955,12 @@ class IpsecTra6(object):
         self.assertEqual(
             pkts, count, "incorrect SA out counts: expected %d != %d" % (count, pkts)
         )
-        self.assert_packet_counter_equal(self.tra6_encrypt_node_name, count)
-        self.assert_packet_counter_equal(self.tra6_decrypt_node_name[0], count)
+        self.assert_packet_counter_equal(
+            self.get_node_counter(self.tra6_encrypt_node_name, "rx_pkts"), count
+        )
+        self.assert_packet_counter_equal(
+            self.get_node_counter(self.tra6_decrypt_node_name[0], "rx_pkts"), count
+        )
 
     def gen_encrypt_pkts_ext_hdrs6(
         self, sa, sw_intf, src, dst, count=1, payload_size=54
@@ -2096,7 +2104,7 @@ class IpsecTra46Tests(IpsecTra4Tests, IpsecTra6Tests):
     pass
 
 
-class IpsecTun4(object):
+class IpsecTun4(VppTestCase):
     """verify methods for Tunnel v4"""
 
     def verify_counters4(self, p, count, n_frags=None, worker=None):
@@ -2122,8 +2130,12 @@ class IpsecTun4(object):
                 "incorrect SA out counts: expected %d != %d" % (count, pkts),
             )
 
-        self.assert_packet_counter_equal(self.tun4_encrypt_node_name, n_frags)
-        self.assert_packet_counter_equal(self.tun4_decrypt_node_name[0], count)
+        self.assert_packet_counter_equal(
+            self.get_node_counter(self.tun4_encrypt_node_name, "rx_pkts"), n_frags
+        )
+        self.assert_packet_counter_equal(
+            self.get_node_counter(self.tun4_decrypt_node_name[0], "rx_pkts"), count
+        )
 
     def verify_decrypted(self, p, rxs):
         for rx in rxs:
@@ -2373,7 +2385,7 @@ class IpsecTun4Tests(IpsecTun4):
         self.verify_tun_44(self.params[socket.AF_INET], count=127)
 
 
-class IpsecTun6(object):
+class IpsecTun6(VppTestCase):
     """verify methods for Tunnel v6"""
 
     def verify_counters6(self, p_in, p_out, count, worker=None):
@@ -2389,8 +2401,12 @@ class IpsecTun6(object):
                 count,
                 "incorrect SA out counts: expected %d != %d" % (count, pkts),
             )
-        self.assert_packet_counter_equal(self.tun6_encrypt_node_name, count)
-        self.assert_packet_counter_equal(self.tun6_decrypt_node_name[0], count)
+        self.assert_packet_counter_equal(
+            self.get_node_counter(self.tun6_encrypt_node_name, "rx_pkts"), count
+        )
+        self.assert_packet_counter_equal(
+            self.get_node_counter(self.tun6_decrypt_node_name[0], "rx_pkts"), count
+        )
 
     def verify_decrypted6(self, p, rxs):
         for rx in rxs:

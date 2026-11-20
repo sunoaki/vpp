@@ -551,7 +551,9 @@ class VppTestCase(VppAsfTestCase):
             self.assert_checksum_valid(pkt, "ICMPv6EchoReply")
 
     def assert_packet_counter_equal(self, counter, expected_value):
-        counter_value = self.get_counter(counter)
+        # A path this VPP does not hold names no counter, and reads as none
+        # counted rather than as a missing entry of the stats directory.
+        counter_value = self.statistics.get_err_counter(counter)
         self.assert_equal(
             counter_value, expected_value, "packet counter `%s'" % counter
         )
