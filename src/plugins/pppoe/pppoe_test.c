@@ -112,7 +112,7 @@ api_pppoe_add_del_session (vat_main_t *vam)
 {
   unformat_input_t *line_input = vam->input;
   vl_api_pppoe_add_del_session_t *mp;
-  u16 session_id = 0;
+  u32 session_id = 0;
   ip46_address_t client_ip;
   u8 is_add = 1;
   u8 client_ip_set = 0;
@@ -183,8 +183,8 @@ api_pppoe_add_del_session (vat_main_t *vam)
       ip_address_encode (&client_ip, IP46_TYPE_IP4, &mp->client_ip);
     }
 
-  mp->decap_vrf_id = ntohl (decap_vrf_id);
-  mp->session_id = ntohl (session_id);
+  mp->decap_vrf_id = htonl (decap_vrf_id);
+  mp->session_id = htons ((u16) session_id);
   mp->is_add = is_add;
   memcpy (mp->client_mac, client_mac, 6);
 
@@ -295,7 +295,7 @@ vl_api_pppoe_session_details_t_handler (vl_api_pppoe_session_details_t *mp)
   vat_main_t *vam = &vat_main;
   ip46_address_t client_ip;
   ip_address_decode (&mp->client_ip, &client_ip);
-  print (vam->ofp, "%11d%14d%24U%14d%14d%30U%30U", ntohl (mp->sw_if_index), ntohl (mp->session_id),
+  print (vam->ofp, "%11d%14d%24U%14d%14d%30U%30U", ntohl (mp->sw_if_index), ntohs (mp->session_id),
 	 format_ip46_address, &client_ip, IP46_TYPE_ANY, ntohl (mp->encap_if_index),
 	 ntohl (mp->decap_vrf_id), format_ethernet_address, mp->local_mac, format_ethernet_address,
 	 mp->client_mac);
@@ -379,7 +379,7 @@ api_pppoe_add_del_cp (vat_main_t *vam)
   M (PPPOE_ADD_DEL_CP, mp);
 
   mp->is_add = is_add;
-  mp->sw_if_index = sw_if_index;
+  mp->sw_if_index = htonl (sw_if_index);
 
   S (mp);
   W (ret);
