@@ -1761,9 +1761,23 @@ class ARPTestCase(VppTestCase):
         self.assertFalse(find_nbr(self, self.pg2.sw_if_index, "10.99.0.3", is_static=1))
         self.assertFalse(find_route(self, "10.99.0.3", 32))
 
-    def test_arp_static_replace_dynamic_same_mac(self):
-        """ARP Static can replace Dynamic (same mac)"""
-        self.pg2.generate_remote_hosts(1)
+    def test_arp_static_replace_dynamic(self):
+        """ARP Static can replace Dynamic
+
+        Pinning a learned entry to the MAC it already holds leaves the entry
+        and its rewrite where they are. Pinning it to another MAC moves the
+        entry and the adjacency rewrite to that one, which is what a control
+        plane does when an address moves to a device with a new MAC. Learning
+        against a static entry stays refused, which test_arp_static_vs_learn
+        covers.
+        """
+        self.pg2.generate_remote_hosts(2)
+        p = (
+            Ether(dst=self.pg2.local_mac, src=self.pg2.remote_mac)
+            / IP(src=self.pg2.remote_ip4, dst=self.pg2.remote_hosts[0].ip4)
+            / UDP(sport=1234, dport=1234)
+            / Raw()
+        )
 
         dyn_arp = VppNeighbor(
             self,
@@ -1824,66 +1838,18 @@ class ARPTestCase(VppTestCase):
                 mac=self.pg2.remote_hosts[0].mac,
             )
         )
+        #
+        # the pinned entry forwards to the mac it holds
+        #
+        rx = self.send_and_expect(self.pg2, [p], self.pg2)
+        self.assertEqual(rx[0][Ether].dst, self.pg2.remote_hosts[0].mac)
 
         #
-        # clean-up
+        # pin the same entry to the mac the second host answers for
         #
-        static_arp.remove_vpp_config()
-
-    def test_arp_static_replace_dynamic_diff_mac(self):
-        """ARP Static can replace Dynamic (diff mac)"""
-        self.pg2.generate_remote_hosts(2)
-
-        dyn_arp = VppNeighbor(
-            self,
-            self.pg2.sw_if_index,
-            self.pg2.remote_hosts[0].mac,
-            self.pg2.remote_hosts[0].ip4,
-        )
-        static_arp = VppNeighbor(
-            self,
-            self.pg2.sw_if_index,
-            self.pg2.remote_hosts[1].mac,
-            self.pg2.remote_hosts[0].ip4,
-            is_static=1,
-        )
-
-        #
-        # Add a dynamic ARP entry
-        #
-        dyn_arp.add_vpp_config()
-
-        #
-        # We should find the dynamic nbr
-        #
-        self.assertFalse(
-            find_nbr(
-                self, self.pg2.sw_if_index, self.pg2.remote_hosts[0].ip4, is_static=1
-            )
-        )
-        self.assertTrue(
-            find_nbr(
-                self,
-                self.pg2.sw_if_index,
-                self.pg2.remote_hosts[0].ip4,
-                is_static=0,
-                mac=self.pg2.remote_hosts[0].mac,
-            )
-        )
-
-        #
-        # Add a static ARP entry with a changed mac
-        #
+        static_arp.mac_addr = self.pg2.remote_hosts[1].mac
         static_arp.add_vpp_config()
 
-        #
-        # We should now find the static nbr with a changed mac
-        #
-        self.assertFalse(
-            find_nbr(
-                self, self.pg2.sw_if_index, self.pg2.remote_hosts[0].ip4, is_static=0
-            )
-        )
         self.assertTrue(
             find_nbr(
                 self,
@@ -1893,6 +1859,8 @@ class ARPTestCase(VppTestCase):
                 mac=self.pg2.remote_hosts[1].mac,
             )
         )
+        rx = self.send_and_expect(self.pg2, [p], self.pg2)
+        self.assertEqual(rx[0][Ether].dst, self.pg2.remote_hosts[1].mac)
 
         #
         # clean-up
