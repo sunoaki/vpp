@@ -36,6 +36,16 @@ from scapy.layers.inet import IP, TCP
 class TestSfdpTwoWorkers(BaseSfdpTest):
     """SFDP packet handoff between two workers"""
 
+    # Two workers plus the main thread need three physical cores. The runner
+    # hands out one whole core per VPP thread (get_cores_required and
+    # assign_cores in asfframework.py) and deliberately leaves each core's
+    # sibling idle so no two VPP threads share a core; a runner with fewer
+    # cores skips this class rather than packing threads onto shared cores.
+    # Reporting two cores while declaring two workers is worse than a skip:
+    # VPP would start with a corelist-workers shorter than its worker count,
+    # and these tests need both worker threads (see the worker=1 send below).
+    # Do not lower the count to make it run here - the suite would lose a
+    # worker.
     vpp_worker_count = 2
 
     # Increase stats-segment memory, as 32M default
@@ -104,7 +114,9 @@ class TestSfdpTwoWorkers(BaseSfdpTest):
 class TestSfdpKillMultiWorker(VppTestCase):
     """SFDP kill immediacy with multiple worker threads"""
 
-    # 1 worker thread: sessions go to thread index 1 (worker 0)
+    # One worker thread: sessions go to VPP thread index 1 (worker 0). Two
+    # cores (main + worker), so this class runs on a two-core runner; the
+    # two-worker classes below are the ones that need a third core.
     vpp_worker_count = 1
 
     # 20ms per tick; sessions-log2 5 = 32 sessions (small memory footprint)
@@ -378,6 +390,10 @@ class TestSfdpKillTwoWorkers(VppTestCase):
 
     # 2 worker threads: sessions go to thread index 1 (worker 0)
     # and thread index 2 (worker 1)
+    #
+    # Three physical cores (main + two workers), one whole core per VPP
+    # thread; see the note on TestSfdpTwoWorkers for why the runner skips
+    # this class instead of sharing cores on a smaller runner.
     vpp_worker_count = 2
 
     # 20ms per tick; sessions-log2 5 = 32 sessions (small memory footprint)
