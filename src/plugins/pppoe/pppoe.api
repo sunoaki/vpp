@@ -39,6 +39,41 @@ define pppoe_add_del_session
   option vat_help = "client-addr <client-addr> session-id <nn> [encap-if-index <nn>] [decap-next [ip4|ip6|node <name>]] local-mac <local-mac> client-mac <client-mac> [del]";
 };
 
+/** \brief Set or delete an PPPOE session, naming the port to the client
+    The fields are the ones of pppoe_add_del_session, plus encap_if_index and
+    disable_fib.
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+    @param is_add - add address if non-zero, else delete
+    @param session_id - PPPoE session ID
+    @param client_ip - PPPOE session's client address.
+    @param decap_vrf_id - the vrf index for pppoe decaped packet
+    @param client_mac - the client ethernet address
+    @param encap_if_index - the interface towards the client, 0xFFFFFFFF to
+                            learn it from the received frames of the client
+    @param disable_fib - leave the reverse route for client_ip, the IPv4
+                         client address of this request, to whoever owns it.
+                         An IPv6 client address the session already holds
+                         has its reverse route removed as well; this message
+                         carries no IPv6 address, so it cannot say who owns
+                         that one, and the route is not restored by this call.
+*/
+define pppoe_add_del_session_v2
+{
+  option in_progress;
+
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  u16 session_id;
+  vl_api_address_t client_ip;
+  u32 decap_vrf_id;
+  vl_api_mac_address_t client_mac;
+  vl_api_interface_index_t encap_if_index [default=0xFFFFFFFF];
+  bool disable_fib;
+  option vat_help = "client-addr <client-addr> session-id <nn> [encap-if-index <intfc>] [decap-next [ip4|ip6|node <name>]] local-mac <local-mac> client-mac <client-mac> [disable_fib] [del]";
+};
+
 /** \brief reply for set or delete an PPPOE session
     @param context - sender context, to match reply w/ request
     @param retval - return code
@@ -46,6 +81,20 @@ define pppoe_add_del_session
 */
 define pppoe_add_del_session_reply
 {
+  u32 context;
+  i32 retval;
+  vl_api_interface_index_t sw_if_index;
+};
+
+/** \brief reply for set or delete an PPPOE session naming the port
+    @param context - sender context, to match reply w/ request
+    @param retval - return code
+    @param sw_if_index - software index of the interface
+*/
+define pppoe_add_del_session_v2_reply
+{
+  option in_progress;
+
   u32 context;
   i32 retval;
   vl_api_interface_index_t sw_if_index;

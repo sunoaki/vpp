@@ -544,6 +544,18 @@ pppoe_session_detach (pppoe_main_t *pem, pppoe_session_t *t)
   pppoe_ip4_addresses_clear (vnm, t->sw_if_index);
   pppoe_ip6_addresses_clear (vnm, t->sw_if_index);
 
+  /*
+   * The address belongs to the session, not to the slot it was held in: a
+   * session released here leaves nothing of itself behind, and the next one
+   * starts without an address and gets its own when one is negotiated. The
+   * routes that name the address are gone by now, so the fields can go with
+   * them.
+   */
+  clib_memset (&t->client_ip, 0, sizeof (t->client_ip));
+  clib_memset (&t->client_ip6, 0, sizeof (t->client_ip6));
+  t->client_ip4_set = 0;
+  t->client_ip6_set = 0;
+
   si = vnet_get_sw_interface (vnm, t->sw_if_index);
   si->flags |= VNET_SW_INTERFACE_FLAG_HIDDEN;
   vnet_sw_interface_set_flags (vnm, t->sw_if_index, 0 /* down */);
@@ -665,16 +677,33 @@ vnet_pppoe_add_del_session (vnet_pppoe_add_del_session_args_t *a, u32 *sw_if_ind
   cached_key.raw = ~0;
   cached_result.raw = ~0; /* warning be gone */
 
-  if (a->session_id == 0)
-    return VNET_API_ERROR_INVALID_ARGUMENT;
-
   /*
    * The caller may name the data plane port the client is reached on; the
    * control plane does, because its session is created from a negotiation
    * frame rather than from a data frame, so the link table has nothing to say
-   * about the client yet. Only a caller that does not name one is resolved
-   * through the link table.
+   * about the client yet. The link table keeps moving with the client's
+   * frames, so this is decided before a delete learns the frames' port, and a
+   * delete of a session that is still there takes the port the session was
+   * created on.
    */
+  if (!a->is_add)
+    {
+      pppoe_lookup_1 (&pem->session_table, &cached_key, &cached_result, a->client_mac,
+		      clib_host_to_net_u16 (a->session_id), &key, &bucket, &result);
+
+      /* a key outlives the session it named, so it can lead to a free slot */
+      if (result.fields.session_index != ~0 &&
+	  !pool_is_free_index (pem->sessions, result.fields.session_index) &&
+	  a->encap_if_index == ~0)
+	{
+	  t = pool_elt_at_index (pem->sessions, result.fields.session_index);
+	  a->encap_if_index = t->encap_if_index;
+	}
+    }
+
+  if (a->session_id == 0)
+    return VNET_API_ERROR_INVALID_ARGUMENT;
+
   if (a->encap_if_index == ~0)
     {
       pppoe_lookup_1 (&pem->link_table, &cached_key, &cached_result, a->client_mac, 0, &key,
@@ -772,10 +801,29 @@ vnet_pppoe_add_del_session (vnet_pppoe_add_del_session_args_t *a, u32 *sw_if_ind
        * this branch released it earlier or because it never had one. Deleting
        * it again is what the caller asked for, not an error.
        */
-      if (session_index == ~0)
+      if (session_index == ~0 || pool_is_free_index (pem->sessions, session_index))
 	return 0;
 
       t = pool_elt_at_index (pem->sessions, session_index);
+
+      /*
+       * A caller that named a count meant one session of that slot. The slot
+       * the client's key leads to can have been released and handed to the
+       * client's next connection since the caller read it, and the release
+       * belongs to the session that was asked for, not to the one that took
+       * its place; that session is already gone, which is what a second
+       * delete of it answers.
+       *
+       * No caller in this tree can reach the mismatch: the only one that
+       * names a count, pppoe_delete_collect_cb, reads the count under the
+       * barrier the release is made under, and nothing releases a session
+       * between the read and this comparison. The test is kept so that a
+       * delete queued before the workers were parked cannot release the
+       * client's next connection.
+       */
+      if (a->generation != ~0 && t->generation != a->generation)
+	return 0;
+
       sw_if_index = t->sw_if_index;
 
       pppoe_session_release (pem, t);
@@ -955,6 +1003,10 @@ pppoe_delete_collect_cb (BVT (clib_bihash_kv) * kvp, void *arg)
     .encap_if_index = t->encap_if_index,
     .decap_fib_index = t->decap_fib_index,
     .client_ip = t->client_ip,
+    /* the delete names the session this walk read, count included, so the
+     * slot the client's key leads to is not released when it is no longer
+     * that session */
+    .generation = t->generation,
   };
   clib_memcpy (a.client_mac, key.fields.mac, 6);
 

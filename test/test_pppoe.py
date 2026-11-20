@@ -12,6 +12,7 @@ from framework import VppTestCase
 from asfframework import VppTestRunner
 from vpp_ip_route import VppIpRoute, VppRoutePath
 from vpp_pppoe_interface import VppPppoeInterface
+from vpp_papi_exceptions import UnexpectedApiReturnValueError
 from util import ppp
 from config import config
 
@@ -383,6 +384,138 @@ class TestPPPoE(VppTestCase):
         # Delete a route that resolves the server's destination
         route_sever_dst.remove_vpp_config()
 
+    def test_PPPoE_Encap_From_Caller_Interface(self):
+        """PPPoE Session Created On The Interface The Caller Names Test"""
+
+        #
+        # The client is known to the control plane from its frames on pg0, and
+        # those frames are what the binding records. No frame is sent here, so
+        # the binding names pg0 only when the caller asks for it.
+        #
+        pppoe_if = VppPppoeInterface(
+            self,
+            self.pg0.remote_ip4,
+            self.pg0.remote_mac,
+            self.session_id,
+            encap_if_index=self.pg0.sw_if_index,
+        )
+        pppoe_if.add_vpp_config()
+        self.assertTrue(pppoe_if.sw_if_index > 0)
+        self.assertNotEqual(pppoe_if.sw_if_index, self.pg0.sw_if_index)
+
+        details = self.vapi.pppoe_session_dump(sw_if_index=pppoe_if.sw_if_index)
+        self.assertEqual(1, len(details))
+        session = details[0]
+        self.assertEqual(self.session_id, session.session_id)
+        self.assertEqual(str(self.pg0.remote_mac), str(session.client_mac))
+        self.assertEqual(self.pg0.sw_if_index, session.encap_if_index)
+
+        #
+        # test case cleanup
+        #
+
+        # Delete PPPoE session
+        pppoe_if.remove_vpp_config()
+        self.assertEqual([], self.vapi.pppoe_session_dump())
+
+    def test_PPPoE_Delete_All_Sessions(self):
+        """PPPoE Delete All Sessions Deletes Every Session Test"""
+
+        #
+        # Both sessions name the port they sit on, so no frame has to be sent
+        # to bind their clients first.
+        #
+        pppoe_if1 = VppPppoeInterface(
+            self,
+            self.pg0.remote_ip4,
+            self.pg0.remote_mac,
+            self.session_id,
+            encap_if_index=self.pg0.sw_if_index,
+        )
+        pppoe_if1.add_vpp_config()
+
+        pppoe_if2 = VppPppoeInterface(
+            self,
+            self.pg2.remote_ip4,
+            self.pg2.remote_mac,
+            self.session_id + 1,
+            encap_if_index=self.pg2.sw_if_index,
+        )
+        pppoe_if2.add_vpp_config()
+
+        sessions = self.vapi.pppoe_session_dump()
+        self.assertEqual(2, len(sessions))
+
+        self.vapi.cli("delete pppoe sessions")
+
+        #
+        # The command answers without an error whether or not the deletions
+        # landed, so what it deleted is read back from the sessions.
+        #
+        self.assertEqual([], self.vapi.pppoe_session_dump())
+        self.assertEqual(
+            [], self.vapi.pppoe_session_dump(sw_if_index=pppoe_if1.sw_if_index)
+        )
+        self.assertEqual(
+            [], self.vapi.pppoe_session_dump(sw_if_index=pppoe_if2.sw_if_index)
+        )
+
+    def test_PPPoE_Delete_Without_Binding(self):
+        """PPPoE Delete Naming No Port Deletes The Session Test"""
+
+        #
+        # The session names its port, and the client sent no frame, so the
+        # binding knows neither the client nor the port it was reached on.
+        #
+        pppoe_if = VppPppoeInterface(
+            self,
+            self.pg0.remote_ip4,
+            self.pg0.remote_mac,
+            self.session_id,
+            encap_if_index=self.pg0.sw_if_index,
+        )
+        pppoe_if.add_vpp_config()
+
+        sessions = self.vapi.pppoe_session_dump(sw_if_index=pppoe_if.sw_if_index)
+        self.assertEqual(1, len(sessions))
+
+        #
+        # The older message names no port, so a delete through it is left with
+        # the binding. The session is there under the key the delete names, and
+        # the port it was created on is what the delete releases it from.
+        #
+        self.vapi.pppoe_add_del_session(
+            pppoe_if.client_ip,
+            pppoe_if.client_mac,
+            pppoe_if.session_id,
+            is_add=0,
+        )
+
+        self.assertEqual([], self.vapi.pppoe_session_dump())
+        self.assertEqual(
+            [], self.vapi.pppoe_session_dump(sw_if_index=pppoe_if.sw_if_index)
+        )
+
+    def test_PPPoE_Add_No_Binding_Fails(self):
+        """PPPoE Add With No Port Fails Through The API Test"""
+
+        #
+        # No frame is sent, so the binding knows nothing about this client, and
+        # the message names no port, so the session add fails with the invalid
+        # interface index master answers. The handler has to carry that code
+        # back in the reply; one that drops it answers 0 and this fails.
+        #
+        pppoe_if = VppPppoeInterface(
+            self, self.pg0.remote_ip4, self.pg0.remote_mac, self.session_id
+        )
+        with self.assertRaises(UnexpectedApiReturnValueError) as e:
+            pppoe_if.add_vpp_config()
+        # VNET_API_ERROR_INVALID_SW_IF_INDEX
+        self.assertEqual(e.exception.retval, -2)
+
+        # no session was built, so there is nothing to delete
+        self.assertEqual([], self.vapi.pppoe_session_dump())
+
     def test_PPPoE_Del_Twice(self):
         """PPPoE Delete Same Session Twice Test"""
 
@@ -414,24 +547,34 @@ class TestPPPoE(VppTestCase):
         self.pg_start()
 
         # Create PPPoE session
+        #
+        # The session names the port, so the delete below is left with the
+        # port the session was created on rather than with the binding, which
+        # learning has moved to pg1 by now.
+        #
         pppoe_if = VppPppoeInterface(
-            self, self.pg0.remote_ip4, self.pg0.remote_mac, self.session_id
+            self,
+            self.pg0.remote_ip4,
+            self.pg0.remote_mac,
+            self.session_id,
+            encap_if_index=self.pg0.sw_if_index,
         )
         pppoe_if.add_vpp_config()
 
         # Delete PPPoE session
         pppoe_if.remove_vpp_config()
+        self.assertEqual([], self.vapi.pppoe_session_dump())
 
         #
-        # The double del (del the same session twice) should fail,
-        # and we should still be able to use the original
+        # The key of the client outlives the session it named, so the second
+        # delete finds a key that leads to a released session. Deleting a
+        # session that is already gone is what the caller asked for: it names
+        # no error and leaves no session behind. A call that cannot be
+        # delivered raises through the provider, which is a failure here.
         #
-        try:
-            pppoe_if.remove_vpp_config()
-        except Exception:
-            pass
-        else:
-            self.fail("Double GRE tunnel del does not fail")
+        del_again = pppoe_if.del_vpp_config()
+        self.assertEqual(0, del_again.retval)
+        self.assertEqual([], self.vapi.pppoe_session_dump())
 
         #
         # test case cleanup

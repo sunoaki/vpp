@@ -82,7 +82,11 @@ typedef struct
   u8 client_ip4_set;
   u8 client_ip6_set;
 
-  /* the index of tx interface for pppoe encaped packet */
+  /*
+   * The interface towards the client, fixed when the session is created: the
+   * caller's interface, else the one the binding held for the client at that
+   * moment. Later frames of the client move the binding, never this.
+   */
   u32 encap_if_index;
 
   /** FIB indices - inner IP packet lookup here */

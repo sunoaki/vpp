@@ -23,6 +23,27 @@
 #define REPLY_MSG_ID_BASE pem->msg_id_base
 #include <vlibapi/api_helper_macros.h>
 
+static int
+pppoe_add_del_session_from_api (vnet_pppoe_add_del_session_args_t *a, u32 decap_fib_index,
+				vl_api_interface_index_t encap_if_index, u8 disable_fib,
+				u32 *sw_if_indexp)
+{
+  int rv;
+
+  a->decap_fib_index = decap_fib_index;
+  a->encap_if_index = encap_if_index;
+  a->disable_fib = disable_fib;
+  /* the API names the session by its ID and address, not by a session a
+   * queued observation was made for */
+  a->generation = ~0;
+
+  rv = vnet_pppoe_add_del_session (a, sw_if_indexp);
+  if (rv)
+    *sw_if_indexp = ~0;
+
+  return rv;
+}
+
 static void
 vl_api_pppoe_add_del_session_t_handler (vl_api_pppoe_add_del_session_t *mp)
 {
@@ -39,7 +60,8 @@ vl_api_pppoe_add_del_session_t_handler (vl_api_pppoe_add_del_session_t *mp)
    * interface and the binding cannot be given one here, so an add for a MAC
    * with no binding is rejected as an invalid interface index. The control
    * plane path learns the MAC before it adds the session, so it meets the
-   * requirement by construction; this message cannot.
+   * requirement by construction; this message cannot. pppoe_add_del_session_v2
+   * names the interface instead.
    */
   uword *p = hash_get (im->fib_index_by_table_id, ntohl (mp->decap_vrf_id));
   if (!p)
@@ -51,20 +73,55 @@ vl_api_pppoe_add_del_session_t_handler (vl_api_pppoe_add_del_session_t *mp)
 
   vnet_pppoe_add_del_session_args_t a = {
     .is_add = mp->is_add,
-    .encap_if_index = ~0,
-    .decap_fib_index = decap_fib_index,
     .session_id = ntohs (mp->session_id),
-    /* the API names the session by its ID and address, not by a session a
-     * queued observation was made for */
-    .generation = ~0,
   };
   ip_address_decode (&mp->client_ip, &a.client_ip);
   clib_memcpy (a.client_mac, mp->client_mac, 6);
 
-  rv = vnet_pppoe_add_del_session (&a, &sw_if_index);
+  rv = pppoe_add_del_session_from_api (&a, decap_fib_index, ~0, 0, &sw_if_index);
 
 out:
   REPLY_MACRO2 (VL_API_PPPOE_ADD_DEL_SESSION_REPLY, ({ rmp->sw_if_index = ntohl (sw_if_index); }));
+}
+
+static void
+vl_api_pppoe_add_del_session_v2_t_handler (vl_api_pppoe_add_del_session_v2_t *mp)
+{
+  vl_api_pppoe_add_del_session_v2_reply_t *rmp;
+  int rv = 0;
+  u32 decap_fib_index;
+  u32 sw_if_index = ~0;
+  ip4_main_t *im = &ip4_main;
+  pppoe_main_t *pem = &pppoe_main;
+
+  /*
+   * The request names the interface towards the client when it knows it, as
+   * the control plane does for a session it creates from a negotiation frame.
+   * With 0xFFFFFFFF the binding is asked instead, and it only knows a client
+   * from a frame the client sent, so such an add for a MAC with no binding is
+   * rejected as an invalid interface index.
+   */
+  uword *p = hash_get (im->fib_index_by_table_id, ntohl (mp->decap_vrf_id));
+  if (!p)
+    {
+      rv = VNET_API_ERROR_NO_SUCH_INNER_FIB;
+      goto out;
+    }
+  decap_fib_index = p[0];
+
+  vnet_pppoe_add_del_session_args_t a = {
+    .is_add = mp->is_add,
+    .session_id = ntohs (mp->session_id),
+  };
+  ip_address_decode (&mp->client_ip, &a.client_ip);
+  clib_memcpy (a.client_mac, mp->client_mac, 6);
+
+  rv = pppoe_add_del_session_from_api (&a, decap_fib_index, ntohl (mp->encap_if_index),
+				       mp->disable_fib, &sw_if_index);
+
+out:
+  REPLY_MACRO2 (VL_API_PPPOE_ADD_DEL_SESSION_V2_REPLY,
+		({ rmp->sw_if_index = ntohl (sw_if_index); }));
 }
 
 static void
