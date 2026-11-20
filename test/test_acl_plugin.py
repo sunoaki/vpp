@@ -1641,30 +1641,23 @@ class TestACLplugin(VppTestCase):
     _MAX_WORKERS = 100
     _session_blocks = {}
 
-    def _ensure_pg0(self):
-        """Re-create pg0 unless the interface of that name is still configured.
+    def _check_pg0_configured(self):
+        """Stop with a cause when pg0 is gone and the fixture no longer fits it.
 
-        The scenarios that delete pg0 leave the class without one, and the
-        ones that follow read `self.pg0.sw_if_index`; a request naming the
-        closed index of the deleted interface is rejected with
-        `VNET_API_ERROR_INVALID_SW_IF_INDEX`. `client_index` survives the
-        deletion, and the pool hands out its lowest free slot, so a re-created
-        pg0 takes the index the deleted one had.
+        The scenario that runs first repairs a pg0 its predecessor deleted: it
+        replaces the class's `pg0` and `pg_interfaces` with the interface it
+        created. `hosts_by_pg_idx`, `flows` and `pg_if_packet_sizes` are
+        filled in `setUpClass` and still name the old objects, so a scenario
+        that finds pg0 gone reads a host the interface does not use. Re-creating
+        pg0 here would rebuild the interface and not those maps.
         """
-        pg0 = self.pg0
-        if pg0.query_vpp_config():
-            return pg0
-        pg0 = self.create_pg_interfaces([pg0.pg_index])[0]
-        # the class setup puts pg0 up and into the bridge domain, and a frame
-        # on an interface that is down never reaches the ACL node
-        pg0.admin_up()
-        self.vapi.sw_interface_set_l2_bridge(
-            rx_sw_if_index=pg0.sw_if_index, bd_id=self.bd_id
+        if self.pg0.query_vpp_config():
+            return
+        self.fail(
+            "pg0 (sw_if_index %d) is not configured: an earlier scenario of "
+            "this class deleted it. Run the scenario that restores it first."
+            % self.pg0.sw_if_index
         )
-        type(self).pg_interfaces = [pg0] + [
-            pg_if for pg_if in self.pg_interfaces if pg_if is not pg0
-        ]
-        return pg0
 
     def _apply_acl(self, sw_if_index, rules, tag):
         """Apply an ACL to the input of an interface."""
@@ -1902,6 +1895,8 @@ class TestACLplugin(VppTestCase):
         #    surviving pg1 back into it rather than leave a list of one.
         new_pg0 = self.create_pg_interfaces([0])[0]
         type(self).pg_interfaces = [new_pg0, pg1]
+        # hosts_by_pg_idx is keyed by sw_if_index and holds the hosts of the
+        # deleted interface, which the pool hands to the new one
         self.assertEqual(new_pg0.sw_if_index, pg0_index)
         # the class setup put pg0 up and into the bridge domain; a frame on an
         # interface that is down never reaches the ACL node, and the assertion
@@ -1942,7 +1937,7 @@ class TestACLplugin(VppTestCase):
         """
         self.logger.info("ACLP_TEST_START_0401")
 
-        self._ensure_pg0()
+        self._check_pg0_configured()
         pg0_index = self.pg0.sw_if_index
         pg1_index = self.pg1.sw_if_index
         pg0_host = self.hosts_by_pg_idx[pg0_index][0]
@@ -2038,7 +2033,7 @@ class TestACLplugin(VppTestCase):
         """
         self.logger.info("ACLP_TEST_START_0402")
 
-        self._ensure_pg0()
+        self._check_pg0_configured()
         pg0_index = self.pg0.sw_if_index
         pg1_index = self.pg1.sw_if_index
         pg0_host = self.hosts_by_pg_idx[pg0_index][0]
