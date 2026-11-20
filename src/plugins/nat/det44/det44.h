@@ -110,6 +110,21 @@ typedef struct
   snat_det_session_t *sessions;
 } snat_det_map_t;
 
+/* Deterministic NAT identity mapping */
+typedef struct
+{
+  /* inside IP address */
+  ip4_address_t addr;
+  /* protocol */
+  nat_protocol_t proto;
+  /* inside port */
+  u16 port;
+  /* flags */
+  u32 flags;
+  /* opaque string tag */
+  u8 *tag;
+} det44_identity_mapping_t;
+
 typedef struct
 {
   u32 sw_if_index;
@@ -146,6 +161,9 @@ typedef struct det44_main_s
 
   /* Deterministic NAT mappings */
   snat_det_map_t *det_maps;
+
+  /* Deterministic NAT identity mappings, kept in insertion order */
+  det44_identity_mapping_t *identity_mappings;
 
   /* TCP MSS clamping */
   u16 mss_clamping;
@@ -186,6 +204,9 @@ extern det44_main_t det44_main;
   vlib_log(VLIB_LOG_LEVEL_INFO, det44_main.log_class, __VA_ARGS__)
 #define det44_log_debug(...)\
   vlib_log(VLIB_LOG_LEVEL_DEBUG, det44_main.log_class, __VA_ARGS__)
+
+/* Deterministic NAT identity mapping flags */
+#define DET44_FLAG_ADDR_ONLY (1 << 0)
 
 /* Deterministic NAT interface flags */
 #define DET44_INTERFACE_FLAG_IS_INSIDE 1
@@ -228,21 +249,137 @@ format_function_t format_det_map_ses;
 int snat_det_add_map (ip4_address_t * in_addr, u8 in_plen,
 		      ip4_address_t * out_addr, u8 out_plen, int is_add);
 
+/** Maximum stored identity mapping tag, so the API string fits. */
+#define DET44_IDENTITY_TAG_LEN 63
+
+/** Identity mapping storage outcome. */
+typedef enum
+{
+  DET44_IDENTITY_MAPPING_ADDED,
+  DET44_IDENTITY_MAPPING_DELETED,
+  DET44_IDENTITY_MAPPING_NOT_FOUND,
+  DET44_IDENTITY_MAPPING_ALREADY_EXISTS,
+} det44_identity_mapping_result_t;
+
+/**
+ * @brief Add or delete a Deterministic NAT identity mapping.
+ *
+ * A tag longer than DET44_IDENTITY_TAG_LEN bytes is truncated when stored.
+ *
+ * @param addr   inside IPv4 address.
+ * @param proto  NAT protocol.
+ * @param port   inside port in network byte order.
+ * @param is_add nonzero to add, zero to delete.
+ * @param flags  DET44_FLAG_ADDR_ONLY for an address-only mapping.
+ * @param tag    optional opaque tag, copied into the mapping.
+ *
+ * @return storage outcome; the caller turns it into a CLI or API error.
+ */
+static_always_inline det44_identity_mapping_result_t
+det44_add_del_identity_mapping (ip4_address_t addr, nat_protocol_t proto, u16 port, u8 is_add,
+				u32 flags, u8 *tag)
+{
+  det44_main_t *dm = &det44_main;
+  det44_identity_mapping_t *m;
+  u16 tag_len;
+
+  vec_foreach (m, dm->identity_mappings)
+    {
+      if (m->addr.as_u32 != addr.as_u32 || m->flags != flags)
+	continue;
+      if (!(flags & DET44_FLAG_ADDR_ONLY) && (m->proto != proto || m->port != port))
+	continue;
+      if (is_add)
+	return DET44_IDENTITY_MAPPING_ALREADY_EXISTS;
+      if (m->tag)
+	vec_free (m->tag);
+      vec_del1 (dm->identity_mappings, m - dm->identity_mappings);
+      return DET44_IDENTITY_MAPPING_DELETED;
+    }
+
+  if (!is_add)
+    return DET44_IDENTITY_MAPPING_NOT_FOUND;
+
+  vec_add2 (dm->identity_mappings, m, 1);
+  clib_memset (m, 0, sizeof (*m));
+  m->addr = addr;
+  m->proto = proto;
+  m->port = port;
+  m->flags = flags;
+  if (tag)
+    {
+      tag_len = clib_min (vec_len (tag), DET44_IDENTITY_TAG_LEN);
+      m->tag = format (0, "%.*s%c", tag_len, tag, 0);
+    }
+  return DET44_IDENTITY_MAPPING_ADDED;
+}
+
+/**
+ * @brief Apply the routing that an identity mapping match requires.
+ *
+ * The packet keeps its addresses and ports; it is routed by the FIB of the
+ * direction it is leaving towards, so that a match does not fall into the
+ * det map's inside or outside table.
+ *
+ * @param b0        buffer holding the packet.
+ * @param fib_index outside FIB index on in2out, inside FIB index on out2in.
+ */
+static_always_inline void
+det44_identity_mapping_bypass (vlib_buffer_t *b0, u32 fib_index)
+{
+  vnet_buffer (b0)->sw_if_index[VLIB_TX] = fib_index;
+}
+
+/**
+ * @brief Match a Deterministic NAT identity mapping by inside address.
+ *
+ * Identity mappings are searched in insertion order and the first match
+ * wins. An address-only mapping therefore shadows every later mapping on
+ * the same address, regardless of protocol and port; an operator who wants
+ * per-port behaviour on such an address has to add the per-port mapping
+ * first.
+ *
+ * A mapping that also falls inside a det map is one-way by design: in2out
+ * bypasses the map, the outside peer answers the inside address, and there
+ * is no out2in session to translate the answer back.
+ *
+ * @param addr  inside IPv4 address.
+ * @param proto NAT protocol.
+ * @param port  inside port in network byte order.
+ *
+ * @return matching identity mapping, otherwise NULL.
+ */
+static_always_inline det44_identity_mapping_t *
+det44_identity_mapping_match (ip4_address_t addr, nat_protocol_t proto, u16 port)
+{
+  det44_main_t *dm = &det44_main;
+  det44_identity_mapping_t *m;
+
+  vec_foreach (m, dm->identity_mappings)
+    {
+      if (m->addr.as_u32 != addr.as_u32)
+	continue;
+      if (m->flags & DET44_FLAG_ADDR_ONLY)
+	return m;
+      if (m->proto == proto && m->port == port)
+	return m;
+    }
+  return 0;
+}
+
 /* icmp session match functions */
-u32 icmp_match_out2in_det (vlib_node_runtime_t * node,
-			   u32 thread_index, vlib_buffer_t * b0,
-			   ip4_header_t * ip0, ip4_address_t * addr,
-			   u16 * port, u32 * fib_index,
-			   nat_protocol_t * proto, void *d, void *e,
-			   u8 * dont_translate);
+u32 icmp_match_out2in_det (vlib_node_runtime_t *node, u32 thread_index, vlib_buffer_t *b0,
+			   ip4_header_t *ip0, ip4_address_t *addr, u16 *port, u32 *fib_index,
+			   nat_protocol_t *proto, void *d, void *e, u8 *dont_translate,
+			   u8 *identity);
 u32 icmp_match_in2out_det (vlib_node_runtime_t *node, u32 thread_index, vlib_buffer_t *b0,
 			   ip4_header_t *ip0, ip4_address_t *addr, u16 *port, u32 *fib_index,
 			   nat_protocol_t *proto, void *d, void *e, u8 *dont_translate, u8 *created,
-			   ip4_address_t *created_addr);
+			   ip4_address_t *created_addr, u8 *identity);
 u32 det44_icmp_in2out (vlib_buffer_t *b0, ip4_header_t *ip0, icmp46_header_t *icmp0,
 		       u32 sw_if_index0, u32 rx_fib_index0, vlib_node_runtime_t *node, u32 next0,
 		       u32 thread_index, void *d, void *e, u8 *session_accepted,
-		       ip4_address_t *created_addr);
+		       ip4_address_t *created_addr, u8 *identity);
 u32 det44_icmp_out2in (vlib_buffer_t * b0, ip4_header_t * ip0,
 		       icmp46_header_t * icmp0, u32 sw_if_index0,
 		       u32 rx_fib_index0, vlib_node_runtime_t * node,

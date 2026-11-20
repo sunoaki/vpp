@@ -568,6 +568,153 @@ VLIB_CLI_COMMAND (det44_show_sessions_command, static) = {
 
 /*?
  * @cliexpar
+ * @cliexstart{det44 add identity mapping}
+ * Create identity mapping which allows traffic to pass through
+ * NAT without translation. An inside address given without a protocol and
+ * port maps the whole address; otherwise only that protocol and port bypass
+ * translation. Mappings are matched in the order they were added and the
+ * first match wins, so an address-only mapping shadows every later mapping
+ * on the same address.
+ * To create identity mapping for address 10.0.0.3 use:
+ *  vpp# det44 add identity mapping 10.0.0.3
+ * To create identity mapping for address 10.0.0.3 port 3606 use:
+ *  vpp# det44 add identity mapping 10.0.0.3 tcp 3606
+ * To delete identity mapping use:
+ *  vpp# det44 add identity mapping 10.0.0.3 del
+ * A tag longer than 63 characters is truncated to 63 characters when
+ * stored.
+ * @cliexend
+?*/
+static clib_error_t *
+det44_add_identity_mapping_command_fn (vlib_main_t *vm, unformat_input_t *input,
+				       vlib_cli_command_t *cmd)
+{
+  unformat_input_t _line_input, *line_input = &_line_input;
+  clib_error_t *error = 0;
+  ip4_address_t addr;
+  nat_protocol_t proto = NAT_PROTOCOL_TCP;
+  u32 port = 0;
+  u8 is_add = 1, addr_set = 0, proto_set = 0;
+  u32 flags = 0;
+  u8 *tag = 0;
+  det44_identity_mapping_result_t rv;
+
+  if (!unformat_user (input, unformat_line_input, line_input))
+    return clib_error_return (0, DET44_EXPECTED_ARGUMENT);
+
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (line_input, "%U", unformat_ip4_address, &addr))
+	addr_set = 1;
+      else if (unformat (line_input, "%U %u", unformat_nat_protocol, &proto, &port))
+	proto_set = 1;
+      else if (unformat (line_input, "tag %s", &tag))
+	;
+      else if (unformat (line_input, "del"))
+	is_add = 0;
+      else
+	{
+	  error = clib_error_return (0, "unknown input '%U'", format_unformat_error, line_input);
+	  goto done;
+	}
+    }
+
+  if (!addr_set)
+    {
+      error = clib_error_return (0, "missing required parameter: address");
+      goto done;
+    }
+
+  if (!proto_set)
+    flags |= DET44_FLAG_ADDR_ONLY;
+  else
+    {
+      if (port < 1 || port > 65535)
+	{
+	  error = clib_error_return (0,
+				     "invalid port number: %u "
+				     "(must be 1-65535)",
+				     port);
+	  goto done;
+	}
+      port = clib_host_to_net_u16 (port);
+    }
+
+  if (!det44_main.enabled)
+    {
+      error = clib_error_return (0, "DET44 plugin is not enabled.");
+      goto done;
+    }
+
+  rv = det44_add_del_identity_mapping (addr, proto, (u16) port, is_add, flags, tag);
+  switch (rv)
+    {
+    case DET44_IDENTITY_MAPPING_DELETED:
+    case DET44_IDENTITY_MAPPING_ADDED:
+      break;
+    case DET44_IDENTITY_MAPPING_NOT_FOUND:
+      error = clib_error_return (0, "Identity mapping does not exist.");
+      break;
+    case DET44_IDENTITY_MAPPING_ALREADY_EXISTS:
+      error = clib_error_return (0, "Identity mapping already exists.");
+      break;
+    }
+
+done:
+  unformat_free (line_input);
+  if (tag)
+    vec_free (tag);
+  return error;
+}
+
+/*?
+ * @cliexpar
+ * @cliexstart{show det44 identity mappings}
+ * Show identity mappings in insertion order, which is the order the packet
+ * path matches them in; the first match wins.
+ * vpp# show det44 identity mappings
+ * DET44 identity mappings:
+ *  10.0.0.3
+ *  10.0.0.4 tcp 3606
+ * @cliexend
+?*/
+static clib_error_t *
+det44_show_identity_mappings_command_fn (vlib_main_t *vm, unformat_input_t *input,
+					 vlib_cli_command_t *cmd)
+{
+  det44_main_t *dm = &det44_main;
+  det44_identity_mapping_t *m;
+  u8 *s;
+
+  vlib_cli_output (vm, "DET44 identity mappings:");
+  vec_foreach (m, dm->identity_mappings)
+    {
+      s = format (0, " %U", format_ip4_address, &m->addr);
+      if (!(m->flags & DET44_FLAG_ADDR_ONLY))
+	s = format (s, " %U %u", format_nat_protocol, m->proto, clib_net_to_host_u16 (m->port));
+      if (m->tag)
+	s = format (s, " tag %s", m->tag);
+      vlib_cli_output (vm, "%v", s);
+      vec_free (s);
+    }
+  return 0;
+}
+
+VLIB_CLI_COMMAND (det44_add_identity_mapping_command, static) = {
+  .path = "det44 add identity mapping",
+  .short_help = "det44 add identity mapping <ip4-addr> [<protocol> <port>] "
+		"[tag <string, truncated to 63>] [del]",
+  .function = det44_add_identity_mapping_command_fn,
+};
+
+VLIB_CLI_COMMAND (det44_show_identity_mappings_command, static) = {
+  .path = "show det44 identity mappings",
+  .short_help = "show det44 identity mappings",
+  .function = det44_show_identity_mappings_command_fn,
+};
+
+/*?
+ * @cliexpar
  * @cliexstart{det44 close session out}
  * Close session using outside ip address and port
  * and external ip address and port, use:

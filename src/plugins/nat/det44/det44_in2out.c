@@ -35,6 +35,7 @@ typedef struct
   u32 sw_if_index;
   u32 next_index;
   u32 session_index;
+  u8 identity;
 } det44_in2out_trace_t;
 
 #define foreach_det44_in2out_error                 \
@@ -65,8 +66,8 @@ format_det44_in2out_trace (u8 * s, va_list * args)
   CLIB_UNUSED (vlib_node_t * node) = va_arg (*args, vlib_node_t *);
   det44_in2out_trace_t *t = va_arg (*args, det44_in2out_trace_t *);
 
-  s = format (s, "DET44_IN2OUT: sw_if_index %d, next index %d, session %d",
-	      t->sw_if_index, t->next_index, t->session_index);
+  s = format (s, "DET44_IN2OUT: sw_if_index %d, next index %d, session %d%s", t->sw_if_index,
+	      t->next_index, t->session_index, t->identity ? ", identity mapping" : "");
 
   return s;
 }
@@ -82,9 +83,12 @@ format_det44_in2out_trace (u8 * s, va_list * args)
  * @param[in,out] ip0            ip header
  * @param[out] p_proto           protocol used for matching
  * @param[out] p_value           address and port after NAT translation
- * @param[out] p_dont_translate  if packet should not be translated
+ * @param[out] p_dont_translate  if packet should not be translated, either
+ *                               because it is aimed at an interface address
+ *                               or holds an identity mapping
  * @param[out] created           session was created by this packet
  * @param[out] created_addr      inside address of the created session
+ * @param[out] identity          if a matching identity mapping was found
  * @param d                      optional parameter
  * @param e                      optional parameter
  */
@@ -92,7 +96,7 @@ u32
 icmp_match_in2out_det (vlib_node_runtime_t *node, u32 thread_index, vlib_buffer_t *b0,
 		       ip4_header_t *ip0, ip4_address_t *addr, u16 *port, u32 *fib_index,
 		       nat_protocol_t *proto, void *d, void *e, u8 *dont_translate, u8 *created,
-		       ip4_address_t *created_addr)
+		       ip4_address_t *created_addr, u8 *identity)
 {
   det44_main_t *dm = &det44_main;
   vlib_main_t *vm = vlib_get_main ();
@@ -114,6 +118,7 @@ icmp_match_in2out_det (vlib_node_runtime_t *node, u32 thread_index, vlib_buffer_
   u16 in_port;
   *dont_translate = 0;
   *created = 0;
+  *identity = 0;
 
   icmp0 = (icmp46_header_t *) ip4_next_header (ip0);
   echo0 = (icmp_echo_header_t *) (icmp0 + 1);
@@ -150,6 +155,15 @@ icmp_match_in2out_det (vlib_node_runtime_t *node, u32 thread_index, vlib_buffer_
 	  next0 = DET44_IN2OUT_NEXT_DROP;
 	  goto out;
 	}
+    }
+
+  /* An identity mapping keeps the packet untranslated, so it has to be
+     routed by the outside FIB instead of the inside one. */
+  if (PREDICT_FALSE (det44_identity_mapping_match (in_addr, protocol, in_port) != 0))
+    {
+      *dont_translate = 1;
+      *identity = 1;
+      goto out;
     }
 
   mp0 = snat_det_map_by_user (&in_addr);
@@ -248,8 +262,10 @@ out:
 u32
 det44_icmp_in2out (vlib_buffer_t *b0, ip4_header_t *ip0, icmp46_header_t *icmp0, u32 sw_if_index0,
 		   u32 rx_fib_index0, vlib_node_runtime_t *node, u32 next0, u32 thread_index,
-		   void *d, void *e, u8 *session_accepted, ip4_address_t *created_addr)
+		   void *d, void *e, u8 *session_accepted, ip4_address_t *created_addr,
+		   u8 *identity)
 {
+  det44_main_t *dm = &det44_main;
   vlib_main_t *vm = vlib_get_main ();
   u16 old_id0, new_id0, port, checksum0, old_checksum0, new_checksum0;
   u32 new_addr0, old_addr0, next0_tmp, fib_index;
@@ -258,18 +274,28 @@ det44_icmp_in2out (vlib_buffer_t *b0, ip4_header_t *ip0, icmp46_header_t *icmp0,
   ip4_header_t *inner_ip0;
   ip4_address_t addr;
   void *l4_header;
-  u8 dont_translate, created;
+  u8 dont_translate, created, identity_found;
   ip_csum_t sum0;
   nat_protocol_t protocol;
 
   *session_accepted = 0;
+  *identity = 0;
+  identity_found = 0;
   echo0 = (icmp_echo_header_t *) (icmp0 + 1);
-  next0_tmp = icmp_match_in2out_det (node, thread_index, b0, ip0, &addr, &port, &fib_index,
-				     &protocol, d, e, &dont_translate, &created, created_addr);
+  next0_tmp =
+    icmp_match_in2out_det (node, thread_index, b0, ip0, &addr, &port, &fib_index, &protocol, d, e,
+			   &dont_translate, &created, created_addr, &identity_found);
   if (next0_tmp != ~0)
     next0 = next0_tmp;
-  if (next0 == DET44_IN2OUT_NEXT_DROP || dont_translate)
+  if (next0 == DET44_IN2OUT_NEXT_DROP)
     goto out;
+  if (dont_translate)
+    {
+      *identity = identity_found;
+      if (PREDICT_FALSE (*identity))
+	det44_identity_mapping_bypass (b0, dm->outside_fib_index);
+      goto out;
+    }
 
   if (PREDICT_TRUE (!ip4_is_fragment (ip0)))
     {
@@ -428,6 +454,7 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
       u8 session_created0 = 0, session_created1 = 0;
       ip4_address_t icmp_addr0, icmp_addr1, out_addr0, out_addr1;
       icmp46_header_t *icmp0, *icmp1;
+      u8 identity0 = 0, identity1 = 0;
 
       b0 = *b;
       b++;
@@ -478,7 +505,8 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 
 	  // TODO:
 	  next0 = det44_icmp_in2out (b0, ip0, icmp0, sw_if_index0, rx_fib_index0, node, next0,
-				     thread_index, &ses0, &mp0, &session_created0, &icmp_addr0);
+				     thread_index, &ses0, &mp0, &session_created0, &icmp_addr0,
+				     &identity0);
 	  if (PREDICT_FALSE (session_created0))
 	    {
 	      snat_det_session_addresses (mp0, ses0, &icmp_addr0, &out_addr0);
@@ -487,6 +515,13 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 						  clib_net_to_host_u16 (ses0->out.out_port),
 						  dm->outside_fib_index);
 	    }
+	  goto trace0;
+	}
+
+      if (PREDICT_FALSE (det44_identity_mapping_match (ip0->src_address, proto0, tcp0->src) != 0))
+	{
+	  det44_identity_mapping_bypass (b0, dm->outside_fib_index);
+	  identity0 = 1;
 	  goto trace0;
 	}
 
@@ -630,6 +665,7 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 	  t->sw_if_index = sw_if_index0;
 	  t->next_index = next0;
 	  t->session_index = ~0;
+	  t->identity = identity0;
 	  if (ses0)
 	    t->session_index = ses0 - mp0->sessions;
 	}
@@ -661,7 +697,8 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 	  icmp1 = (icmp46_header_t *) udp1;
 
 	  next1 = det44_icmp_in2out (b1, ip1, icmp1, sw_if_index1, rx_fib_index1, node, next1,
-				     thread_index, &ses1, &mp1, &session_created1, &icmp_addr1);
+				     thread_index, &ses1, &mp1, &session_created1, &icmp_addr1,
+				     &identity1);
 	  if (PREDICT_FALSE (session_created1))
 	    {
 	      snat_det_session_addresses (mp1, ses1, &icmp_addr1, &out_addr1);
@@ -670,6 +707,13 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 						  clib_net_to_host_u16 (ses1->out.out_port),
 						  dm->outside_fib_index);
 	    }
+	  goto trace1;
+	}
+
+      if (PREDICT_FALSE (det44_identity_mapping_match (ip1->src_address, proto1, tcp1->src) != 0))
+	{
+	  det44_identity_mapping_bypass (b1, dm->outside_fib_index);
+	  identity1 = 1;
 	  goto trace1;
 	}
 
@@ -813,6 +857,7 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 	  t->sw_if_index = sw_if_index1;
 	  t->next_index = next1;
 	  t->session_index = ~0;
+	  t->identity = identity1;
 	  if (ses1)
 	    t->session_index = ses1 - mp1->sessions;
 	}
@@ -845,6 +890,7 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
       u8 created0 = 0;
       u8 session_created0 = 0;
       ip4_address_t icmp_addr0, out_addr0;
+      u8 identity0 = 0;
 
       b0 = *b;
       b++;
@@ -875,7 +921,8 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 	  icmp0 = (icmp46_header_t *) udp0;
 
 	  next0 = det44_icmp_in2out (b0, ip0, icmp0, sw_if_index0, rx_fib_index0, node, next0,
-				     thread_index, &ses0, &mp0, &session_created0, &icmp_addr0);
+				     thread_index, &ses0, &mp0, &session_created0, &icmp_addr0,
+				     &identity0);
 	  if (PREDICT_FALSE (session_created0))
 	    {
 	      snat_det_session_addresses (mp0, ses0, &icmp_addr0, &out_addr0);
@@ -884,6 +931,13 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 						  clib_net_to_host_u16 (ses0->out.out_port),
 						  dm->outside_fib_index);
 	    }
+	  goto trace00;
+	}
+
+      if (PREDICT_FALSE (det44_identity_mapping_match (ip0->src_address, proto0, tcp0->src) != 0))
+	{
+	  det44_identity_mapping_bypass (b0, dm->outside_fib_index);
+	  identity0 = 1;
 	  goto trace00;
 	}
 
@@ -1027,6 +1081,7 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 	  t->sw_if_index = sw_if_index0;
 	  t->next_index = next0;
 	  t->session_index = ~0;
+	  t->identity = identity0;
 	  if (ses0)
 	    t->session_index = ses0 - mp0->sessions;
 	}
