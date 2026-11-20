@@ -1641,6 +1641,32 @@ class TestACLplugin(VppTestCase):
     _MAX_WORKERS = 100
     _session_blocks = {}
 
+    def _recreate_pg0(self, index):
+        """Create pg0 again for the sw_if_index the deleted interface had.
+
+        The scenarios that delete pg0 give its index back to the pool, and the
+        pool hands out its lowest free slot, so the next packet-generator
+        interface takes the same index. `setUpClass` keys `hosts_by_pg_idx` by
+        `sw_if_index`, and that map still describes the index, which is what
+        the scenarios read for their hosts. `flows` is keyed by the interface
+        object instead, so a re-created pg0 is not found there; no scenario on
+        these paths reads it. The packet sizes are the same for every
+        interface, so `pg_if_packet_sizes` carries over as it is. The interface
+        is put up and back into the bridge domain, since a frame on a down
+        interface never reaches the ACL node.
+        """
+        pg0 = self.create_pg_interfaces([self.pg0.pg_index])[0]
+        pg0.admin_up()
+        self.vapi.sw_interface_set_l2_bridge(
+            rx_sw_if_index=pg0.sw_if_index, bd_id=self.bd_id
+        )
+        # `create_pg_interfaces` leaves the class list holding what it created;
+        # put the interfaces that stayed back into it
+        type(self).pg_interfaces = [pg0] + [
+            pg_if for pg_if in self.pg_interfaces if pg_if is not pg0
+        ]
+        return pg0
+
     def _apply_acl(self, sw_if_index, rules, tag):
         """Apply an ACL to the input of an interface."""
         acl = VppAcl(self, rules, tag=tag)
@@ -1872,19 +1898,11 @@ class TestACLplugin(VppTestCase):
         # 3. the new interface takes the same sw_if_index and a deny ACL.
         #    Nothing else allocates a software interface in between, and the
         #    pool hands out its lowest free slot, so this is deterministic and
-        #    is the premise of the assertion below. `create_pg_interfaces`
-        #    replaces the class-level list with what it created, so put the
-        #    surviving pg1 back into it rather than leave a list of one.
-        new_pg0 = self.create_pg_interfaces([0])[0]
-        type(self).pg_interfaces = [new_pg0, pg1]
+        #    is the premise of the assertion below.
+        new_pg0 = self._recreate_pg0(pg0_index)
+        # hosts_by_pg_idx is keyed by sw_if_index and holds the hosts of the
+        # deleted interface, which the pool hands to the new one
         self.assertEqual(new_pg0.sw_if_index, pg0_index)
-        # the class setup put pg0 up and into the bridge domain; a frame on an
-        # interface that is down never reaches the ACL node, and the assertion
-        # below must not pass for that reason
-        new_pg0.admin_up()
-        self.vapi.sw_interface_set_l2_bridge(
-            rx_sw_if_index=new_pg0.sw_if_index, bd_id=self.bd_id
-        )
         deny_rules = [self.create_rule(self.IPV4, self.DENY, self.PORTS_ALL, 0)]
         acl_if = self._apply_acl(new_pg0.sw_if_index, deny_rules, "deny")
         self.assertEqual(len(acl_if.current_acl_indexes()), 1)
@@ -1976,6 +1994,12 @@ class TestACLplugin(VppTestCase):
 
         self.assertNotIn(pg0_index, self._sessions_by_interface())
         self.assertEqual(self._sessions_by_interface()[pg1_index], pg1_sessions)
+
+        # hand the next scenario the interface it reads for its host: this one
+        # ends by deleting pg0, and 0402 applies its ACL list to the index it
+        # reads before it sends anything. `_recreate_pg0` puts pg1 back into
+        # `pg_interfaces`, which the deletion above narrowed to pg1 alone.
+        self._recreate_pg0(pg0_index)
 
         self.logger.info("ACLP_TEST_FINISH_0401")
 

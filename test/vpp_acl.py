@@ -299,6 +299,9 @@ class VppEtypeWhitelist(VppObject):
         return self
 
     def remove_vpp_config(self):
+        # nothing left for the registry to query once the whitelist is gone,
+        # and the query answers False in every case
+        self._test.registry.unregister(self.object_id(), self._test.logger)
         self._test.vapi.acl_interface_set_etype_whitelist(
             sw_if_index=self._sw_if_index, count=0, n_input=0, whitelist=[]
         )
@@ -344,11 +347,7 @@ class VppAclInterface(VppObject):
                 count=self.count,
                 acls=self.encode_acls(),
             )
-            if self.count == 0:
-                # the list is gone, so there is nothing left for the registry
-                # to query: dumping a closed sw_if_index would read a free slot
-                self._test.registry.unregister(self.object_id(), self._test.logger)
-            else:
+            if self.count > 0:
                 self._test.registry.register(self, self._test.logger)
             if expect_error:
                 self._test.fail("Unexpected api reply")
@@ -359,13 +358,13 @@ class VppAclInterface(VppObject):
         return None
 
     def remove_vpp_config(self, expect_error=False):
+        # the list is gone before the call answers, so the registry goes first:
+        # an entry left behind would stand for a list that no longer exists
+        self._test.registry.unregister(self.object_id(), self._test.logger)
         try:
             reply = self._test.vapi.acl_interface_set_acl_list(
                 sw_if_index=self._sw_if_index, n_input=0, count=0, acls=[]
             )
-            # the list is gone, so there is nothing left for the registry to
-            # query: dumping a closed sw_if_index would read a free slot
-            self._test.registry.unregister(self.object_id(), self._test.logger)
             if expect_error:
                 self._test.fail("Unexpected api reply")
         except UnexpectedApiReturnValueError:
@@ -508,6 +507,9 @@ class VppMacipAclInterface(VppObject):
         self._test.registry.register(self, self._test.logger)
 
     def remove_vpp_config(self):
+        # the bindings are gone before the call answers, so the registry goes
+        # first: an entry left behind would stand for bindings that are gone
+        self._test.registry.unregister(self.object_id(), self._test.logger)
         for acl in self.acls:
             self._test.vapi.macip_acl_interface_add_del(
                 is_add=False, sw_if_index=self._sw_if_index, acl_index=acl.acl_index
