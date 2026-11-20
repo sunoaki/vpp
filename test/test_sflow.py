@@ -7,7 +7,6 @@ from scapy.layers.l2 import Ether
 from scapy.packet import Raw
 from scapy.layers.inet import IP, UDP
 from random import randint
-import re  # for finding counters in "sh errors" output
 
 
 class SFlowTestCase(VppTestCase):
@@ -158,13 +157,12 @@ class SFlowTestCase(VppTestCase):
         )
 
     def get_sflow_counter(self, counter):
-        counters = self.vapi.cli("sh errors").split("\n")
-        for i in range(1, len(counters) - 1):
-            results = counters[i].split()
-            if results[1] == "sflow":
-                if re.search(counter, counters[i]) is not None:
-                    return int(results[0])
-        return None
+        # the plugin counts every counter below on the "sflow" node, and names
+        # them in the stats segment the way "sh errors" lists them
+        err = "/err/sflow/" + counter
+        if err not in self.statistics.directory:
+            return None
+        return self.statistics.get_err_counter(err)
 
     def verify_sflow(self, count):
         ctr_processed = "sflow packets processed"
@@ -179,7 +177,10 @@ class SFlowTestCase(VppTestCase):
         ps_fail = self.get_sflow_counter(ctr_ps_fail)
         self.assert_equal(processed, count, ctr_processed)
         self.assert_equal(sampled, count, ctr_sampled)
-        self.assert_equal(dropped, None, ctr_dropped)
+        # the packet is still forwarded when this counter is raised, so it
+        # stands for a sample the plugin discarded rather than a lost packet;
+        # no sample should be dropped by this stream
+        self.assert_equal(dropped, 0, ctr_dropped)
         # TODO decide how to warn if PSAMPLE is not working
         # It requires a prior "sudo modprobe psample", but
         # that should probably be done at system boot time
@@ -212,8 +213,8 @@ class SFlowTestCase(VppTestCase):
         # verify capture
         self.verify_capture(self.pg0, self.pg1, capture)
 
-        # nudge vpp clock to encourage flow sampling, otherwise "show errors"
-        # might be lacking sflow counters and verify_sflow() could fail
+        # nudge vpp clock to encourage flow sampling, otherwise the sflow
+        # process might not have counted the packets and verify_sflow() could fail
         self.virtual_sleep(1, remark="encourage flow sampling")
 
         # verify sflow counters
