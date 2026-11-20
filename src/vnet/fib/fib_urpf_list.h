@@ -104,6 +104,9 @@ fib_urpf_check (index_t ui, u32 sw_if_index)
     fib_urpf_list_t *urpf;
     u32 *swi;
 
+    if (PREDICT_FALSE (INDEX_INVALID == ui))
+        return (0);
+
     urpf = fib_urpf_list_get(ui);
 
     vec_foreach(swi, urpf->furpf_itfs)
@@ -128,6 +131,9 @@ always_inline int
 fib_urpf_check_size (index_t ui)
 {
     fib_urpf_list_t *urpf;
+
+    if (PREDICT_FALSE (INDEX_INVALID == ui))
+        return (0);
 
     urpf = fib_urpf_list_get(ui);
 
