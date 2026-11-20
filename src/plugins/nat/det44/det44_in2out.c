@@ -116,6 +116,7 @@ icmp_match_in2out_det (vlib_node_runtime_t *node, u32 thread_index, vlib_buffer_
   snat_det_session_t *ses0 = 0;
   ip4_address_t in_addr;
   u16 in_port;
+  u8 is_first_fragment;
   *dont_translate = 0;
   *created = 0;
   *identity = 0;
@@ -124,17 +125,16 @@ icmp_match_in2out_det (vlib_node_runtime_t *node, u32 thread_index, vlib_buffer_
   echo0 = (icmp_echo_header_t *) (icmp0 + 1);
   sw_if_index0 = vnet_buffer (b0)->sw_if_index[VLIB_RX];
   rx_fib_index0 = ip4_fib_table_get_index_for_sw_if_index (sw_if_index0);
+  is_first_fragment = ip4_get_fragment_offset (ip0) == 0;
 
-  if (!icmp_type_is_error_message
-      (vnet_buffer (b0)->ip.reass.icmp_type_or_tcp_flags))
+  /* Reassembly wrote the type of the first fragment only, so a later
+     fragment has no ICMP header to read and keeps the port of an ICMP
+     message without an echo header, as it did before. The error branch
+     needs both embedded headers after the ICMP header. */
+  if (is_first_fragment && icmp0->type != ICMP4_echo_request &&
+      clib_net_to_host_u16 (ip0->length) - ip4_header_bytes (ip0) >= 28)
     {
-      protocol = NAT_PROTOCOL_ICMP;
-      in_addr = ip0->src_address;
-      in_port = vnet_buffer (b0)->ip.reass.l4_src_port;
-    }
-  else
-    {
-      /* if error message, then it's not fragmented and we can access it */
+      /* an error message carries both headers past the ICMP header */
       inner_ip0 = (ip4_header_t *) (echo0 + 1);
       l4_header = ip4_next_header (inner_ip0);
       protocol = ip_proto_to_nat_proto (inner_ip0->protocol);
@@ -155,6 +155,12 @@ icmp_match_in2out_det (vlib_node_runtime_t *node, u32 thread_index, vlib_buffer_
 	  next0 = DET44_IN2OUT_NEXT_DROP;
 	  goto out;
 	}
+    }
+  else
+    {
+      protocol = NAT_PROTOCOL_ICMP;
+      in_addr = ip0->src_address;
+      in_port = is_first_fragment ? echo0->identifier : 0;
     }
 
   /* An identity mapping keeps the packet untranslated, so it has to be
@@ -225,10 +231,8 @@ icmp_match_in2out_det (vlib_node_runtime_t *node, u32 thread_index, vlib_buffer_
 	}
     }
 
-  if (PREDICT_FALSE
-      (vnet_buffer (b0)->ip.reass.icmp_type_or_tcp_flags != ICMP4_echo_request
-       && !icmp_type_is_error_message (vnet_buffer (b0)->ip.
-				       reass.icmp_type_or_tcp_flags)))
+  if (PREDICT_FALSE (is_first_fragment && icmp0->type != ICMP4_echo_request &&
+		     !icmp_type_is_error_message (icmp0->type)))
     {
       b0->error = node->errors[DET44_IN2OUT_ERROR_BAD_ICMP_TYPE];
       next0 = DET44_IN2OUT_NEXT_DROP;
@@ -321,7 +325,8 @@ det44_icmp_in2out (vlib_buffer_t *b0, ip4_header_t *ip0, icmp46_header_t *icmp0,
 			 src_address /* changed member */ );
   ip0->checksum = ip_csum_fold (sum0);
 
-  if (!vnet_buffer (b0)->ip.reass.is_non_first_fragment)
+  /* A non-first fragment has no ICMP header to rewrite. */
+  if (ip4_get_fragment_offset (ip0) == 0)
     {
       if (icmp0->checksum == 0)
 	icmp0->checksum = 0xffff;
@@ -432,6 +437,28 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
   u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
   vlib_get_buffers (vm, from, b, n_left_from);
+
+  /* A stale or partly removed feature behaves as if the plugin were not
+     enabled for the packet: the frame is routed untouched through the
+     receiving interface's FIB, without translation or the enabled path's
+     checks. That is what det44_plugin_disable is trying to reach. */
+  if (PREDICT_FALSE (!plugin_enabled ()))
+    {
+      u32 i;
+      vlib_buffer_t **b0 = b;
+      vlib_buffer_t *buf;
+
+      for (i = 0; i < frame->n_vectors; i++)
+	{
+	  buf = b0[i];
+	  vnet_buffer (buf)->sw_if_index[VLIB_TX] =
+	    ip4_fib_table_get_index_for_sw_if_index (vnet_buffer (buf)->sw_if_index[VLIB_RX]);
+	  nexts[i] = DET44_IN2OUT_NEXT_LOOKUP;
+	}
+
+      vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
+      return frame->n_vectors;
+    }
 
   while (n_left_from >= 2)
     {

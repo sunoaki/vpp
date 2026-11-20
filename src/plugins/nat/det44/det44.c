@@ -178,7 +178,7 @@ det44_reset_timeouts ()
 }
 
 int
-det44_interface_add_del (u32 sw_if_index, u8 is_inside, int is_del)
+det44_interface_add_del (u32 sw_if_index, u8 is_inside_flag, int is_del)
 {
   det44_main_t *dm = &det44_main;
   det44_interface_t *tmp, *i = 0;
@@ -198,7 +198,8 @@ det44_interface_add_del (u32 sw_if_index, u8 is_inside, int is_del)
   }
 out:
 
-  feature_name = is_inside ? "det44-in2out" : "det44-out2in";
+  feature_name =
+    (is_inside_flag & DET44_INTERFACE_FLAG_IS_INSIDE) ? "det44-in2out" : "det44-out2in";
 
   if (is_del)
     {
@@ -208,12 +209,11 @@ out:
 	  return VNET_API_ERROR_INVALID_VALUE;
 	}
 
-      rv = ip4_sv_reass_enable_disable_with_refcnt (sw_if_index, 0);
+      rv = vnet_feature_enable_disable ("ip4-unicast", feature_name, sw_if_index, 0, 0, 0);
       if (rv)
 	return rv;
 
-      rv = vnet_feature_enable_disable ("ip4-unicast", feature_name,
-					sw_if_index, 1, 0, 0);
+      rv = ip4_sv_reass_enable_disable_with_refcnt (sw_if_index, 0);
       if (rv)
 	return rv;
 
@@ -241,13 +241,13 @@ out:
 
       i->sw_if_index = sw_if_index;
 
-      if (is_inside)
+      if (is_inside_flag & DET44_INTERFACE_FLAG_IS_INSIDE)
 	i->flags |= DET44_INTERFACE_FLAG_IS_INSIDE;
       else
 	i->flags |= DET44_INTERFACE_FLAG_IS_OUTSIDE;
     }
 
-  if (!is_inside)
+  if (!(is_inside_flag & DET44_INTERFACE_FLAG_IS_INSIDE))
     {
       u32 fib_index = fib_table_get_index_for_sw_if_index (FIB_PROTOCOL_IP4,
 							   sw_if_index);
@@ -379,6 +379,7 @@ det44_plugin_disable ()
   det44_interface_t *i, *interfaces;
   det44_identity_mapping_t *identity_mapping;
   snat_det_map_t *mp;
+  const char *feature_name;
   int rv = 0;
 
   if (plugin_enabled () == 0)
@@ -421,6 +422,16 @@ det44_plugin_disable ()
       }
   }
   vec_free (interfaces);
+
+  /* A delete that stopped early leaves its feature installed while the
+     interface entry is gone, and a later add would install a second copy of
+     it. Unset the feature each remaining interface still carries. */
+  pool_foreach (i, dm->interfaces)
+    {
+      feature_name = (i->flags & DET44_INTERFACE_FLAG_IS_INSIDE) ? "det44-in2out" : "det44-out2in";
+      if (vnet_feature_is_enabled ("ip4-unicast", feature_name, i->sw_if_index) == 1)
+	vnet_feature_enable_disable ("ip4-unicast", feature_name, i->sw_if_index, 0, 0, 0);
+    }
 
   pool_foreach (mp, dm->det_maps)
    {
