@@ -161,7 +161,7 @@ static int api_nsh_add_del_entry (vat_main_t * vam)
     else if (md_type == 2)
       length = 2;  /* base header length */
 
-    nsp_nsi = (nsp<<8) | nsi;
+    nsp_nsi = htonl ((nsp << 8) | nsi);
 
     /* Construct the API message */
     M(NSH_ADD_DEL_ENTRY, nsh_add_del_entry);
@@ -210,6 +210,8 @@ static int api_nsh_entry_dump (vat_main_t * vam)
 
     /* Get list of nsh entries */
     M(NSH_ENTRY_DUMP, nsh_entry_dump);
+
+    mp->entry_index = htonl (~0);
 
     /* send it... */
     S;
@@ -308,6 +310,8 @@ static int api_nsh_map_dump (vat_main_t * vam)
 
     /* Get list of nsh entries */
     M(NSH_MAP_DUMP, nsh_map_dump);
+
+    mp->map_index = htonl (~0);
 
     /* send it... */
     S;
