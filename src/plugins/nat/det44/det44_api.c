@@ -154,6 +154,15 @@ vl_api_det44_add_del_identity_mapping_t_handler (vl_api_det44_add_del_identity_m
   else
     {
       proto = ip_proto_to_nat_proto (mp->protocol);
+      /* The packet path never passes NAT_PROTOCOL_OTHER, so a mapping
+	 added with it could never match. A delete must still reach the
+	 store, which finds the entry by the stored protocol, so the CLI
+	 can delete what it created with "other". */
+      if (proto == NAT_PROTOCOL_OTHER && mp->is_add)
+	{
+	  rv = VNET_API_ERROR_UNSUPPORTED;
+	  goto send_reply;
+	}
       port = mp->port;
     }
 
