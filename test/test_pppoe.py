@@ -790,6 +790,65 @@ class TestPPPoE(VppTestCase):
         # Delete a route that resolves the server's destination
         route_sever_dst.remove_vpp_config()
 
+    def test_PPPoE_Add_Del_CP(self):
+        """a control plane binding created and removed over the api"""
+
+        #
+        # the binding lives between a control plane interface and the data
+        # plane interface that carries the session traffic. The data plane
+        # side has to be ethernet, and every packet gateway interface is.
+        #
+        cp_index = self.pg0.sw_if_index
+        dp_index = self.pg1.sw_if_index
+
+        self.vapi.pppoe_add_del_cp(dp_index, cp_index, is_add=1)
+
+        #
+        # A binding is one pair per interface, so adding the same pair again
+        # has to be refused. The -116 shows the daemon found a binding on both
+        # the data plane index and the control plane index, so both arrived
+        # naming an interface; it does not show which index is which, since
+        # the indexes are distinct and a swap would fit the message too.
+        #
+        with self.vapi.assert_known_api_retval(retvals=[-116]):
+            self.vapi.pppoe_add_del_cp(dp_index, cp_index, is_add=1)
+
+        #
+        # A delete is refused unless both sides name the binding. This one
+        # names a data plane index that is off by one while the binding is in
+        # place, so it returns -6 for the binding it could not find, not for
+        # the missing binding an unbound state would give: the delete of the
+        # real pair below returns 0 and is what tells the two apart.
+        #
+        with self.vapi.assert_known_api_retval(retvals=[-6]):
+            self.vapi.pppoe_add_del_cp(dp_index + 1, cp_index, is_add=0)
+
+        #
+        # the refused delete above left the binding in place, which the -116
+        # of this add shows: the pair is still bound on both sides.
+        #
+        with self.vapi.assert_known_api_retval(retvals=[-116]):
+            self.vapi.pppoe_add_del_cp(dp_index, cp_index, is_add=1)
+
+        self.vapi.pppoe_add_del_cp(dp_index, cp_index, is_add=0)
+
+        #
+        # the unguarded delete above is checked against the default expected
+        # retval of 0, so a refusal fails the test here; this delete of a pair
+        # that is no longer bound now finds nothing and is refused.
+        #
+        with self.vapi.assert_known_api_retval(retvals=[-6]):
+            self.vapi.pppoe_add_del_cp(dp_index, cp_index, is_add=0)
+
+        self.vapi.pppoe_add_del_cp(dp_index, cp_index, is_add=1)
+        self.vapi.pppoe_add_del_cp(dp_index, cp_index, is_add=0)
+
+        #
+        # one interface cannot be both sides of its own binding.
+        #
+        with self.vapi.assert_known_api_retval(retvals=[-73]):
+            self.vapi.pppoe_add_del_cp(cp_index, cp_index, is_add=1)
+
     def test_route_via_pppoe_subif(self):
         """a route via a sub-interface created on a PPPoE session"""
 

@@ -229,6 +229,22 @@ vl_api_pppoe_add_del_cp_t_handler (vl_api_pppoe_add_del_cp_t *mp)
   REPLY_MACRO (VL_API_PPPOE_ADD_DEL_CP_REPLY);
 }
 
+/*
+ * pppoe_add_del_cp naming both interfaces of the pair, so the handler no
+ * longer has to look the other one up in the binding.
+ */
+static void
+vl_api_pppoe_add_del_cp_v2_t_handler (vl_api_pppoe_add_del_cp_v2_t *mp)
+{
+  vl_api_pppoe_add_del_cp_v2_reply_t *rmp;
+  i32 rv = 0;
+  pppoe_main_t *pem = &pppoe_main;
+
+  rv = pppoe_add_del_cp (ntohl (mp->cp_sw_if_index), ntohl (mp->dp_sw_if_index), mp->is_add);
+
+  REPLY_MACRO (VL_API_PPPOE_ADD_DEL_CP_V2_REPLY);
+}
+
 typedef struct
 {
   u32 context;

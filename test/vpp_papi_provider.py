@@ -875,6 +875,24 @@ class VppPapiProvider(object):
         """
         return self.api(self.papi.pppoe_session_dump, {"sw_if_index": sw_if_index})
 
+    def pppoe_add_del_cp(self, dp_sw_if_index, cp_sw_if_index, is_add=1):
+        """Pair the control plane and data plane interfaces of one binding.
+
+        :param dp_sw_if_index: data plane interface index
+        :param cp_sw_if_index: control plane interface index
+        :param is_add: 1 to create the binding, 0 to remove it
+            (Default value = 1)
+
+        """
+        return self.api(
+            self.papi.pppoe_add_del_cp_v2,
+            {
+                "dp_sw_if_index": dp_sw_if_index,
+                "cp_sw_if_index": cp_sw_if_index,
+                "is_add": is_add,
+            },
+        )
+
     def sr_mpls_policy_add(self, bsid, weight, type, segments):
         return self.api(
             self.papi.sr_mpls_policy_add,
