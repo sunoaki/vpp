@@ -197,12 +197,15 @@ class VPPStats:
 
     def refresh(self, blocking=True):
         """Refresh directory vector cache (epoch changed)"""
-        directory = {}
-        directory_by_idx = {}
+        # last_epoch is set only by the read the lock accepted, after the
+        # directory is stored. Set before the read, it would record the
+        # segment as read while the directory is the previous one, an empty
+        # one after a rejected first read, and no refresh would be due.
         while True:
+            directory = {}
+            directory_by_idx = {}
             try:
                 with self.lock:
-                    self.last_epoch = self.epoch
                     for i, direntry in enumerate(
                         StatsVector(self, self.directory_vector, self.elementfmt)
                     ):
@@ -212,6 +215,7 @@ class VPPStats:
                         directory_by_idx[i] = path
                     self.directory = directory
                     self.directory_by_idx = directory_by_idx
+                    self.last_epoch = self.epoch
                     return
             except IOError:
                 if not blocking:
@@ -220,15 +224,38 @@ class VPPStats:
     def __getitem__(self, item, blocking=True):
         if not self.connected:
             self.connect()
+        # A KeyError from the read refreshes the directory and reads again,
+        # once. The read covers both the lookup of item and get_counter,
+        # which for a symlink entry looks up directory_by_idx[index1] and
+        # then the entry it names. A vector that grew while it was read
+        # leaves that index out of the directory_by_idx of the same read,
+        # at the epoch the segment had when the read began, so no refresh
+        # is due. After the second read the KeyError is reported with item,
+        # the path or index the caller asked for.
+        #
+        # An IOError is a refused read, not a missing counter, so it takes
+        # the same second read that a KeyError takes, and only then is it
+        # reported: a blocking caller whose read was refused is told the
+        # read failed, not that the item names no counter.
+        retried = False
+        io_error = None
         while True:
             try:
-                if self.last_epoch != self.epoch:
+                if retried or self.last_epoch != self.epoch:
                     self.refresh(blocking)
                 with self.lock:
                     return self.directory[item].get_counter(self)
-            except IOError:
+            except IOError as e:
                 if not blocking:
                     raise
+                io_error = e
+            except KeyError:
+                pass
+            if retried:
+                if io_error is not None:
+                    raise IOError("Optimistic lock failed, retry") from io_error
+                raise KeyError(item)
+            retried = True
 
     def __iter__(self):
         return iter(self.directory.items())
@@ -348,17 +375,21 @@ class StatsLock:
     def __exit__(self, exc_type=None, exc_value=None, traceback=None):
         self.release()
 
+    # Wait between readings of in_progress when blocking, and between
+    # readings of a timeout that has not expired yet.
+    poll_interval = 0.01
+
     def acquire(self, blocking=True, timeout=-1):
         """Acquire the lock. Await in progress to go false. Record epoch."""
         self.epoch = self.stats.epoch
         if timeout > 0:
-            start = time.monotonic()
+            deadline = time.monotonic() + timeout
         while self.stats.in_progress:
+            if timeout > 0 and time.monotonic() >= deadline:
+                return False
             if not blocking:
-                time.sleep(0.01)
-                if timeout > 0:
-                    if start + time.monotonic() > timeout:
-                        return False
+                return False
+            time.sleep(self.poll_interval)
         return True
 
     def release(self):
