@@ -38,7 +38,7 @@ from util import ppp
 from vpp_ip_route import VppIpRoute, VppIpTable, VppRoutePath
 from vpp_neighbor import VppNeighbor
 from vpp_papi import VppEnum
-from vpp_papi_exceptions import CliFailedCommandError, UnexpectedApiReturnValueError
+from vpp_papi_exceptions import UnexpectedApiReturnValueError
 from config import config
 
 
@@ -4095,11 +4095,12 @@ class TestNAT44EI(MethodHolder):
         # The count is parsed from the "locks:[...]" field that
         # format_ip4_fib_table in src/vnet/fib/ip4_fib.c prints for every
         # nonzero lock source of the table, so the field names printed there
-        # are part of this helper's contract. The table is present because
-        # VppIpTable takes a FIB_SOURCE_API lock on it, and nat44-ei-hi is a
-        # plugin source, so its reference is counted with fib_table_lock_inc.
-        # A plugin source the table holds no reference to is left out of the
-        # field, so an absent name is a count of zero.
+        # are part of this helper's contract. Only the nat44-ei-hi source is
+        # matched, so the FIB_SOURCE_API lock VppIpTable takes when it creates
+        # the table is not part of the returned count. nat44-ei-hi is a plugin
+        # source, so fib_table_lock_inc moves it by one. A plugin source the
+        # table holds no reference to is left out of the field, so an absent
+        # name is a count of zero.
         table = self.vapi.cli("show ip fib table %d" % table_id)
         locks = re.search(r"locks:\[(.*)\]", table)
         if not locks:
@@ -4306,13 +4307,13 @@ class TestNAT44EI(MethodHolder):
             # everything else the plugin holds
             for cycle in range(2):
                 plugin_set(enable=1)
-                # the plugin's own locks go on top of the API lock the table
-                # was created with, so a count of one means the enable added
-                # none and a count of two means it added exactly one
+                # nat44_ei_plugin_enable takes exactly one fib_src_hi lock per
+                # table (nat44_ei.c:524-529), and the helper reads only that
+                # source, so one is the only count an enable can leave
                 for table_id in table_ids:
                     self.assertEqual(
                         self.nat44_ei_hi_fib_locks(table_id),
-                        2,
+                        1,
                         "cycle %d: table %d not locked once" % (cycle, table_id),
                     )
 
@@ -4354,10 +4355,13 @@ class TestNAT44EI(MethodHolder):
                 # address this cycle added and unlocks the two tables
                 self.nat44_ei_remove_interface_features()
                 plugin_set(enable=0)
+                # nat44_ei_plugin_disable releases exactly the fib_src_hi lock
+                # the enable took (nat44_ei.c:1309-1310), so the table carries
+                # none of that source once the disable returns
                 for table_id in table_ids:
                     self.assertEqual(
                         self.nat44_ei_hi_fib_locks(table_id),
-                        1,
+                        0,
                         "cycle %d: table %d still locked" % (cycle, table_id),
                     )
 
@@ -4426,17 +4430,12 @@ class TestNAT44EI(MethodHolder):
             # the delete reaches fib_table_unlock with FIB_SOURCE_API, which
             # destroys the table once no source holds a lock, and a source that
             # still held one would keep the table alive; the count is read
-            # here, while the table is there, because the show that reads it
-            # refuses a deleted table
+            # here, while the table is there, because the helper raises rather
+            # than reading zero when the show prints no locks field
             for table_id in table_ids:
                 attempt(
                     "require table %d without a plugin lock" % table_id,
-                    lambda table_id=table_id: self.assertEqual(
-                        self.nat44_ei_hi_fib_locks(table_id),
-                        1,
-                        "table %d: plugin lock count %d after disable"
-                        % (table_id, self.nat44_ei_hi_fib_locks(table_id)),
-                    ),
+                    lambda table_id=table_id: self.nat44_ei_require_unlocked(table_id),
                 )
             for table_id in table_ids:
                 attempt(
@@ -4445,16 +4444,18 @@ class TestNAT44EI(MethodHolder):
                         self, table_id, register=False
                     ).remove_vpp_config(),
                 )
-                # a deleted table is gone with its lock, so the show that read
-                # the count before the delete has no table to format after it;
-                # every interface left it before the delete, so the delete
+                # ip4_show_fib skips every table whose id differs from the one
+                # asked for and returns 0 without printing anything
+                # (src/vnet/fib/ip4_fib.c:318-460), so a deleted table answers
+                # the show with an empty reply instead of a CLI error; every
+                # interface left the table before the delete, so the delete
                 # meets none to move off it
                 attempt(
                     "require table %d gone" % table_id,
-                    lambda table_id=table_id: self.assertRaises(
-                        CliFailedCommandError,
-                        self.vapi.cli,
-                        "show ip fib table %d" % table_id,
+                    lambda table_id=table_id: self.assertEqual(
+                        self.vapi.cli("show ip fib table %d" % table_id),
+                        "",
+                        "table %d still listed after its delete" % table_id,
                     ),
                 )
             # the interfaces are in table 0 and their records above say so, so
@@ -4472,11 +4473,19 @@ class TestNAT44EI(MethodHolder):
                     plugin_state_retvals=(self.VNET_API_ERROR_FEATURE_ALREADY_ENABLED,)
                 ),
             )
+            # nat44_ei_show_running_config reports no field that says whether
+            # the plugin is on: its flags carry only the static-mapping-only,
+            # connection-tracking and out2in-dpo bits
+            # (src/plugins/nat/nat44-ei/nat44_ei_api.c:23-58), so the session
+            # limit the enable recorded is read instead; the disable zeroes
+            # that copy of the config (nat44_ei.c:1304), so the limit is
+            # reported only while the plugin is on
             attempt(
                 "require plugin enabled",
                 lambda: self.assertEqual(
-                    self.vapi.nat44_ei_show_running_config().flags,
-                    self.config_flags.NAT44_EI_IF_INSIDE,
+                    self.vapi.nat44_ei_show_running_config().sessions,
+                    self.max_translations,
+                    "running config reports no session limit after the enable",
                 ),
             )
             if problem:
