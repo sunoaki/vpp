@@ -957,6 +957,192 @@ class TestClassifierComplex(TestClassifier):
         self.pg2.assert_nothing_captured(remark="packets forwarded")
         self.pg3.assert_nothing_captured(remark="packets forwarded")
 
+    def test_iacl_trailing_vectors(self):
+        """Input ACL over six, seven and eight match vectors
+
+        Test scenario for ACLs whose key ends at vector 6, 7 or 8.  A
+        256-bit compare that loaded three u64x4 chunks covered vectors 0 to
+        5 only, so at seven and eight vectors it never compared the
+        trailing ones and reported a match for a packet that differed
+        there.  Six vectors reaches the end of the last loaded chunk and is
+        the boundary case that was already correct.
+            - Create an IPv4 stream for pg0 -> pg1.
+            - For each width, create an iACL table over ethernet, IP, UDP
+              and payload, add a session for the stream's key and verify it
+              forwards.
+            - Send a packet that differs from the key in the last vector
+              alone and verify it is dropped.
+        """
+
+        sport = 13720
+        dport = 9080
+        hit_path = "/err/ip4-inacl/input ACL hits"
+        miss_path = "/err/ip4-inacl/input ACL misses"
+        raw_start = 14 + 20 + 8
+
+        for match_n_vectors in (6, 7, 8):
+            with self.subTest(match_n_vectors=match_n_vectors):
+                # One bucket is what makes this test able to see the defect.
+                # The packet hash covers every match vector, so a packet
+                # differing in the last one normally hashes to a different
+                # bucket and is rejected there without ever reaching the
+                # equal check under test.  With a single bucket the bucket
+                # index is always 0, and with a single session the entry
+                # index inside it is always 0, so the equal check runs on
+                # every packet.
+                nbuckets = 1
+
+                # mac (14 B) + ip (24 B) cover packet bytes 0 to 37, which
+                # is the ethernet and IP headers plus the two UDP ports.
+                # The IP checksum and the UDP length and checksum inside
+                # that range are left as don't-care by the build_*_mask
+                # helpers, and they must be: Scapy recomputes them whenever
+                # a frame is serialised again, so they cannot take part in
+                # the compare.  A payload mask at offset 4 continues at
+                # packet byte 38 and runs to the end of the last vector.
+                payload_mask_bytes = match_n_vectors * 16 - (14 + 24) - 4
+                mask = (
+                    self.build_mac_mask(
+                        src_mac="ffffffffffff",
+                        dst_mac="ffffffffffff",
+                        ether_type="ffff",
+                    )
+                    + self.build_ip_mask(
+                        proto="ff",
+                        src_ip="ffffffff",
+                        dst_ip="ffffffff",
+                        src_port="ffff",
+                        dst_port="ffff",
+                    )
+                    + self.build_payload_mask(
+                        [VarMask(offset=4, spec="f" * (2 * payload_mask_bytes))]
+                    )
+                )
+                mask_match, mask_match_len = self._resolve_mask_match(mask)
+                self.assertEqual(len(mask_match), match_n_vectors * 16)
+                self.assertEqual(mask_match_len, match_n_vectors * 16)
+                # The UDP length and checksum are the four bytes at 38 to 41.
+                for offset in range(38, 42):
+                    self.assertEqual(
+                        mask_match[offset], 0, "UDP length/checksum is masked"
+                    )
+
+                table_index = self.vapi.classify_add_del_table(
+                    is_add=1,
+                    mask=mask_match,
+                    mask_len=mask_match_len,
+                    nbuckets=nbuckets,
+                    match_n_vectors=match_n_vectors,
+                    miss_next_index=0,
+                    current_data_flag=1,
+                    current_data_offset=-14,
+                ).new_table_index
+
+                # Each width builds its own stream, so the packet bookkeeping
+                # starts empty again; verify_capture walks that list from the
+                # beginning and would otherwise compare this width's capture
+                # against the previous width's packets.
+                self.reset_packet_infos()
+                # A single size long enough to hold the key.
+                pkts = self.create_stream(
+                    self.pg0, self.pg1, [256], UDP(sport=sport, dport=dport)
+                )
+
+                # Take the session key and both packets from the frame
+                # itself rather than from hand-computed offsets: the frame
+                # starts at the ethernet header thanks to
+                # current_data_offset, and masking it with the table mask
+                # gives exactly the bytes the classifier compares.  That
+                # also keeps Scapy's own checksums out of the key, because
+                # the mask leaves them as don't-care.
+                frame = bytes(pkts[0])
+                self.assertGreaterEqual(len(frame), match_n_vectors * 16)
+                key = bytes(a & b for a, b in zip(frame, mask_match))
+
+                # The vector to change is the last one, and the byte chosen
+                # is one the mask covers, so the packet differs from the key
+                # exactly there.
+                vector_start = (match_n_vectors - 1) * 16
+                flip = next(
+                    offset
+                    for offset in range(vector_start, vector_start + 16)
+                    if mask_match[offset] == 0xFF
+                )
+                self.assertGreater(flip, raw_start, "flipped byte must be payload")
+
+                self.vapi.classify_add_del_session(
+                    is_add=1,
+                    table_index=table_index,
+                    match=key,
+                    match_len=match_n_vectors * 16,
+                    hit_next_index=0xFFFFFFFF,
+                )
+
+                self.input_acl_set_interface(self.pg0, table_index)
+                key_name = "trailing_%d" % match_n_vectors
+                self.acl_tbl_idx[key_name] = table_index
+                self.acl_active_table = key_name
+
+                hits_pre = self.statistics.get_err_counter(hit_path)
+                misses_pre = self.statistics.get_err_counter(miss_path)
+
+                self.pg_enable_capture(self.pg_interfaces)
+                self.pg0.add_stream(pkts)
+                self.pg_start()
+
+                forwarded = self.pg1.get_capture(len(pkts))
+                self.verify_capture(self.pg1, forwarded)
+                self.pg2.assert_nothing_captured(remark="packets forwarded")
+                self.pg3.assert_nothing_captured(remark="packets forwarded")
+                self.assertEqual(
+                    self.statistics.get_err_counter(hit_path),
+                    hits_pre + len(pkts),
+                    "a packet equal to the key must match",
+                )
+
+                # The same frame with the one byte in the last vector
+                # flipped.  Nothing else changes, so the packet still
+                # matches the key over every earlier vector and differs only
+                # in the trailing one.  Scapy recomputes the IP and UDP
+                # checksums when the frame is serialised, so the comparison
+                # is made on the masked key bytes, which is what the
+                # classifier compares; the mask leaves those checksum bytes
+                # as don't-care.
+                differing = pkts[0].copy()
+                load = bytearray(differing[Raw].load)
+                load[flip - raw_start] ^= 0xFF
+                differing[Raw].load = bytes(load)
+                differing_key = bytes(
+                    a & b for a, b in zip(bytes(differing), mask_match)
+                )
+                self.assertEqual(
+                    [i for i in range(len(key)) if differing_key[i] != key[i]],
+                    [flip],
+                    "the masked keys may differ in the chosen vector byte alone",
+                )
+
+                self.pg0.add_stream([differing])
+                self.pg_enable_capture(self.pg_interfaces)
+                self.pg_start()
+                self.pg1.assert_nothing_captured(
+                    remark="packet differing in the last vector must be dropped"
+                )
+                self.pg2.assert_nothing_captured(remark="packets forwarded")
+                self.pg3.assert_nothing_captured(remark="packets forwarded")
+                # A compare that stops at the sixth vector reports a match
+                # here and forwards the packet, so this counter is what pins
+                # the defect at seven and eight vectors.
+                self.assertEqual(
+                    self.statistics.get_err_counter(miss_path),
+                    misses_pre + 1,
+                    "a packet differing in the last vector must miss",
+                )
+                self.assertEqual(
+                    self.statistics.get_err_counter(hit_path),
+                    hits_pre + len(pkts),
+                    "the differing packet must not match",
+                )
+
 
 class TestClassifierPBR(TestClassifier):
     """Classifier PBR Test Case"""
