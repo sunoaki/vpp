@@ -823,6 +823,25 @@ ip6_sv_reassembly_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      is_atomic_fragment = (0 == ip6_frag_hdr_offset (frag_hdr) &&
 				    !ip6_frag_hdr_more (frag_hdr));
 	    }
+	  else
+	    {
+	      u32 truncated_frag_hdr_offset;
+
+	      /* The walk stops at a fragment header the packet does not hold in
+	       * full, so an unfragmented packet and one cut off inside that
+	       * header reach this point alike. Answer the latter instead of
+	       * forwarding a packet whose headers could not be parsed.
+	       */
+	      if (ip6_reass_truncated_fragment_header (b0, ip0, &hdr_chain,
+						       &truncated_frag_hdr_offset))
+		{
+		  ip6_reass_set_truncated_fragment_header_error (b0, truncated_frag_hdr_offset);
+		  error0 = IP6_ERROR_REASS_INVALID_FRAG_LEN;
+		  b0->error = node->errors[error0];
+		  next0 = IP6_SV_REASSEMBLY_NEXT_ICMP_ERROR;
+		  goto packet_enqueue;
+		}
+	    }
 
 	  if (res < 0 ||
 	      hdr_chain.eh[res].protocol != IP_PROTOCOL_IPV6_FRAGMENTATION ||

@@ -205,6 +205,15 @@ When SVR detects that a packet has been truncated in a way where L4
 headers are not available, it will mark it as such in vnet_buffer,
 allowing downstream features to handle such packets as they deem fit.
 
+Malformed fragment header
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+RFC 8200 section 4.5 places the fragment header inside the payload the
+IPv6 Payload Length field declares. A packet whose header chain reaches
+a fragment header those bounds end inside is malformed, and both full
+and shallow reassembly answer it with ICMPv6 Parameter Problem, code 0,
+pointing at the first byte of that header.
+
 Fast path/slow path
 ^^^^^^^^^^^^^^^^^^^
 

@@ -1944,7 +1944,12 @@ class TestIPv6Reassembly(VppTestCase):
         self.extend_packet(p, 1000, self.padding)
         fragments = fragment_rfc8200(p, 1, 500)
         bad_fragment = fragments[0]
-        self.extend_packet(bad_fragment, len(bad_fragment) + 5)
+        # Extend the declared payload, not just the frame: a receiver derives a
+        # fragment's length from the Payload Length field (RFC 8200 section
+        # 4.5), so bytes appended to the frame alone are not fragment data.
+        bad_fragment[Raw].load += b"X" * 5
+        del bad_fragment[IPv6].plen
+        bad_fragment = bad_fragment.__class__(bytes(bad_fragment))
         self.pg_enable_capture()
         self.src_if.add_stream([bad_fragment])
         self.pg_start()
