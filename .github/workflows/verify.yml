@@ -282,16 +282,75 @@ jobs:
             printf '%s\n' "${selected}"
           }
 
+          # A module that defines a unittest protocol method of its own: a test
+          # method, setUp or tearDown. A suite keeps its test methods even when
+          # they are generated after the class body.
+          suite_defines_tests() {
+            grep -qE '^[[:space:]]*((async +)?def +(test_|setUp|tearDown))' "$1"
+          }
+
+          # Whether a harness file of the tree imports the module named $1. The
+          # harness files are the ones beside the suites whose own name does not
+          # start with test_, so the suites that import each other are not
+          # consulted. This is what tells a support module of the harness apart
+          # from a test module, and it is read from the tree rather than kept as
+          # a list of names.
+          suite_is_harness_import() {
+            local name="$1" harness
+            for harness in test/*.py test/asf/*.py; do
+              case ${harness##*/} in
+                test_*) continue ;;
+              esac
+              if grep -qE "^[[:space:]]*from +${name} +import([[:space:]]|$)" \
+                "${harness}" 2>/dev/null; then
+                return 0
+              fi
+              if grep -qE "^[[:space:]]*import +${name}([[:space:]]|$|,|as )" \
+                "${harness}" 2>/dev/null; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
           # Every suite of the checked-out tree: the module names of
           # test/test_*.py and test/asf/test_*.py, without the test_ prefix and
           # the .py suffix, sorted and deduplicated, one name per line. It is
           # read from the tree so the list cannot fall behind a new test module.
+          #
+          # A module that is a support module of the harness is not a suite: the
+          # harness imports it and it defines no test of its own, so handing its
+          # name to the test filter would select a module with nothing to run and
+          # fail the job. test_result_code.py is the module of this tree that the
+          # rule removes; it holds the TestResultCode enum that run_tests.py and
+          # asfframework.py import. Both halves of the rule are read from the
+          # files, so a new support module is excluded without editing this list.
+          #
+          # Over this tree the import half decides every case on its own: only
+          # test_result_code.py is imported by a harness file, and it is the only
+          # module named test_*.py without a protocol method. The protocol half is
+          # there for the module that arrives later, a shared base or a data
+          # module that a harness file happens to import while its own suite
+          # family needs it enumerated.
+          #
+          # The mission's preferred predicate, "no test method and no
+          # VppTestCase", selects the same 200 names on this tree: of the 20
+          # modules without a test method, 19 match the string VppTestCase and
+          # the 20th is test_result_code.py. The predicate here is preferred
+          # because it reads a declaration instead of the occurrence of a name, so
+          # a module that inherits its case class under another name, or mentions
+          # VppTestCase in a comment, is classified by what it defines.
           all_test_suites() {
-            local paths
-            paths=$(ls test/test_*.py test/asf/test_*.py 2>/dev/null || true)
-            if [ -n "${paths}" ]; then
-              printf '%s\n' "${paths}"
-            fi | sed 's#.*/test_##; s#\.py$##' | sort -u
+            local path name suite
+            for path in $(ls test/test_*.py test/asf/test_*.py 2>/dev/null || true); do
+              name=${path##*/}
+              name=${name%.py}
+              suite=${name#test_}
+              if ! suite_defines_tests "${path}" && suite_is_harness_import "${name}"; then
+                continue
+              fi
+              printf '%s\n' "${suite}"
+            done | sort -u
           }
 
           # Print the number of suites all_test_suites lists. The names go
@@ -445,6 +504,28 @@ jobs:
           union=$(cd "${order_tree}" && expand_manual_suites "all aardvark zeta")
           if [ "${union}" != "aardvark alpha beta gamma zeta" ]; then
             echo "::error::'all aardvark zeta' did not expand to the sorted union, got '${union}'"
+            failures=$((failures + 1))
+          fi
+          # A module is excluded only when both halves of the rule hold, and the
+          # fixture tree adds a module for each way they can disagree. runner.py
+          # is a harness file of the same directory, because its name does not
+          # start with test_. It imports two of the modules: test_helper.py holds
+          # an enum and declares no protocol method, so it leaves the
+          # enumeration, and test_protocol.py declares setUp, so it stays even
+          # though a harness file imports it. test_generated.py is imported by
+          # nothing and declares only setUpClass, so it stays as a suite whose
+          # test methods are generated after the class body.
+          printf 'from test_helper import Value\nfrom test_protocol import Protocol\n' \
+            > "${order_tree}/test/runner.py"
+          printf 'import enum\n\n\nclass Value(enum.IntEnum):\n    ONE = 1\n' \
+            > "${order_tree}/test/test_helper.py"
+          printf 'class Protocol:\n    def setUp(self):\n        pass\n' \
+            > "${order_tree}/test/test_protocol.py"
+          printf 'class Generated:\n    def setUpClass(cls):\n        pass\n' \
+            > "${order_tree}/test/test_generated.py"
+          filtered=$(cd "${order_tree}" && all_test_suites | tr '\n' ' ')
+          if [ "${filtered}" != "alpha beta gamma generated protocol " ]; then
+            echo "::error::the suite exclusion is wrong, got '${filtered}'"
             failures=$((failures + 1))
           fi
           # word_count prints a bare non-negative integer; anything else is a
@@ -658,8 +739,8 @@ jobs:
           # of two runs hold the same suites in the same order. A hash over the
           # names would scramble that order for no benefit, because the suites
           # differ widely in duration and no assignment by name balances them.
-          # A dispatch that selects all 201 suites puts 201 // 12 = 16 in each
-          # shard and gives one more, 17, to the leading 201 % 12 = 9 shards.
+          # A dispatch that selects all 200 suites puts 200 // 12 = 16 in each
+          # shard and gives one more, 17, to the leading 200 % 12 = 8 shards.
           # Fewer suites shrink the shard count instead of leaving empty
           # shards that would start a runner to run nothing.
           shard_count=12
