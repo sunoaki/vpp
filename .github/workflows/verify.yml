@@ -512,16 +512,17 @@ jobs:
       variants: ${{ steps.plan.outputs.variants }}
       tunnel_control: ${{ steps.plan.outputs.tunnel_control }}
       # The build job is a matrix, and a matrix job cannot carry outputs to a
-      # later job. The suite filter is derived here once, and the test job's
-      # matrix reads the shard lists; the build job reads the tunnel flag for
-      # its ESP control so both jobs act on one derivation.
+      # later job. The suite filter is derived here once; the build job reads
+      # the tunnel flag for its ESP control and this job's namespace check, and
+      # the test job's matrix reads the shards, so every job acts on one
+      # derivation.
       tunnel_regression: ${{ steps.tests.outputs.tunnel_regression }}
       # The suites this run selected, for the build job's namespace check.
       suites: ${{ steps.tests.outputs.suites }}
-      # The test job's matrix: entry N of `batches` holds the suites of the
-      # shard whose number is entry N of `shard_indexes`.
-      batches: ${{ steps.batches.outputs.batches }}
-      shard_indexes: ${{ steps.batches.outputs.shard_indexes }}
+      # The test job's matrix: one entry per shard, each an object pairing the
+      # shard's number with the suites it runs, so the matrix has one dimension
+      # and cannot expand into a cross product.
+      shards: ${{ steps.shards.outputs.shards }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -582,20 +583,6 @@ jobs:
               output.write("tunnel_control=" + str(enabled).lower() + "\n")
           PY
 
-      # The suites this run selects, derived with the helper the style job
-      # wrote. The build job reads the tunnel flag from this step's output, so
-      # the ESP control and the test matrix never disagree about the filter.
-      # The derivation rules are the file the style job wrote, so this step and
-      # the split below read one definition of which paths select which suite.
-      # src/vnet/<dir> resolves through the alias table (ip-neighbor selects
-      # neighbor, mfib selects ip_mcast) and otherwise to <dir>; a prefix match
-      # is never used, because a directory such as ip would pull in every
-      # ip4/ip6/ipip/ipsec suite. A src path that resolves to no test module is
-      # logged as UNCOVERED with the module names that were tried, so a missing
-      # mapping is visible in the log instead of shrinking the run silently.
-      # src/vnet/tunnel/tunnel_dp.h is reported that way too: the ESP control
-      # below selects ipsec_esp for it separately. Changes under src/vppinfra,
-      # src/svm and src/vlib select nothing and use the ip4 fallback.
       - name: Derive a test filter from the changed paths
         id: tests
         env:
@@ -623,8 +610,6 @@ jobs:
           else
             suites=$(printf '%s\n' "${changed}" | derive_test_suites)
           fi
-          echo "Running TEST suites: ${suites}"
-          echo "suites=${suites}" >> "$GITHUB_OUTPUT"
           tunnel_regression=false
           case $'\n'"${changed}"$'\n' in
             *$'\n'src/vnet/tunnel/tunnel_dp.h$'\n'*)
@@ -633,18 +618,34 @@ jobs:
               fi
               ;;
           esac
+          # The derivation reports src/vnet/tunnel/tunnel_dp.h as UNCOVERED, so
+          # on its own the change falls back to ip4 and the negative control
+          # would run while the positive never did. The suite is appended here,
+          # before the split, so it lands in a shard.
+          if [ "${tunnel_regression}" = true ]; then
+            case " ${suites} " in
+              *' ipsec_esp '*) ;;
+              *) suites="${suites} ipsec_esp" ;;
+            esac
+          fi
+          echo "Running TEST suites: ${suites}"
+          echo "suites=${suites}" >> "$GITHUB_OUTPUT"
           echo "tunnel_regression=${tunnel_regression}" >> "$GITHUB_OUTPUT"
 
-      # One entry per shard for each of the two matrix lists, so entry N of
-      # `batches` and entry N of `shard_indexes` name the same shard. The
-      # filter is read from the derive step above: the suites input on a
-      # dispatch run, the changed paths otherwise.
+      # The split reads the filter the derive step published, so the tunnel
+      # suite the derive step appends is in one of the shards.
       - name: Split the selected suites into test shards
-        id: batches
+        id: shards
         env:
           SUITES: ${{ steps.tests.outputs.suites }}
         run: |
           set -eu
+          # One entry per shard, each an object pairing the shard's number with
+          # the suites it runs. The pairing is in the data, because the matrix
+          # expands independent dimensions as a cross product and has no way to
+          # zip two lists. `variant` pairs with this list through `include:`
+          # below, so the rendered job count is the number of entries here.
+          #
           # Every selected suite is handed to exactly one shard. The count is
           # fixed at twelve and the split follows the list order, so the shards
           # of two runs hold the same suites in the same order. A hash over the
@@ -674,12 +675,15 @@ jobs:
           if [ "${total}" -lt "${shard_count}" ]; then
             shards="${total}"
           fi
-          # Each shard is written as one JSON array of suite names, and the
-          # arrays are joined with commas between them. The size of a shard is
+          # A shard's suites are written as one space-separated string, not as
+          # an array: the matrix entry is interpolated into the step that runs
+          # the suites, and an array interpolated there arrives as one token
+          # holding the JSON text, which no `TEST=` accepts. The string goes
+          # through a JSON encoder rather than through sed, so a name with a
+          # quote in it cannot break the object, and the size of a shard is
           # decided by the shard's own index, not by how many suites are already
-          # placed: the leading `remainder` shards take one suite more.
-          batches=""
-          indexes=""
+          # placed: the leading `remainder` shards take one more.
+          entries=""
           offset=0
           shard=0
           while [ "${shard}" -lt "${shards}" ]; do
@@ -687,28 +691,28 @@ jobs:
             if [ "${shard}" -lt "${remainder}" ]; then
               size=$((size + 1))
             fi
-            names=$(printf '%s\n' "${suites}" | sed -n "$((offset + 1)),$((offset + size))p" |
-                    sed 's/^/"/; s/$/"/' | sed ':a;N;$!ba;s/\n/,/g')
-            # The first shard starts each list; every later shard is preceded
-            # by one comma, so no trailing comma is left behind.
+            names=$(printf '%s\n' "${suites}" |
+                      sed -n "$((offset + 1)),$((offset + size))p" |
+                      python3 -c 'import json,sys; print(json.dumps(" ".join(sys.stdin.read().split())))')
+            # The first entry starts the list; every later entry is preceded by
+            # one comma, so no trailing comma is left behind.
             if [ "${shard}" -ne 0 ]; then
-              batches="${batches},"
-              indexes="${indexes},"
+              entries="${entries},"
             fi
-            batches="${batches}[${names}]"
-            indexes="${indexes}$((shard + 1))"
+            entries="${entries}{\"batch\":$((shard + 1)),\"suites\":${names}}"
             offset=$((offset + size))
             shard=$((shard + 1))
           done
-          batches="[${batches}]"
+          shards_json="[${entries}]"
           echo "Split ${total} suite(s) into ${shards} shard(s); sizes:"
-          printf '%s\n' "${batches}" |
-            python3 -c 'import json,sys; print([len(s) for s in json.load(sys.stdin)])'
-          echo "batches=${batches}" >> "$GITHUB_OUTPUT"
-          echo "shard_indexes=[${indexes}]" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "${shards_json}" |
+            python3 -c 'import json,sys; d=json.load(sys.stdin); print([len(s["suites"].split()) for s in d])'
+          echo "shards=${shards_json}" >> "$GITHUB_OUTPUT"
 
   build-test:
-    name: build and test (${{ matrix.variant }})
+    # It builds the tree and, on a tunnel regression, runs the ESP negative
+    # control. It runs no suite: the shards of the test job do that.
+    name: build (${{ matrix.variant }})
     needs: test-plan
     strategy:
       fail-fast: false
@@ -968,14 +972,23 @@ jobs:
           echo "name=${name}" >> "$GITHUB_OUTPUT"
           ls -ld build-root/build-vpp_debug-native/vpp/.mu_build_install_timestamp \
             build-root/install-vpp_debug-native/external/lib/pkgconfig/libdpdk.pc
-          tar --zstd -cf "${RUNNER_TEMP}/${name}.tar.zst" build-root
+          # build-root as a whole is 1.8 GiB here, and two of its trees are
+          # never read by a shard: .ccache is only used by this build job's own
+          # ccache steps, and build-vpp-native is the release tree. Leaving them
+          # out keeps the download near 1.2 GiB per shard instead of 1.8 GiB,
+          # and the shard's Extract step asserts that every tree it does need
+          # arrived.
+          tar --zstd --exclude='build-root/.ccache' \
+            --exclude='build-root/build-vpp-native' \
+            --exclude='build-root/install-vpp-native' \
+            -cf "${RUNNER_TEMP}/${name}.tar.zst" build-root
           ls -l "${RUNNER_TEMP}/${name}.tar.zst"
 
       - name: Upload the built image
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: vpp-debug-image-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: vpp-debug-image-fixed-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/${{ steps.image.outputs.name }}.tar.zst
           retention-days: 3
           if-no-files-found: error
@@ -1194,7 +1207,7 @@ jobs:
           compression-level: 6
 
   test:
-    name: test (${{ matrix.variant }} shard ${{ matrix.batch }})
+    name: test (shard ${{ matrix.entry.batch }})
     needs: [test-plan, build-test]
     # A skipped build has no image, so these runners would only fail on the
     # download; everything else is left to the shard's own steps.
@@ -1207,12 +1220,20 @@ jobs:
       # all of them installing packages and building the test environment at
       # once.
       max-parallel: 12
+      # One dimension, holding one object per shard. The shard's number and its
+      # suites come out of the same object, so they cannot be paired wrongly:
+      # independent matrix dimensions would expand as a cross product, which
+      # would run every shard list twelve times.
+      #
+      # `include` adds the variant to each of those objects rather than making
+      # a dimension of it. The variant is `fixed` because these jobs run the
+      # suites against the built tree, and only that variant is built to pass
+      # them: `original-df` carries the deliberately broken header the negative
+      # control in the build job is designed to reject, so it gets no shard.
       matrix:
-        variant: ${{ fromJSON(needs.test-plan.outputs.variants) }}
-        # One entry per shard: its index, and the suites it runs in order. The
-        # two lists come from one split, so entry N of each names the same shard.
-        batch: ${{ fromJSON(needs.test-plan.outputs.shard_indexes) }}
-        suites: ${{ fromJSON(needs.test-plan.outputs.batches) }}
+        entry: ${{ fromJSON(needs.test-plan.outputs.shards) }}
+        include:
+          - variant: fixed
     runs-on: ubuntu-24.04
     # A shard that hangs is cut off here rather than holding a runner until the
     # platform ceiling, and its summary is the last artifact it uploaded.
@@ -1240,8 +1261,6 @@ jobs:
       SHARD_DIAGNOSTICS: ${{ runner.temp }}/shard-diagnostics
       # The ESP evidence check and the suite loop both read this flag.
       TUNNEL_REGRESSION: ${{ needs.test-plan.outputs.tunnel_regression }}
-      # Set only on the negative-control variant, whose shard runs no suite.
-      ESP_VARIANT: ${{ matrix.variant == 'original-df' && 'original-df' || '' }}
     steps:
 
       - name: Disable APT cache cleanup
@@ -1282,9 +1301,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: /var/cache/apt/archives
-          key: apt-debian13-${{ runner.arch }}-test-${{ matrix.variant }}-${{ steps.deps.outputs.hash }}
+          key: apt-debian13-${{ runner.arch }}-test-fixed-${{ steps.deps.outputs.hash }}
           restore-keys: |
-            apt-debian13-${{ runner.arch }}-test-${{ matrix.variant }}-
+            apt-debian13-${{ runner.arch }}-test-fixed-
             apt-debian13-${{ runner.arch }}-build-test-
 
       - name: Install VPP build and test dependencies
@@ -1295,8 +1314,67 @@ jobs:
       - name: Download the built image
         uses: actions/download-artifact@v4
         with:
-          name: vpp-debug-image-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: vpp-debug-image-fixed-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/image
+
+      # The archive carries the build and install trees, the external
+      # dependency trees, and every .mu_build_* timestamp beside them.
+      # `make test-debug` runs `vpp-install`, which is `%-install: %-build`
+      # plus install_check_timestamp (build-root/Makefile:724-736), so three
+      # checks decide whether the shard rebuilds:
+      #
+      #   configure_check_timestamp  reads $(PACKAGE_SOURCE), the platform
+      #                              file and every CMakeLists.txt under it
+      #   build_check_timestamp      reads $(PACKAGE_SOURCE) and the installed
+      #                              package dependencies
+      #   install_check_timestamp    reads $(PACKAGE_BUILD_DIR) only
+      #
+      # $(PACKAGE_SOURCE) is not always src/: build-data/packages/external.mk
+      # sets external_source = build, and vpp_configure_depend += external-install
+      # makes vpp-install enter external-install first. The source set is
+      # therefore read out of the package files rather than hard-coded, so a
+      # directory a package points at is in the guard below even when it is not
+      # src/. `build/` was the case that exposed this.
+      #
+      # The checkout writes those directories after the build job finished, so
+      # their mtimes are later than every archived timestamp and the shard would
+      # rebuild. Each timestamp is therefore given the mtime of the newest file
+      # this runner already has, copied to the nanosecond: a later checkout is
+      # still later than the stamps, and the guard keeps holding. Truncating to
+      # whole seconds is not enough, because a source file written in the same
+      # second would count as newer.
+      - name: Extract the built image
+        run: |
+          set -eu
+          image="${RUNNER_TEMP}/image/vpp-debug-image-fixed-${{ github.run_id }}-${{ github.run_attempt }}.tar.zst"
+          tar --zstd -xf "${image}"
+          test -f build-root/build-vpp_debug-native/vpp/.mu_build_install_timestamp
+          test -f build-root/build-vpp_debug-native/external/.mu_build_install_timestamp
+          test -f build-root/install-vpp_debug-native/external/lib/pkgconfig/libdpdk.pc
+          # Every directory a package names as its source, plus the make inputs.
+          sources=$(sed -n 's/^[a-z][a-z0-9_-]*_source[[:space:]]*=[[:space:]]*//p' \
+                      build-data/packages/*.mk | sort -u | tr '\n' ' ')
+          echo "Source directories read by the make checks: ${sources}"
+          find_set="${sources} build-data build-root/Makefile"
+          newest=$(find ${find_set} -type f -printf '%T@ %p\n' 2>/dev/null |
+                     sort -n | tail -1)
+          newest=${newest#* }
+          for stamp in build-root/build-vpp_debug-native/*/.mu_build_*_timestamp; do
+            touch -r "${newest}" "${stamp}"
+          done
+          # The reset must have removed every rebuild trigger. The comparisons
+          # build-root/Makefile:635-650, 683-696 and 724-736 make are repeated
+          # here on the trees they read, so a shard that would still rebuild
+          # stops before it runs a suite.
+          for stamp in build-root/build-vpp_debug-native/*/.mu_build_*_timestamp; do
+            stale=$(find ${find_set} -newer "${stamp}" -type f 2>/dev/null || true)
+            if [ -n "${stale}" ]; then
+              echo "::error::${stale%%$'\n'*} is newer than ${stamp}; this shard would rebuild"
+              printf '%s\n' "${stale}" | head -20
+              exit 1
+            fi
+          done
+          echo "No file the make checks read is newer than the archive's timestamps"
 
       # The archive holds all of build-root: the build and install trees, the
       # external dependency trees, and every .mu_build_* timestamp beside them.
@@ -1305,47 +1383,6 @@ jobs:
       # its install dependencies, so those timestamps decide whether the shard
       # installs anything. They travel with the archive.
       #
-      # The checkout, however, writes src/ and build-data/ after the build job
-      # finished, so their mtimes are later than every archived timestamp and
-      # `vpp-build` would re-run configure and build the whole tree here. The
-      # timestamps are therefore set to the newest file this runner already has,
-      # which is later than every source file the checkout produced, so the
-      # shard installs nothing and the suites run against the built tree.
-      - name: Extract the built image
-        run: |
-          set -eu
-          image="${RUNNER_TEMP}/image/vpp-debug-image-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}.tar.zst"
-          tar --zstd -xf "${image}"
-          test -f build-root/build-vpp_debug-native/vpp/.mu_build_install_timestamp
-          test -f build-root/build-vpp_debug-native/external/.mu_build_install_timestamp
-          test -f build-root/install-vpp_debug-native/external/lib/pkgconfig/libdpdk.pc
-          # The timestamps take the mtime of the newest file this runner
-          # already has, copied to the nanosecond, so a checkout that lands
-          # after this step is still later than they are and the guard below
-          # keeps holding. Truncating to whole seconds is not enough: a source
-          # file written in the same second would count as newer.
-          newest=$(find src build-data build-root/Makefile -type f \
-                     -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1)
-          newest=${newest#* }
-          for stamp in build-root/build-vpp_debug-native/*/.mu_build_*_timestamp; do
-            touch -r "${newest}" "${stamp}"
-          done
-          # The reset must have removed every rebuild trigger. The comparison
-          # build-root/Makefile:683-696 and 724-736 make is repeated here on the
-          # trees they read, so a shard that would still rebuild stops before it
-          # runs a suite.
-          for package in vpp external; do
-            stamp="build-root/build-vpp_debug-native/${package}/.mu_build_install_timestamp"
-            stale=$(find src build-data build-root/Makefile \
-                      -newer "${stamp}" -type f 2>/dev/null || true)
-            if [ -n "${stale}" ]; then
-              echo "::error::${stale%%$'\n'*} is newer than ${stamp}; this shard would rebuild"
-              printf '%s\n' "${stale}" | head -20
-              exit 1
-            fi
-          done
-          echo "No source file is newer than the archived build timestamps"
-
       - name: Remount /dev/shm for the test harness
         uses: ./.github/actions/vpp-docker-runtime-setup
         with:
@@ -1542,9 +1579,8 @@ jobs:
           COLLECT
 
       - name: Run the shard's suites
-        if: env.ESP_VARIANT == '' || matrix.variant == env.ESP_VARIANT
         env:
-          SUITES: ${{ matrix.suites }}
+          SUITES: ${{ matrix.entry.suites }}
         run: |
           git config --global --add safe.directory "$PWD"
           set -eu
@@ -1640,7 +1676,7 @@ jobs:
       - name: Finish the suite records
         if: always()
         env:
-          SUITES: ${{ matrix.suites }}
+          SUITES: ${{ matrix.entry.suites }}
         run: |
           set -eu
           read -ra suites <<< "${SUITES}"
@@ -1656,15 +1692,16 @@ jobs:
       # are the assertion: every DF=1 case of the ESP test passed, and the
       # build job's control found them failing on the unpatched tree.
       - name: Verify the ESP positive against the fixed build
-        if: always() && env.ESP_VARIANT == ''
+        if: always()
         env:
           BUILD_OUTCOME: ${{ needs.build-test.result }}
+          SHARD_SUITES: ${{ matrix.entry.suites }}
         run: |
           if [ "${TUNNEL_REGRESSION}" != true ]; then
             echo "No tunnel regression in this change; nothing to assert for the ESP test"
             exit 0
           fi
-          case " ${{ matrix.suites }} " in
+          case " ${SHARD_SUITES} " in
             *' ipsec_esp '*) ;;
             *) echo "This shard does not run ipsec_esp"; exit 0 ;;
           esac
@@ -1701,7 +1738,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: vpp-test-diagnostics-${{ matrix.variant }}-batch${{ matrix.batch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: vpp-test-diagnostics-batch${{ matrix.entry.batch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/shard-diagnostics/
           retention-days: 7
           if-no-files-found: warn
@@ -1713,7 +1750,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vpp-suite-summary-${{ matrix.variant }}-batch${{ matrix.batch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: vpp-suite-summary-batch${{ matrix.entry.batch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/shard-diagnostics/suite-summary.txt
           retention-days: 7
           if-no-files-found: warn
