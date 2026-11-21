@@ -953,18 +953,24 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
     # Actions that act on every table and name no route.
     _ROUTER_TABLE_WIDE_ACTIONS = ("begin", "end")
 
-    def _router(self, action, route=None):
-        """Run one router command; the action comes before the route it acts on.
+    def _base(self, table_id=None):
+        """The table a command names: the family, then the table id."""
+        return f"ip4 table {table_id or self.table_id}"
+
+    def _router(self, action, route=None, table_id=None):
+        """Run one router command; the table comes before the action it acts on.
 
         begin and end act on every table and name no route, so they are the
         only actions that may leave one out; a route left out of any other
-        action is a mistake in the test, not a command for the plugin.
+        action is a mistake in the test, not a command for the plugin. The
+        record probe names its table after its own verb and does not come
+        through here.
         """
         if route is None:
             if action not in self._ROUTER_TABLE_WIDE_ACTIONS:
                 raise TypeError(f"test lcp router {action} needs a route")
             return self.vapi.cli(f"test lcp router {action}")
-        return self.vapi.cli(f"test lcp router {action} {route}")
+        return self.vapi.cli(f"test lcp router {self._base(table_id)} {action} {route}")
 
     def _mroute(self, group, source=None, table_id=None):
         return self.vapi.cli(
@@ -998,8 +1004,12 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
         return int(fields["plugin-low"])
 
     def _router_record(self, table_id=None):
-        """The plugin's record of a table: absent, or the indices it names."""
-        output = self._router("record", f"ip4 table {table_id or self.table_id}")
+        """The plugin's record of a table: absent, or the indices it names.
+
+        The plugin reads a record by its table, so this probe names the table
+        after its own verb, as the parser dispatches it before any family.
+        """
+        output = self.vapi.cli(f"test lcp router record {self._base(table_id)}")
         fields = dict(field.split(":", 1) for field in output.split())
         if fields["router-record"] == "absent":
             return {"state": "absent"}
@@ -1011,8 +1021,15 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
             "table-mfib": int(fields["table-mfib"]),
         }
 
+    def _router_state(self, table_id=None):
+        """The plugin's state line for one table, absent or present.
+
+        Unlike the record probe, state is read after the table it names.
+        """
+        return self.vapi.cli(f"test lcp router {self._base(table_id)} state")
+
     def _table_state(self, table_id=None):
-        output = self._router("state", f"ip4 table {table_id or self.table_id}")
+        output = self._router_state(table_id)
         self.assertNotIn("absent", output, output)
         state = dict(
             field.split(":", 1)
@@ -1024,11 +1041,13 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
             "mcast-routes": int(state["mcast-routes"]),
         }
 
-    def _route(self, group, source=None, vif=True, table_id=None):
-        route = (
-            f"ip4 table {table_id or self.table_id} {group}/32 proto 4 multicast "
-            f"source {source or '0.0.0.0'}"
-        )
+    def _route(self, group, source=None, vif=True):
+        """The route a router action acts on, without the table it lives in.
+
+        _router names the table before the action, so the route carries only
+        what the action itself takes.
+        """
+        route = f"{group}/32 proto 4 multicast source {source or '0.0.0.0'}"
         return route + (f" vif {self.pair.vif_index}" if vif else "")
 
     def test_multicast_route_delete(self):
@@ -1052,9 +1071,7 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
             # The table held nothing else, so the reference the route held was
             # the last one and the table went with it. Releasing it twice
             # would have freed a table that was gone already.
-            self.assertNotIn(
-                "refs:", self._router("state", f"ip4 table {self.table_id}")
-            )
+            self.assertNotIn("refs:", self._router_state())
             # The kernel repeats deletes; a second one must not fault or
             # change the table.
             self._router("del", route)
@@ -1132,23 +1149,17 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
             )
             # The route's reference went with it, as it does on a delete: the
             # table held nothing else and is gone.
-            self.assertNotIn(
-                "refs:", self._router("state", f"ip4 table {self.table_id}")
-            )
+            self.assertNotIn("refs:", self._router_state())
             # No record is left for the next synchronization to trip over.
             self._router("begin")
             self._router("end")
-            self.assertNotIn(
-                "refs:", self._router("state", f"ip4 table {self.table_id}")
-            )
+            self.assertNotIn("refs:", self._router_state())
 
             # Nor does a second replace act on what is no longer there: it
             # reaches the plugin with no record to find.
             self._router("replace", empty)
             self.assertEqual(self._entry(self.group, self.source), (False, {}))
-            self.assertNotIn(
-                "refs:", self._router("state", f"ip4 table {self.table_id}")
-            )
+            self.assertNotIn("refs:", self._router_state())
         finally:
             self._router("del", route)
 
@@ -1163,9 +1174,7 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
         try:
             self._router("add", empty)
             self.assertEqual(self._entry(self.group, self.source), (False, {}))
-            self.assertNotIn(
-                "refs:", self._router("state", f"ip4 table {self.table_id}")
-            )
+            self.assertNotIn("refs:", self._router_state())
 
             # Nor does it take away a route the plugin holds: the add names no
             # nexthop, so it is not the replace that drops the nexthop list.
@@ -1218,11 +1227,11 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
         """
         # A table of its own, deleted and re-created here.
         table_id = self.table_id - 1
-        route = self._route(self.group, self.source, table_id=table_id)
+        route = self._route(self.group, self.source)
         table = VppIpTable(self, table_id, create_mfib=False).add_vpp_config()
         self.addCleanup(VppIpTable(self, table_id, create_mfib=False).remove_vpp_config)
         try:
-            self._router("add", route)
+            self._router("add", route, table_id)
             self.assertTrue(
                 self._entry(self.group, self.source, table_id)[0],
                 "multicast route was not installed",
@@ -1242,10 +1251,10 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
                 "the plugin kept a record of the deleted table",
             )
             # The table is gone for the fixture too, and asking does not fault.
-            self.assertIn("absent", self._router("state", f"ip4 table {table_id}"))
+            self.assertIn("absent", self._router_state(table_id))
 
             VppIpTable(self, table_id, create_mfib=False).add_vpp_config()
-            self._router("add", route)
+            self._router("add", route, table_id)
             after = self._router_record(table_id)
             self.assertEqual(after["state"], "present")
             self.assertEqual(after["fib"], after["table-fib"])
@@ -1258,7 +1267,7 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
                 "multicast route was not installed in the re-created table",
             )
         finally:
-            self._router("del", route)
+            self._router("del", route, table_id)
 
     def test_multicast_sync_is_idempotent(self):
         """Replaying the same routes does not leak a table reference each time"""
