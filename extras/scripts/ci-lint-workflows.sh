@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Cisco Systems, Inc.
 
-# actionlint checks .github/workflows/*.yml against GitHub's own expression
-# context table, which is what a YAML parser does not do. `jobs.<id>.env`
+# actionlint checks the workflow files under .github/workflows/ against GitHub's
+# own expression context table, which is what a YAML parser does not do. `jobs.<id>.env`
 # holding `${{ runner.temp }}` parses as YAML and is rejected by GitHub with
 # HTTP 422 "Unrecognized named-value: 'runner'", so the whole workflow file
 # stops being a workflow. This script makes that class of defect fail here.
@@ -80,14 +80,16 @@ ACTIONLINT="${WORKDIR}/actionlint"
 # shellcheck and pyflakes are separate programs, and the checks that need them
 # are skipped when they are absent; shellcheck's is disabled here so the run
 # depends on nothing but the pinned binary.
+# GitHub runs a workflow named either .yml or .yaml, so both extensions have to
+# be globbed or a .yaml workflow escapes the check while it reports success.
 shopt -s nullglob
-workflows=("${WORKFLOW_DIR}"/*.yml)
+workflows=("${WORKFLOW_DIR}"/*.yml "${WORKFLOW_DIR}"/*.yaml)
 shopt -u nullglob
 [ "${#workflows[@]}" -gt 0 ] \
-    || fail "No *.yml under ${WORKFLOW_DIR}; nothing was checked"
+    || fail "No *.yml or *.yaml under ${WORKFLOW_DIR}; nothing was checked"
 
 # actionlint prints a file's path relative to the current directory, so the run
-# starts at the repository root and names the files .github/workflows/....yml.
+# starts at the repository root and names the files .github/workflows/<name>.
 cd "${WS_ROOT}"
 workflows=("${workflows[@]#"${WS_ROOT}/"}")
 
