@@ -2213,7 +2213,8 @@ hss_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
  * @clistart
  * show http static server
  * @cliend
- * @cliexcmd{show http static server sessions cache [verbose [nn]]}
+ * @cliexcmd{show http static server [sessions] [cache [<index>]] [listeners]
+ * [verbose [<nn>]]}
 ?*/
 VLIB_CLI_COMMAND (hss_show_command, static) = {
   .path = "show http static server",

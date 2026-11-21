@@ -182,8 +182,10 @@ class TestGreTeib(VppTestCase):
 
         Every subTest stands on its own: table 1 is created empty for it, and
         the tunnel named here is the one that moves, since the adj fib follows
-        it. Its IPv4 address comes off for the bind because VPP refuses to move
-        an interface that still has a global address, and the bind to table 1
+        it. In the v4 subTest the tunnel's IPv4 address comes off for the bind,
+        because VPP refuses to move an interface that still has a global
+        address of the family; the tunnel is configured for v4 only, so the v6
+        subTest has no address of the family to take off. The bind to table 1
         is asserted, so a refusal fails here instead of leaving the peer in
         table 0.
         """
@@ -229,7 +231,7 @@ class TestGreTeib(VppTestCase):
         there after the peer is deleted. Not pinned: that nothing was taken and
         nothing released. The unbind to table 0 runs before the delete, and
         teib_walk_table_bind's only guard is whether the entry's recorded table
-        already equals the table the interface is going to (teib.c:417).
+        already equals the table the interface is going to (teib.c:418).
         INDEX_INVALID is not a real table, so the walk does not skip this entry:
         it calls teib_adj_fib_remove, which returns at :224 because the recorded
         table is INDEX_INVALID, and then teib_adj_fib_add for table 0, where
@@ -249,8 +251,10 @@ class TestGreTeib(VppTestCase):
 
         Every subTest stands on its own: table 1 is created empty for it, and
         the tunnel named here is the one that moves, since the adj fib follows
-        it. Its IPv4 address comes off for the bind because VPP refuses to move
-        an interface that still has a global address, and the bind to table 1
+        it. In the v4 subTest the tunnel's IPv4 address comes off for the bind,
+        because VPP refuses to move an interface that still has a global
+        address of the family; the tunnel is configured for v4 only, so the v6
+        subTest has no address of the family to take off. The bind to table 1
         is asserted. The route's next hop is picked by family, since a next hop
         of the other family is not a path VPP accepts.
         """
