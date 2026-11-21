@@ -21,6 +21,9 @@ from vpp_teib import VppTeib
 class TestGreTeib(VppTestCase):
     """GRE configuration identity and TEIB ingress ownership"""
 
+    # src/vnet/error.h: VNET_API_ERROR_ENTRY_ALREADY_EXISTS
+    VNET_API_ERROR_ENTRY_ALREADY_EXISTS = -116
+
     def setUp(self):
         super().setUp()
         self.create_pg_interfaces(range(2))
@@ -195,7 +198,9 @@ class TestGreTeib(VppTestCase):
                     peer = "198.19.0.4" if not is_ip6 else "2001:db8::4"
                     entry = self.make_peer(tunnel, is_ip6, peer)
                     self.assertTrue(self.peer_has_adj_fib(is_ip6, 1, peer, tunnel))
-                    with self.assertRaisesRegex(Exception, "ALREADY_EXISTS"):
+                    with self.vapi.assert_known_api_retval(
+                        retvals=[self.VNET_API_ERROR_ENTRY_ALREADY_EXISTS]
+                    ):
                         self.add_peer_raw(tunnel, is_ip6, peer)
                     entry.remove_vpp_config()
                     self.assertFalse(entry.query_vpp_config())
