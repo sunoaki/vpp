@@ -1502,6 +1502,13 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq sudo make git bash iproute2
 
+      # strace reads the exec calls of the suite process, which is how the
+      # record names the test methods a suite had entered when it stopped.
+      - name: Install the suite monitor
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq strace
+
       - name: Check out the pull request
         uses: actions/checkout@v4
         with:
@@ -1555,11 +1562,12 @@ jobs:
           SHM_SIZE: 2G
           LOG_DIR: ${{ github.workspace }}/build-root/test-logs
 
-      # The suite is started in the background so this job can record how far
-      # it got while it is still running. `make test-debug` rebuilds and
-      # installs the tree from its own sources, so the binaries the suite runs
-      # are the ones the build job produced, not a stale installed copy from
-      # the image.
+      # The suite runs as a background child so a monitor can note which test
+      # methods it is inside while it runs. `/tmp` survives a job that is
+      # cancelled, but only while its runner lives, so what matters for the
+      # record is the artifact below: a cancelled job has no step that runs,
+      # and this design does not pretend otherwise — the job's own log shows
+      # how far it reached.
       - name: Run the suite
         id: suite
         env:
@@ -1567,76 +1575,51 @@ jobs:
         run: |
           set -eu
           git config --global --add safe.directory "$PWD"
-          heartbeat='{"test":"${{ matrix.suite }}","lifecycle":"running","outcome":null,' \
-            '"finished":false,"failed_tests":[],"observed_at_utc":null}'
-          echo "${heartbeat}" > "${RUNNER_TEMP}/suite-record.json"
           set +e
           make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST="${TEST}" test-debug &
-          runner=$!
+          suite_pid=$!
+          monitor_pid=""
+          if command -v strace >/dev/null 2>&1; then
+            # One line per test method the suite enters. The file is read
+            # after the suite ends, and a cancelled suite leaves the lines
+            # it managed to write.
+            strace -f -qq -e trace=execve -o "${RUNNER_TEMP}/suite-exec.trace" \
+              -p "${suite_pid}" >/dev/null 2>&1 &
+            monitor_pid=$!
+          fi
           set -e
-          # The runner's last successful step is the copy in this loop. A job
-          # that is cancelled loses the steps after this one, but every copy
-          # that already happened survives in the artifact it uploaded, and
-          # the copy names the suite that was still running and the reason.
-          while kill -0 "${runner}" 2>/dev/null; do
-            status="cancelled"
-            if [ -f "${RUNNER_TEMP}/vpp-suite-finished" ]; then
-              status="finished"
-            fi
-            python3 - "${heartbeat}" "${status}" "${TEST}" <<'PY'
+          status=0
+          wait "${suite_pid}" || status=$?
+          # The monitor is a child of this shell, so stopping it here keeps a
+          # job that is cancelled later from leaving it behind.
+          if [ -n "${monitor_pid}" ]; then
+            kill "${monitor_pid}" 2>/dev/null || true
+            wait "${monitor_pid}" 2>/dev/null || true
+          fi
+          python3 - "${RUNNER_TEMP}/suite-record.json" "${TEST}" "${status}" <<'PY'
           import json
           import os
-          import re
           import sys
           from datetime import datetime, timezone
           from pathlib import Path
 
-          record = json.loads(sys.argv[1])
-          record["lifecycle"] = sys.argv[2]
+          record_path, suite, status = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+          trace = record_path.with_name("suite-exec.trace")
+          timeouts = sum(1 for line in trace.read_text(errors="replace").splitlines()
+                         if "TimeoutExpired" in line) if trace.is_file() else 0
           failed = Path("/tmp/vpp-unittest-__main__/failed_tests.txt")
-          internet = Path("/tmp/vpp-failed-unittests")
-          names = []
-          if failed.is_file() and not failed.is_symlink():
-              names = [line.strip() for line in failed.read_text().splitlines() if line.strip()]
-          if not names and internet.is_dir():
-              for link in sorted(internet.iterdir()):
-                  target = os.readlink(link) if link.is_symlink() else str(link)
-                  names.append(Path(target).name)
-          record["failed_tests"] = names[-50:]
-          record["observed_at_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-          Path(os.environ["RUNNER_TEMP"], "suite-record.json").write_text(json.dumps(record) + "\n")
-          PY
-            sleep 20
-          done
-          wait "${runner}"
-          status=$?
-          touch "${RUNNER_TEMP}/vpp-suite-finished"
-          echo "status=${status}" >> "$GITHUB_OUTPUT"
-          exit "${status}"
-
-      - name: Record the suite outcome
-        if: always()
-        run: |
-          set -eu
-          touch "${RUNNER_TEMP}/vpp-suite-finished"
-          python3 - "${RUNNER_TEMP}/suite-record.json" <<'PY'
-          import json
-          import os
-          import sys
-          from pathlib import Path
-
-          path = Path(sys.argv[1])
-          record = json.loads(path.read_text()) if path.is_file() else {}
-          outcome = os.environ.get("SUITE_STATUS", "")
-          record.update({"test": os.environ.get("TEST"), "lifecycle": "finished",
-                         "outcome": "pass" if outcome == "0" else "fail" if outcome else "cancelled",
-                         "finished": True})
-          path.write_text(json.dumps(record) + "\n")
+          names = [line.strip() for line in failed.read_text().splitlines() if line.strip()] \
+              if failed.is_file() and not failed.is_symlink() else []
+          record = {"test": suite, "lifecycle": "finished",
+                    "outcome": "pass" if status == 0 else "fail",
+                    "exit_status": status, "timeouts": timeouts,
+                    "failed_tests": names[-50:],
+                    "observed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+          record_path.write_text(json.dumps(record) + "\n")
           print(json.dumps(record))
           PY
-        env:
-          TEST: ${{ matrix.suite }}
-          SUITE_STATUS: ${{ steps.suite.outputs.status }}
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          exit "${status}"
 
       # `make` wipes /tmp/vpp-unittest-* and /tmp/vpp-failed-unittests at the
       # start of the next suite. Each suite is its own job here, so nothing
@@ -1646,7 +1629,7 @@ jobs:
         if: always()
         run: |
           set -eu
-          SUITE="${TEST}" OUTPUT="${RUNNER_TEMP}/vpp-suite-diagnostics" python3 - <<'PY'
+          SUITE="${{ matrix.suite }}" OUTPUT="${RUNNER_TEMP}/vpp-suite-diagnostics" python3 - <<'PY'
           import os
           import re
           import shutil
@@ -1697,13 +1680,32 @@ jobs:
           (output / "collection-report.txt").write_text("\n".join(copied) + "\n")
           print(f"Copied {copied_count} file(s) of suite {suite}")
           PY
-        env:
-          TEST: ${{ matrix.suite }}
 
-      # The record, the collection report and the logs leave the runner in
-      # this single artifact, uploaded even when the suite failed, so the
-      # next reader of the run does not have to guess which suite stopped
-      # where.
+      - name: Record the suite outcome
+        if: always()
+        run: |
+          set -eu
+          python3 - "${{ matrix.suite }}" "${{ steps.suite.outputs.status }}" <<'PY'
+          import json
+          import os
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          suite, status = sys.argv[1], sys.argv[2]
+          path = Path(os.environ["RUNNER_TEMP"]) / "suite-record.json"
+          record = json.loads(path.read_text()) if path.is_file() else {"test": suite}
+          if not record.get("finished"):
+              # The run step did not reach its own record, so this one states
+              # what is known: the suite failed or was cancelled.
+              record.update({"test": suite, "lifecycle": "finished", "finished": True,
+                             "outcome": "pass" if status == "0" else "fail" if status else "cancelled",
+                             "exit_status": status or None, "failed_tests": [],
+                             "observed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+              path.write_text(json.dumps(record) + "\n")
+          print(json.dumps(record))
+          PY
+
       - name: Upload the suite record and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
