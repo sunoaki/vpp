@@ -65,10 +65,14 @@ covered, static ones included, before the address exists on the new interface:
 the traffic is blackholed for the interval between the two calls, and after the
 second call a dynamic entry is learned again while a static entry is not, so a
 control plane that programs static neighbours has to program them again on the
-new interface. Adding the address to the new interface first leaves the old
-interface's neighbours alone until the delete, which then removes them the
-same way. Nothing migrates a neighbour between interfaces, because the
-interface is part of its key.
+new interface. The other order is only available inside a replace window: a
+plain add of a prefix that another interface in the same table already holds is
+refused, and a control plane has to bracket the move with
+``sw_interface_address_replace_begin`` and ``sw_interface_address_replace_end``.
+Inside that window the add of the prefix on the new interface deletes the old
+interface's copy first, which destroys the neighbours that address covered at
+that moment, so the old interface's neighbours go either way. Nothing migrates
+a neighbour between interfaces, because the interface is part of its key.
 
 A complete adjacency forwards to its rewrite and never asks ARP or ND for the
 address again, so the MAC of a static entry is only ever replaced by the

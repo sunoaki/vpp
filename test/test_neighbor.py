@@ -2046,6 +2046,15 @@ class ARPTestCase(VppTestCase):
         """
         self.pg2.generate_remote_hosts(2)
 
+        #
+        # the learns that get refused arrive as ARP frames on pg2, and ARP is
+        # only processed on an interface that has an address: without one the
+        # frames are dropped at arp-disabled and nothing is ever refused. The
+        # address also puts the static entry's adj-fib in a real table, which
+        # is what makes the gratuitous ARP match it and reach the learn.
+        #
+        self.pg2.config_ip4()
+
         static_arp = VppNeighbor(
             self,
             self.pg2.sw_if_index,
@@ -2178,6 +2187,7 @@ class ARPTestCase(VppTestCase):
         # clean-up
         #
         static_arp.remove_vpp_config()
+        self.pg2.unconfig_ip4()
 
     def test_arp_incomplete(self):
         """ARP Incomplete"""
