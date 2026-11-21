@@ -62,7 +62,9 @@ jobs:
       - name: Install base tools
         run: |
           apt-get update -qq
-          apt-get install -y -qq sudo make git bash
+          # curl and ca-certificates are for extras/scripts/ci-lint-workflows.sh,
+          # which fetches the pinned actionlint release over TLS.
+          apt-get install -y -qq sudo make git bash ca-certificates curl
 
       - name: Check out the pull request
         uses: actions/checkout@v4
@@ -72,6 +74,13 @@ jobs:
           # tags are needed.
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Check the workflow files with actionlint
+        # A YAML parser accepts ${{ runner.temp }} in a job-level env, and
+        # GitHub then rejects the whole file with HTTP 422, so only actionlint's
+        # context check catches it. The script pins its own actionlint version
+        # and checksums and needs nothing installed beyond curl.
+        run: extras/scripts/ci-lint-workflows.sh
 
       - name: Install VPP checkstyle dependencies
         run: |
