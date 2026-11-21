@@ -2877,12 +2877,15 @@ lcp_router_route_sync_end (void)
   vec_foreach (index, indices)
     {
       nlt = pool_elt_at_index (lcp_router_table_pool, *index);
-      /* Before the reference below, which keeps the table alive while the
-       * routes go: what the multicast routes hold is what keeps the table
-       * removed once nothing else does. */
+      /* The reference keeps the table alive while its routes go. It has to be
+       * taken before the walk below, not after: every recorded route holds one
+       * reference of its own, and a table whose only references are those
+       * routes loses the last of them to the last route removed. The removal
+       * then frees the record, and the sweep below would read a freed one. */
+      nlt->nlt_refs++;
+
       lcp_router_table_mcast_sync_end (nlt);
 
-      nlt->nlt_refs++;
       u32 before = lcp_router_table_source_count (nlt, lcp_rt_fib_src) +
 		   lcp_router_table_source_count (nlt, lcp_rt_fib_src_dynamic);
       fib_table_sweep (nlt->nlt_fib_index, nlt->nlt_proto, lcp_rt_fib_src);
