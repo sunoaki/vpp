@@ -16,9 +16,17 @@ import uuid
 
 from asfframework import VppAsfTestCase, VppTestRunner
 from config import config
+from vpp_ip_route import VppIpRoute, VppIpTable, VppRoutePath
 
 DIAGNOSTIC = "unable to initialize certificate/key pair"
 ATTEMPTS = 100
+# Each peer gets its own loopback, FIB table and app namespace. Both peers on
+# one loopback in the default table share an address, so the connecting peer
+# sends from the listener's own receive address and ip4-local drops every
+# packet as a spoofed local-address packet. loop0 stays in the default table
+# and loop1 gets table 1, the layout the TCP and UDP session suites use.
+SERVER_NAMESPACE, SERVER_TABLE = "quic-crypto-server", 0
+CLIENT_NAMESPACE, CLIENT_TABLE = "quic-crypto-client", 1
 # quic_connect_connection() formats the hostname before the crypto context is
 # acquired, so every record below that frame belongs to the connect path.
 CALLSITE = re.compile(r"\bquic_connect_connection\b")
@@ -31,7 +39,7 @@ LEAKS = {"fixed": False, "original": True}
 class VclProcess:
     """One quic_crypto_client.py subprocess speaking JSON lines."""
 
-    def __init__(self, test, name, address):
+    def __init__(self, test, name, address, namespace):
         self.test = test
         self.name = name
         self.stopped = False
@@ -49,8 +57,10 @@ class VclProcess:
         # listen request in vppcom_session_listen. The connect wait is bounded
         # by CONNECT_POLL_LIMIT_S.
         conf.write_text("vcl { app-scope-global app-timeout 60 session-timeout 5 }\n")
+        # The helper attaches through the namespace socket, so its sessions
+        # take that namespace's FIB table instead of the default one.
         env = dict(os.environ, VCL_CONFIG=str(conf))
-        env["VCL_VPP_SAPI_SOCKET"] = f"{test.tempdir}/app_ns_sockets/default"
+        env["VCL_VPP_SAPI_SOCKET"] = f"{test.tempdir}/app_ns_sockets/{namespace}"
         self.stderr = self.stderr_path.open("w")
         self.process = subprocess.Popen(
             [
@@ -159,15 +169,84 @@ class QUICCredentialFailure(VppAsfTestCase):
         self.evidence.mkdir(parents=True, exist_ok=True)
         self.cli_log = (self.evidence / "cli.jsonl").open("w")
         self.addCleanup(self.cli_log.close)
-        self.create_loopback_interfaces(1)
-        self.loop = self.lo_interfaces[0]
-        self.loop.admin_up()
-        self.loop.config_ip4()
-        self.addCleanup(self.loop.admin_down)
-        self.addCleanup(self.loop.unconfig_ip4)
+        self.create_loopback_interfaces(2)
+        self.server_loop, self.client_loop = self.lo_interfaces
+        self.tables = {}
+        self.routes = []
+        self.configured_loops = []
+        self.namespaces = []
+        # The registry cannot tear this down: loopback interfaces are not
+        # registered objects, and a table cannot be removed while an address,
+        # a route or a namespace still refers to it.
+        self.addCleanup(self.teardown_topology)
+        for loop, table in (
+            (self.server_loop, SERVER_TABLE),
+            (self.client_loop, CLIENT_TABLE),
+        ):
+            loop.admin_up()
+            # Recorded before the rest of the per-loop configuration so a
+            # failure inside it still gets admin_down, the table reset and the
+            # address removal on the way out.
+            self.configured_loops.append((loop, table))
+            # Table 0 always exists; only the extra table is created here.
+            if table:
+                self.tables[table] = VppIpTable(
+                    self, table, register=False
+                ).add_vpp_config()
+            loop.set_table_ip4(table)
+            loop.config_ip4()
+        # Each peer speaks from its own table, so each table needs a route to
+        # the other peer's address. Without one the source lookup finds no
+        # path and the connection has nowhere to go.
+        self.routes.append(
+            VppIpRoute(
+                self,
+                self.client_loop.local_ip4,
+                32,
+                [VppRoutePath("0.0.0.0", 0xFFFFFFFF, nh_table_id=CLIENT_TABLE)],
+                table_id=SERVER_TABLE,
+                register=False,
+            ).add_vpp_config()
+        )
+        self.routes.append(
+            VppIpRoute(
+                self,
+                self.server_loop.local_ip4,
+                32,
+                [VppRoutePath("0.0.0.0", 0xFFFFFFFF, nh_table_id=SERVER_TABLE)],
+                table_id=CLIENT_TABLE,
+                register=False,
+            ).add_vpp_config()
+        )
+        # The namespace binds one loopback, and transport_alloc_local_endpoint()
+        # derives the source address from the namespace's sw_if_index, so each
+        # peer sends from its own loopback.
+        for namespace, loop in (
+            (SERVER_NAMESPACE, self.server_loop),
+            (CLIENT_NAMESPACE, self.client_loop),
+        ):
+            self.vapi.app_namespace_add_del_v4(
+                namespace_id=namespace, sw_if_index=loop.sw_if_index
+            )
+            self.namespaces.append((namespace, loop))
         self.run_cli("quic set crypto api engine-lib")
         self.run_cli("show threads")
         self.run_cli("show version verbose")
+
+    def teardown_topology(self):
+        for namespace, loop in reversed(self.namespaces):
+            self.vapi.app_namespace_add_del_v4(
+                is_add=0, namespace_id=namespace, sw_if_index=loop.sw_if_index
+            )
+        for route in reversed(self.routes):
+            route.remove_vpp_config()
+        for loop, table in reversed(self.configured_loops):
+            loop.unconfig_ip4()
+            loop.set_table_ip4(0)
+            table_object = self.tables.pop(table, None)
+            if table_object is not None:
+                table_object.remove_vpp_config()
+            loop.admin_down()
 
     def run_cli(self, command):
         reply = self.vapi.cli(command)
@@ -251,8 +330,12 @@ class QUICCredentialFailure(VppAsfTestCase):
 
     def probe(self, label, valid_cert, key, baseline, signatures=None):
         """Complete handshake, then prove the hostname allocation is released."""
-        server = VclProcess(self, label + "-server", self.loop.local_ip4)
-        client = VclProcess(self, label + "-client", self.loop.local_ip4)
+        server = VclProcess(
+            self, label + "-server", self.server_loop.local_ip4, SERVER_NAMESPACE
+        )
+        client = VclProcess(
+            self, label + "-client", self.server_loop.local_ip4, CLIENT_NAMESPACE
+        )
         for peer in (server, client):
             peer.request("attach", cert=str(valid_cert), key=str(key))
         server.request("listen")
@@ -260,8 +343,11 @@ class QUICCredentialFailure(VppAsfTestCase):
         before = self.trace(label + "-before")
         connected = client.request("connect", timeout=15)
         accepted = server.request("accept", timeout=15)
-        # session_connect returns EINPROGRESS for a non-blocking session by
-        # design; "connected" is the settled outcome the helper observed.
+        # The client dials through its own namespace, so its source address is
+        # its own loopback's address and the reply comes back over the route
+        # installed above. session_connect returns EINPROGRESS for a
+        # non-blocking session by design; "connected" is the settled outcome
+        # the helper observed.
         self.assertEqual(connected["connect"], -115, connected)
         self.assertTrue(connected["connected"], connected)
         self.assertEqual(connected["errors"], [0], connected)
@@ -382,7 +468,9 @@ class QUICCredentialFailure(VppAsfTestCase):
         self.assertEqual(
             self.hostname_totals(self.trace("baseline"), signatures), [0, 0]
         )
-        client = VclProcess(self, "failures", self.loop.local_ip4)
+        client = VclProcess(
+            self, "failures", self.server_loop.local_ip4, CLIENT_NAMESPACE
+        )
         registration = client.request("attach", cert="malformed", key=str(key))
         baseline = self.snapshot()
         self.assertEqual(baseline["used"], preapp["used"])
