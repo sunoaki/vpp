@@ -217,12 +217,20 @@ class TestDET44(VppTestCase):
 
         ipfix_flush is not synchronous: it only signals the process that
         exports, which sends the buffers of every thread on its next cycle,
-        and a cycle waits up to 5 seconds of VPP time. So the collector is
-        drained and then polled with the clock moved forward one second per
-        poll, up to IPFIX_EXPORT_POLLS polls, until a packet arrives; the
-        remaining packets of that cycle are read until the interface goes
-        idle. A cycle slower than the budget fails the test, it never passes
-        with fewer records.
+        and a cycle waits up to 5 seconds of VPP time. A cycle sends the
+        template of every report before the data of the report, and the two
+        messages are separate packets, so the packets that arrive right
+        after a flush are the templates of every report and the data of the
+        cycle follows in a later burst. The collector is drained and then
+        polled with the clock moved forward one second per poll, up to
+        IPFIX_EXPORT_POLLS polls, until a data record decodes. A cycle
+        slower than the budget fails the test, it never passes with fewer
+        records.
+
+        A snapshot of a cycle that wrote no record holds templates and no
+        data set, so the assertion covers only a snapshot that carried a
+        data set: the snapshot is allowed to hold no record, the data set of
+        the session stream is not.
 
         The polling has a second effect that keeps snapshots apart. The
         process that exports waits on a clock event, so its cycle only
@@ -235,27 +243,33 @@ class TestDET44(VppTestCase):
         self.drain_ipfix_collector()
         self.vapi.ipfix_flush()
         capture = []
+        ipfix = IPFIXDecoder()
+        records = []
+        has_data = False
         for _ in range(self.IPFIX_EXPORT_POLLS):
             p = self.ipfix_collector_packet()
             if p is None:
                 # the process that exports waits on a clock, so time passes
-                # for it only while the clock moves
+                # for it only while the clock moves. A timeout here follows
+                # the templates of the cycle, so the export still has to be
+                # given the clock step that sends its data set.
                 self.virtual_sleep(1)
                 continue
-            capture = [p] + self.drain_ipfix_collector()
-            break
-        for p in capture:
-            self.assertTrue(p.haslayer(IPFIX))
-        ipfix = IPFIXDecoder()
-        for p in capture:
-            if p.haslayer(Template):
-                ipfix.add_template(p.getlayer(Template))
-        records = self.ipfix_data_records(ipfix, capture)
-        records += self.ipfix_stream_records(capture)
-        if capture:
+            for packet in [p] + self.drain_ipfix_collector():
+                self.assertTrue(packet.haslayer(IPFIX))
+                capture.append(packet)
+                if packet.haslayer(Template):
+                    ipfix.add_template(packet.getlayer(Template))
+                if packet.haslayer(Data):
+                    has_data = True
+            if has_data:
+                records = self.ipfix_data_records(ipfix, capture)
+                records += self.ipfix_stream_records(capture)
+                break
+        if has_data:
             self.assertTrue(
                 records,
-                "the snapshot holds IPFIX packets but no data set decodes "
+                "the snapshot holds a data set but no data set decodes "
                 "against the session stream",
             )
         return [
@@ -1467,50 +1481,58 @@ class TestDET44IdentityMapping(TestDET44):
         self.assert_packet_checksums_valid(p)
         self.assertEqual(self.nat_ip, p[IP].src)
 
-    def create_translatable_tcp(self, in_if, src_ip, sport):
+    def create_translatable_tcp(self, in_if, src_ip, sport, dst_ip=None):
         """Create an inside TCP packet the det map translates.
 
-        The destination is the translated NAT address, which the outside FIB
-        reaches over the outside interface once the packet is translated, and
-        does not reach otherwise.
+        The destination defaults to the outside host, which both the det map
+        and the identity mapping reach over the outside interface: the plugin
+        registers the two interfaces in the same VRF, so one FIB serves both
+        and routing alone never tells a bypassed packet from a translated
+        one. The tests tell them apart by the source address the packet
+        leaves with.
 
         :param in_if: Inside interface
         :param src_ip: Inside source address
         :param sport: Inside source port
+        :param dst_ip: Destination address, the outside host when omitted
         """
         return (
             Ether(dst=in_if.local_mac, src=in_if.remote_mac)
-            / IP(src=src_ip, dst=self.nat_ip)
+            / IP(src=src_ip, dst=dst_ip if dst_ip is not None else self.pg1.remote_ip4)
             / TCP(sport=sport, dport=self.tcp_external_port)
         )
 
-    def create_translatable_udp(self, in_if, src_ip, sport):
+    def create_translatable_udp(self, in_if, src_ip, sport, dst_ip=None):
         """Create an inside UDP packet the det map translates.
 
         :param in_if: Inside interface
         :param src_ip: Inside source address
         :param sport: Inside source port
+        :param dst_ip: Destination address, the outside host when omitted
         """
         return (
             Ether(dst=in_if.local_mac, src=in_if.remote_mac)
-            / IP(src=src_ip, dst=self.nat_ip)
+            / IP(src=src_ip, dst=dst_ip if dst_ip is not None else self.pg1.remote_ip4)
             / UDP(sport=sport, dport=self.udp_external_port)
         )
 
-    def create_untouched_tcp(self, in_if, src_ip, sport):
-        """Create an inside TCP packet that is only seen untranslated.
+    def create_untouched_tcp(self, in_if, src_ip, sport, dst_ip=None):
+        """Create an inside TCP packet that is not translated.
 
-        The destination is unreachable in both FIBs, so ip4-lookup discards
-        the packet unless the identity mapping sets the outside FIB before
-        the lookup, and it is never translated.
+        The destination defaults to the outside host, so the packet is
+        forwardable whether the identity mapping bypassed the det map or the
+        map translated it. The bypass is shown by the source address: a
+        bypassed packet keeps the inside address, a translated one carries
+        the NAT address.
 
         :param in_if: Inside interface
         :param src_ip: Inside source address
         :param sport: Inside source port
+        :param dst_ip: Destination address, the outside host when omitted
         """
         return (
             Ether(dst=in_if.local_mac, src=in_if.remote_mac)
-            / IP(src=src_ip, dst="203.0.113.7")
+            / IP(src=src_ip, dst=dst_ip if dst_ip is not None else self.pg1.remote_ip4)
             / TCP(sport=sport, dport=self.tcp_external_port)
         )
 
@@ -1569,7 +1591,10 @@ class TestDET44IdentityMapping(TestDET44):
         other_port = 6308
         mapped_ip = self.pg0.remote_hosts[1].ip4
 
-        self.configure_det44(self.pg0.remote_ip4, in_plen=32)
+        # The map has to cover the address the mapping is added for: a packet
+        # whose source is in no map is dropped by det44_in2out and never
+        # reaches the translation the other port is meant to get.
+        self.configure_det44(mapped_ip, in_plen=32)
         self.add_identity_mapping(mapped_ip, "tcp", mapped_port)
 
         # The mapped port bypasses the det map, the same source address on
@@ -1586,7 +1611,7 @@ class TestDET44IdentityMapping(TestDET44):
         self.assertEqual(1, len(translated))
 
         self.assertEqual(mapped_port, bypassed[0][TCP].sport)
-        self.assertEqual(self.nat_ip, bypassed[0][IP].dst)
+        self.assertEqual(self.pg1.remote_ip4, bypassed[0][IP].dst)
         self.assertEqual(self.tcp_external_port, bypassed[0][TCP].dport)
         self.assertNotEqual(mapped_port, translated[0][TCP].sport)
         for p in capture:
@@ -1597,7 +1622,7 @@ class TestDET44IdentityMapping(TestDET44):
         mapped_port = 6309
         mapped_ip = self.pg0.remote_hosts[1].ip4
 
-        self.configure_det44(self.pg0.remote_ip4, in_plen=32)
+        self.configure_det44(mapped_ip, in_plen=32)
         self.add_identity_mapping(mapped_ip, "udp", mapped_port)
 
         p = self.create_translatable_udp(self.pg0, mapped_ip, mapped_port)
@@ -1607,7 +1632,7 @@ class TestDET44IdentityMapping(TestDET44):
         self.assert_packet_checksums_valid(capture[0])
         self.assertEqual(mapped_ip, capture[0][IP].src)
         self.assertEqual(mapped_port, capture[0][UDP].sport)
-        self.assertEqual(self.nat_ip, capture[0][IP].dst)
+        self.assertEqual(self.pg1.remote_ip4, capture[0][IP].dst)
         self.assertEqual(self.udp_external_port, capture[0][UDP].dport)
 
     def test_identity_mapping_bypass_out2in(self):
@@ -1635,7 +1660,12 @@ class TestDET44IdentityMapping(TestDET44):
         self.assertEqual(self.tcp_external_port, p[TCP].sport)
 
     def create_untouched_udp(self, in_if, src_ip, sport, dst_ip):
-        """Create an inside UDP packet that is only seen untranslated.
+        """Create an inside UDP packet that is not translated.
+
+        The destination is supplied by the caller, so a test that compares a
+        bypassed packet with a translated one can send both to an address the
+        outside interface reaches. The bypass is shown by the source address,
+        which a bypassed packet keeps and a translated one replaces.
 
         :param in_if: Inside interface
         :param src_ip: Inside source address
@@ -1697,9 +1727,11 @@ class TestDET44IdentityMapping(TestDET44):
         """A mapping added before another on the same address is matched first"""
         mapped_port = 6312
         extra_port = 6313
-        mapped_ip = "172.31.0.3"
+        mapped_ip = self.pg0.remote_hosts[1].ip4
 
-        self.configure_det44(self.pg0.remote_ip4, in_plen=32)
+        # The map covers the address the mappings are added for, so the port
+        # that the identity mappings do not match reaches the translation.
+        self.configure_det44(mapped_ip, in_plen=32)
         self.add_identity_mapping(mapped_ip)
         self.add_identity_mapping(mapped_ip, "tcp", mapped_port)
 
@@ -1709,8 +1741,8 @@ class TestDET44IdentityMapping(TestDET44):
         )
 
         # The address-only mapping matches every port, so a packet from this
-        # address on any other port still leaves the outside FIB untranslated
-        # instead of falling through to the det map.
+        # address on any other port still bypasses the det map instead of
+        # falling through to it: both ports leave with the inside address.
         pkts = [
             self.create_untouched_tcp(self.pg0, mapped_ip, mapped_port),
             self.create_untouched_tcp(self.pg0, mapped_ip, extra_port),
@@ -1729,10 +1761,8 @@ class TestDET44IdentityMapping(TestDET44):
         )
 
         # The mapped port still bypasses, but the extra port now falls
-        # through to the det map. That port is translated rather than
-        # discarded: the packet reaches the outside interface with the NAT
-        # address as its source. A failure here is a wrong source address,
-        # not a missing packet.
+        # through to the det map and is translated, so it leaves with the NAT
+        # address as its source.
         pkts = [
             self.create_untouched_tcp(self.pg0, mapped_ip, mapped_port),
             self.create_untouched_tcp(self.pg0, mapped_ip, extra_port),
@@ -1752,12 +1782,10 @@ class TestDET44IdentityMapping(TestDET44):
     def test_identity_mapping_first_match_port_first(self):
         """A per-port mapping added first is matched before a later one"""
         mapped_port = 6314
-        mapped_ip = "172.31.0.4"
+        mapped_ip = self.pg0.remote_hosts[1].ip4
         reachable_ip = self.pg1.remote_hosts[0].ip4
-        unreachable_ip = "203.0.113.7"
-        unreachable_alt_ip = "203.0.113.9"
 
-        self.configure_det44(self.pg0.remote_ip4, in_plen=32)
+        self.configure_det44(mapped_ip, in_plen=32)
         # The address-only entry bypasses every port of this address, so the
         # two entries only produce different captures if the per-port one is
         # consulted first for its own port.
@@ -1769,16 +1797,16 @@ class TestDET44IdentityMapping(TestDET44):
             ["%s udp %d" % (mapped_ip, mapped_port), "%s" % mapped_ip], listed
         )
 
-        # Ports the address-only entry matches: bypassed, so the packets
-        # reach an address neither FIB can route. Both have to arrive, so a
-        # first match that instead translates them fails on the set of
+        # Ports the address-only entry matches bypass the det map, so both
+        # packets leave with the inside address. Both have to arrive, so a
+        # first match that instead translated them fails on the set of
         # packets rather than on a timeout.
         pkts = [
             self.create_untouched_udp(
-                self.pg0, mapped_ip, mapped_port + 1, unreachable_ip
+                self.pg0, mapped_ip, mapped_port + 1, reachable_ip
             ),
             self.create_untouched_udp(
-                self.pg0, mapped_ip, mapped_port + 2, unreachable_ip
+                self.pg0, mapped_ip, mapped_port + 2, reachable_ip
             ),
         ]
         capture = self.send_and_capture(self.pg0, self.pg1, pkts, 2)
@@ -1788,10 +1816,9 @@ class TestDET44IdentityMapping(TestDET44):
             self.assertEqual(mapped_ip, p[IP].src)
             self.assertEqual(port, p[UDP].sport)
 
-        # The mapped udp port: no bypass, so the det map translates it and
-        # the packet leaves towards the reachable outside host. If the
-        # address-only entry answered first, this packet would go untranslated
-        # towards an unreachable address and nothing would be captured.
+        # The mapped udp port: no bypass, so the det map translates it. If the
+        # address-only entry answered first, this packet would leave with the
+        # inside address instead.
         p = self.create_untouched_udp(self.pg0, mapped_ip, mapped_port, reachable_ip)
         capture = self.send_and_capture(self.pg0, self.pg1, [p], 1)
 
@@ -1819,28 +1846,25 @@ class TestDET44IdentityMapping(TestDET44):
             ["%s" % mapped_ip, "%s udp %d" % (mapped_ip, mapped_port)], listed
         )
 
-        # The mapped port is sent towards the other unreachable address so its
-        # external key differs from the one the first order used: the det map
-        # keeps a port per external host address and port, and sharing the key
-        # across the two orders would make whichever runs second pick a
-        # different outside port than its own prediction.
-        p = self.create_untouched_udp(
-            self.pg0, mapped_ip, mapped_port, unreachable_alt_ip
-        )
+        # This order bypasses the mapped port, so it opens no session and
+        # leaves with the inside address. The destination is the outside host
+        # so the packet is forwardable; the bypass is read from the address it
+        # leaves with, not from where it goes.
+        p = self.create_untouched_udp(self.pg0, mapped_ip, mapped_port, reachable_ip)
         capture = self.send_and_capture(self.pg0, self.pg1, [p], 1)
 
         self.assertEqual(1, len(capture))
         self.assert_packet_checksums_valid(capture[0])
         self.assertEqual(mapped_ip, capture[0][IP].src)
         self.assertEqual(mapped_port, capture[0][UDP].sport)
-        self.assertEqual(unreachable_alt_ip, capture[0][IP].dst)
+        self.assertEqual(reachable_ip, capture[0][IP].dst)
 
     def test_identity_mapping_does_not_create_session(self):
         """A bypassed packet leaves the deterministic NAT session table alone"""
         mapped_port = 6316
         mapped_ip = self.pg0.remote_hosts[1].ip4
 
-        self.configure_det44(self.pg0.remote_ip4, in_plen=32)
+        self.configure_det44(mapped_ip, in_plen=32)
         self.add_identity_mapping(mapped_ip, "tcp", mapped_port)
 
         translated = self.create_translatable_tcp(self.pg0, mapped_ip, mapped_port + 1)
@@ -1933,12 +1957,21 @@ class TestDET44PluginState(VppTestCase):
         return len(self.vapi.det44_session_dump(self.inside.remote_ip4))
 
     def interface_features(self, pg_interface):
-        """Return the non-empty lines of the interface's ip4-unicast section."""
+        """Return the det44 features in the interface's ip4-unicast section.
+
+        det44_interface_add_del installs ip4-sv-reassembly-feature on the same
+        interface (det44.c:230), so the section holds that feature whether or
+        not a det44 one is there. Only the det44 features say whether the
+        plugin registered the interface, and when it registered none the CLI
+        prints its own placeholder for the empty section instead.
+        """
         output = self.vapi.cli("show interface %s features" % pg_interface.name)
         section = output.split("ip4-unicast:", 1)
         if len(section) < 2:
             return []
-        return [line for line in section[1].split("\n\n", 1)[0].split("\n") if line]
+        lines = [line for line in section[1].split("\n\n", 1)[0].split("\n") if line]
+        features = [line for line in lines if line.strip().startswith("det44-")]
+        return features if features else lines
 
     def det44_interfaces(self):
         """Return the sw_if_index values the plugin reports as registered."""
