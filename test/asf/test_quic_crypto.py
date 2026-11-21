@@ -46,8 +46,8 @@ class VclProcess:
         conf = test.evidence / f"{name}-vcl.conf"
         # The listener stays blocking, so accept waits on the event queue
         # instead of racing it, and session-timeout 5 bounds the listener's
-        # listen request in vppcom_session_listen. The connect poll is bounded
-        # separately by CONNECT_POLL_LIMIT_S; the timeout also backstops it.
+        # listen request in vppcom_session_listen. The connect wait is bounded
+        # by CONNECT_POLL_LIMIT_S.
         conf.write_text("vcl { app-scope-global app-timeout 60 session-timeout 5 }\n")
         env = dict(os.environ, VCL_CONFIG=str(conf))
         env["VCL_VPP_SAPI_SOCKET"] = f"{test.tempdir}/app_ns_sockets/default"

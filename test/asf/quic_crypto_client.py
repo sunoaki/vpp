@@ -148,19 +148,13 @@ class Client:
         return handle
 
     def write_ready(self, handle):
-        length = ct.c_uint32(ct.sizeof(ct.c_int))
-        nwrite = ct.c_int(0)
-        self.require_zero(
-            self.call(
-                "session_attr",
-                handle,
-                ATTR_GET_NWRITE,
-                ct.byref(nwrite),
-                ct.byref(length),
-            ),
-            "session_attr GET_NWRITE",
-        )
-        return nwrite.value
+        """Return the available write count, or a negative VCL error.
+
+        vppcom_session_attr returns the count itself for GET_NWRITE and does
+        not touch the buffer, so there is nothing to assert: a negative return
+        is EBADFD/ECONNRESET/ENOTCONN and the caller treats it as not ready.
+        """
+        return self.call("session_attr", handle, ATTR_GET_NWRITE, None, None)
 
     def wait_writable(self, handle, timeout):
         """Wait until the session is writable, draining the app event queue.
