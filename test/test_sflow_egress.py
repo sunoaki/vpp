@@ -110,9 +110,9 @@ class SFlowEgressTestCase(VppTestCase):
         self.logger.info(ctr_dm_fail + "=" + str(dm_fail))
         self.assert_equal(pk_proc, count * 2, ctr_pk_proc)
         self.assert_equal(pk_samp, count * 2, ctr_pk_samp)
-        self.assert_equal(pk_drop, None, ctr_pk_drop)
-        self.assert_equal(di_proc, None, ctr_di_proc)
-        self.assert_equal(di_drop, None, ctr_di_drop)
+        self.assert_equal(pk_drop, 0, ctr_pk_drop)
+        self.assert_equal(di_proc, 0, ctr_di_proc)
+        self.assert_equal(di_drop, 0, ctr_di_drop)
         # sending to PSAMPLE or DROPMON will fail if not
         # running with root privileges. So do not insist
         # on these numbers:
