@@ -69,10 +69,20 @@ vnet_set_flow_classify_intfc (vlib_main_t * vm, u32 sw_if_index,
 	  return VNET_API_ERROR_NO_SUCH_TABLE;
 	}
 
-      /* Return ok on ADD operaton if feature is already enabled */
+      /* The feature is already enabled on this interface, so there is
+	 nothing to enable.  The table the caller names still has to be the
+	 one the dataplane looks up: an interface holds a single table of
+	 each type, and returning here without storing the new index left
+	 the previous table classifying flows while the call reported
+	 success, so a caller that replaced a table silently kept the old
+	 rules.  Only this table type is done, so the types after it in the
+	 same call still run. */
       if (is_add &&
 	  fcm->classify_table_index_by_sw_if_index[ti][sw_if_index] != ~0)
-	return 0;
+	{
+	  fcm->classify_table_index_by_sw_if_index[ti][sw_if_index] = pct[ti];
+	  continue;
+	}
 
       vnet_flow_classify_feature_enable (vm, fcm, sw_if_index, ti, is_add);
 

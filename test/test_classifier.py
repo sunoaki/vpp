@@ -1651,5 +1651,401 @@ class TestClassifierIPTable(TestClassifier):
         self.assertEqual(rx[0][ICMP].type, 0)  # echo-reply
 
 
+class TestClassifierTableReplacement(TestClassifier):
+    """Replacing an installed classify table Test Case
+
+    Flow and policer classify each keep one table of each type per
+    interface.  The dataplane reads the per-interface vector, so a second
+    ADD for a type the interface already holds has to store the table it
+    names.  A call that reports success and keeps the old index leaves the
+    old table running while the caller believes its replacement is live.
+    """
+
+    @staticmethod
+    def interface_table_rows(cli_output):
+        """Return sw_if_index to table index from a classify show command.
+
+        `show classify flow` and `show classify policer` print a header row
+        followed by one row per interface holding a table, as the interface
+        index, the table index and the interface name.  Interfaces without a
+        table are left out, and the header row's second field is not a
+        number, so a row is selected by a numeric first field.
+        """
+
+        rows = {}
+        for line in cli_output.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
+                rows[int(fields[0])] = int(fields[1])
+        return rows
+
+    def installed_table(self, cli_command, intf):
+        """Return the table index the CLI reports for an interface, or None."""
+
+        rows = self.interface_table_rows(self.vapi.cli(cli_command))
+        return rows.get(intf.sw_if_index)
+
+    def unset_installed_tables(self, cli_command, table_types, unset):
+        """Unset each table type the interface reports and never raise.
+
+        A delete names the table it removes and is refused when the interface
+        holds a different one for that type, so the index unset is the one
+        the interface reports rather than the one the test meant to install.
+        That keeps cleanup correct whether or not a replacement was stored.  A
+        failure is logged instead of raised, because cleanup after a failed
+        assertion must not replace the failure being reported.
+
+        unset takes the table type as it appears in the show command and the
+        index to unset, and issues the delete for that one type.
+        """
+
+        for table_type in table_types:
+            try:
+                table_index = self.installed_table(
+                    cli_command + " type " + table_type, self.pg0
+                )
+                if table_index is not None:
+                    unset(table_type, table_index)
+            except Exception as e:
+                self.logger.warning(
+                    "cleanup of an installed %s table did not complete: %s"
+                    % (table_type, e)
+                )
+
+    def quietly(self, action, description):
+        """Run a cleanup action, logging a failure instead of raising it.
+
+        Cleanup runs after the assertion that decides the test's result, so a
+        delete that fails must be reported in the log rather than raised: an
+        exception here would replace the failure being diagnosed with a
+        teardown error.
+        """
+
+        try:
+            action()
+        except Exception as e:
+            self.logger.warning("%s did not complete: %s" % (description, e))
+
+    @staticmethod
+    def masked_key(packet, mask):
+        """Return the masked key a classify table compares for a frame.
+
+        Both classify nodes set h0 = b->data and hash from there with no
+        offset of their own, and src/plugins/policer/police_inlines.h records
+        that the ethernet header is always at b->data regardless of
+        current_data, so the key starts at the first byte of the frame and
+        holds zeros where the mask is zero.
+        """
+
+        return bytes(a & b for a, b in zip(bytes(packet), mask))
+
+    @staticmethod
+    def stable_frame_mask():
+        """Return a mask over the frame bytes that do not change per send.
+
+        Two vectors cover the ethernet header and the first eighteen bytes of
+        the IPv4 header: frame bytes 0 to 23 are the destination and source
+        MAC, the ethertype and the IP version, length, identification and
+        flags, all fixed for the frames this case sends.  Bytes 24 and 25 are
+        the IPv4 header checksum, which Scapy recomputes whenever it
+        serialises the packet, so they are masked out.  Bytes 26 to 31 are the
+        IPv4 source and destination addresses, which stay in.
+        """
+
+        return bytes([0xFF] * 24 + [0x00, 0x00] + [0xFF] * 6)
+
+    def test_flow_classify_replacement(self):
+        """Flow classify keeps the table a replacement ADD names
+
+        Test scenario for replacing an installed ip4 flow classify table
+            - Install table T1, which holds no session, and check the CLI
+              reports it on the interface.
+            - Install table T2, which holds the session for the stream, and an
+              ip6 table T3 in the same call, and check the CLI reports both.
+            - Send one packet.  It has to match T2's session and reach pg1.
+              Against T1 the same packet misses instead, so a call that kept
+              T1 shows a miss and no hit.
+        """
+
+        pkt = (
+            Ether(src=self.pg0.remote_mac, dst=self.pg0.local_mac)
+            / IP(src=self.pg0.remote_ip4, dst=self.pg1.remote_ip4)
+            / UDP(sport=1234, dport=5678)
+            / Raw(b"\xa5" * 16)
+        )
+        mask = self.stable_frame_mask()
+        key = self.masked_key(pkt, mask)
+
+        t1 = self.vapi.classify_add_del_table(
+            is_add=True, mask=mask, mask_len=len(mask), match_n_vectors=2
+        ).new_table_index
+        t2 = self.vapi.classify_add_del_table(
+            is_add=True, mask=mask, mask_len=len(mask), match_n_vectors=2
+        ).new_table_index
+        ip6_mask = b"\xff" * 32
+        t3 = self.vapi.classify_add_del_table(
+            is_add=True, mask=ip6_mask, mask_len=len(ip6_mask), match_n_vectors=2
+        ).new_table_index
+        self.vapi.classify_add_del_session(
+            is_add=True, table_index=t2, match=key, match_len=len(key)
+        )
+
+        try:
+            self.vapi.flow_classify_set_interface(
+                sw_if_index=self.pg0.sw_if_index,
+                ip4_table_index=t1,
+                ip6_table_index=INVALID_INDEX,
+                is_add=1,
+            )
+            self.assertEqual(
+                self.installed_table("show classify flow type ip4", self.pg0),
+                t1,
+                "the interface must report the first installed table",
+            )
+
+            # The replacement names an ip4 table the interface already holds
+            # and an ip6 table it does not.  The ip4 index is the one that has
+            # to change, and the ip6 install in the same call still has to
+            # run.
+            self.vapi.flow_classify_set_interface(
+                sw_if_index=self.pg0.sw_if_index,
+                ip4_table_index=t2,
+                ip6_table_index=t3,
+                is_add=1,
+            )
+            self.assertEqual(
+                self.installed_table("show classify flow type ip4", self.pg0),
+                t2,
+                "the interface must report the table the replacement names",
+            )
+            self.assertEqual(
+                self.installed_table("show classify flow type ip6", self.pg0),
+                t3,
+                "the other table type the call names must install as well",
+            )
+
+            hit_path = "/err/ip4-flow-classify/Flow classify hits"
+            miss_path = "/err/ip4-flow-classify/Flow classify misses"
+            hits_pre = self.statistics.get_err_counter(hit_path)
+            misses_pre = self.statistics.get_err_counter(miss_path)
+
+            self.send_and_expect(self.pg0, [pkt], self.pg1)
+            self.pg2.assert_nothing_captured(remark="packets forwarded")
+            self.pg3.assert_nothing_captured(remark="packets forwarded")
+
+            self.assertEqual(
+                self.statistics.get_err_counter(hit_path),
+                hits_pre + 1,
+                "the replacement table's session must match the packet",
+            )
+            self.assertEqual(
+                self.statistics.get_err_counter(miss_path),
+                misses_pre,
+                "the table without the session must not be the one running",
+            )
+        finally:
+            self.unset_installed_tables(
+                "show classify flow",
+                ("ip4", "ip6"),
+                lambda table_type, table_index: self.quietly(
+                    lambda: self.vapi.flow_classify_set_interface(
+                        sw_if_index=self.pg0.sw_if_index,
+                        ip4_table_index=(
+                            table_index if table_type == "ip4" else INVALID_INDEX
+                        ),
+                        ip6_table_index=(
+                            table_index if table_type == "ip6" else INVALID_INDEX
+                        ),
+                        is_add=0,
+                    ),
+                    "unsetting the %s flow classify table" % table_type,
+                ),
+            )
+            for table_index, table_mask in (
+                (t1, mask),
+                (t2, mask),
+                (t3, ip6_mask),
+            ):
+                self.quietly(
+                    lambda: self.vapi.classify_add_del_table(
+                        is_add=False,
+                        table_index=table_index,
+                        mask=table_mask,
+                        mask_len=len(table_mask),
+                        match_n_vectors=2,
+                    ),
+                    "deleting classify table %d" % table_index,
+                )
+
+    def test_policer_classify_replacement(self):
+        """Policer classify keeps the table a replacement ADD names
+
+        Test scenario for replacing an installed ip4 policer classify table
+            - Install table T1, whose session names a policer that drops every
+              packet, and check the CLI reports it on the interface.
+            - Send the packet and check it is dropped.
+            - Install table T2, whose session names a policer that transmits
+              every packet, on the same interface and check the CLI reports it.
+            - Send the packet again and check it reaches pg1.  A call that kept
+              T1 drops it here instead.
+        """
+
+        pkt = (
+            Ether(src=self.pg0.remote_mac, dst=self.pg0.local_mac)
+            / IP(src=self.pg0.remote_ip4, dst=self.pg1.remote_ip4)
+            / UDP(sport=1234, dport=5678)
+            / Raw(b"\xa5" * 16)
+        )
+        mask = self.stable_frame_mask()
+        key = self.masked_key(pkt, mask)
+
+        # A policer with every rate and burst at zero has no tokens at all, so
+        # every packet is violated and the violate action decides its fate.
+        # All three actions are the same in each policer, so the outcome does
+        # not depend on which colour a packet draws or on bucket state.
+        drop_action = {"type": 0, "dscp": 0}
+        transmit_action = {"type": 1, "dscp": 0}
+        drop_policer = self.vapi.policer_add(
+            name="m360-classify-replace-drop",
+            infos={
+                "cir": 0,
+                "eir": 0,
+                "cb": 0,
+                "eb": 0,
+                "rate_type": 0,
+                "round_type": 0,
+                "type": 0,
+                "color_aware": False,
+                "conform_action": drop_action,
+                "exceed_action": drop_action,
+                "violate_action": drop_action,
+            },
+        ).policer_index
+        transmit_policer = self.vapi.policer_add(
+            name="m360-classify-replace-transmit",
+            infos={
+                "cir": 10000,
+                "eir": 0,
+                "cb": 100000,
+                "eb": 0,
+                "rate_type": 0,
+                "round_type": 0,
+                "type": 0,
+                "color_aware": False,
+                "conform_action": transmit_action,
+                "exceed_action": transmit_action,
+                "violate_action": transmit_action,
+            },
+        ).policer_index
+
+        t1 = self.vapi.classify_add_del_table(
+            is_add=True, mask=mask, mask_len=len(mask), match_n_vectors=2
+        ).new_table_index
+        t2 = self.vapi.classify_add_del_table(
+            is_add=True, mask=mask, mask_len=len(mask), match_n_vectors=2
+        ).new_table_index
+        ip6_mask = b"\xff" * 32
+        t3 = self.vapi.classify_add_del_table(
+            is_add=True, mask=ip6_mask, mask_len=len(ip6_mask), match_n_vectors=2
+        ).new_table_index
+        self.vapi.classify_add_del_session(
+            is_add=True,
+            table_index=t1,
+            match=key,
+            match_len=len(key),
+            hit_next_index=drop_policer,
+        )
+        self.vapi.classify_add_del_session(
+            is_add=True,
+            table_index=t2,
+            match=key,
+            match_len=len(key),
+            hit_next_index=transmit_policer,
+        )
+
+        try:
+            self.vapi.policer_classify_set_interface(
+                sw_if_index=self.pg0.sw_if_index,
+                ip4_table_index=t1,
+                ip6_table_index=INVALID_INDEX,
+                l2_table_index=INVALID_INDEX,
+                is_add=1,
+            )
+            self.assertEqual(
+                self.installed_table("show classify policer type ip4", self.pg0),
+                t1,
+                "the interface must report the first installed table",
+            )
+            self.send_and_assert_no_replies(
+                self.pg0, [pkt], remark="the first table's policer drops"
+            )
+
+            # The replacement names an ip4 table the interface already holds
+            # and an ip6 table it does not.  The ip4 index is the one that has
+            # to change, and the ip6 install in the same call still has to
+            # run.
+            self.vapi.policer_classify_set_interface(
+                sw_if_index=self.pg0.sw_if_index,
+                ip4_table_index=t2,
+                ip6_table_index=t3,
+                l2_table_index=INVALID_INDEX,
+                is_add=1,
+            )
+            self.assertEqual(
+                self.installed_table("show classify policer type ip4", self.pg0),
+                t2,
+                "the interface must report the table the replacement names",
+            )
+            self.assertEqual(
+                self.installed_table("show classify policer type ip6", self.pg0),
+                t3,
+                "the other table type the call names must install as well",
+            )
+            self.send_and_expect(self.pg0, [pkt], self.pg1)
+            self.pg2.assert_nothing_captured(remark="packets forwarded")
+            self.pg3.assert_nothing_captured(remark="packets forwarded")
+        finally:
+            self.unset_installed_tables(
+                "show classify policer",
+                ("ip4", "ip6", "l2"),
+                lambda table_type, table_index: self.quietly(
+                    lambda: self.vapi.policer_classify_set_interface(
+                        sw_if_index=self.pg0.sw_if_index,
+                        ip4_table_index=(
+                            table_index if table_type == "ip4" else INVALID_INDEX
+                        ),
+                        ip6_table_index=(
+                            table_index if table_type == "ip6" else INVALID_INDEX
+                        ),
+                        l2_table_index=(
+                            table_index if table_type == "l2" else INVALID_INDEX
+                        ),
+                        is_add=0,
+                    ),
+                    "unsetting the %s policer classify table" % table_type,
+                ),
+            )
+            for table_index, table_mask in (
+                (t1, mask),
+                (t2, mask),
+                (t3, ip6_mask),
+            ):
+                self.quietly(
+                    lambda: self.vapi.classify_add_del_table(
+                        is_add=False,
+                        table_index=table_index,
+                        mask=table_mask,
+                        mask_len=len(table_mask),
+                        match_n_vectors=2,
+                    ),
+                    "deleting classify table %d" % table_index,
+                )
+            for policer_index in (drop_policer, transmit_policer):
+                self.quietly(
+                    lambda: self.vapi.policer_del(policer_index=policer_index),
+                    "deleting policer %d" % policer_index,
+                )
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=VppTestRunner)
