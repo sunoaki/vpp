@@ -1655,16 +1655,17 @@ class TestACLplugin(VppTestCase):
         is put up and back into the bridge domain, since a frame on a down
         interface never reaches the ACL node.
         """
+        # `create_pg_interfaces` replaces the class list with what it created,
+        # so the interfaces that stay have to be read before the call. Reading
+        # them after it loses every one of them, which costs pg1 its capture on
+        # every later send and leaves the scenarios reading a stale pcap.
+        staying = [pg_if for pg_if in self.pg_interfaces if pg_if is not self.pg0]
         pg0 = self.create_pg_interfaces([self.pg0.pg_index])[0]
         pg0.admin_up()
         self.vapi.sw_interface_set_l2_bridge(
             rx_sw_if_index=pg0.sw_if_index, bd_id=self.bd_id
         )
-        # `create_pg_interfaces` leaves the class list holding what it created;
-        # put the interfaces that stayed back into it
-        type(self).pg_interfaces = [pg0] + [
-            pg_if for pg_if in self.pg_interfaces if pg_if is not pg0
-        ]
+        type(self).pg_interfaces = [pg0] + staying
         return pg0
 
     def _apply_acl(self, sw_if_index, rules, tag):
