@@ -538,8 +538,7 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 	    {
 	      snat_det_session_addresses (mp0, ses0, &icmp_addr0, &out_addr0);
 	      nat_ipfix_logging_nat44_ses_create (thread_index, icmp_addr0.as_u32, out_addr0.as_u32,
-						  ses0->proto, clib_net_to_host_u16 (ses0->in_port),
-						  clib_net_to_host_u16 (ses0->out.out_port),
+						  ses0->proto, ses0->in_port, ses0->out.out_port,
 						  dm->outside_fib_index);
 	    }
 	  goto trace0;
@@ -677,10 +676,9 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 
       if (PREDICT_FALSE (created0))
 	{
-	  nat_ipfix_logging_nat44_ses_create (
-	    thread_index, ip0->src_address.as_u32, new_addr0.as_u32, ses0->proto,
-	    clib_net_to_host_u16 (ses0->in_port), clib_net_to_host_u16 (ses0->out.out_port),
-	    dm->outside_fib_index);
+	  nat_ipfix_logging_nat44_ses_create (thread_index, ip0->src_address.as_u32,
+					      new_addr0.as_u32, ses0->proto, ses0->in_port,
+					      ses0->out.out_port, dm->outside_fib_index);
 	}
 
     trace0:
@@ -730,8 +728,7 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 	    {
 	      snat_det_session_addresses (mp1, ses1, &icmp_addr1, &out_addr1);
 	      nat_ipfix_logging_nat44_ses_create (thread_index, icmp_addr1.as_u32, out_addr1.as_u32,
-						  ses1->proto, clib_net_to_host_u16 (ses1->in_port),
-						  clib_net_to_host_u16 (ses1->out.out_port),
+						  ses1->proto, ses1->in_port, ses1->out.out_port,
 						  dm->outside_fib_index);
 	    }
 	  goto trace1;
@@ -869,10 +866,9 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 
       if (PREDICT_FALSE (created1))
 	{
-	  nat_ipfix_logging_nat44_ses_create (
-	    thread_index, ip1->src_address.as_u32, new_addr1.as_u32, ses1->proto,
-	    clib_net_to_host_u16 (ses1->in_port), clib_net_to_host_u16 (ses1->out.out_port),
-	    dm->outside_fib_index);
+	  nat_ipfix_logging_nat44_ses_create (thread_index, ip1->src_address.as_u32,
+					      new_addr1.as_u32, ses1->proto, ses1->in_port,
+					      ses1->out.out_port, dm->outside_fib_index);
 	}
 
     trace1:
@@ -954,8 +950,7 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 	    {
 	      snat_det_session_addresses (mp0, ses0, &icmp_addr0, &out_addr0);
 	      nat_ipfix_logging_nat44_ses_create (thread_index, icmp_addr0.as_u32, out_addr0.as_u32,
-						  ses0->proto, clib_net_to_host_u16 (ses0->in_port),
-						  clib_net_to_host_u16 (ses0->out.out_port),
+						  ses0->proto, ses0->in_port, ses0->out.out_port,
 						  dm->outside_fib_index);
 	    }
 	  goto trace00;
@@ -1093,10 +1088,9 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 
       if (PREDICT_FALSE (created0))
 	{
-	  nat_ipfix_logging_nat44_ses_create (
-	    thread_index, ip0->src_address.as_u32, new_addr0.as_u32, ses0->proto,
-	    clib_net_to_host_u16 (ses0->in_port), clib_net_to_host_u16 (ses0->out.out_port),
-	    dm->outside_fib_index);
+	  nat_ipfix_logging_nat44_ses_create (thread_index, ip0->src_address.as_u32,
+					      new_addr0.as_u32, ses0->proto, ses0->in_port,
+					      ses0->out.out_port, dm->outside_fib_index);
 	}
 
     trace00:
