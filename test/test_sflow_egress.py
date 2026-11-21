@@ -7,7 +7,6 @@ from scapy.layers.l2 import Ether
 from scapy.packet import Raw
 from scapy.layers.inet import IP, UDP
 from random import randint
-import re  # for finding counters in "sh errors" output
 
 
 class SFlowEgressTestCase(VppTestCase):
@@ -74,13 +73,12 @@ class SFlowEgressTestCase(VppTestCase):
         return packets
 
     def get_sflow_counter(self, counter):
-        counters = self.vapi.cli("sh errors").split("\n")
-        for i in range(1, len(counters) - 1):
-            results = counters[i].split()
-            if results[1] == "sflow":
-                if re.search(counter, counters[i]) is not None:
-                    return int(results[0])
-        return None
+        # the plugin increments these counters on the "sflow" node even when a
+        # sample is dropped or egress-sampled, so read them all from there
+        try:
+            return self.get_node_counter("sflow", counter)
+        except KeyError:
+            return None
 
     def verify_sflow(self, count):
         ctr_pk_proc = "sflow packets processed"

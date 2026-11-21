@@ -157,12 +157,12 @@ class SFlowTestCase(VppTestCase):
         )
 
     def get_sflow_counter(self, counter):
-        # the plugin counts every counter below on the "sflow" node, and names
-        # them in the stats segment the way "sh errors" lists them
-        err = "/err/sflow/" + counter
-        if err not in self.statistics.directory:
+        # the plugin increments these counters on the "sflow" node even when a
+        # sample is dropped or egress-sampled, so read them all from there
+        try:
+            return self.get_node_counter("sflow", counter)
+        except KeyError:
             return None
-        return self.statistics.get_err_counter(err)
 
     def verify_sflow(self, count):
         ctr_processed = "sflow packets processed"
