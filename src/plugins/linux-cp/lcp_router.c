@@ -22,6 +22,9 @@
 #include <netlink/route/addr.h>
 #include <netlink/route/link/vlan.h>
 
+#include <vlib/stats/stats.h>
+
+#include <vnet/api_errno.h>
 #include <vnet/fib/fib_entry_src.h>
 #include <vnet/fib/fib_path_list.h>
 #include <vnet/fib/fib_table.h>
@@ -138,6 +141,269 @@ static fib_source_t lcp_rt_fib_src_onlink;
  * delivers every neighbour's current state, so a failed neighbour arrives
  * there on every resynchronization and is reported at debug level instead. */
 static u8 lcp_router_neigh_sync_active;
+
+/* Set for a synchronization whose begin step marked the dynamic neighbours,
+ * which is what makes its end step sweep them. The mark is the sweep's
+ * subject, not a general stale bit: a mark set by anything else, the
+ * neighbour replace API's begin step among them, is that caller's to clear. */
+static u8 lcp_router_neigh_sync_marked;
+
+/*
+ * The neighbour states that say the kernel has confirmed the link layer
+ * address. ip_neighbor_add() has no way to express the states that say it has
+ * not: ip_neighbor_refresh() calls ip_neighbor_touch(), which clears
+ * IP_NEIGHBOR_FLAG_STALE and resets the probe count on every add, so a
+ * neighbour synced from a revalidating kernel record arrives in VPP as one
+ * just confirmed. Syncing nothing for those records is what keeps the
+ * kernel's pending revalidation from becoming VPP's confirmation.
+ */
+#define LCP_ROUTER_NUD_CONFIRMED    (NUD_REACHABLE | NUD_PERMANENT | NUD_NOARP)
+#define LCP_ROUTER_NUD_REVALIDATING (NUD_STALE | NUD_DELAY | NUD_PROBE)
+
+/*
+ * A neighbour synchronization is a netlink callback, not a graph node, so it
+ * has no error counters to raise, and a refusal logged at LCP_ROUTER_ERROR is
+ * invisible where the lcp logger is off. The outcomes an operator has to be
+ * able to see are published as stat segment gauges instead: the plugin keeps
+ * the totals, which only the main thread writes, and copies them out.
+ */
+static u64 lcp_router_neigh_refused;
+static u64 lcp_router_neigh_replaced;
+static u64 lcp_router_neigh_stale_skipped;
+static u32 lcp_router_neigh_refused_stat = STAT_SEGMENT_INDEX_INVALID;
+static u32 lcp_router_neigh_replaced_stat = STAT_SEGMENT_INDEX_INVALID;
+static u32 lcp_router_neigh_stale_skipped_stat = STAT_SEGMENT_INDEX_INVALID;
+
+static void
+lcp_router_neigh_stat_publish (u32 entry, u64 value)
+{
+  if (STAT_SEGMENT_INDEX_INVALID != entry)
+    vlib_stats_set_gauge (entry, value);
+}
+
+/*
+ * The static neighbours the plugin installed, by address and interface. The
+ * kernel owns a static neighbour under linux-cp: the plugin installs one for
+ * a record the kernel marks NUD_PERMANENT or NUD_NOARP, and the kernel can
+ * change that record into one it learned, with another device's link layer
+ * address. A static entry in VPP is only changed by its owner, so the plugin
+ * may only correct an entry it installed itself. This records which those
+ * are, and the link layer address the plugin wrote, so an entry an operator
+ * reprogrammed in the meantime is left alone.
+ */
+typedef struct
+{
+  ip_address_t lcns_ip;
+  u32 lcns_sw_if_index;
+} lcp_router_neigh_static_key_t;
+
+/* the key to the link layer address the plugin wrote, packed into the value */
+static uword *lcp_router_neigh_static_db;
+
+static void
+lcp_router_neigh_static_key (lcp_router_neigh_static_key_t *key, const ip_address_t *ip,
+			     u32 sw_if_index)
+{
+  clib_memset (key, 0, sizeof (*key));
+  ip_address_copy (&key->lcns_ip, ip);
+  key->lcns_sw_if_index = sw_if_index;
+}
+
+/*
+ * Record that the plugin wrote the static entry at a key with this link layer
+ * address. Only a static write is recorded: a dynamic entry is re-installed
+ * from the next kernel record, so nothing about it is the plugin's to correct
+ * later, and a refusal of it says the static entry belongs to someone else.
+ */
+static void
+lcp_router_neigh_static_record (const ip_address_t *ip, u32 sw_if_index, const mac_address_t *mac)
+{
+  lcp_router_neigh_static_key_t key;
+
+  lcp_router_neigh_static_key (&key, ip, sw_if_index);
+
+  /*
+   * A key that is already recorded keeps its allocation: hash_set_mem_alloc()
+   * copies the key and would leave the previous copy to no one on a key the
+   * hash already holds, and a resynchronization re-records every static entry
+   * it dumps.
+   */
+  if (lcp_router_neigh_static_db)
+    {
+      uword *recorded = hash_get_mem (lcp_router_neigh_static_db, &key);
+
+      if (recorded)
+	{
+	  recorded[0] = mac_address_as_u64 (mac);
+	  return;
+	}
+    }
+  else
+    lcp_router_neigh_static_db = hash_create_mem (0, sizeof (key), sizeof (uword));
+
+  hash_set_mem_alloc (&lcp_router_neigh_static_db, &key, mac_address_as_u64 (mac));
+}
+
+/*
+ * Forget the plugin's ownership of the entry at a key. An add never demotes a
+ * static entry by itself, but a correction does: it deletes the entry the
+ * plugin wrote and adds the dynamic one the kernel reported, so the entry is
+ * no longer static and the record goes with the ownership. A delete of the
+ * entry, or of its interface, ends the ownership the same way.
+ */
+static void
+lcp_router_neigh_static_forget (const ip_address_t *ip, u32 sw_if_index)
+{
+  lcp_router_neigh_static_key_t key;
+
+  if (NULL == lcp_router_neigh_static_db)
+    return;
+
+  lcp_router_neigh_static_key (&key, ip, sw_if_index);
+  hash_unset_mem_free (lcp_router_neigh_static_db, &key);
+}
+
+/* The link layer address the plugin wrote for the entry at a key. */
+static u8
+lcp_router_neigh_static_recorded (const ip_address_t *ip, u32 sw_if_index, mac_address_t *mac)
+{
+  lcp_router_neigh_static_key_t key;
+  uword *recorded;
+
+  if (NULL == lcp_router_neigh_static_db)
+    return 0;
+
+  lcp_router_neigh_static_key (&key, ip, sw_if_index);
+
+  recorded = hash_get_mem (lcp_router_neigh_static_db, &key);
+  if (NULL == recorded)
+    return 0;
+
+  mac_address_from_u64 (mac, recorded[0]);
+
+  return 1;
+}
+
+typedef struct
+{
+  const ip_address_t *lcnow_ip;
+  ip_neighbor_t *lcnow_ipn;
+} lcp_router_neigh_owned_ctx_t;
+
+static walk_rc_t
+lcp_router_neigh_owned_walk (index_t ipni, void *arg)
+{
+  lcp_router_neigh_owned_ctx_t *ctx = arg;
+  ip_neighbor_t *ipn = ip_neighbor_get (ipni);
+
+  if (0 != ip_address_cmp (ip_neighbor_get_ip (ipn), ctx->lcnow_ip))
+    return WALK_CONTINUE;
+
+  ctx->lcnow_ipn = ipn;
+
+  return WALK_STOP;
+}
+
+/* The neighbour at a key, as the neighbour module holds it now. */
+static ip_neighbor_t *
+lcp_router_neigh_find (const ip_address_t *ip, u32 sw_if_index)
+{
+  lcp_router_neigh_owned_ctx_t ctx = { .lcnow_ip = ip };
+
+  ip_neighbor_walk (ip_addr_version (ip), sw_if_index, lcp_router_neigh_owned_walk, &ctx);
+
+  return ctx.lcnow_ipn;
+}
+
+/*
+ * Whether the static entry at a key is still the plugin's to change: the
+ * plugin wrote it, and the entry still carries the link layer address the
+ * plugin wrote. An operator who reprogrammed the entry since owns it now, and
+ * an entry the plugin never installed is not its own either.
+ */
+static u8
+lcp_router_neigh_static_owned (const ip_address_t *ip, u32 sw_if_index)
+{
+  ip_neighbor_t *ipn;
+  mac_address_t recorded;
+
+  if (!lcp_router_neigh_static_recorded (ip, sw_if_index, &recorded))
+    return 0;
+
+  ipn = lcp_router_neigh_find (ip, sw_if_index);
+  if (NULL == ipn)
+    return 0;
+
+  return (0 == mac_address_cmp (ip_neighbor_get_mac (ipn), &recorded));
+}
+
+/*
+ * Record the entry an add just wrote, or drop the ownership record for it.
+ * The neighbour module never demotes a static entry, so an add that carried a
+ * dynamic flag leaves a static entry static and its record stands. Only an
+ * entry that is static now is recorded, with the link layer address the module
+ * holds for it; an entry that is dynamic has nothing the plugin would later
+ * correct, and any record left over for the key belongs to an entry that is
+ * gone.
+ */
+static void
+lcp_router_neigh_static_reconcile (const ip_address_t *ip, u32 sw_if_index,
+				   ip_neighbor_flags_t flags)
+{
+  mac_address_t recorded;
+  ip_neighbor_t *ipn;
+
+  /*
+   * The lookup walks the neighbours of the interface, so it is only done when
+   * a record can exist or be wanted. A dynamic add for a key the plugin never
+   * wrote has nothing to record and no record to drop, and walking for it
+   * would make a dump of a large table quadratic.
+   */
+  if (!(flags & IP_NEIGHBOR_FLAG_STATIC) &&
+      !lcp_router_neigh_static_recorded (ip, sw_if_index, &recorded))
+    return;
+
+  ipn = lcp_router_neigh_find (ip, sw_if_index);
+
+  if (ipn && (ipn->ipn_flags & IP_NEIGHBOR_FLAG_STATIC))
+    lcp_router_neigh_static_record (ip, sw_if_index, ip_neighbor_get_mac (ipn));
+  else
+    lcp_router_neigh_static_forget (ip, sw_if_index);
+}
+
+/*
+ * An interface is gone, and so is every static entry the plugin installed on
+ * it, since the neighbour flush on interface delete removes them whatever
+ * their kind. Their keys can no longer be reached by a netlink record, and a
+ * sw_if_index later handed to another interface must not inherit them.
+ */
+static void
+lcp_router_neigh_static_flush_if (u32 sw_if_index)
+{
+  lcp_router_neigh_static_key_t **doomed = NULL;
+  hash_pair_t *p;
+  u32 i;
+
+  if (NULL == lcp_router_neigh_static_db)
+    return;
+
+  /*
+   * The keys are collected first: a hash cannot be walked while it is being
+   * unset. The key memory outlives the walk, because hash_set_mem_alloc()
+   * allocates each key on its own.
+   */
+  hash_foreach_pair (p, lcp_router_neigh_static_db, ({
+		       lcp_router_neigh_static_key_t *key = uword_to_pointer (p->key, void *);
+
+		       if (key->lcns_sw_if_index == sw_if_index)
+			 vec_add1 (doomed, key);
+		     }));
+
+  for (i = 0; i < vec_len (doomed); i++)
+    hash_unset_mem_free (lcp_router_neigh_static_db, doomed[i]);
+
+  vec_free (doomed);
+}
 
 static const mfib_prefix_t ip4_specials[] = {
   /* ALL prefixes are in network order */
@@ -1052,21 +1318,22 @@ lcp_router_neigh_del (struct rtnl_neigh *rn)
 	}
       else
 	{
+	  /*
+	   * The entry is gone, so any ownership record for it is stale. It is
+	   * dropped here rather than left behind: the address can be learned
+	   * again, and a left-over record would make the plugin treat the new
+	   * entry as its own to correct.
+	   */
+	  lcp_router_neigh_static_forget (&nh, sw_if_index);
+
 	  LCP_ROUTER_DBG ("neighbor del: %U %U", format_ip_address, &nh,
-			  format_vnet_sw_if_index_name, vnet_get_main (),
-			  sw_if_index);
+			  format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index);
 	}
     }
   else
     LCP_ROUTER_INFO ("ignore neighbour del on: %d",
 		     rtnl_neigh_get_ifindex (rn));
 }
-
-#ifndef NUD_VALID
-#define NUD_VALID                                                             \
-  (NUD_PERMANENT | NUD_NOARP | NUD_REACHABLE | NUD_PROBE | NUD_STALE |        \
-   NUD_DELAY)
-#endif
 
 static void
 lcp_router_neigh_add (struct rtnl_neigh *rn)
@@ -1111,7 +1378,51 @@ lcp_router_neigh_add (struct rtnl_neigh *rn)
       ll = rtnl_neigh_get_lladdr (rn);
       state = rtnl_neigh_get_state (rn);
 
-      if (ll && (state & NUD_VALID))
+      /*
+       * A record the kernel is revalidating says the link layer address was
+       * usable once, not that it is now. ip_neighbor_add() cannot carry that
+       * distinction: ip_neighbor_refresh() calls ip_neighbor_touch(), which
+       * clears IP_NEIGHBOR_FLAG_STALE and resets the probe count, so the
+       * entry would arrive in VPP as one just confirmed. The record is
+       * therefore not synced, and the next confirmed record for the address,
+       * if one comes, is what updates VPP.
+       *
+       * A synchronization marks every dynamic neighbour before its dump and
+       * sweeps the ones still marked after it, and the mark clears only
+       * through the refresh the skip above does without. A record the kernel
+       * still holds would therefore be deleted at the end of the
+       * synchronization it was reported in, so the mark is cleared here when
+       * the entry exists and the sweep can reach it. Clearing the flag is not
+       * the refresh: the probe count and the update time are left as they
+       * are, and the entry stays one the kernel has not confirmed.
+       *
+       * Only a record that arrives outside a synchronization is counted: a
+       * dump repeats the state of every revalidating neighbour it holds, and
+       * counting those would add one skip per resynchronization to a signal
+       * that describes what the kernel reported.
+       */
+      if (ll && (state & LCP_ROUTER_NUD_REVALIDATING))
+	{
+	  if (lcp_router_neigh_sync_active && lcp_router_neigh_sync_marked)
+	    {
+	      ip_neighbor_t *ipn = lcp_router_neigh_find (&nh, sw_if_index);
+
+	      if (ipn && (ipn->ipn_flags & IP_NEIGHBOR_FLAG_DYNAMIC))
+		ipn->ipn_flags &= ~IP_NEIGHBOR_FLAG_STALE;
+	    }
+	  else if (!lcp_router_neigh_sync_active)
+	    {
+	      lcp_router_neigh_stale_skipped++;
+	      lcp_router_neigh_stat_publish (lcp_router_neigh_stale_skipped_stat,
+					     lcp_router_neigh_stale_skipped);
+	    }
+
+	  LCP_ROUTER_DBG ("skip revalidating neighbor: %U %U state 0x%x", format_ip_address, &nh,
+			  format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index, state);
+	  return;
+	}
+
+      if (ll && (state & LCP_ROUTER_NUD_CONFIRMED))
 	{
 	  mac_address_t mac;
 	  ip_neighbor_flags_t flags;
@@ -1133,13 +1444,47 @@ lcp_router_neigh_add (struct rtnl_neigh *rn)
 
 	  rv = ip_neighbor_add (&nh, &mac, sw_if_index, flags, NULL);
 
+	  /*
+	   * A static entry is only changed by its owner. The kernel owns the
+	   * static neighbours the plugin installed from its records, and it can
+	   * change one: a permanent record can become one the kernel learned,
+	   * with another device's link layer address, which arrives here as a
+	   * dynamic record. ip_neighbor_add() refuses that, so the correction is
+	   * the delete and add an operator would do by hand, made on the entry
+	   * the plugin itself wrote.
+	   *
+	   * The entry must still carry the link layer address the plugin wrote,
+	   * or an operator has reprogrammed it since and it is that owner's to
+	   * change. An entry with no ownership record was never installed by the
+	   * plugin, and is left untouched as well.
+	   */
+	  if (VNET_API_ERROR_ENTRY_ALREADY_EXISTS == rv &&
+	      lcp_router_neigh_static_owned (&nh, sw_if_index))
+	    {
+	      ip_neighbor_del (&nh, sw_if_index);
+	      rv = ip_neighbor_add (&nh, &mac, sw_if_index, flags, NULL);
+
+	      if (!rv)
+		{
+		  lcp_router_neigh_replaced++;
+		  lcp_router_neigh_stat_publish (lcp_router_neigh_replaced_stat,
+						 lcp_router_neigh_replaced);
+		}
+	    }
+
 	  if (rv)
 	    {
+	      lcp_router_neigh_refused++;
+	      lcp_router_neigh_stat_publish (lcp_router_neigh_refused_stat,
+					     lcp_router_neigh_refused);
+
 	      LCP_ROUTER_ERROR ("Failed to create neighbor: %U %U", format_ip_address, &nh,
 				format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index);
 	    }
 	  else
 	    {
+	      lcp_router_neigh_static_reconcile (&nh, sw_if_index, flags);
+
 	      LCP_ROUTER_DBG ("neighbor add: %U %U", format_ip_address, &nh,
 			      format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index);
 	    }
@@ -1240,7 +1585,10 @@ lcp_router_neigh_sync_begin (void)
   lcp_router_neigh_sync_active = 1;
 
   if (lcp_get_del_dynamic_on_link_down ())
-    lcp_itf_pair_walk (lcp_router_neighbor_mark, 0);
+    {
+      lcp_itf_pair_walk (lcp_router_neighbor_mark, 0);
+      lcp_router_neigh_sync_marked = 1;
+    }
 
   LCP_ROUTER_INFO ("Begin synchronization of neighbors");
 }
@@ -1259,6 +1607,8 @@ lcp_router_neigh_sync_end (void)
 
   if (lcp_get_del_dynamic_on_link_down ())
     lcp_router_neigh_sync_sweep ();
+
+  lcp_router_neigh_sync_marked = 0;
 
   LCP_ROUTER_INFO ("End synchronization of neighbors");
 }
@@ -1280,6 +1630,29 @@ lcp_router_neigh_test_end (void)
 {
   lcp_router_neigh_sync_end ();
 }
+
+/*
+ * The neighbour synchronization's outcome totals. The stat segment gauges
+ * under /lcp/neighbor/ carry the same numbers; this command prints them
+ * without touching a counter set, an interface, or a graph node, so it is
+ * safe to run on a box where walking counters is not.
+ */
+static clib_error_t *
+lcp_router_show_neighbours_command_fn (vlib_main_t *vm, unformat_input_t *input,
+				       vlib_cli_command_t *cmd)
+{
+  vlib_cli_output (vm, "Refused: %lu", lcp_router_neigh_refused);
+  vlib_cli_output (vm, "Replaced: %lu", lcp_router_neigh_replaced);
+  vlib_cli_output (vm, "Stale skipped: %lu", lcp_router_neigh_stale_skipped);
+
+  return 0;
+}
+
+VLIB_CLI_COMMAND (lcp_router_show_neighbours_command, static) = {
+  .path = "show lcp neighbors",
+  .short_help = "show lcp neighbors",
+  .function = lcp_router_show_neighbours_command_fn,
+};
 
 /*
  * Whether a table counts a lock of one source. A table that never took the
@@ -3064,6 +3437,8 @@ lcp_router_interface_del_cb (lcp_itf_pair_t *lip)
   lcp_router_ip4_mroutes_add_del (lip->lip_phy_sw_if_index, 0);
   lcp_router_ip6_mroutes_add_del (lip->lip_phy_sw_if_index, 0);
 
+  lcp_router_neigh_static_flush_if (lip->lip_phy_sw_if_index);
+
   vec_validate_init_empty (sw_if_index_to_bool, lip->lip_phy_sw_if_index, false);
   sw_if_index_to_bool[lip->lip_phy_sw_if_index] = true;
 
@@ -3157,6 +3532,19 @@ lcp_router_init (vlib_main_t *vm)
 
   lcp_rt_fib_src_onlink =
     fib_source_allocate ("lcp-rt-onlink", FIB_SOURCE_PRIORITY_HI, FIB_SOURCE_BH_API);
+
+  /*
+   * Publish the neighbour synchronization's outcomes where an operator can
+   * see them without the lcp logger. Each is a cumulative count for the
+   * lifetime of the process, like the netlink synchronization counters.
+   */
+  lcp_router_neigh_refused_stat = vlib_stats_add_gauge ("/lcp/neighbor/refused");
+  lcp_router_neigh_replaced_stat = vlib_stats_add_gauge ("/lcp/neighbor/replaced");
+  lcp_router_neigh_stale_skipped_stat = vlib_stats_add_gauge ("/lcp/neighbor/stale-skipped");
+
+  lcp_router_neigh_stat_publish (lcp_router_neigh_refused_stat, 0);
+  lcp_router_neigh_stat_publish (lcp_router_neigh_replaced_stat, 0);
+  lcp_router_neigh_stat_publish (lcp_router_neigh_stale_skipped_stat, 0);
 
   return (NULL);
 }

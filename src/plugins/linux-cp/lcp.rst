@@ -162,6 +162,62 @@ route's table being local in the nexthop's table, which mirroring does
 not evaluate, so the route is installed unchanged. Multicast and MPLS
 paths are not checked this way.
 
+Neighbour synchronization
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A neighbour record from the kernel is applied to VPP only when it says
+the kernel has confirmed the link layer address. The states
+``NUD_REACHABLE``, ``NUD_PERMANENT`` and ``NUD_NOARP`` carry a
+confirmed address and are synced. The states ``NUD_STALE``,
+``NUD_DELAY`` and ``NUD_PROBE`` say the kernel still holds the address
+but is revalidating it, and are not synced.
+
+The skip is deliberate. ``ip_neighbor_add()`` clears
+``IP_NEIGHBOR_FLAG_STALE`` and resets the probe count on every call, so
+a record the kernel is revalidating cannot arrive in VPP as anything
+but a just-confirmed entry. Syncing it would turn the kernel's pending
+revalidation into VPP's confirmation, which is how a device that has
+stopped answering keeps looking alive. The next confirmed record for
+the address is what updates VPP.
+
+During a synchronization, such a record keeps the dynamic entry VPP
+already holds, without marking that entry as confirmed.
+
+A record with no link layer address, and one whose state is none of the
+six above, is treated as a delete: VPP holds no usable address for it.
+This covers ``NUD_FAILED``, which the kernel sends for a host that
+stopped answering, and ``NUD_INCOMPLETE``.
+
+A static entry in VPP is changed only by the owner that installed it.
+Under linux-cp the kernel is that owner for the static neighbours the
+plugin installed from its own records, so the plugin remembers which
+address and interface pairs it wrote and with which link layer address.
+When the kernel later reports a different link layer address for one of
+them, the add is refused by the neighbour module, and the plugin makes
+the delete and add an operator would do by hand. The correction is
+counted as replaced. The correction is not made when the entry no
+longer carries the address the plugin wrote: an operator has
+reprogrammed it since, and it is that owner's to change.
+
+Refusals are counted, whether or not the plugin can correct them. Three
+cumulative counters are kept for the lifetime of the process, and
+``show lcp neighbors`` prints them::
+
+  Refused: 0
+  Replaced: 0
+  Stale skipped: 0
+
+``Refused`` counts neighbour adds the neighbour module rejected.
+``Replaced`` counts static entries the plugin corrected with a delete
+and add. ``Stale skipped`` counts records the kernel reported as
+revalidating, outside a synchronization; a dump repeats the state of
+every revalidating neighbour it holds, so those are not counted.
+
+The same three numbers are published in the statistics segment as
+``/lcp/neighbor/refused``, ``/lcp/neighbor/replaced`` and
+``/lcp/neighbor/stale-skipped``. Reading a path reads one directory
+entry and walks no counter set.
+
 Forwarding
 __________
 
