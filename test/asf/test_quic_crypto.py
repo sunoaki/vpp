@@ -35,10 +35,19 @@ ESCALATION_SIGNALS = ((signal.SIGTERM, 5), (signal.SIGKILL, 5))
 # and loop1 gets table 1, the layout the TCP and UDP session suites use.
 SERVER_NAMESPACE, SERVER_TABLE = "quic-crypto-server", 0
 CLIENT_NAMESPACE, CLIENT_TABLE = "quic-crypto-client", 1
-# quic_connect_connection() formats the hostname before the crypto context is
-# acquired, so every record below that frame belongs to the connect path.
-CALLSITE = re.compile(r"\bquic_connect_connection\b")
-HOSTNAME_FORMAT = re.compile(r"\bformat\b|format_ip46_address")
+# A traceback record keeps at most 12 frames (clib_mem_trace_t.callers in
+# src/vppinfra/mem.h) and save_memory_trace writes only those. srv_hostname is
+# built by format (0, "%U", format_ip46_address, ...) in quic.c, and that chain
+# runs through format, va_format and do_percent before the vector allocator.
+# It is longer than 12 frames, so quic_connect_connection() is never part of a
+# recorded traceback and an assertion that looks for that frame cannot pass.
+# The format frames of that chain are the ones the window keeps, so they are
+# what attribution keys on; the tests guard the case where even they are absent
+# instead of reporting an empty selection as a product regression.
+FORMAT_FRAME = re.compile(
+    r"\b(?:format|va_format|format_ip4_address|format_ip6_address"
+    r"|format_ip46_address)\b"
+)
 # b332ab4cd returns from quic_connect_connection() without freeing the context
 # and its hostname; 40b52275d adds exactly those two frees.
 LEAKS = {"fixed": False, "original": True}
@@ -363,11 +372,55 @@ class QUICCredentialFailure(VppAsfTestCase):
 
     @staticmethod
     def signature(record):
-        frames = record["traceback"]
-        for index, frame in enumerate(frames):
-            if CALLSITE.search(frame):
-                return tuple(frames[: index + 1])
-        return None
+        """Name a record by the frames it was allocated through.
+
+        The allocator hashes exactly the frames it kept, so the whole kept
+        window names one bucket and a site keeps its bucket across traces. Two
+        traces of the same run therefore join on this name.
+        """
+        return tuple(record["traceback"])
+
+    @staticmethod
+    def allocated_by_format(record):
+        """True when a kept frame is part of a format() call.
+
+        srv_hostname is built by format (0, "%U", format_ip46_address, ...) in
+        quic.c. The quic_connect_connection() frame sits outside the 12 frames a
+        record keeps, but the format, va_format and format_ip46_address frames
+        inside that chain are among the ones kept, so this test is reachable
+        where a quic_connect_connection() test is not.
+        """
+        return any(FORMAT_FRAME.search(frame) for frame in record["traceback"])
+
+    def hostname_signatures(self, records, baseline=None):
+        """Buckets a format call allocated into, optionally only those grown.
+
+        Passing a baseline keeps only the buckets that gained both an
+        allocation and bytes since it, which is how the connect's own
+        allocation is told apart from a format bucket that was already live and
+        only got bigger. Such a bucket can grow in bytes alone: an in-place
+        realloc keeps the block offset, so clib_mem_heap_realloc_aligned()
+        updates the byte count through clib_mem_trace_put()/clib_mem_trace_get()
+        without changing the allocation count (src/vppinfra/mem_dlmalloc.c).
+        Requiring both counters matches what the assertions below require.
+        """
+        seen = {}
+        for record in records:
+            if self.allocated_by_format(record):
+                seen[self.signature(record)] = (record["count"], record["bytes"])
+        if baseline is None:
+            return set(seen)
+        before = {
+            self.signature(record): (record["count"], record["bytes"])
+            for record in baseline
+            if self.allocated_by_format(record)
+        }
+        return {
+            name
+            for name, current in seen.items()
+            if current[0] > before.get(name, (0, 0))[0]
+            and current[1] > before.get(name, (0, 0))[1]
+        }
 
     def hostname_records(self, records, signatures):
         return [record for record in records if self.signature(record) in signatures]
@@ -390,6 +443,8 @@ class QUICCredentialFailure(VppAsfTestCase):
             peer.request("attach", cert=str(valid_cert), key=str(key))
         server.request("listen")
         listening = self.snapshot()
+        # Taken after the listener is up and before the client connects, so the
+        # only hostname allocation the delta can contain is the connect's.
         before = self.trace(label + "-before")
         connected = client.request("connect", timeout=15)
         # The client dials through its own namespace, so its source address is
@@ -418,32 +473,80 @@ class QUICCredentialFailure(VppAsfTestCase):
         )
         self.run_cli("show session verbose 2")
         records = self.trace(label + "-live")
+        # srv_hostname is built by
+        # format (0, "%U", format_ip46_address, ...) in quic.c because VCL
+        # supplies no hostname, so it lands in a bucket a format frame
+        # allocated, and only format buckets that advanced since the listener
+        # came up are selected. quic_connect_connection() is outside the 12
+        # frames a record keeps (clib_mem_trace_t.callers in
+        # src/vppinfra/mem.h), which is why the format frames are the key.
+        # vec_terminate_c_string() then appends the NUL; format's growth leaves
+        # spare capacity (50% on realloc, allocator rounding on first
+        # allocation), so that append normally does not reallocate. If it did,
+        # the vector would move to a bucket no format frame allocated, this set
+        # would be empty and the guard below fails loudly. The same blind spot
+        # in the credential loop is covered by the context-pool assertion in
+        # snapshot(), not by the hostname counters; see that branch.
+        live_signatures = self.hostname_signatures(records, before)
+        # An empty result describes the measurement, not the rollback. Fail on
+        # that fact alone so a missing attribution can never be reported later
+        # as a count mismatch.
+        self.assertTrue(
+            live_signatures,
+            f"no format-path bucket in {label}-live grew across the connect, so "
+            f"the srv_hostname allocation cannot be identified. The format path "
+            f'format (0, "%U", format_ip46_address, ...) must appear among the '
+            f"12 kept frames of a record and its counters must advance; "
+            f"before={len(before)} live={len(records)}",
+        )
         if signatures is None:
-            signatures = {
-                self.signature(record)
-                for record in records
-                if self.signature(record) is not None
-                and HOSTNAME_FORMAT.search(" ".join(self.signature(record)))
-            }
-            self.assertEqual(
-                len(signatures), 1, "hostname callsite attribution remains OPEN"
+            signatures = live_signatures
+        else:
+            # The second probe reuses the first probe's buckets, so they must
+            # still appear live. Otherwise the reused set selects nothing and
+            # the assertions below would hold over an empty selection.
+            self.assertTrue(
+                live_signatures & signatures,
+                f"hostname buckets from the first probe are absent from "
+                f"{label}-live, so the allocation site does not match across "
+                f"probes; format buckets are "
+                f"{sorted(list(item) for item in live_signatures)}",
             )
-            (self.evidence / "hostname-callsite.json").write_text(
-                json.dumps(
-                    {
-                        "signatures": sorted(signatures),
-                        "thread": thread,
-                        "source": "quic_connect_connection: format srv_hostname before crypto acquire",
-                        "connected": connected,
-                        "accepted": accepted,
-                    },
-                    indent=2,
-                )
-            )
+            # Keep only the reused buckets that grew in this probe. A reused
+            # bucket whose counters dropped between the two traces would
+            # otherwise subtract its negative delta from a growing bucket's
+            # gain and hide the growth the assertions below look for. A bucket
+            # that merely stayed the same adds the same counts to both sides,
+            # so it is harmless but is dropped too.
+            signatures = live_signatures & signatures
         before_totals = self.hostname_totals(before, signatures)
         live_totals = self.hostname_totals(records, signatures)
-        self.assertEqual(live_totals[0], before_totals[0] + 1)
+        # Every selected bucket grew in count and in bytes, so the totals must
+        # advance on both. The property under test is the teardown equality
+        # below: those buckets must return to where they started, which a
+        # leaked srv_hostname breaks.
+        self.assertGreater(live_totals[0], before_totals[0])
         self.assertGreater(live_totals[1], before_totals[1])
+        (self.evidence / "hostname-callsite.json").write_text(
+            json.dumps(
+                {
+                    "signatures": [list(item) for item in sorted(signatures)],
+                    "thread": thread,
+                    "source": "quic.c builds srv_hostname with "
+                    'format (0, "%U", format_ip46_address, ...) when the '
+                    "caller supplies no hostname, and VCL supplies none",
+                    "before": before_totals,
+                    "live": live_totals,
+                    "tracebacks": [
+                        record["traceback"]
+                        for record in self.hostname_records(records, signatures)
+                    ],
+                    "connected": connected,
+                    "accepted": accepted,
+                },
+                indent=2,
+            )
+        )
         for peer in (client, server):
             peer.request("close")
         for peer in (client, server):
@@ -463,7 +566,19 @@ class QUICCredentialFailure(VppAsfTestCase):
             time.sleep(0.05)
         self.wait_snapshot(baseline)
         closed = self.trace(label + "-closed")
-        self.assertEqual(self.hostname_totals(closed, signatures), before_totals)
+        closed_totals = self.hostname_totals(closed, signatures)
+        # Every bucket the handshake grew must be released again, which is what
+        # a leaked srv_hostname breaks. If a format bucket grew for an unrelated
+        # reason and outlives the handshake this reports both sides with the
+        # evidence file naming the selected buckets, rather than a bare pair.
+        self.assertEqual(
+            closed_totals,
+            before_totals,
+            f"{label}: format buckets did not return to their pre-connect "
+            f"totals after teardown; before={before_totals} "
+            f"live={live_totals} closed={closed_totals}. See "
+            f"{(self.evidence / 'hostname-callsite.json')} for the tracebacks",
+        )
         return signatures
 
     def fixture(self):
@@ -519,9 +634,12 @@ class QUICCredentialFailure(VppAsfTestCase):
         self.run_cli("memory-trace on main-heap")
         self.addCleanup(self.run_cli, "memory-trace off")
         signatures = self.probe("coverage-before", valid_cert, key, preapp)
-        self.assertEqual(
-            self.hostname_totals(self.trace("baseline"), signatures), [0, 0]
-        )
+        # The attribution buckets are measured, not assumed empty: the same 12
+        # kept frames can serve more than one address-formatting site, so the
+        # assertions below compare each trace against this baseline instead of
+        # against zero. A rollback that leaks one vector per attempt still moves
+        # the count by one per attempt, which is what the leak assertion checks.
+        hostname_zero = self.hostname_totals(self.trace("baseline"), signatures)
         client = VclProcess(
             self, "failures", self.server_loop.local_ip4, CLIENT_NAMESPACE
         )
@@ -537,7 +655,7 @@ class QUICCredentialFailure(VppAsfTestCase):
             preapp["certificates"].splitlines() + [expected_cert],
         )
         thread = str(min(1, self.vpp_worker_count))
-        count_per_attempt = bytes_per_attempt = None
+        bytes_per_attempt = None
         for attempt in range(1, ATTEMPTS + 1):
             self.assertEqual(self.snapshot(), baseline)
             start = len("".join(self.vpp_stderr_deque))
@@ -571,18 +689,49 @@ class QUICCredentialFailure(VppAsfTestCase):
             actual = self.snapshot()
             records = self.trace(f"attempt-{attempt:03d}")
             totals = self.hostname_totals(records, signatures)
+            grown = [totals[0] - hostname_zero[0], totals[1] - hostname_zero[1]]
             if not LEAKS[mode]:
+                # The context-pool counters in this snapshot are the safety net
+                # for an unfreed vector this selection cannot see: a leak that
+                # moved srv_hostname onto a non-format bucket leaves the
+                # hostname counters at zero but still leaves the QUIC context
+                # allocated, and snapshot() reads "Thread N: ctx pool used/cap"
+                # for every thread. A record-existence guard would be wrong
+                # here, because a correct rollback frees the vector and so must
+                # leave no hostname record behind.
                 self.assertEqual(actual, baseline)
-                self.assertEqual(totals, [0, 0])
+                self.assertEqual(
+                    grown,
+                    [0, 0],
+                    f"attempt {attempt} left a hostname allocation behind: "
+                    f"baseline={hostname_zero} attempt={totals}",
+                )
             else:
+                # A leaked vector has to be visible in the trace. Without this
+                # guard a selection that matched nothing would report the
+                # expected growth as a mismatch, which reads like a different
+                # defect than the one under test.
+                self.assertTrue(
+                    self.hostname_records(records, signatures),
+                    f"attempt {attempt} left no attributable hostname record, "
+                    f"so the leaked vector cannot be counted at all",
+                )
                 expected = dict(baseline, used=dict(baseline["used"]))
                 expected["used"][thread] = preapp["used"][thread] + attempt
                 self.assertEqual(actual, expected)
+                # grown is measured against the pre-failure baseline, so it is
+                # cumulative: attempt n must show n leaked vectors. A rollback
+                # that freed the vector would leave it at zero throughout.
                 if attempt == 1:
-                    count_per_attempt, bytes_per_attempt = totals
-                    self.assertEqual(count_per_attempt, 1)
-                    self.assertGreater(bytes_per_attempt, 0)
-                self.assertEqual(totals, [attempt, attempt * bytes_per_attempt])
+                    self.assertEqual(grown[0], 1, grown)
+                    self.assertGreater(grown[1], 0, grown)
+                    bytes_per_attempt = grown[1]
+                self.assertEqual(
+                    grown,
+                    [attempt, bytes_per_attempt * attempt],
+                    f"attempt {attempt} did not leave {attempt} leaked "
+                    f"vectors: baseline={hostname_zero} attempt={totals}",
+                )
                 baseline = actual
             self.run_cli("show version")
             (self.evidence / f"attempt-{attempt:03d}-result.json").write_text(
@@ -593,6 +742,7 @@ class QUICCredentialFailure(VppAsfTestCase):
                         "vcl": result,
                         "snapshot": actual,
                         "hostname": totals,
+                        "hostname_growth": grown,
                     }
                 )
             )
@@ -620,6 +770,7 @@ class QUICCredentialFailure(VppAsfTestCase):
                     "final": final,
                     "cleanup": "passed",
                     "hostname": self.hostname_totals(self.trace("final"), signatures),
+                    "hostname_baseline": hostname_zero,
                 },
                 indent=2,
             )
