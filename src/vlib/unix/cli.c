@@ -106,6 +106,24 @@
  * This is far more than twenty digits of count and the fixed text. */
 #define UNIX_CLI_OUTPUT_OVERFLOW_NOTICE_SIZE 256
 
+/** Room kept below the pending output limit for the end-of-command terminator.
+ * A non-interactive client learns that a command has finished only from the
+ * NUL byte that follows it (see the end of @c unix_cli_process_input), so that
+ * byte has to be queued however much of the report was discarded. Report bytes
+ * are capped below this reserve and the truncation notice is queued out of the
+ * notice reserve above it, so this reserve stays free for the terminator and
+ * for the interactive prompt that precedes it. The default prompt is six
+ * bytes; the rest is slack for a longer one. */
+#define UNIX_CLI_OUTPUT_TERMINATOR_SIZE 16
+
+/** Queue the end-of-command bytes even if the pending output is at its limit.
+ * A client that does not learn the command finished cannot proceed. */
+#define UNIX_CLI_OUTPUT_FORCE 1
+/** As @c UNIX_CLI_OUTPUT_FORCE, and close the session if the bytes still do
+ * not fit, so a client that cannot be told the command finished sees EOF
+ * instead of waiting. */
+#define UNIX_CLI_OUTPUT_FORCE_OR_CLOSE 2
+
 /** A CLI banner line. */
 typedef struct
 {
@@ -722,7 +740,7 @@ static void
 unix_cli_add_pending_output (clib_file_t *uf, unix_cli_file_t *cf, u8 *buffer, uword buffer_bytes)
 {
   uword max = unix_cli_max_pending_output ();
-  uword limit = max - UNIX_CLI_OUTPUT_OVERFLOW_NOTICE_SIZE;
+  uword limit = max - UNIX_CLI_OUTPUT_TERMINATOR_SIZE - UNIX_CLI_OUTPUT_OVERFLOW_NOTICE_SIZE;
   uword flush = max >> 2;
   uword pending = vec_len (cf->output_vector);
 
@@ -762,6 +780,47 @@ unix_cli_add_pending_output (clib_file_t *uf, unix_cli_file_t *cf, u8 *buffer, u
     }
 }
 
+/** Queue bytes that must reach the client whatever the pending output limit.
+ *
+ * Used for the end-of-command NUL that tells a non-interactive client the
+ * command has finished, and for the prompt an interactive client sees. The
+ * pending output limit leaves room for both (@c UNIX_CLI_OUTPUT_TERMINATOR_SIZE),
+ * so the reserve is available however much of the report was discarded.
+ *
+ * If the reserve were ever exhausted, the two callers need different treatment.
+ * A non-interactive client that never learns the command finished waits
+ * forever, so its session is closed and it sees EOF instead. An interactive
+ * client that misses a prompt is not wedged, only less convenient, so the
+ * prompt is dropped rather than closing a session the operator is still using.
+ */
+static void
+unix_cli_add_terminator_output (clib_file_t *uf, unix_cli_file_t *cf, u8 *buffer,
+				uword buffer_bytes, u8 close_on_overflow)
+{
+  uword max = unix_cli_max_pending_output ();
+  uword pending = vec_len (cf->output_vector);
+
+  if (cf->has_epipe)
+    return;
+
+  if (pending + buffer_bytes > max)
+    {
+      /* The reserve was not enough. Only a socket session may be closed this
+       * way: killing the stdin session shuts VPP down (see unix_cli_kill). */
+      if (close_on_overflow && cf->is_socket)
+	{
+	  unix_main_t *um = &unix_main;
+	  cf->has_epipe = 1;
+	  vlib_process_signal_event (um->vlib_main, cf->process_node_index,
+				     UNIX_CLI_PROCESS_EVENT_QUIT, uf->private_data);
+	}
+      return;
+    }
+
+  vec_add (cf->output_vector, buffer, buffer_bytes);
+  unix_cli_pending_output_update (uf, cf);
+}
+
 /** Say in the session's output that bytes were dropped, and how many.
  *
  * Called once at the end of a command, where the whole report, including the
@@ -769,6 +828,15 @@ unix_cli_add_pending_output (clib_file_t *uf, unix_cli_file_t *cf, u8 *buffer, u
  * follows the bytes that were kept, so the operator sees it after the part of
  * the report that was kept and before any later command's output, and is not
  * shown a partial report that looks complete.
+ *
+ * The notice is queued out of the reserve the report limit leaves free, and is
+ * never paid for by discarding bytes that were already kept. Discarding those
+ * would delete the oldest part of the report the operator was told had been
+ * kept, so the prefix the client receives would not be the prefix the count
+ * describes. If the notice does not fit that reserve, the client has not read
+ * enough for several commands: the count is kept and announced with a later
+ * command's notice instead, and it continues to describe report bytes only, so
+ * it never under- or over-reports what was lost.
  *
  * @return non-zero if a notice was added.
  */
@@ -786,14 +854,24 @@ unix_cli_pending_output_overflow_notice (clib_file_t *uf, unix_cli_file_t *cf)
 		   "because the client did not read them%s\n",
 		   cf->crlf_mode ? "\r\n\r\n" : "\n\n",
 		   (unsigned long long) cf->output_dropped_bytes, cf->crlf_mode ? "\r" : "");
-  cf->output_dropped_bytes = 0;
 
-  /* Drop the oldest pending output to make room, so that the notice cannot
-   * push the buffer past its limit however often it is added. */
+  /* The report limit stops below the maximum by the notice and terminator
+   * reserves. The notice may use its own reserve but must leave the terminator
+   * reserve free, so the count is only announced while it still leaves room for
+   * the end-of-command NUL. Either way the output stays under the maximum. */
   pending = vec_len (cf->output_vector);
-  limit = unix_cli_max_pending_output ();
+  limit = unix_cli_max_pending_output () - UNIX_CLI_OUTPUT_TERMINATOR_SIZE;
   if (pending + vec_len (notice) > limit)
-    unix_cli_del_pending_output (uf, cf, pending + vec_len (notice) - limit);
+    {
+      /* Keep the count for a later command rather than evicting kept report
+       * bytes to make room. The count still describes report bytes only, so
+       * the notice a later command emits is accurate; nothing is lost from the
+       * tally while the client is not reading. */
+      vec_free (notice);
+      return 0;
+    }
+
+  cf->output_dropped_bytes = 0;
 
   vec_add (cf->output_vector, notice, vec_len (notice));
   unix_cli_pending_output_update (uf, cf);
@@ -846,10 +924,14 @@ unix_vlib_findchr (u8 chr, u8 * str, word len)
  * @param uf The Unix file structure of the desired stream to write to.
  * @param buffer Pointer to the buffer that needs to be written.
  * @param buffer_bytes The number of bytes from \c buffer to write.
+ * @param force @c UNIX_CLI_OUTPUT_FORCE to queue the bytes even past the
+ *              pending output limit, @c UNIX_CLI_OUTPUT_FORCE_OR_CLOSE to also
+ *              close the session if they do not fit, or zero for the normal
+ *              capped path.
  */
 static void
-unix_vlib_cli_output_raw (unix_cli_file_t * cf,
-			  clib_file_t * uf, u8 * buffer, uword buffer_bytes)
+unix_vlib_cli_output_raw_force (unix_cli_file_t *cf, clib_file_t *uf, u8 *buffer,
+				uword buffer_bytes, u8 force)
 {
   int n = 0;
 
@@ -887,8 +969,18 @@ unix_vlib_cli_output_raw (unix_cli_file_t * cf,
        * queue up whatever didn't get sent for later. */
       if (n < 0)
 	n = 0;
-      unix_cli_add_pending_output (uf, cf, buffer + n, buffer_bytes - n);
+      if (force)
+	unix_cli_add_terminator_output (uf, cf, buffer + n, buffer_bytes - n,
+					force == UNIX_CLI_OUTPUT_FORCE_OR_CLOSE);
+      else
+	unix_cli_add_pending_output (uf, cf, buffer + n, buffer_bytes - n);
     }
+}
+
+static void
+unix_vlib_cli_output_raw (unix_cli_file_t *cf, clib_file_t *uf, u8 *buffer, uword buffer_bytes)
+{
+  unix_vlib_cli_output_raw_force (cf, uf, buffer, buffer_bytes, 0 /* force */);
 }
 
 /** @brief Process a buffer for CRLF handling before outputting it to the CLI.
@@ -997,15 +1089,21 @@ unix_vlib_cli_output_cursor_left (unix_cli_file_t * cf, clib_file_t * uf)
   cf->cursor_direction = 1;	/* going backwards now */
 }
 
-/** @brief Output the CLI prompt */
+/** @brief Output the CLI prompt.
+ *
+ * The prompt is the interactive session's signal that the command finished, so
+ * it is queued past the pending output limit for the same reason the
+ * non-interactive NUL at the end of a command is: a truncated report must not
+ * leave the terminal without a prompt.
+ */
 static void
 unix_cli_cli_prompt (unix_cli_file_t * cf, clib_file_t * uf)
 {
   unix_cli_main_t *cm = &unix_cli_main;
 
   if (cf->is_interactive)	/* Only interactive sessions get a prompt */
-    unix_vlib_cli_output_raw (cf, uf, cm->cli_prompt,
-			      vec_len (cm->cli_prompt));
+    unix_vlib_cli_output_raw_force (cf, uf, cm->cli_prompt, vec_len (cm->cli_prompt),
+				    UNIX_CLI_OUTPUT_FORCE);
 }
 
 /** @brief Output a pager prompt and show number of buffered lines */
@@ -2869,9 +2967,13 @@ done:
    * order to move on to closing the session. Commands with no output
    * would thus cause vppctl to hang indefinitely in non-interactive mode
    * since there is also no prompt sent after the command completes.
+   *
+   * This is the only completion signal the client gets, so it is queued past
+   * the pending output limit: a command whose report filled the buffer still
+   * has to tell the client it finished, or the client waits forever.
    */
   if (!cf->is_interactive)
-    unix_vlib_cli_output_raw (cf, uf, (u8 *) "\0", 1);
+    unix_vlib_cli_output_raw_force (cf, uf, (u8 *) "\0", 1, UNIX_CLI_OUTPUT_FORCE_OR_CLOSE);
 }
 
 /** Destroy a CLI session.
