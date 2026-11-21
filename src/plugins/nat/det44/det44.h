@@ -552,15 +552,18 @@ snat_det_ses_close (u32 thread_index, snat_det_map_t *dm, snat_det_session_t *se
   ip_protocol_t proto;
   u16 in_port;
 
-  if (!clib_atomic_bool_cmp_and_swap (&ses->in_port, ses->in_port, 0))
+  /* The compare and swap clears in_port when it succeeds, so read the port
+     before it and keep it: the delete record names the session it ends.
+     The ports stay in the byte order the packet header uses, which is the
+     order the other NAT plugins hand their records. */
+  in_port = ses->in_port;
+  if (!clib_atomic_bool_cmp_and_swap (&ses->in_port, in_port, 0))
     return;
 
-  in_port = clib_net_to_host_u16 (ses->in_port);
   proto = ses->proto;
   snat_det_session_addresses (dm, ses, &in_addr, &out_addr);
   nat_ipfix_logging_nat44_ses_delete (thread_index, in_addr.as_u32, out_addr.as_u32, proto, in_port,
-				      clib_net_to_host_u16 (ses->out.out_port),
-				      dmain->outside_fib_index);
+				      ses->out.out_port, dmain->outside_fib_index);
 
   ses->out.as_u64 = 0;
   clib_atomic_add_fetch (&dm->ses_num, -1);
