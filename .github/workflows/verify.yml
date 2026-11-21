@@ -28,7 +28,10 @@ on:
 
 # One run per ref: a new push to the same branch cancels the previous run.
 concurrency:
-  group: verify-${{ github.ref }}
+  # A pull request and a dispatch run share their head branch, so the
+  # dispatch is a group of its own: it drives the twelve shards and is not
+  # cancelled by, nor cancels, the run a push to the same branch starts.
+  group: verify-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 permissions:
@@ -268,27 +271,35 @@ jobs:
           # arrays are joined with commas between them. The suites are read one
           # per line in list order, so the shards hold the same suites in the
           # same order on every run.
-          batches=""
+          batches="["
           offset=0
-          index=0
-          while [ "${index}" -lt "${total}" ]; do
+          placed=0
+          while [ "${placed}" -lt "${total}" ]; do
             size="${per_shard}"
-            if [ "${index}" -lt "${remainder}" ]; then
+            if [ "${placed}" -lt "${remainder}" ]; then
               size=$((size + 1))
             fi
             shard=$(printf '%s\n' "${suites}" | sed -n "$((offset + 1)),$((offset + size))p" |
-                    sed 's/^/"/; s/$/"/' | tr '\n' ',' | sed 's/,$//')
-            batches="${batches}${batches:+,}[${shard}]"
-            echo "Shard ${index} holds ${size} suite(s): $(printf '%s\n' "${suites}" |
-              sed -n "$((offset + 1)),$((offset + size))p" | tr '\n' ' ')"
+                    sed 's/^/"/; s/$/"/' | sed ':a;N;$!ba;s/\n/,/g')
+            # The outer array opened above, so every shard but the first takes
+            # a comma before its own bracket.
+            if [ "${placed}" -ne 0 ]; then
+              batches="${batches},"
+            fi
+            batches="${batches}[${shard}]"
             offset=$((offset + size))
-            index=$((index + 1))
+            placed=$((placed + size))
           done
           batches="${batches}]"
-          count=$(printf '%s' "${batches}" | grep -o '\["' | wc -l)
-          echo "Split ${total} suite(s) into ${count} shard(s)"
+          # An empty matrix is a workflow error, so a filter that selects
+          # nothing stops the run here with the reason instead.
+          if [ "${total}" -eq 0 ]; then
+            echo "::error::The suite filter selected no suite; the test matrix would be empty"
+            exit 1
+          fi
+          echo "Split ${total} suite(s) into ${shard_count} shard(s)"
           echo "batches=${batches}" >> "$GITHUB_OUTPUT"
-          echo "batch_count=${count}" >> "$GITHUB_OUTPUT"
+          echo "batch_count=${shard_count}" >> "$GITHUB_OUTPUT"
 
   build-test:
     name: build and test (${{ matrix.variant }})
@@ -1477,6 +1488,7 @@ jobs:
   # shard's outcome is, so a cancelled or timed-out shard still leaves a
   # readable record.
   test:
+    # Each shard is its own matrix entry, so it is its own job in the run list.
     name: test (${{ matrix.variant }} shard)
     needs: [test-plan, build-test]
     # A failed or cancelled build has no image for these runners. A failed
@@ -1568,9 +1580,9 @@ jobs:
         run: |
           set -eu
           git config --global --add safe.directory "$PWD"
-          # One summary per shard: the shard's position in the matrix keeps two
-          # shards from writing over each other's file.
-          SUMMARY_FILE="${RUNNER_TEMP}/vpp-shard-summary-${{ strategy.job-index }}.txt"
+          # One summary per shard, named after the shard's position in its
+          # matrix, so two shards never write over each other's file.
+          SUMMARY_FILE="${RUNNER_TEMP}/vpp-shard-summary-${{ strategy.job-index }}-${{ strategy.job-total }}.txt"
           read -ra suites <<< "${TEST}"
           if [ "${#suites[@]}" -eq 0 ]; then
             echo "::error::This shard holds no suite"
@@ -1628,7 +1640,7 @@ jobs:
       - name: Report the shard summary
         if: always()
         run: |
-          SUMMARY_FILE="${RUNNER_TEMP}/vpp-shard-summary-${{ strategy.job-index }}.txt"
+          SUMMARY_FILE="${RUNNER_TEMP}/vpp-shard-summary-${{ strategy.job-index }}-${{ strategy.job-total }}.txt"
           if [ ! -s "${SUMMARY_FILE}" ]; then
             echo "No suite finished before this step ran" > "${SUMMARY_FILE}"
           fi
@@ -1639,7 +1651,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vpp-shard-summary-${{ matrix.variant }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: vpp-shard-summary-${{ strategy.job-index }}-of-${{ strategy.job-total }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/vpp-shard-summary-*.txt
           retention-days: 7
           if-no-files-found: warn
