@@ -508,6 +508,11 @@ vnet_classify_entry_is_equal (vnet_classify_entry_t *v, const u8 *d, u8 *m, u32 
   if (PREDICT_FALSE (load_mask))
     r |= (u64x4_mask_load_zero (data + 2, load_mask) & mask[2]) ^
 	 u64x4_mask_load_zero (key + 2, load_mask);
+  load_mask >>= 4;
+
+  if (PREDICT_FALSE (load_mask))
+    r |= (u64x4_mask_load_zero (data + 3, load_mask) & mask[3]) ^
+	 u64x4_mask_load_zero (key + 3, load_mask);
 
   if (u64x4_is_all_zero (r))
     return 1;

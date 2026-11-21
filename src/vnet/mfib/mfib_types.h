@@ -221,7 +221,7 @@ extern int mfib_prefix_is_cover(const mfib_prefix_t *p1,
 /**
  * \brief Return true is the prefix is a host prefix
  */
-extern int mfib_prefix_is_host(const mfib_prefix_t *p);
+__clib_export extern int mfib_prefix_is_host(const mfib_prefix_t *p);
 
 __clib_export extern fib_forward_chain_type_t mfib_forw_chain_type_from_dpo_proto(dpo_proto_t proto);
 __clib_export extern fib_forward_chain_type_t mfib_forw_chain_type_from_fib_proto(fib_protocol_t proto);

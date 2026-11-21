@@ -7,7 +7,7 @@ import scapy.compat
 from time import sleep
 from config import config
 from framework import VppTestCase
-from ipfix import IPFIX, Set, Template, Data, IPFIXDecoder
+from ipfix import IPFIX, Template, Data, IPFIXDecoder
 from scapy.data import IP_PROTOS
 from scapy.layers.inet import IP, TCP, UDP, ICMP
 from scapy.layers.inet import IPerror, UDPerror
@@ -43,21 +43,20 @@ class TestDET44(VppTestCase):
 
     # The NAT44 session data record: observationTimeMilliseconds, then the
     # template fields of nat_template_rewrite, 26 octets as NAT44_SESSION_CREATE_LEN
-    # in src/plugins/nat/lib/ipfix_logging.c
+    # in src/plugins/nat/lib/ipfix_logging.c. Each entry is the information
+    # element, its offset in the record and its length.
     NAT44_SESSION_RECORD_LAYOUT = [
-        (230, 1),  # natEvent
-        (8, 4),  # sourceIPv4Address
-        (225, 4),  # postNATSourceIPv4Address
-        (4, 1),  # protocolIdentifier
-        (7, 2),  # sourceTransportPort
-        (227, 2),  # postNAPTSourceTransportPort
-        (234, 4),  # ingressVRFID
+        (153, 0, 8),  # observationTimeMilliseconds
+        (230, 8, 1),  # natEvent
+        (8, 9, 4),  # sourceIPv4Address
+        (225, 13, 4),  # postNATSourceIPv4Address
+        (4, 17, 1),  # protocolIdentifier
+        (7, 18, 2),  # sourceTransportPort
+        (227, 20, 2),  # postNAPTSourceTransportPort
+        (234, 22, 4),  # ingressVRFID
     ]
-    NAT44_SESSION_RECORD_FIELDS = (153,) + tuple(
-        f for f, _ in NAT44_SESSION_RECORD_LAYOUT
-    )
-    NAT44_SESSION_RECORD_LEN = 8 + sum(
-        length for _, length in NAT44_SESSION_RECORD_LAYOUT
+    NAT44_SESSION_RECORD_LEN = sum(
+        length for _, _, length in NAT44_SESSION_RECORD_LAYOUT
     )
 
     # Polls of one second that a collector snapshot waits for the exporter to
@@ -155,11 +154,19 @@ class TestDET44(VppTestCase):
         """
         Export NAT sessions to the collector on pg2
 
+        Call this before the traffic whose session events are collected.
+        nat_ipfix_logging_nat44_ses_create and the delete drop their record
+        when logging is disabled (skip_if_disabled, ipfix_logging.c:107), so a
+        session created before this call leaves no create record to collect.
+
         The capture of pg2 is enabled here, once per test. Enabling a capture
         deletes its pcap, so it has to be on before the exporter sends its
-        first packet, and nothing else clears it afterwards. A call at the
-        start of every snapshot would also delete the packets an earlier
-        snapshot left unread.
+        first packet.
+
+        The clock step lets the exporter send the templates of its reports,
+        which it sends while the session stream has sent none yet. They are
+        drained here, so a snapshot that holds no record of an event cannot
+        be mistaken for a snapshot that holds nothing but templates.
         """
         if not self.pg2._pcap_reader:
             self.pg_enable_capture([self.pg2])
@@ -170,12 +177,8 @@ class TestDET44(VppTestCase):
             template_interval=10,
         )
         self.vapi.nat_ipfix_enable_disable(domain_id=1, src_port=4739, enable=1)
-        # The flow reporting process sends a template while it has not sent
-        # one yet, and no template leaves before it sees a report. Move the
-        # clock past the reporting cycle behind this call, so the template of
-        # the session stream is in the capture before the first snapshot: a
-        # data set that arrives before its template cannot be decoded.
         self.virtual_sleep(1)
+        self.drain_ipfix_collector()
 
     def ipfix_collector_packet(self):
         """Return the next IPFIX packet exported to the collector on pg2"""
@@ -208,6 +211,10 @@ class TestDET44(VppTestCase):
         Return the NAT44 session records exported to the collector on pg2
         after this call started
 
+        The caller has to have called configure_ipfix_collector before the
+        traffic whose events are collected: logging is what writes a record,
+        and it is off until that call enables it.
+
         ipfix_flush is not synchronous: it only signals the process that
         exports, which sends the buffers of every thread on its next cycle,
         and a cycle waits up to 5 seconds of VPP time. So the collector is
@@ -225,7 +232,6 @@ class TestDET44(VppTestCase):
 
         :returns: Decoded NAT44 session records
         """
-        self.configure_ipfix_collector()
         self.drain_ipfix_collector()
         self.vapi.ipfix_flush()
         capture = []
@@ -268,21 +274,26 @@ class TestDET44(VppTestCase):
         capture names are used, so a data set of another stream in the same
         packets cannot shift the records of this one.
 
+        A data set is read from the set that encloses p[Data], not from
+        p[Set], which returns the first Set layer of the packet whatever it
+        is.
+
         :param ipfix: Decoder collecting the templates of the stream
         :param packets: Captured IPFIX packets
         :returns: Decoded data records
         """
-        template_id = next(
-            (int(p[Set].setID) for p in packets if p.haslayer(Template)), None
-        )
+        template_ids = {
+            int(p[Template].templateID) for p in packets if p.haslayer(Template)
+        }
         records = []
         for p in packets:
             if not p.haslayer(Data):
                 continue
+            data_set = p[Data].underlayer
             # a capture without any template is decoded by ipfix_stream_records
-            if template_id is not None:
-                self.assertEqual(template_id, int(p[Set].setID))
-            records.extend(ipfix.decode_data_set(p.getlayer(Set)))
+            if template_ids and int(data_set.setID) not in template_ids:
+                continue
+            records.extend(ipfix.decode_data_set(data_set))
         return records
 
     def ipfix_stream_records(self, packets):
@@ -291,8 +302,8 @@ class TestDET44(VppTestCase):
         sends, whether or not the capture carried its template
 
         The template is only in a capture when the stream sends it, and the
-        stream sends it as a set with a data set, so a snapshot of one
-        message after the template normally holds a bare data set.
+        exporter sends it as its own message, so a snapshot of one message
+        after the template normally holds a bare data set.
 
         :param packets: Captured IPFIX packets
         :returns: Decoded data records
@@ -305,7 +316,11 @@ class TestDET44(VppTestCase):
                 known_ids.add(int(p[Template].templateID))
         records = []
         for p in packets:
-            if not p.haslayer(Data) or int(p[Set].setID) in known_ids:
+            if not p.haslayer(Data):
+                continue
+            # a data set of a template in the capture is decoded by
+            # ipfix_data_records, so it is not counted here as well
+            if int(p[Data].underlayer.setID) in known_ids:
                 continue
             data = p[Data].data
             for offset in range(0, len(data), self.NAT44_SESSION_RECORD_LEN):
@@ -313,15 +328,10 @@ class TestDET44(VppTestCase):
                 if len(raw) < self.NAT44_SESSION_RECORD_LEN:
                     break
                 records.append(
-                    dict(
-                        zip(
-                            self.NAT44_SESSION_RECORD_FIELDS,
-                            [
-                                raw[o : o + length]
-                                for o, length in self.NAT44_SESSION_RECORD_LAYOUT
-                            ],
-                        )
-                    )
+                    {
+                        ie: raw[start : start + length]
+                        for ie, start, length in self.NAT44_SESSION_RECORD_LAYOUT
+                    }
                 )
         return records
 
@@ -1149,6 +1159,8 @@ class TestDET44(VppTestCase):
     def test_ipfix_tcp_session_events(self):
         """DET44 IPFIX logging of a TCP session create and delete"""
         self.add_ipfix_tcp_test_map()
+        # before the SYN, so the create of the session it claims is logged
+        self.configure_ipfix_collector()
 
         # the SYN claims the session and prints its translated port
         p = self.send_session_packet(
@@ -1211,6 +1223,8 @@ class TestDET44(VppTestCase):
     def test_ipfix_icmp_session_events(self):
         """DET44 IPFIX logging of an ICMP echo session create and delete"""
         self.add_ipfix_tcp_test_map()
+        # before the echo request, so the create of the session it claims is logged
+        self.configure_ipfix_collector()
         # the timeout has to be short before the session exists, since the
         # create fixes its expire
         timeouts = self.set_icmp_timeout(5)
@@ -1259,6 +1273,8 @@ class TestDET44(VppTestCase):
         the index of its thread.
         """
         self.add_ipfix_tcp_test_map()
+        # before the SYN, so the create of the session it claims is logged
+        self.configure_ipfix_collector()
 
         # a single SYN claims the session, the close below ends it
         p = self.send_session_packet(
@@ -1368,7 +1384,7 @@ class TestDET44(VppTestCase):
         # verify events in data set
         for p in capture:
             if p.haslayer(Data):
-                data = ipfix.decode_data_set(p.getlayer(Set))
+                data = ipfix.decode_data_set(p[Data].underlayer)
                 self.verify_ipfix_max_entries_per_user(data, 1000, self.pg0.remote_ip4)
         self.vapi.nat_ipfix_enable_disable(domain_id=1, src_port=4739, enable=0)
 
