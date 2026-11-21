@@ -1311,8 +1311,38 @@ jobs:
     timeout-minutes: 180
     container:
       image: debian:trixie
-      # Copied from the build job: the framework and the namespace, TAP and
-      # vhost tests need the same shared memory, capabilities and devices.
+      # The framework and the namespace, TAP and vhost tests need the same
+      # shared memory, capabilities and devices as the build job. The memlock
+      # limit is the one addition; it is for the af_packet suites, which the
+      # build job does not run.
+      #
+      # VPP maps every host interface's packet ring with MAP_SHARED|MAP_LOCKED
+      # (src/plugins/af_packet/af_packet.c:404-405), and the kernel charges
+      # that mapping to RLIMIT_MEMLOCK. A container inherits the daemon's
+      # limit, which is systemd's DefaultLimitMEMLOCK=8M on this image, so mmap
+      # fails with EAGAIN; the suites see `create host-interface: Resource
+      # temporarily unavailable (errno 11)` at test/asf/test_prom.py:47 and
+      # test/asf/test_http_static.py:58 and :198. --ulimit sets it for the
+      # container and for every `docker exec` the runner runs each step with,
+      # which is where VPP actually starts.
+      # The ring size comes from af_packet.c:38-48 and :369-394:
+      #
+      #   TPACKET_V3, the default of `create host-interface` and of
+      #   af_packet_create_v3: RX 2048*32*160 = 10 MiB plus TX
+      #   2048*33*1024*1 = 66 MiB, so 76 MiB.
+      #
+      #   TPACKET_V2, which test_vm_af_packet_* selects with
+      #   AF_PACKET_API_FLAG_VERSION_2: RX 2048*33*1024*1 = 66 MiB plus TX the
+      #   same, so 132 MiB.
+      #
+      # vm_vpp_interfaces.py:338 and :451 create a client and a server
+      # af_packet interface in one method, which is 264 MiB for a V2 pair in
+      # one VPP process. 1 GiB covers three such pairs, so a ring whose delete
+      # did not unmap it (af_packet_ring_free, af_packet.c:847) does not turn
+      # the next method into an errno 11. The limit is per process, so each of
+      # the concurrent test processes TEST_JOBS=auto starts gets its own.
+      # --ulimit takes plain bytes; no capability is added, because the limit
+      # is what mmap(MAP_LOCKED) checks and IPC_LOCK only bypasses it.
       options: >-
         --shm-size=2g
         --cap-add=SYS_ADMIN
@@ -1320,6 +1350,7 @@ jobs:
         --security-opt=apparmor=unconfined
         --device-cgroup-rule="c 10:200 rwm"
         --device-cgroup-rule="c 10:238 rwm"
+        --ulimit memlock=1073741824:1073741824
     defaults:
       run:
         shell: bash
