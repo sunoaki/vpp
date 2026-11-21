@@ -1050,6 +1050,44 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
         route = f"{group}/32 proto 4 multicast source {source or '0.0.0.0'}"
         return route + (f" vif {self.pair.vif_index}" if vif else "")
 
+    def test_multicast_zero_source_route_is_a_wildcard_entry(self):
+        """A route that names an all-zero source is the (*,G) entry
+
+        Netlink can carry a source attribute with an all-zero address, which
+        names no source at all: the MFIB key folds nothing into its low half
+        for such a source, so the route is the same entry a wildcard add
+        installs. It is therefore keyed at the group's own length. Keying it at
+        the (S,G) length would file it in a bucket the (S,G) lookup misses
+        because its key differs, and that the group fallback of the table
+        lookup never reaches, so nothing could find it.
+        """
+        route = self._route(self.group, vif=True)
+        try:
+            self._router("add", route)
+            present, sources = self._entry(self.group)
+            self.assertTrue(
+                present,
+                "a route with a zero source was not found as the (*,G) entry",
+            )
+            plugin_low = self._plugin_low(self.group)
+            self.assertIn(plugin_low, sources)
+            self.assertTrue(
+                sources[plugin_low][1] > 0,
+                "a route with a zero source lost its paths",
+            )
+            # The entry is the group's, so the (S,G) query does not reach it:
+            # exact match reads the host-length bucket, which this key never
+            # filled. This is the shape that made the bug invisible, and it is
+            # why the route must live in the group's bucket.
+            self.assertEqual(
+                self._entry(self.group, "0.0.0.0"),
+                (False, {}),
+                "the zero-source route was filed under the (S,G) key",
+            )
+            self.assertEqual(self._table_state(), {"refs": 1, "mcast-routes": 1})
+        finally:
+            self._router("del", route)
+
     def test_multicast_route_delete(self):
         """A deleted (S,G) leaves the MFIB, and a repeated delete changes nothing"""
         route = self._route(self.group, self.source)
