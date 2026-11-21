@@ -250,14 +250,30 @@ class TestLifecycleObservations(unittest.TestCase):
         )
         self.assertEqual(helper("_listener_states")(self), ({2: 1, 3: 0}, listeners))
         apps = (
-            f"{5:<10}{'http_static_server_9':<20}{'default':<40}\n"
-            f"{7:<10}{'http_static_server_10':<20}{'default':<40}\n"
+            f"5         {'http_static_server_9':<20} default\n"
+            f"7         {'http_static_server_10':<20} default\n"
         )
         self.vapi.cli.return_value = apps
         self.assertEqual(
             helper("_hss_apps")(self),
             ({("5", "http_static_server_9"), ("7", "http_static_server_10")}, apps),
         )
+        # A two-digit generation must not be captured as the truncation of a
+        # longer name, and the padded column ending is what separates them.
+        apps = f"4         {'http_static_server_13':<20} default\n"
+        self.vapi.cli.return_value = apps
+        self.assertEqual(
+            helper("_hss_apps")(self), ({("4", "http_static_server_13")}, apps)
+        )
+
+    def test_app_parser_rejects_truncated_name_column(self):
+        apps = (
+            "Index     Name                Namespace                               \n"
+            "4         http_static_server_1default                                 \n"
+        )
+        self.vapi = types.SimpleNamespace(cli=unittest.mock.Mock(return_value=apps))
+        with self.assertRaisesRegex(AssertionError, "http_static_server_"):
+            helper("_hss_apps")(self)
 
     def test_destroy_observer_rejects_each_retained_resource(self):
         old_app = ("5", "http_static_server_9")
@@ -440,6 +456,19 @@ class TestLifecycleObservations(unittest.TestCase):
 
 
 class TestDestroyDispatchContract(unittest.TestCase):
+    def test_app_dump_columns_grow_instead_of_truncating(self):
+        source = (ROOT / "src/vnet/session/application.c").read_text()
+        formatter = source.split("\nformat_application (u8 * s, va_list * args)", 1)[
+            1
+        ].split("\nvoid\n", 1)[0]
+        self.assertIn("vec_len (app_get_name (elt))", formatter)
+        self.assertIn(
+            "vec_len (app_namespace_id_from_index (elt->ns_index))", formatter
+        )
+        self.assertIn('"%-10u%-*v %-*v"', formatter)
+        self.assertNotIn("%-20v", formatter)
+        self.assertNotIn("%-20s", formatter)
+
     def test_source_uses_persistent_batches_and_cleanup_before_ack(self):
         source = (ROOT / "src/plugins/http_static/static_server.c").read_text()
         destroy = source.split("\nhss_destroy (vlib_main_t *vm)", 1)[1].split(
@@ -591,6 +620,16 @@ class TestPendingAcceptWitness(unittest.TestCase):
         )
         self.assertNotIn("hss_ts_accept_callback", witness)
         self.assertNotIn("clib_fifo_advance_head", witness)
+        # The listener's first fifo segment is created before the accepts, so
+        # its APP_ADD_SEGMENT notification cannot inflate the queue depth.
+        self.assertLess(
+            witness.index("segment_manager_add_segment (sm"),
+            witness.index("hss_test_accept_alloc (listener"),
+        )
+        self.assertIn(
+            "hss_test_accept_queue_depth (app_wrk, 0, &other_events)", witness
+        )
+        self.assertIn("if (i != 129 || other_events)", witness)
 
     def test_model_129_callbacks_survive_listener_handle_reuse(self):
         # This model verifies the ownership protocol, not C execution or HTTP scheduling.
