@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import selectors
+import signal
 import subprocess
 import sys
 import time
@@ -20,6 +21,13 @@ from vpp_ip_route import VppIpRoute, VppIpTable, VppRoutePath
 
 DIAGNOSTIC = "unable to initialize certificate/key pair"
 ATTEMPTS = 100
+# Cleanup never relies on a single long wait. Closing stdin is the graceful
+# path; a helper stuck inside a C call never sees the EOF, so it gets
+# EOF_TIMEOUT_S, then each escalation signal in turn with its own bound. The
+# steps add up to the single wait this replaced, so a healthy helper is never
+# cut short and a hung one is reported instead of silently killed.
+EOF_TIMEOUT_S = 20
+ESCALATION_SIGNALS = ((signal.SIGTERM, 5), (signal.SIGKILL, 5))
 # Each peer gets its own loopback, FIB table and app namespace. Both peers on
 # one loopback in the default table share an address, so the connecting peer
 # sends from the listener's own receive address and ip4-local drops every
@@ -34,6 +42,16 @@ HOSTNAME_FORMAT = re.compile(r"\bformat\b|format_ip46_address")
 # b332ab4cd returns from quic_connect_connection() without freeing the context
 # and its hostname; 40b52275d adds exactly those two frees.
 LEAKS = {"fixed": False, "original": True}
+
+
+def signame(returncode):
+    """Name the signal behind a negative subprocess return code."""
+    if returncode is not None and returncode < 0:
+        try:
+            return signal.Signals(-returncode).name
+        except ValueError:
+            return f"signal {-returncode}"
+    return f"exit code {returncode}"
 
 
 class VclProcess:
@@ -52,10 +70,11 @@ class VclProcess:
         libraries = list(Path(config.vpp_install_dir).rglob("libvppcom.so"))
         test.assertEqual(len(libraries), 1, libraries)
         conf = test.evidence / f"{name}-vcl.conf"
-        # The listener stays blocking, so accept waits on the event queue
-        # instead of racing it, and session-timeout 5 bounds the listener's
-        # listen request in vppcom_session_listen. The connect wait is bounded
-        # by CONNECT_POLL_LIMIT_S.
+        # The listener is non-blocking in the helper, so accept cannot block
+        # inside vppcom_session_accept; ACCEPT_POLL_LIMIT_S bounds the wait.
+        # session-timeout 5 bounds the listener's listen request in
+        # vppcom_session_listen and the connect wait is bounded by
+        # CONNECT_POLL_LIMIT_S.
         conf.write_text("vcl { app-scope-global app-timeout 60 session-timeout 5 }\n")
         # The helper attaches through the namespace socket, so its sessions
         # take that namespace's FIB table instead of the default one.
@@ -108,39 +127,70 @@ class VclProcess:
             )
         reply = json.loads(line)
         self.test.assertEqual(reply["id"], self.sequence)
+        # The helper answers a failed operation with "error" and then ends its
+        # loop, so the failure surfaces here with its own text and cleanup still
+        # sees a helper that exited by itself with status 0.
+        if "error" in reply:
+            raise AssertionError(
+                f"{self.name} helper failed {request}: {reply['error']}"
+            )
         return reply["result"]
 
     def stop(self):
+        """End the helper deterministically and fail if it did not exit itself.
+
+        Closing stdin is the graceful path: the request loop ends and the
+        helper's finally block runs client.destroy(). A helper blocked inside a
+        C call never sees that EOF, so it is escalated through SIGTERM and
+        SIGKILL with a bound on each step. The test still fails when a signal
+        was needed; what changes is that cleanup reports which one and finishes
+        in seconds instead of waiting out one long timeout.
+        """
         if self.stopped:
             return
         self.stopped = True
         try:
-            if self.process is not None and self.process.poll() is None:
+            if self.process is None:
+                return
+            if self.process.poll() is None:
                 try:
                     self.process.stdin.close()
                 except OSError:
-                    # The helper exited between poll() and close(); its exit
-                    # code is asserted below.
+                    # The helper exited between poll() and close(); the exit
+                    # status is checked below.
                     pass
-                try:
-                    self.process.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait(timeout=5)
+                if not self.exited(EOF_TIMEOUT_S):
+                    for signal_number, timeout in ESCALATION_SIGNALS:
+                        self.process.send_signal(signal_number)
+                        if self.exited(timeout):
+                            self.test.fail(
+                                f"{self.name} helper needed "
+                                f"{signame(-signal_number)} during cleanup, so "
+                                f"it never left the operation it was in; see "
+                                f"{self.stderr_path}"
+                            )
                     self.test.fail(
-                        f"{self.name} helper required killing during cleanup"
+                        f"{self.name} helper survived "
+                        f"{[signame(-number) for number, _ in ESCALATION_SIGNALS]} "
+                        f"during cleanup; see {self.stderr_path}"
                     )
+            self.test.assertEqual(
+                self.process.returncode,
+                0,
+                f"{self.name} helper failed: {signame(self.process.returncode)}, "
+                f"see {self.stderr_path}",
+            )
         finally:
             for handle in (self.selector, self.stderr, self.transcript):
                 if handle is not None:
                     handle.close()
-        if self.process is not None:
-            self.test.assertEqual(
-                self.process.returncode,
-                0,
-                f"{self.name} helper failed with code {self.process.returncode}, "
-                f"see {self.stderr_path}",
-            )
+
+    def exited(self, timeout):
+        try:
+            self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
 
 
 @unittest.skipIf("quic" in config.excluded_plugins, "QUIC plugin excluded")
@@ -342,17 +392,21 @@ class QUICCredentialFailure(VppAsfTestCase):
         listening = self.snapshot()
         before = self.trace(label + "-before")
         connected = client.request("connect", timeout=15)
-        accepted = server.request("accept", timeout=15)
         # The client dials through its own namespace, so its source address is
         # its own loopback's address and the reply comes back over the route
         # installed above. session_connect returns EINPROGRESS for a
         # non-blocking session by design; "connected" is the settled outcome
-        # the helper observed.
+        # the helper observed. Assert it before the accept: the accept only has
+        # something to accept when the client reached a handshake, so asserting
+        # after it would report a silent accept timeout in place of the connect
+        # error that actually caused it.
         self.assertEqual(connected["connect"], -115, connected)
         self.assertTrue(connected["connected"], connected)
         self.assertEqual(connected["errors"], [0], connected)
         self.assertLessEqual(connected["waited_s"], 5.0, connected)
+        accepted = server.request("accept", timeout=15)
         self.assertGreaterEqual(accepted["accepted"], 0)
+        self.assertLessEqual(accepted["waited_s"], 5.0, accepted)
         live = self.snapshot()
         thread = str(min(1, self.vpp_worker_count))
         delta = {

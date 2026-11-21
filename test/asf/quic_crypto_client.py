@@ -8,6 +8,7 @@ libvppcom.so of any checkout under test.
 """
 
 import ctypes as ct
+import errno
 import json
 import socket
 import sys
@@ -22,6 +23,10 @@ ATTR_SET_CKPAIR = 35
 # vppcom_session_connect returns this for every non-blocking session, whatever
 # the outcome; the outcome arrives later as a session error or as writeability.
 VPPCOM_EINPROGRESS = -115
+# vppcom_session_accept returns VPPCOM_EAGAIN for a non-blocking listener as
+# soon as the app event queue holds no accept event. vppcom.h defines it as
+# -EAGAIN, so take the value from errno rather than hardcoding it.
+VPPCOM_EAGAIN = -errno.EAGAIN
 # A certificate that ptls_load_certificate_chain() rejects while the private
 # key loads, so the crypto context is built but no certificate chain is.
 MALFORMED_CERT = b"-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n"
@@ -29,6 +34,11 @@ MALFORMED_CERT = b"-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n"
 # closes the handle, so a stalled attempt cannot reach the VCL session-timeout.
 CONNECT_POLL_LIMIT_S = 5.0
 CONNECT_POLL_INTERVAL_S = 0.01
+# Upper bound on how long accept() waits for an accept event. The listener is
+# non-blocking, and vppcom_session_accept on a non-blocking listener returns
+# VPPCOM_EAGAIN instead of waiting, so this bound is what keeps a handshake
+# that never completes from blocking the helper inside the C call.
+ACCEPT_POLL_LIMIT_S = 5.0
 
 
 class Endpoint(ct.Structure):
@@ -218,11 +228,14 @@ class Client:
         }
 
     def listen(self):
-        # vppcom_session_accept returns VPPCOM_EAGAIN as soon as the app event
-        # queue is empty for a non-blocking listener, without flushing the MQ,
-        # so an accept can race the in-flight connect notification. A blocking
-        # listener instead waits on the MQ and flushes it before re-checking.
-        self.listener = self.session(is_nonblocking=0)
+        # The listener must be non-blocking: vppcom_session_accept waits on the
+        # worker message queue without a timeout (src/vcl/vppcom.c, the
+        # vcl_worker_wait_mq(wrk, -1, ...) loop) for a blocking listener, so a
+        # handshake that never completes would block the helper inside the C
+        # call and no later operation, close or app_destroy could run. A
+        # non-blocking listener returns VPPCOM_EAGAIN instead, and accept()
+        # bounds the wait with vppcom_select.
+        self.listener = self.session(is_nonblocking=1)
         self.require_zero(
             self.call("session_bind", self.listener, ct.byref(self.endpoint)),
             "session_bind",
@@ -232,11 +245,52 @@ class Client:
         )
         return {"listener": self.listener}
 
+    def wait_readable(self, handle, timeout):
+        """Wait until the session is readable, draining the app event queue.
+
+        For a listener, readability means its accept_evts_fifo has an entry, so
+        this is what turns the accept wait into a bounded one.
+        """
+        index = self.call("session_index", handle)
+        n_bits = index + 1
+        words = (n_bits + 63) // 64
+        read_map = (ct.c_ulong * words)()
+        read_map[index // 64] = 1 << (index % 64)
+        return self.call("select", n_bits, read_map, None, None, float(timeout))
+
     def accept(self):
-        self.connection = self.call("session_accept", self.listener, None, 0)
-        if self.connection < 0:
-            raise RuntimeError(f"session_accept failed: {self.connection}")
-        return {"accepted": self.connection}
+        """Accept one connection, waiting at most ACCEPT_POLL_LIMIT_S for it.
+
+        vppcom_session_accept on a non-blocking listener returns VPPCOM_EAGAIN
+        rather than waiting, so the wait belongs here: poll the listener's
+        readability and only call accept once an accept event is queued. A
+        handshake that never completes is then reported as a timeout with the
+        seconds waited instead of blocking the helper.
+        """
+        started = time.monotonic()
+        polls = 0
+        while True:
+            remaining = ACCEPT_POLL_LIMIT_S - (time.monotonic() - started)
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"session_accept saw no connection within "
+                    f"{ACCEPT_POLL_LIMIT_S}s on listener {self.listener} "
+                    f"after {polls} polls"
+                )
+            polls += 1
+            self.wait_readable(self.listener, min(remaining, CONNECT_POLL_INTERVAL_S))
+            handle = self.call("session_accept", self.listener, None, 0)
+            if handle == VPPCOM_EAGAIN:
+                continue
+            if handle < 0:
+                raise RuntimeError(f"session_accept failed: {handle}")
+            self.connection = handle
+            break
+        return {
+            "accepted": self.connection,
+            "polls": polls,
+            "waited_s": round(time.monotonic() - started, 3),
+        }
 
     def close(self):
         reply = {}
@@ -284,10 +338,24 @@ def main():
             operation = OPERATIONS.get(request["operation"])
             if operation is None:
                 raise ValueError(f"unknown operation {request['operation']}")
-            print(
-                json.dumps({"id": request["id"], "result": operation(client, request)}),
-                flush=True,
-            )
+            # Report a failed operation as a reply rather than letting it end
+            # the process: an exception here would skip the remaining requests,
+            # so the test would also report a helper that exited early and the
+            # original failure would be buried under a cleanup failure.
+            try:
+                reply = {"result": operation(client, request)}
+            except Exception as error:
+                print(
+                    json.dumps(
+                        {
+                            "id": request["id"],
+                            "error": f"{type(error).__name__}: {error}",
+                        }
+                    ),
+                    flush=True,
+                )
+                break
+            print(json.dumps(dict(reply, id=request["id"])), flush=True)
     finally:
         client.destroy()
 
