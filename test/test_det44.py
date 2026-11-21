@@ -155,11 +155,19 @@ class TestDET44(VppTestCase):
         """
         Export NAT sessions to the collector on pg2
 
+        Call this before the traffic whose session events are collected.
+        nat_ipfix_logging_nat44_ses_create and the delete drop their record
+        when logging is disabled (skip_if_disabled, ipfix_logging.c:107), so a
+        session created before this call leaves no create record to collect.
+
         The capture of pg2 is enabled here, once per test. Enabling a capture
         deletes its pcap, so it has to be on before the exporter sends its
-        first packet, and nothing else clears it afterwards. A call at the
-        start of every snapshot would also delete the packets an earlier
-        snapshot left unread.
+        first packet.
+
+        The clock step lets the exporter send the templates of its reports,
+        which it sends while the session stream has sent none yet. They are
+        drained here, so a snapshot that holds no record of an event cannot
+        be mistaken for a snapshot that holds nothing but templates.
         """
         if not self.pg2._pcap_reader:
             self.pg_enable_capture([self.pg2])
@@ -170,12 +178,8 @@ class TestDET44(VppTestCase):
             template_interval=10,
         )
         self.vapi.nat_ipfix_enable_disable(domain_id=1, src_port=4739, enable=1)
-        # The flow reporting process sends a template while it has not sent
-        # one yet, and no template leaves before it sees a report. Move the
-        # clock past the reporting cycle behind this call, so the template of
-        # the session stream is in the capture before the first snapshot: a
-        # data set that arrives before its template cannot be decoded.
         self.virtual_sleep(1)
+        self.drain_ipfix_collector()
 
     def ipfix_collector_packet(self):
         """Return the next IPFIX packet exported to the collector on pg2"""
@@ -208,6 +212,10 @@ class TestDET44(VppTestCase):
         Return the NAT44 session records exported to the collector on pg2
         after this call started
 
+        The caller has to have called configure_ipfix_collector before the
+        traffic whose events are collected: logging is what writes a record,
+        and it is off until that call enables it.
+
         ipfix_flush is not synchronous: it only signals the process that
         exports, which sends the buffers of every thread on its next cycle,
         and a cycle waits up to 5 seconds of VPP time. So the collector is
@@ -225,7 +233,6 @@ class TestDET44(VppTestCase):
 
         :returns: Decoded NAT44 session records
         """
-        self.configure_ipfix_collector()
         self.drain_ipfix_collector()
         self.vapi.ipfix_flush()
         capture = []
@@ -1149,6 +1156,8 @@ class TestDET44(VppTestCase):
     def test_ipfix_tcp_session_events(self):
         """DET44 IPFIX logging of a TCP session create and delete"""
         self.add_ipfix_tcp_test_map()
+        # before the SYN, so the create of the session it claims is logged
+        self.configure_ipfix_collector()
 
         # the SYN claims the session and prints its translated port
         p = self.send_session_packet(
@@ -1211,6 +1220,8 @@ class TestDET44(VppTestCase):
     def test_ipfix_icmp_session_events(self):
         """DET44 IPFIX logging of an ICMP echo session create and delete"""
         self.add_ipfix_tcp_test_map()
+        # before the echo request, so the create of the session it claims is logged
+        self.configure_ipfix_collector()
         # the timeout has to be short before the session exists, since the
         # create fixes its expire
         timeouts = self.set_icmp_timeout(5)
@@ -1259,6 +1270,8 @@ class TestDET44(VppTestCase):
         the index of its thread.
         """
         self.add_ipfix_tcp_test_map()
+        # before the SYN, so the create of the session it claims is logged
+        self.configure_ipfix_collector()
 
         # a single SYN claims the session, the close below ends it
         p = self.send_session_packet(
