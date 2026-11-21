@@ -2305,6 +2305,7 @@ class IpsecTun4(IpsecCounterWindowMixin, VppTestCase):
 
     def verify_tun_reass_44(self, p):
         self.vapi.cli("clear errors")
+        counters = self.open_tunnel_counters(4)
         self.vapi.ip_reassembly_enable_disable(
             sw_if_index=self.tun_if.sw_if_index, enable_ip4=True
         )
@@ -2333,7 +2334,6 @@ class IpsecTun4(IpsecCounterWindowMixin, VppTestCase):
             self.logger.info(self.vapi.ppcli("show error"))
             self.logger.info(self.vapi.ppcli("show ipsec all"))
 
-        counters = self.open_tunnel_counters(4)
         self.verify_counters4(p, 1, 1, counters=counters)
         self.vapi.ip_reassembly_enable_disable(
             sw_if_index=self.tun_if.sw_if_index, enable_ip4=False
