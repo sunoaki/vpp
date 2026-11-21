@@ -109,11 +109,25 @@ class TestGreTeib(VppTestCase):
         return entry
 
     def bind_pg1_to_table(self, is_ip6, table_id):
-        """bind pg1's family to a table, failing here if VPP declines"""
-        bind = self.vapi.sw_interface_set_table(
-            self.pg1.sw_if_index, 1 if is_ip6 else 0, table_id
-        )
-        self.assertEqual(bind.retval, 0)
+        """bind pg1's family to a table, failing here if VPP declines
+
+        ip_table_bind answers ADDRESS_FOUND_FOR_INTERFACE for every bind, the
+        one back to table 0 included, while the interface still holds a global
+        address of the family, and setUp leaves pg1 holding one of each. So the
+        address comes off before the bind and goes back on after it, and the
+        interface keeps it in whichever table it was moved to.
+        """
+        interface = self.pg1
+        address = self.vapi.sw_interface_add_del_address
+        prefix = interface.local_ip6_prefix if is_ip6 else interface.local_ip4_prefix
+        address(sw_if_index=interface.sw_if_index, prefix=prefix, is_add=0)
+        try:
+            bind = self.vapi.sw_interface_set_table(
+                interface.sw_if_index, 1 if is_ip6 else 0, table_id
+            )
+            self.assertEqual(bind.retval, 0)
+        finally:
+            address(sw_if_index=interface.sw_if_index, prefix=prefix)
 
     def add_peer_raw(self, tunnel, is_ip6, peer):
         """add peer the way make_peer does, without registering or checking"""
