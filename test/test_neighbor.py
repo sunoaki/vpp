@@ -2023,6 +2023,19 @@ class ARPTestCase(VppTestCase):
         self.assertEqual(rx[0][Ether].dst, self.pg2.remote_hosts[1].mac)
 
         #
+        # the host route the neighbour installed keeps resolving through this
+        # interface after the move. It is the adj-fib, and its path names the
+        # next hop and interface rather than the MAC, so the MAC change is
+        # carried by the adjacency rewrite the packet above followed.
+        #
+        self.assertEqual(
+            self.get_adj_sourced_routes(
+                VppIpTable(self, 0, register=False), self.pg2.sw_if_index
+            ),
+            [self.pg2.remote_hosts[0].ip4],
+        )
+
+        #
         # clean-up
         #
         static_arp.remove_vpp_config()
@@ -2253,6 +2266,168 @@ class ARPTestCase(VppTestCase):
         self.assertFalse(
             find_nbr(self, first_index, addr, is_static=1),
         )
+
+    def test_arp_rebind_via_cli(self):
+        """A static re-add at the CLI moves the neighbour; a learn does not
+
+        'set ip neighbor static' is operator intent, so naming a new MAC for an
+        entry that already exists moves the neighbour and its rewrite to that
+        MAC and the command succeeds. The same request without 'static' is a
+        learn, which a static entry refuses, and the CLI must report that
+        refusal instead of returning success.
+        """
+        self.pg2.generate_remote_hosts(2)
+        self.pg2.config_ip4()
+
+        static_arp = VppNeighbor(
+            self,
+            self.pg2.sw_if_index,
+            self.pg2.remote_hosts[0].mac,
+            self.pg2.remote_hosts[0].ip4,
+            is_static=1,
+        )
+        static_arp.add_vpp_config()
+
+        #
+        # pin the entry to the second host's MAC through the CLI and expect
+        # the command to report success, with the neighbour following it
+        #
+        reply = self.vapi.cli_return_response(
+            "set ip neighbor static %s %s %s"
+            % (
+                self.pg2.name,
+                self.pg2.remote_hosts[0].ip4,
+                self.pg2.remote_hosts[1].mac,
+            )
+        )
+        self.assertEqual(reply.retval, 0)
+        self.assertTrue(
+            find_nbr(
+                self,
+                self.pg2.sw_if_index,
+                self.pg2.remote_hosts[0].ip4,
+                is_static=1,
+                mac=self.pg2.remote_hosts[1].mac,
+            )
+        )
+
+        #
+        # the same address with another MAC, not flagged static, is a learn
+        # and stays refused. The CLI reports the failure and names the error,
+        # which is what the operator needs to tell a refusal from a success.
+        # The dispatcher above the command function returns the generic -1 for
+        # any command failure, so the reason has to be in the reply text.
+        #
+        reply = self.vapi.cli_return_response(
+            "set ip neighbor %s %s %s"
+            % (
+                self.pg2.name,
+                self.pg2.remote_hosts[0].ip4,
+                self.pg2.remote_hosts[0].mac,
+            )
+        )
+        self.assertEqual(reply.retval, -1)
+        self.assertEqual(
+            reply.reply.strip(),
+            "set ip neighbor: %s with mac %s on %s: Entry already exists"
+            % (
+                self.pg2.remote_hosts[0].ip4,
+                self.pg2.remote_hosts[0].mac,
+                self.pg2.name,
+            ),
+        )
+        self.assertTrue(
+            find_nbr(
+                self,
+                self.pg2.sw_if_index,
+                self.pg2.remote_hosts[0].ip4,
+                is_static=1,
+                mac=self.pg2.remote_hosts[1].mac,
+            )
+        )
+
+        #
+        # clean-up
+        #
+        static_arp.remove_vpp_config()
+        self.pg2.unconfig_ip4()
+
+    def test_arp_cli_count_reports_a_refusal(self):
+        """'count' keeps adding after a refusal and still reports it
+
+        The count loop adds a block of neighbours that differ in address and in
+        MAC. One entry of the block being refused must not stop the ones after
+        it, and the command must still fail so the operator sees the refusal.
+        """
+        #
+        # addresses on a prefix pg2 does not have a connected route for, so
+        # the case depends on no configuration of the generated hosts
+        #
+        first_ip = "10.77.0.2"
+        second_ip = "10.77.0.3"
+        first_mac = "aa:bb:cc:00:00:02"
+        second_mac = "aa:bb:cc:00:00:03"
+
+        #
+        # the first address of the block is a static entry with another MAC,
+        # so the learn for it is refused
+        #
+        static_arp = VppNeighbor(
+            self,
+            self.pg2.sw_if_index,
+            "aa:bb:cc:00:00:01",
+            first_ip,
+            is_static=1,
+        )
+        static_arp.add_vpp_config()
+
+        #
+        # the block starts at that address and moves both the address and the
+        # MAC on by one for the second entry
+        #
+        reply = self.vapi.cli_return_response(
+            "set ip neighbor %s %s %s count 2" % (self.pg2.name, first_ip, first_mac)
+        )
+
+        self.assertEqual(reply.retval, -1)
+        self.assertEqual(
+            reply.reply.strip(),
+            "set ip neighbor: %s with mac %s on %s: Entry already exists"
+            % (first_ip, first_mac, self.pg2.name),
+        )
+
+        #
+        # the refused entry kept its MAC, and the entry after it was added
+        #
+        self.assertTrue(
+            find_nbr(
+                self,
+                self.pg2.sw_if_index,
+                first_ip,
+                is_static=1,
+                mac="aa:bb:cc:00:00:01",
+            )
+        )
+        self.assertTrue(
+            find_nbr(
+                self,
+                self.pg2.sw_if_index,
+                second_ip,
+                is_static=0,
+                mac=second_mac,
+            )
+        )
+
+        #
+        # clean-up
+        #
+        VppNeighbor(
+            self,
+            self.pg2.sw_if_index,
+            second_mac,
+            second_ip,
+        ).remove_vpp_config()
+        static_arp.remove_vpp_config()
 
     def test_arp_incomplete(self):
         """ARP Incomplete"""

@@ -1063,6 +1063,7 @@ ip_neighbor_cmd (vlib_main_t * vm,
   mac_address_t mac = ZERO_MAC_ADDRESS;
   vnet_main_t *vnm = vnet_get_main ();
   ip_neighbor_flags_t flags;
+  clib_error_t *error = NULL;
   u32 sw_if_index = ~0;
   int is_add = 1, is_flush = 0;
   int count = 1;
@@ -1109,7 +1110,23 @@ ip_neighbor_cmd (vlib_main_t * vm,
   while (count)
     {
       if (is_add)
-	ip_neighbor_add (&ip, &mac, sw_if_index, flags, NULL);
+	{
+	  int rv;
+
+	  rv = ip_neighbor_add (&ip, &mac, sw_if_index, flags, NULL);
+
+	  /*
+	   * Report the first refusal and keep going, so the entries after it
+	   * are still programmed: 'count N' adds a block of neighbours, and one
+	   * of them already being an operator-programmed static entry with
+	   * another MAC does not invalidate the rest. Dropping the return value
+	   * here told the operator the add happened when it did not.
+	   */
+	  if (rv && !error)
+	    error = clib_error_return_code (
+	      0, rv, 0, "%U with mac %U on %U: %U", format_ip_address, &ip, format_mac_address_t,
+	      &mac, format_vnet_sw_if_index_name, vnm, sw_if_index, format_vnet_api_errno, rv);
+	}
       else
 	ip_neighbor_del (&ip, sw_if_index);
 
@@ -1119,7 +1136,7 @@ ip_neighbor_cmd (vlib_main_t * vm,
       --count;
     }
 
-  return NULL;
+  return error;
 }
 
 /*?
