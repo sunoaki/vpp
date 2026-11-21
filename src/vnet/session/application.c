@@ -1857,12 +1857,23 @@ format_application (u8 * s, va_list * args)
   const u8 *app_ns_name, *app_name;
   app_worker_map_t *wrk_map;
   app_worker_t *app_wrk;
-  u32 indent = 2;
+  application_t *elt;
+  u32 indent = 2, name_width = 20, ns_width = 40;
+
+  /* A name is an identifier, so a column wider than its minimum grows to fit
+   * instead of truncating a longer name into the next one. */
+  if (!verbose)
+    pool_foreach (elt, app_main.app_pool)
+      {
+	name_width = clib_max (name_width, vec_len (app_get_name (elt)));
+	ns_width = clib_max (ns_width, vec_len (app_namespace_id_from_index (elt->ns_index)));
+      }
 
   if (app == 0)
     {
       if (!verbose)
-	s = format (s, "%-10s%-20s%-40s", "Index", "Name", "Namespace");
+	s = format (s, "%-10s%-*s %-*s", "Index", (int) name_width, "Name", (int) ns_width,
+		    "Namespace");
       return s;
     }
 
@@ -1871,7 +1882,7 @@ format_application (u8 * s, va_list * args)
   props = application_segment_manager_properties (app);
   if (!verbose)
     {
-      s = format (s, "%-10u%-20v%-40v", app->app_index, app_name,
+      s = format (s, "%-10u%-*v %-*v", app->app_index, (int) name_width, app_name, (int) ns_width,
 		  app_ns_name);
       return s;
     }

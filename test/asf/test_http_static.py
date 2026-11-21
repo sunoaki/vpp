@@ -433,10 +433,13 @@ else:
 
     def _hss_apps(self):
         output = self.vapi.cli("show app")
+        # The name column is padded, so a name is only a name when a space
+        # follows it. A truncated column would glue the namespace onto it.
         apps = set(
-            re.findall(r"^\s*(\d+)\s+(http_static_server_\d+)", output, re.MULTILINE)
+            re.findall(r"^\s*(\d+)\s+(http_static_server_\d+)\s", output, re.MULTILINE)
         )
-        self.assertEqual(len(apps), output.count("http_static_server_"), output)
+        found = output.count("http_static_server_")
+        self.assertEqual(found, len(apps), output)
         return apps, output
 
     def _wait_listener_gone(self, index):

@@ -1454,6 +1454,26 @@ hss_test_accept_free (session_handle_t handle)
   session_free (s);
 }
 
+static u32
+hss_test_accept_queue_depth (app_worker_t *app_wrk, clib_thread_index_t thread_index,
+			     u32 *other_events)
+{
+  session_event_t *evt;
+  u32 i, accepted = 0;
+
+  *other_events = 0;
+  for (i = 0; i < clib_fifo_elts (app_wrk->wrk_evts[thread_index]); i++)
+    {
+      evt =
+	app_wrk->wrk_evts[thread_index] + clib_fifo_elt_index (app_wrk->wrk_evts[thread_index], i);
+      if (evt->event_type == SESSION_CTRL_EVT_ACCEPTED)
+	accepted++;
+      else
+	(*other_events)++;
+    }
+  return accepted;
+}
+
 static clib_error_t *
 hss_test_accept_batches (app_worker_t *app_wrk, u32 old_index)
 {
@@ -1512,11 +1532,12 @@ hss_test_pending_accept_command_fn (vlib_main_t *vm, unformat_input_t *input,
   vnet_app_detach_args_t da;
   session_handle_t handles[130], listener;
   app_worker_t *app_wrk;
+  segment_manager_t *sm;
   hss_session_t *hs;
   hss_listener_t *l;
   session_t *s;
   clib_error_t *error = 0;
-  u32 old_index = ~0, new_index = ~0, count = 0, i;
+  u32 old_index = ~0, new_index = ~0, count = 0, i, other_events = 0;
   hss_listener_t saved_default = hsm->default_listener;
   u64 saved_segment_size = hsm->private_segment_size;
   u32 saved_fifo_size = hsm->fifo_size, saved_prealloc = hsm->prealloc_fifos;
@@ -1564,6 +1585,25 @@ hss_test_pending_accept_command_fn (vlib_main_t *vm, unformat_input_t *input,
     }
   old_index = cfg.l_index;
   listener = hss_test_listener_handle (old_index);
+
+  /* A listener segment manager starts without a fifo segment, so the first
+   * accept creates one and queues an APP_ADD_SEGMENT notification on this
+   * thread. Create the segment here so the depth assertion counts accepts. */
+  sm = app_worker_get_listen_segment_manager (app_wrk, listen_session_get_from_handle (listener));
+  if (!pool_elts (sm->segments) &&
+      segment_manager_add_segment (sm, 0 /* segment_size */, 1 /* notify_app */) < 0)
+    {
+      error = clib_error_return (0, "pending accept segment allocation failed");
+      goto done;
+    }
+  app_wrk_flush_wrk_events (app_wrk, 0);
+  if (clib_fifo_elts (app_wrk->wrk_evts[0]))
+    {
+      error = clib_error_return (0, "pending accept segment notification retained %u",
+				 clib_fifo_elts (app_wrk->wrk_evts[0]));
+      goto done;
+    }
+
   for (i = 0; i < 129; i++)
     {
       handles[count] =
@@ -1578,10 +1618,11 @@ hss_test_pending_accept_command_fn (vlib_main_t *vm, unformat_input_t *input,
   clib_atomic_add_fetch (&hss_listener_get (old_index)->ref_count, 1);
   guard = 1;
   vec_validate (hss_pending_accepts, 0);
-  if (clib_fifo_elts (app_wrk->wrk_evts[0]) != 129)
+  i = hss_test_accept_queue_depth (app_wrk, 0, &other_events);
+  if (i != 129 || other_events)
     {
-      error = clib_error_return (0, "pending accept queue %u, expected 129",
-				 clib_fifo_elts (app_wrk->wrk_evts[0]));
+      error = clib_error_return (0, "pending accept queue %u accepted %u, expected 129 accepted",
+				 i + other_events, i);
       goto done;
     }
   if (hss_listener_del (&cfg))
