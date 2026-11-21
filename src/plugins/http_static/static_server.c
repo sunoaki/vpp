@@ -2107,12 +2107,28 @@ format_hss_listener (u8 *s, va_list *args)
   return s;
 }
 
+/*
+ * Listener slots are released with pool_put and never compacted, so slot 0 is
+ * free as soon as the listener that occupied it goes away while the server
+ * keeps running. An index the caller did not name therefore has to resolve to
+ * the default listener, not to slot 0.
+ */
+static int
+hss_cli_resolve_listener_index (u32 *l_index)
+{
+  hss_main_t *hsm = &hss_main;
+
+  if (*l_index == (u32) ~0)
+    *l_index = hsm->default_listener_index;
+  return *l_index == (u32) ~0;
+}
+
 static clib_error_t *
 hss_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		     vlib_cli_command_t *cmd)
 {
   int verbose = 0, show_cache = 0, show_sessions = 0, show_listeners = 0;
-  u32 l_index = 0;
+  u32 l_index = (u32) ~0;
   hss_main_t *hsm = &hss_main;
 
   if (!hsm->is_init)
@@ -2141,7 +2157,11 @@ hss_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   if (show_cache)
     {
-      hss_listener_t *l = hss_listener_get (l_index);
+      hss_listener_t *l;
+
+      if (hss_cli_resolve_listener_index (&l_index))
+	return clib_error_return (0, "no default listener");
+      l = hss_listener_get (l_index);
       if (l == 0)
 	return clib_error_return (0, "listener %d not found", l_index);
       if (l->cache)
@@ -2197,8 +2217,8 @@ hss_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
 ?*/
 VLIB_CLI_COMMAND (hss_show_command, static) = {
   .path = "show http static server",
-  .short_help = "show http static server [sessions] [cache] [listeners] "
-		"[verbose [<nn>]]",
+  .short_help = "show http static server [sessions] [cache [<index>]] "
+		"[listeners] [verbose [<nn>]]",
   .function = hss_show_command_fn,
 };
 
@@ -2207,7 +2227,7 @@ hss_clear_cache_command_fn (vlib_main_t *vm, unformat_input_t *input,
 			    vlib_cli_command_t *cmd)
 {
   hss_main_t *hsm = &hss_main;
-  u32 busy_items = 0, l_index = 0;
+  u32 busy_items = 0, l_index = (u32) ~0;
   hss_listener_t *l;
 
   if (!hsm->is_init)
@@ -2223,6 +2243,9 @@ hss_clear_cache_command_fn (vlib_main_t *vm, unformat_input_t *input,
 				    format_unformat_error, input);
 	}
     }
+
+  if (hss_cli_resolve_listener_index (&l_index))
+    return clib_error_return (0, "no default listener");
 
   l = hss_listener_get (l_index);
   if (l == 0)
