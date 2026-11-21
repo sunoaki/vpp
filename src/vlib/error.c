@@ -470,7 +470,7 @@ sev2str (enum vl_counter_severity_e s)
 }
 
 /* One counter of the report, copied out of counters_heap while the description
- * lock is held. The name and the description are the pointers counters_heap
+ * lock is held. The counter name and the reason are the pointers counters_heap
  * holds, which point into strings the registration owns, not into the entry:
  * vlib_register_errors copies the table it is given, so the entry holds the
  * error_strings[i] it was passed, or the name and desc of the counters it was
@@ -478,20 +478,87 @@ sev2str (enum vl_counter_severity_e s)
  * What the description lock rules out is vlib_unregister_errors deallocating
  * the counters_heap block the entry lives in, which would leave the copied
  * pointers themselves unreadable. The report therefore formats the entry once
- * it holds no lock, and reads only strings the block outlives. */
+ * it holds no lock, and reads only strings the block outlives.
+ *
+ * The node name is the one string the block does not outlive. vlib_node_rename
+ * exchanges it under the description lock, retires the previous one, and a
+ * later rename frees the retired names while it holds the same lock, so a
+ * pointer to a node name is read under the lock but not formatted past it. The
+ * report therefore copies the name, once for each node it lists, into its own
+ * buffer, and the entries of that node name the copy by offset. An offset
+ * survives the buffer growing, which a pointer into it would not. */
 typedef struct
 {
+  /* Offset in the name buffer of the snapshot of the name of this counter's
+   * node. The name ends in a NUL there. */
+  u32 node_name_offset;
+
+  /* Name the registration gave the counter, which is the symbol of its stats
+   * entry. A legacy registration gives one error string, which becomes both the
+   * name and the reason of the counter. */
   char *name;
+
+  /* Reason the registration gave the counter. */
   char *desc;
+
   enum vl_counter_severity_e severity;
 } vlib_error_entry_t;
+
+/* Room the snapshot keeps for one node name, past which the copy is cut. This is
+ * not the width of the Node column: the copy is formatted into a column of 35
+ * characters, and justify() (vppinfra/format.c) cuts a longer name there, so a
+ * name of 35 characters or more shows its first 35. Seven registrations in the
+ * tree exceed that, the longest being 52 characters, and two pairs of them share
+ * their first 35 and so render alike; that is the column's behaviour and not a
+ * bound this buffer sets. The buffer holds one copy per listed node, bounded by
+ * the node count and not by the counters a node registers, and the room here is
+ * wider than the column so that a name the column would show in full is copied
+ * in full. */
+#define VLIB_ERROR_NODE_NAME_BYTES 64
+
+/* Width of the Counter column, the trailing column that names the counter of a
+ * line. It follows the Severity column, so the Node and Reason columns keep the
+ * widths and the order they had, and a Reason a registration wrote wider than
+ * its column is still cut where it was. The longest symbol a registration
+ * passes is under thirty characters, and a longer one is cut here rather than
+ * run past the room a line is given. */
+#define VLIB_ERROR_FORMAT_COUNTER_COLUMN 32
+
+/* The counter name the report shows in its Counter column, or the empty string
+ * when the name adds nothing to the reason. A legacy registration passes one
+ * error string, which vlib_register_errors copies into both the name and the
+ * reason of the counter, so showing the column would print that string twice.
+ * A node registered with a table of counters names the symbol of its stats
+ * entry, which its reason does not repeat. */
+static char *
+error_counter_name (vlib_error_entry_t *entry)
+{
+  if (entry->name == 0 || entry->desc == 0 || strcmp (entry->name, entry->desc) == 0)
+    return "";
+
+  return entry->name;
+}
+
+/* Room one line of a counter takes before it. The columns of a counter line are
+ * the count, the node name, the reason of the counter and its severity, which
+ * the format string below fixes at 10, 35, 35 and 10 characters; verbose adds
+ * the error index at 6, and the Counter column trails all of them. Those come
+ * to 10 + 35 + 35 + 10 + 1 + 32 = 123 characters, where the one is the space
+ * the Counter column puts before its name, and 129 with the index. justify()
+ * cuts every column at its width, the count included, so no column of a line
+ * runs past it and the line is at most those 129 characters and the newline:
+ * 10 + 35 + 35 + 10 + 6 + 1 + 32 + 1 = 130 bytes. The room below is that, with
+ * margin. */
+#define VLIB_ERROR_FORMAT_LINE_BYTES 160
 
 /* The counts the report shows, the nodes it shows them under, and the entries
  * of counters_heap the counters are read from. The report copies those entries
  * into a vector of its own, so that after vlib_error_counts_get returns it
  * holds no lock and names no block a registration can free, and a counter of it
  * costs a count, a sum and its own entry, not a copy of its name and of its
- * description. */
+ * description. The node names are the one thing it copies out of the node
+ * structures, because a rename frees them; each listed node contributes one
+ * name to the buffer below, which the entries of that node share. */
 typedef struct
 {
   /* Count of every error, over the threads, less the count a thread recorded
@@ -516,6 +583,11 @@ typedef struct
 
   /* Index in entries of the first counter of each node in nodes. */
   u32 *entry_index;
+
+  /* The node names the entries name, one per listed node, each ending in a NUL.
+   * An entry names its node's name by offset here, so that growing the buffer
+   * does not move what the entries point at. */
+  u8 *node_names;
 } vlib_error_counts_t;
 
 static void
@@ -528,6 +600,7 @@ vlib_error_counts_free (vlib_error_counts_t *c)
   vec_free (c->nodes);
   vec_free (c->n_errors);
   vec_free (c->error_heap_index);
+  vec_free (c->node_names);
 }
 
 /* True when every counter of the node at a position of the snapshot lies
@@ -596,14 +669,31 @@ vlib_error_lists_at (vlib_error_main_t *em, u32 index)
 }
 
 /* True when the node holds a counter the report reads from counters_heap: it
- * registered a table of counters, rather than error strings, and its first
- * entry names one. The size of the snapshot and its list are both taken from
- * this test, so the two cannot disagree about which nodes are reported. */
+ * registered at least one error, and its first entry names one. The size of the
+ * snapshot and its list are both taken from this test, so the two cannot
+ * disagree about which nodes are reported.
+ *
+ * Both registration shapes pass here. A node registered with a table of
+ * counters has n->error_counters set and entries that name their counters. A
+ * legacy node registered with error strings has n->error_counters clear and
+ * entries that vlib_register_errors filled from those strings, so its counters
+ * name themselves just the same. Selecting on n->error_counters rather than on
+ * the entry would drop every legacy node.
+ *
+ * No node that never registered an error reaches this test. vlib_register_errors
+ * is the only writer of n_errors, it sets the field to the count it registered,
+ * and vlib_unregister_errors sets it back to zero; the node structure itself is
+ * zeroed when it is created. A node that never registered therefore answers
+ * false on n_errors alone, and one that unregistered answers false the same way
+ * even though heap_dealloc leaves the block it freed readable. What remains for
+ * vlib_error_lists_at is to rule out a node whose error_heap_index lies past
+ * the heap, which a registration in progress under the same lock cannot
+ * publish, and an entry whose name is still zero because the registration that
+ * allocated it has not reached its copy. */
 static int
 vlib_error_holds_counters (vlib_error_main_t *em, vlib_node_t *n)
 {
-  return n->n_errors != 0 && n->error_counters != 0 &&
-	 vlib_error_lists_at (em, n->error_heap_index);
+  return n->n_errors != 0 && vlib_error_lists_at (em, n->error_heap_index);
 }
 
 /* Number of the two vectors indexed by error index: the error index the
@@ -704,14 +794,22 @@ vlib_error_counts_read (vlib_error_counts_t *c)
  * stay in counters_heap.
  *
  * The room of the vectors is taken by phase 1, under the segment lock, so the
- * lock held here covers the copies and the counts, and no allocation. A
- * registration that grows the heap between the phases needs more room than
- * phase 1 took, and the grow is repeated here for that case only.
+ * lock held here covers the copies and the counts, and no allocation on that
+ * path. A registration that grows the heap between the phases needs more room
+ * than phase 1 took, and phase 2 takes it for that case only, before this walk
+ * starts, so the walk itself allocates nothing.
  *
  * A node is listed with the counters whose counters_heap entry names them, up
- * to the first one that does not, and is left out when it has none. An entry
- * past the end of counters_heap names nothing, so the list stops where the heap
- * does, and an entry past the end of the snapshot is not reachable: the
+ * to the first one that does not, and is left out when it has none. The walk
+ * stops at that entry rather than skipping it, which assumes the entries of a
+ * node are named from its error_heap_index on without a gap.
+ * vlib_register_errors is the only writer of such a block: it holds the
+ * description lock for the allocation and for the copies, and the walk holds
+ * that lock too, so it sees no block half filled. The one way to a gap is an
+ * error string that is NULL, which no registration in the tree passes; that
+ * would lose the counters of the node past the entry, and not the report. An
+ * entry past the end of counters_heap names nothing, so the list stops where
+ * the heap does, and an entry past the end of the snapshot is not reachable: the
  * snapshot is at least as long as the heap. */
 static void
 vlib_error_counts_list (vlib_error_counts_t *c, vlib_node_main_t *nm, vlib_error_main_t *em)
@@ -719,7 +817,7 @@ vlib_error_counts_list (vlib_error_counts_t *c, vlib_node_main_t *nm, vlib_error
   vlib_error_desc_t *cd;
   vlib_error_entry_t *entry;
   vlib_node_t **node, *n;
-  u32 code, i, at, n_listed, room;
+  u32 code, i, at, n_listed, name_bytes, name_offset, room;
 
   at = 0;
   room = vec_max_len (c->entries);
@@ -741,9 +839,11 @@ vlib_error_counts_list (vlib_error_counts_t *c, vlib_node_main_t *nm, vlib_error
       /* The room of the vectors is that of the heap, and the counters the list
        * shows are disjoint ranges of it, so a listed node finds the room it
        * needs taken already. It needs more only when a registration grew the
-       * heap between the phases, which the walk cannot prevent; that grow
-       * happens under this lock, and it is the fallback the phase 1 sizing
-       * leaves. */
+       * heap after phase 1 measured it, and phase 2 sizes c->sums for that case
+       * but leaves these vectors at the room phase 1 took, so the grow below is
+       * what covers them. The name buffer needs nothing here: phase 2 sized it
+       * from the same measure, and a listed node holds at least one counter, so
+       * that buffer holds a name for every counter the measure reached. */
       if (at + code > room)
 	{
 	  n_listed = vec_len (c->nodes);
@@ -757,7 +857,10 @@ vlib_error_counts_list (vlib_error_counts_t *c, vlib_node_main_t *nm, vlib_error
 
 	  /* The room past the entries taken is not part of the report. The
 	   * length of c->entries is not cut back here: the copy below writes
-	   * up to at + code, and the length is raised to that before it. */
+	   * up to at + code, and the length is raised to that before it. The name
+	   * buffer keeps the length it has, because the names already in it are
+	   * named by the entries already listed, and the copy below appends to
+	   * the room phase 2 took. */
 	  vec_set_len (c->entry_index, n_listed);
 	  vec_set_len (c->nodes, n_listed);
 	  vec_set_len (c->n_errors, n_listed);
@@ -773,6 +876,20 @@ vlib_error_counts_list (vlib_error_counts_t *c, vlib_node_main_t *nm, vlib_error
       if (at + code > vec_len (c->entries))
 	vec_set_len (c->entries, at + code);
 
+      /* The name is copied here because a rename may retire and free it once
+       * this lock is released, so the report keeps a copy of its own and the
+       * entries of the node share it by offset. It is appended to the name
+       * buffer, which the report holds room for, so the lock covers the copy and
+       * not the growth: phase 1 takes the room for one name per listed node, and
+       * phase 2 takes it again when the heap grew between the phases, so the
+       * length of the buffer rises within room already taken and no append here
+       * allocates. The name is cut at the room one name has and ends in a NUL,
+       * and the column formats it as a C string. */
+      name_bytes = clib_min (vec_len (n->name), VLIB_ERROR_NODE_NAME_BYTES - 1);
+      name_offset = vec_len (c->node_names);
+      vec_add (c->node_names, n->name, name_bytes);
+      vec_add1 (c->node_names, 0);
+
       vec_add1 (c->nodes, n->index);
       vec_add1 (c->entry_index, at);
       vec_add1 (c->n_errors, code);
@@ -781,6 +898,7 @@ vlib_error_counts_list (vlib_error_counts_t *c, vlib_node_main_t *nm, vlib_error
       for (i = 0; i < code; i++)
 	{
 	  entry = vec_elt_at_index (c->entries, at + i);
+	  entry->node_name_offset = name_offset;
 	  entry->name = cd[i].name;
 	  entry->desc = cd[i].desc;
 	  entry->severity = cd[i].severity;
@@ -818,9 +936,11 @@ vlib_error_counts_list (vlib_error_counts_t *c, vlib_node_main_t *nm, vlib_error
  *
  * Phase 1 also takes the room phase 2 fills out of it, from the length of
  * counters_heap it reads, so that the description lock covers the copies rather
- * than their allocation. Both phases read that length under a lock that
- * vlib_register_errors holds from its first step to its last, so it cannot
- * change between them. */
+ * than their allocation, the room of the names included. Phase 2 reads that
+ * length again and takes only the room a grow of the heap since phase 1 made
+ * necessary, which is the one allocation the description lock can still cover.
+ * Both phases read the length under a lock that vlib_register_errors holds from
+ * its first step to its last, so it cannot change between them. */
 static void
 vlib_error_counts_get (vlib_error_counts_t *c)
 {
@@ -871,6 +991,16 @@ vlib_error_counts_get (vlib_error_counts_t *c)
 	  vec_reset_length (c->nodes);
 	  vec_reset_length (c->n_errors);
 	  vec_reset_length (c->error_heap_index);
+
+	  /* The name of a listed node, which the list copies one of per node, so
+	   * the buffer needs room for the heap's worth of nodes and no more: a
+	   * listed node holds at least one counter of the heap. The room is one
+	   * name of the full length and its NUL per node, so the appends the list
+	   * makes fit it whatever the names are, and the lock covers the copy and
+	   * not a growth of it. The length is reset, so the list appends to the
+	   * room this took. */
+	  vec_validate (c->node_names, (n_heap + 1) * (VLIB_ERROR_NODE_NAME_BYTES + 1) - 1);
+	  vec_reset_length (c->node_names);
 	}
 
       vlib_error_counts_read (c);
@@ -939,7 +1069,28 @@ vlib_error_counts_get (vlib_error_counts_t *c)
     n_counters = n_heap;
 
   if (n_counters)
-    vec_validate (c->sums, n_counters - 1);
+    {
+      vec_validate (c->sums, n_counters - 1);
+
+      /* Room for one name per listed node. A listed node holds at least one
+       * counter, so the listed nodes number at most n_counters, and a buffer of
+       * a full-length name and its NUL for each of them holds every name the
+       * list appends. Phase 1 took that room for the heap it saw, so on that
+       * path this finds the room taken and touches nothing; it allocates only
+       * when a registration grew the heap after phase 1 measured it, and the
+       * size it takes is linear in the heap and not in the counters listed so
+       * far.
+       *
+       * The append the list makes therefore fits the room the buffer holds: a
+       * u8 vector grows by at most 255 bytes without allocating, and one name
+       * is at most VLIB_ERROR_NODE_NAME_BYTES + 1 bytes. That is what keeps the
+       * copies the list makes under this lock from allocating on the ordinary
+       * path. */
+      if (vec_max_len (c->node_names) < (n_counters + 1) * (VLIB_ERROR_NODE_NAME_BYTES + 1))
+	vec_validate (c->node_names, (n_counters + 1) * (VLIB_ERROR_NODE_NAME_BYTES + 1) - 1);
+
+      vec_reset_length (c->node_names);
+    }
 
   vlib_error_counts_list (c, nm, em);
 
@@ -970,14 +1121,6 @@ typedef struct
 /* Number of formatted lines a thread formats between two prints, before the
  * line the next print follows. */
 #define VLIB_ERROR_FORMAT_BATCH 256
-
-/* What one line of the report is allowed to add to the vector before a print:
- * a count of twenty digits, two columns of 35, a severity of ten and a total
- * of ten, the blank between two of them, and the newline. It is not a bound on
- * the line: the line is cut at the padding below in places, so a longer count
- * or a longer name makes it longer, and the print that follows it is the one
- * that ends it. */
-#define VLIB_ERROR_FORMAT_LINE_BYTES 128
 
 /* Room the thread line keeps for the name of a thread, past its fixed part. */
 #define VLIB_ERROR_FORMAT_THREAD_BYTES 256
@@ -1032,6 +1175,35 @@ vlib_error_format_start (vlib_error_thread_t *t, u32 thread_index, int verbose, 
     t->text = format (t->text, "Thread %u (%v):\n", thread_index, t->name);
 }
 
+/* Formats the Counter column of a line: the symbol the registration gave the
+ * counter, or nothing at all when the reason already names it, in which case
+ * the line ends where Severity ends and gains no trailing space. The column
+ * trails the line, so its space comes first and its name is cut at the width
+ * rather than padded past it. A counter name a registration passes is a
+ * NUL-terminated string, so %s reads it. */
+static u8 *
+format_vlib_error_counter (u8 *s, va_list *va)
+{
+  vlib_error_entry_t *entry = va_arg (*va, vlib_error_entry_t *);
+  char *name = error_counter_name (entry);
+
+  if (name[0] == 0)
+    return s;
+
+  return format (s, " %.*s", VLIB_ERROR_FORMAT_COUNTER_COLUMN, name);
+}
+
+/* The node name of an entry of the snapshot, which the list copied under the
+ * description lock and the format reads with none held. */
+static char *
+vlib_error_node_name (vlib_error_counts_t *c, vlib_error_entry_t *entry)
+{
+  if (entry->node_name_offset >= vec_len (c->node_names))
+    return "";
+
+  return (char *) c->node_names + entry->node_name_offset;
+}
+
 /* Formats one counter of the report from the entry the snapshot copied. The
  * report holds no lock here: the line is added to the output vector of the
  * thread it shows, and the vector is printed once it holds a batch of lines,
@@ -1039,11 +1211,18 @@ vlib_error_format_start (vlib_error_thread_t *t, u32 thread_index, int verbose, 
  * piece each. The output is read when the command is done, so the batching
  * delays nothing that a reader waits for. A total line, which verbose alone
  * asks for, goes to the vector the caller prints once, so it is not printed
- * here. */
+ * here.
+ *
+ * The Node column is the node name the snapshot copied, which is a C string in
+ * the snapshot's own buffer, so %s reads it and nothing past its NUL. The Index
+ * column stays the sixth column of the verbose line where it always was, and
+ * the Counter column trails the line, so no line of a plain report loses the
+ * header it had. */
 static void
-vlib_error_format (vlib_main_t *vm, vlib_error_thread_t *t, vlib_error_entry_t *entry, u32 index,
-		   u64 count, int verbose, int total)
+vlib_error_format (vlib_main_t *vm, vlib_error_thread_t *t, vlib_error_counts_t *c,
+		   vlib_error_entry_t *entry, u32 index, u64 count, int verbose, int total)
 {
+  char *node_name = vlib_error_node_name (c, entry);
   u8 *s = t->text;
 
   /* format returns the vector it grew, which is another one when it had to
@@ -1054,17 +1233,18 @@ vlib_error_format (vlib_main_t *vm, vlib_error_thread_t *t, vlib_error_entry_t *
        * prints the vector once with the header it started, so nothing is
        * printed here. */
       if (verbose)
-	t->text = format (s, "%10lu%=40s%=20s%=10d\n", count, entry->name, entry->desc, index);
+	t->text = format (s, "%10lu%=40s%=20s%=10d%U\n", count, node_name, entry->desc, index,
+			  format_vlib_error_counter, entry);
 
       return;
     }
 
   if (verbose)
-    s = format (s, "%10lu%=35s%=35s%=10s%=6d\n", count, entry->name, entry->desc,
-		sev2str (entry->severity), index);
+    s = format (s, "%10lu%=35s%=35s%=10s%=6d%U\n", count, node_name, entry->desc,
+		sev2str (entry->severity), index, format_vlib_error_counter, entry);
   else
-    s = format (s, "%10lu%=35s%=35s%=10s\n", count, entry->name, entry->desc,
-		sev2str (entry->severity));
+    s = format (s, "%10lu%=35s%=35s%=10s%U\n", count, node_name, entry->desc,
+		sev2str (entry->severity), format_vlib_error_counter, entry);
 
   t->text = s;
 
@@ -1096,7 +1276,7 @@ vlib_error_format_thread (vlib_main_t *vm, vlib_error_thread_t *t, vlib_error_co
 
       entry = vlib_error_counting_entry (c, nj, code);
       if (entry)
-	vlib_error_format (vm, t, entry, index, c->counts[index], verbose, 0);
+	vlib_error_format (vm, t, c, entry, index, c->counts[index], verbose, 0);
     }
 }
 
@@ -1122,7 +1302,7 @@ vlib_error_format_total (vlib_main_t *vm, vlib_error_thread_t *t, vlib_error_cou
 	  entry = vlib_error_counting_entry (c, nj, code);
 
 	  if (sum && entry)
-	    vlib_error_format (vm, t, entry, index, sum, verbose, 1);
+	    vlib_error_format (vm, t, c, entry, index, sum, verbose, 1);
 	}
     }
 }
@@ -1169,11 +1349,16 @@ show_errors (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
    * this command, and frees nothing the report reads. */
   vlib_error_counts_get (&c);
 
+  /* The header names the columns the lines below it fill, in the order they
+   * fill them. The Index column, which verbose alone shows, keeps the position
+   * it had, and the Counter column trails it, so the header of a plain report
+   * and the first five columns of a verbose one are where they were. */
   if (verbose)
-    vlib_cli_output (vm, "%=10s%=35s%=35s%=10s%=6s", "Count", "Node", "Reason", "Severity",
-		     "Index");
+    vlib_cli_output (vm, "%=10s%=35s%=35s%=10s%=6s %s", "Count", "Node", "Reason", "Severity",
+		     "Index", "Counter");
   else
-    vlib_cli_output (vm, "%=10s%=35s%=35s%=10s", "Count", "Node", "Reason", "Severity");
+    vlib_cli_output (vm, "%=10s%=35s%=35s%=10s %s", "Count", "Node", "Reason", "Severity",
+		     "Counter");
 
   for (u32 t = 0; t < vlib_get_n_threads (); t++)
     vlib_error_report_thread (vm, &c, t, verbose);
