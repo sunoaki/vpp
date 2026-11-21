@@ -347,6 +347,14 @@ void
 session_program_cleanup (session_t *s)
 {
   ASSERT (s->session_state == SESSION_STATE_TRANSPORT_DELETED);
+
+  /* The transport delete and a close notification queued before it can both
+   * reach this point for the same session, and only one cleanup may be
+   * scheduled: the second would be served after the session was freed. */
+  if (s->flags & SESSION_F_CLEANUP_PENDING)
+    return;
+  s->flags |= SESSION_F_CLEANUP_PENDING;
+
   session_cleanup_notify (s, SESSION_CLEANUP_SESSION);
 }
 
@@ -1040,6 +1048,21 @@ session_transport_delete_notify (transport_connection_t * tc)
       session_lookup_del_session (s);
       session_set_state (s, SESSION_STATE_TRANSPORT_DELETED);
       session_cleanup_notify (s, SESSION_CLEANUP_TRANSPORT);
+      /* The only thing that would complete this close later is the close
+       * event session_close () queued, which session_transport_close ()
+       * serves, and that event is best effort: session_input.c skips the
+       * disconnect and reset notifications for SESSION_F_APP_CLOSED, and
+       * session_program_transport_ctrl_evt () discards the result of a
+       * cross-thread send, so the event is lost when the target worker's
+       * event ring is full. Program the cleanup here as well, so a lost close
+       * event cannot strand the session, and only here, after the transport
+       * has been undeployed, so no transport is still reading the session or
+       * the buffers it queued. session_program_cleanup () serves only the
+       * first request, so a close event served later does not clean up
+       * twice. Half-opens are left to session_cleanup_half_open (), which
+       * frees them already. */
+      if ((s->flags & SESSION_F_APP_CLOSED) && !(s->flags & SESSION_F_HALF_OPEN))
+	session_program_cleanup (s);
       break;
     case SESSION_STATE_APP_CLOSED:
       /* Cleanup lookup table as transport needs to still be valid.
@@ -1108,6 +1131,14 @@ session_transport_delete_request (transport_connection_t *tc,
       session_lookup_del_session (s);
       session_set_state (s, SESSION_STATE_TRANSPORT_DELETED);
       session_cleanup_notify_custom (s, SESSION_CLEANUP_TRANSPORT, cb_fn);
+      /* Same as session_transport_delete_notify: the queued close event is
+       * best effort and is lost when session_program_transport_ctrl_evt ()
+       * discards a cross-thread send that finds the target worker's event
+       * ring full, so program the session cleanup here too, once the transport
+       * has been undeployed. Half-opens are left to
+       * session_cleanup_half_open (), which frees them already. */
+      if ((s->flags & SESSION_F_APP_CLOSED) && !(s->flags & SESSION_F_HALF_OPEN))
+	session_program_cleanup (s);
       break;
     case SESSION_STATE_APP_CLOSED:
       /* Cleanup lookup table as transport needs to still be valid.

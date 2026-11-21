@@ -702,6 +702,40 @@ else:
             self.vapi.cli(f"http static listener del uri {uri}")
             self._wait_released()
 
+    def test_http_static_peer_close_first_releases_session(self):
+        """Smoke test: a peer-closed session still frees the HSS session.
+
+        The client sends FIN first, so http_static closes a session that is
+        already transport-closing, and the HSS session must leave the pool and
+        return its listener reference. This is a smoke test for that sequence,
+        not a regression test for the ordering race the session delete paths
+        now cover: a clean FIN reaches SESSION_STATE_CLOSED, whose delete
+        branch already programmed the session cleanup before this change, so
+        the test also passes without it.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "page.txt"), "w") as output:
+                output.write("peer closed first")
+            self.vapi.cli("http static server")
+            self.addCleanup(self.vapi.cli, "http static server disable")
+            uri = "http://10.10.1.2:8095"
+            self.vapi.cli(f"http static listener add uri {uri} www-root {root}")
+            client = self._client(8095, "/page.txt")
+            self.assertEqual(self._response(client)["body"], "peer closed first")
+            # Closing the peer first drives http_static into closing a
+            # transport-closing session.
+            self._stop_client(client)
+            deadline = time.monotonic() + 10
+            while "path " in self.vapi.cli("show http static server sessions"):
+                self.assertLess(
+                    time.monotonic(),
+                    deadline,
+                    "HSS session of a peer-closed first socket was retained",
+                )
+                time.sleep(0.05)
+            self.vapi.cli(f"http static listener del uri {uri}")
+            self._wait_released()
+
     def test_http_static_destroy_ownership(self):
         """Disable cleans pending pointer responses before immediate re-enable."""
         with tempfile.TemporaryDirectory() as root:
