@@ -3110,10 +3110,11 @@ vnet_classify_add_del_session (vnet_classify_main_t *cm, u32 table_index,
 			       u32 metadata, int is_add)
 {
   vnet_classify_table_t *t;
-  /* The work area: the entry with its key and the halves of two more
-     vectors it is aligned within, so that up to a vector of slack before
-     or after the key stays inside */
-  u8 _entry[sizeof (vnet_classify_entry_t) + (VNET_CLASSIFY_MAX_N_VECTORS + 2) * sizeof (u32x4)];
+  /* The work area: the entry and the key vectors the add copies out of,
+     which the hash and the key compares read, plus the slack in front of
+     the entry for its alignment and one vector past the match vectors that
+     no read reaches, margin held for the assertion below */
+  u8 _entry[sizeof (vnet_classify_entry_t) + (VNET_CLASSIFY_MAX_N_VECTORS + 3) * sizeof (u32x4)];
   vnet_classify_entry_t *e;
   uword e_offset, key_offset;
   u32 n_vectors;
@@ -3135,19 +3136,23 @@ vnet_classify_add_del_session (vnet_classify_main_t *cm, u32 table_index,
   n_vectors = t->skip_n_vectors + t->match_n_vectors;
 
   clib_memset (_entry, 0, sizeof (_entry));
-  e_offset = (-(uword) _entry) & (sizeof (u32x4) - 1);
-  e = (vnet_classify_entry_t *) (_entry + e_offset);
 
-  /* The equal check reads a vector either side of the key.  Center the
-     key so both stay inside, the two whole vectors from the start of the
-     buffer giving room for a key aligned one vector on */
-  key_offset = ((uword) e + offsetof (vnet_classify_entry_t, key)) & (sizeof (u32x4) - 1);
+  /* The key has to sit on a vector boundary, as the entries the table
+     allocates are.  Start the entry one vector into the buffer so there is
+     room ahead of the key, then move it on until the key, a fixed distance
+     along it, lands on a boundary.  The reads from here reach the key plus
+     the match vectors; the vector this leaves behind them is margin for the
+     assertion below, not for a read. */
+  e_offset = sizeof (u32x4);
+  key_offset =
+    ((uword) _entry + e_offset + offsetof (vnet_classify_entry_t, key)) & (sizeof (u32x4) - 1);
   e_offset += (sizeof (u32x4) - key_offset) & (sizeof (u32x4) - 1);
   e = (vnet_classify_entry_t *) (_entry + e_offset);
 
   ASSERT (sizeof (_entry) - e_offset >=
-	  sizeof (vnet_classify_entry_t) + n_vectors * sizeof (u32x4));
+	  sizeof (vnet_classify_entry_t) + (n_vectors + 1) * sizeof (u32x4));
   ASSERT (e_offset >= sizeof (u32x4));
+  ASSERT (((uword) e + offsetof (vnet_classify_entry_t, key)) % sizeof (u32x4) == 0);
 
   e->next_index = hit_next_index;
   e->opaque_index = opaque_index;
