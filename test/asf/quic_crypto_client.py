@@ -114,8 +114,8 @@ class Client:
             "key_len": len(key_bytes),
         }
 
-    def session(self):
-        handle = self.call("session_create", PROTO_QUIC, 1)
+    def session(self, is_nonblocking=1):
+        handle = self.call("session_create", PROTO_QUIC, is_nonblocking)
         if handle < 0:
             raise RuntimeError(f"session_create failed: {handle}")
         index = ct.c_uint32(self.pair)
@@ -161,7 +161,11 @@ class Client:
         }
 
     def listen(self):
-        self.listener = self.session()
+        # vppcom_session_accept returns VPPCOM_EAGAIN as soon as the app event
+        # queue is empty for a non-blocking listener, without flushing the MQ,
+        # so an accept can race the in-flight connect notification. A blocking
+        # listener instead waits on the MQ and flushes it before re-checking.
+        self.listener = self.session(is_nonblocking=0)
         self.require_zero(
             self.call("session_bind", self.listener, ct.byref(self.endpoint)),
             "session_bind",

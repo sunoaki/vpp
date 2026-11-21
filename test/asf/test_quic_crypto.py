@@ -33,17 +33,24 @@ class VclProcess:
 
     def __init__(self, test, name, address):
         self.test = test
+        self.name = name
+        self.stopped = False
+        self.process = None
+        self.selector = None
+        self.stderr = None
+        self.transcript = None
+        self.stderr_path = test.evidence / f"{name}-stderr.txt"
+        test.addCleanup(self.stop)
         libraries = list(Path(config.vpp_install_dir).rglob("libvppcom.so"))
         test.assertEqual(len(libraries), 1, libraries)
-        self.name = name
         conf = test.evidence / f"{name}-vcl.conf"
-        # The helper creates non-blocking sessions and polls each connect for at
-        # most 5 s, so it never waits on the VCL session-timeout; the bound is
-        # kept short as a second guard for any blocking path left in VCL.
+        # The helper polls each non-blocking connect for at most 5 s, and the
+        # listener stays blocking so accept waits on the event queue instead of
+        # racing it. Neither path relies on the VCL session-timeout, which is
+        # kept short as a second guard for the connect poll.
         conf.write_text("vcl { app-scope-global app-timeout 60 session-timeout 5 }\n")
         env = dict(os.environ, VCL_CONFIG=str(conf))
         env["VCL_VPP_SAPI_SOCKET"] = f"{test.tempdir}/app_ns_sockets/default"
-        self.stderr_path = test.evidence / f"{name}-stderr.txt"
         self.stderr = self.stderr_path.open("w")
         self.process = subprocess.Popen(
             [
@@ -63,7 +70,6 @@ class VclProcess:
         self.transcript = (test.evidence / f"{name}-protocol.jsonl").open("w")
         self.selector = selectors.DefaultSelector()
         self.selector.register(self.process.stdout, selectors.EVENT_READ)
-        test.addCleanup(self.stop)
 
     def request(self, operation, timeout=120, **params):
         self.sequence += 1
@@ -81,8 +87,14 @@ class VclProcess:
         self.transcript.flush()
         if not line:
             self.stderr.flush()
+            try:
+                code = self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                code = "still running"
+            tail = "\n".join(self.stderr_path.read_text().splitlines()[-20:])
             raise AssertionError(
-                f"{self.name} helper exited: " f"{self.stderr_path.read_text()}"
+                f"{self.name} helper exited with code {code}: "
+                f"{request}\nstderr tail ({self.stderr_path}):\n{tail}"
             )
         reply = json.loads(line)
         self.test.assertEqual(reply["id"], self.sequence)
@@ -92,22 +104,33 @@ class VclProcess:
         if self.stopped:
             return
         self.stopped = True
-        if self.process.poll() is None:
-            self.process.stdin.close()
-            try:
-                self.process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
-                self.test.fail(f"{self.name} helper required killing during cleanup")
-        self.selector.close()
-        self.stderr.close()
-        self.transcript.close()
-        self.test.assertEqual(
-            self.process.returncode,
-            0,
-            f"{self.name} helper failed, see {self.stderr_path}",
-        )
+        try:
+            if self.process is not None and self.process.poll() is None:
+                try:
+                    self.process.stdin.close()
+                except OSError:
+                    # The helper exited between poll() and close(); its exit
+                    # code is asserted below.
+                    pass
+                try:
+                    self.process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
+                    self.test.fail(
+                        f"{self.name} helper required killing during cleanup"
+                    )
+        finally:
+            for handle in (self.selector, self.stderr, self.transcript):
+                if handle is not None:
+                    handle.close()
+        if self.process is not None:
+            self.test.assertEqual(
+                self.process.returncode,
+                0,
+                f"{self.name} helper failed with code {self.process.returncode}, "
+                f"see {self.stderr_path}",
+            )
 
 
 @unittest.skipIf("quic" in config.excluded_plugins, "QUIC plugin excluded")
@@ -373,9 +396,9 @@ class QUICCredentialFailure(VppAsfTestCase):
             self.assertEqual(self.snapshot(), baseline)
             start = len("".join(self.vpp_stderr_deque))
             result = client.request("connect", timeout=60)
-            # The helper opens a non-blocking session, so a failed connect
-            # returns VPPCOM_EINPROGRESS rather than blocking for the VCL
-            # session-timeout; it then polls the session error for at most
+            # The helper opens the connect session non-blocking, so a failed
+            # connect returns VPPCOM_EINPROGRESS rather than blocking for the
+            # VCL session-timeout; it then polls the session error for at most
             # CONNECT_POLL_LIMIT_S and closes the handle. Each attempt is
             # bounded by that poll limit plus one snapshot and one trace.
             self.assertIn(result["connect"], (0, -115), result)
