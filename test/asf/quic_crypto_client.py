@@ -16,8 +16,12 @@ from pathlib import Path
 
 PROTO_QUIC = 4
 APP_SCOPE_GLOBAL = 1
-# vppcom_attr_op_t ordinal, counted from src/vcl/vppcom.h
+# vppcom_attr_op_t ordinals, counted from src/vcl/vppcom.h
+ATTR_GET_NWRITE = 1
 ATTR_SET_CKPAIR = 35
+# vppcom_session_connect returns this for every non-blocking session, whatever
+# the outcome; the outcome arrives later as a session error or as writeability.
+VPPCOM_EINPROGRESS = -115
 # A certificate that ptls_load_certificate_chain() rejects while the private
 # key loads, so the crypto context is built but no certificate chain is.
 MALFORMED_CERT = b"-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n"
@@ -68,6 +72,17 @@ SIGNATURES = {
     "session_accept": ([ct.c_uint32, ct.POINTER(Endpoint), ct.c_uint32], ct.c_int),
     "session_close": ([ct.c_uint32], ct.c_int),
     "session_get_error": ([ct.c_uint32], ct.c_int),
+    "session_index": ([ct.c_uint32], ct.c_int),
+    "select": (
+        [
+            ct.c_int,
+            ct.POINTER(ct.c_ulong),
+            ct.POINTER(ct.c_ulong),
+            ct.POINTER(ct.c_ulong),
+            ct.c_double,
+        ],
+        ct.c_int,
+    ),
 }
 
 
@@ -132,29 +147,77 @@ class Client:
         )
         return handle
 
+    def write_ready(self, handle):
+        length = ct.c_uint32(ct.sizeof(ct.c_int))
+        nwrite = ct.c_int(0)
+        self.require_zero(
+            self.call(
+                "session_attr",
+                handle,
+                ATTR_GET_NWRITE,
+                ct.byref(nwrite),
+                ct.byref(length),
+            ),
+            "session_attr GET_NWRITE",
+        )
+        return nwrite.value
+
+    def wait_writable(self, handle, timeout):
+        """Wait until the session is writable, draining the app event queue.
+
+        vppcom_select is the primitive that drains it: the CONNECTED event is
+        handled there, which is what moves the session to VCL_STATE_READY and
+        stores any vpp_error. Reading session_get_error or GET_NWRITE without
+        it only sees the state frozen at connect() time.
+        """
+        index = self.call("session_index", handle)
+        n_bits = index + 1
+        words = (n_bits + 63) // 64
+        read_map = (ct.c_ulong * words)()
+        write_map = (ct.c_ulong * words)()
+        write_map[index // 64] = 1 << (index % 64)
+        return self.call("select", n_bits, read_map, write_map, None, float(timeout))
+
     def connect(self):
-        """Start a non-blocking connect and poll the session error for a bound."""
+        """Start a non-blocking connect and wait for it to settle.
+
+        vppcom_session_connect returns VPPCOM_EINPROGRESS for a non-blocking
+        session whether or not the connect will succeed, so the outcome is
+        observed instead: writability means the session reached
+        VCL_STATE_READY, a non-zero session error means it failed, and neither
+        before the poll limit means the attempt stalled.
+        """
         handle = self.session()
-        result = self.call("session_connect", handle, ct.byref(self.endpoint))
+        queued = self.call("session_connect", handle, ct.byref(self.endpoint))
+        if queued != VPPCOM_EINPROGRESS:
+            raise RuntimeError(
+                f"session_connect on a non-blocking session returned {queued}"
+            )
         errors = []
         polls = 0
+        ready = False
         started = time.monotonic()
-        while result != 0 and time.monotonic() - started < CONNECT_POLL_LIMIT_S:
-            time.sleep(CONNECT_POLL_INTERVAL_S)
+        while time.monotonic() - started < CONNECT_POLL_LIMIT_S:
+            remaining = CONNECT_POLL_LIMIT_S - (time.monotonic() - started)
             polls += 1
+            self.wait_writable(handle, min(remaining, CONNECT_POLL_INTERVAL_S))
             error = self.call("session_get_error", handle)
             if error != (errors[-1] if errors else None):
                 errors.append(error)
-            if error != 0:
+            if error:
+                break
+            ready = self.write_ready(handle) > 0
+            if ready:
                 break
         waited = time.monotonic() - started
-        if result == 0:
+        if ready:
             self.connection = handle
         else:
             self.call("session_close", handle)
         return {
             "handle": handle,
-            "connect": result,
+            "connect": queued,
+            "connected": ready,
             "errors": errors,
             "polls": polls,
             "waited_s": round(waited, 3),
