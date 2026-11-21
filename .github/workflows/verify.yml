@@ -19,7 +19,9 @@ on:
       suites:
         description: >-
           TEST suites that replace the derived filter, for example
-          "neighbor ip_mcast linux_cp". Leave empty to derive them.
+          "neighbor ip_mcast linux_cp". The token "all" expands to every
+          test/test_*.py and test/asf/test_*.py module of the checked-out
+          tree. Leave empty to derive them.
         required: false
         default: ""
         type: string
@@ -200,6 +202,11 @@ jobs:
       matrix:
         variant: ${{ fromJSON(needs.test-plan.outputs.variants) }}
     runs-on: ubuntu-24.04
+    # GitHub caps a GitHub-hosted job at 360 minutes, and the all-suites
+    # dispatch runs every module of the tree in this one job, so the ceiling is
+    # stated here rather than left implicit. A run that reaches it is truncated
+    # by the platform, and the suite summary is then absent from the log.
+    timeout-minutes: 360
     container:
       image: debian:trixie
       # The test framework reserves SHM_PER_PROCESS per worker on top of a
@@ -361,6 +368,50 @@ jobs:
             fi
             printf '%s\n' "${selected}"
           }
+
+          # Every suite of the checked-out tree: the module names of
+          # test/test_*.py and test/asf/test_*.py, without the test_ prefix and
+          # the .py suffix, sorted and deduplicated, one name per line. It is
+          # read from the tree so the list cannot fall behind a new test module.
+          all_test_suites() {
+            local paths
+            paths=$(ls test/test_*.py test/asf/test_*.py 2>/dev/null || true)
+            if [ -n "${paths}" ]; then
+              printf '%s\n' "${paths}"
+            fi | sed 's#.*/test_##; s#\.py$##' | sort -u
+          }
+
+          # Print the number of suites all_test_suites lists. The names go
+          # through a file so the count is words of a file, never file
+          # arguments to wc, and the count is printed as a bare integer.
+          all_test_suites_count() {
+            local listing="$1/listing.txt"
+            all_test_suites > "${listing}"
+            grep -c '[^[:space:]]' "${listing}"
+          }
+
+          # Expand a workflow_dispatch suites input: the token "all" becomes
+          # every suite of the tree, and any other name is kept as given. The
+          # result is the sorted union of both, so an explicit name lands in
+          # its place even when it sits next to "all". An input without "all"
+          # is returned unchanged, so an explicit list behaves as before.
+          expand_manual_suites() {
+            local input="$1" token expanded="" others=""
+            for token in ${input}; do
+              if [ "${token}" = all ]; then
+                expanded="${expanded} $(all_test_suites | tr '\n' ' ')"
+              else
+                others="${others} ${token}"
+              fi
+            done
+            if [ -z "${expanded}" ]; then
+              printf '%s\n' "${others# }"
+              return 0
+            fi
+            printf '%s\n' ${expanded} ${others} | sed '/^$/d' | sort -u |
+              tr '\n' ' ' | sed 's/ *$//'
+            printf '\n'
+          }
           HELPER
 
       # The derivation decides which suites the pull request runs, and a rule
@@ -443,11 +494,57 @@ jobs:
             echo "::error::the suite left out by the cap was not reported, got '${capped}'"
             failures=$((failures + 1))
           fi
+          # The suites input keeps an explicit list as it is and expands "all"
+          # to every module of the tree. The fixture tree pins the enumeration
+          # order and the module-name stripping without depending on this tree's
+          # current test count.
+          mkdir -p "${order_tree}/test/asf"
+          : > "${order_tree}/test/test_alpha.py"
+          : > "${order_tree}/test/test_beta.py"
+          : > "${order_tree}/test/asf/test_gamma.py"
+          explicit=$(cd "${order_tree}" && \
+            expand_manual_suites "neighbor ip_mcast linux_cp")
+          if [ "${explicit}" != "neighbor ip_mcast linux_cp" ]; then
+            echo "::error::an explicit suites input changed, got '${explicit}'"
+            failures=$((failures + 1))
+          fi
+          every=$(cd "${order_tree}" && expand_manual_suites all)
+          if [ "${every}" != "alpha beta gamma" ]; then
+            echo "::error::'all' did not expand to every module, got '${every}'"
+            failures=$((failures + 1))
+          fi
+          # "all" next to explicit names is the sorted union of both: a name
+          # that sorts before every enumerated module and one that sorts after
+          # them both land in their sorted place.
+          union=$(cd "${order_tree}" && expand_manual_suites "all aardvark zeta")
+          if [ "${union}" != "aardvark alpha beta gamma zeta" ]; then
+            echo "::error::'all aardvark zeta' did not expand to the sorted union, got '${union}'"
+            failures=$((failures + 1))
+          fi
+          # word_count prints a bare non-negative integer; anything else is a
+          # self-check failure rather than a comparison that cannot fail.
+          word_count() {
+            local count
+            count=$(all_test_suites_count "${RUNNER_TEMP}")
+            case "${count}" in
+              ''|*[!0-9]*)
+                echo "::error::the suite enumeration counted '${count}', not a number"
+                failures=$((failures + 1))
+                count=0
+                ;;
+            esac
+            printf '%s\n' "${count}"
+          }
+          enumerated=$(word_count)
+          if [ "${enumerated}" -lt 200 ]; then
+            echo "::error::'all' enumerated ${enumerated} suites, expected at least 200"
+            failures=$((failures + 1))
+          fi
           if [ "${failures}" -ne 0 ]; then
             echo "::error::${failures} derivation self-check assertion(s) failed"
             exit 1
           fi
-          echo "The derivation self-check passed"
+          echo "The derivation self-check passed; the tree holds ${enumerated} suites"
 
       # make install-dep installs $(DEB_DEPENDS), which is defined in the
       # Makefile, so key the apt archive cache on that file: the key moves when
@@ -545,6 +642,7 @@ jobs:
           if [ -n "${MANUAL_SUITES}" ]; then
             suites=$(printf '%s' "${MANUAL_SUITES}" | tr -s '[:space:]' ' ' |
                      sed 's/^ *//; s/ *$//')
+            suites=$(expand_manual_suites "${suites}")
             echo "Using the suites input of this workflow_dispatch run: ${suites}"
           else
             suites=$(printf '%s\n' "${changed}" | derive_test_suites)
@@ -794,20 +892,38 @@ jobs:
               *) suites+=(ipsec_esp) ;;
             esac
           fi
+          if [ "${#suites[@]}" -eq 0 ]; then
+            echo "::error::No test suite was selected"
+            exit 1
+          fi
+          # Every suite runs even after one fails. The loop records a
+          # '<suite>: pass|fail' line for each in the summary file as soon as the
+          # suite ends, prints the whole table after the last suite, and only
+          # then fails the step with the names of the suites that failed, so one
+          # red suite does not hide the state of the rest. RETRIES and TEST_JOBS
+          # stay those the suites already use. The summary file survives a job
+          # timeout that kills this step before the table is printed.
+          summary_file="${RUNNER_TEMP}/vpp-suite-summary.txt"
+          echo "Selected ${#suites[@]} suite(s): ${suites[*]}"
+          : > "${summary_file}"
+          results=()
+          failed=()
           for suite in "${suites[@]}"; do
             echo "Running TEST=${suite}"
+            suite_status=0
             if [ "${suite}" = linux_cp ]; then
               recovery_log=/tmp/vpp-unittest-TestLinuxCPNetlinkRecovery/log.txt
               rm -f "${recovery_log}"
             fi
+            # errexit would end the step at the first failing command, so it is
+            # off for the suite body and every command records its own status.
+            set +e
             if [ "${suite}" = ipsec_esp ] && [ '${{ needs.test-plan.outputs.tunnel_control }}' = true ]; then
               rm -f /tmp/vpp-unittest-TestIpsecEspTun/log.txt
               evidence="${RUNNER_TEMP}/esp-evidence"
-              set +e
               make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST="${suite}" test-debug 2>&1 |
                 (ulimit -f 32768; tee "${evidence}/command.log")
               statuses=("${PIPESTATUS[@]}")
-              set -e
               printf '%s\n' "${statuses[0]}" > "${evidence}/raw-returncode.txt"
               printf '%s\n' "${statuses[1]}" > "${evidence}/capture-returncode.txt"
               printf '%s\n' 'make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST=ipsec_esp test-debug' > "${evidence}/command.txt"
@@ -820,13 +936,17 @@ jobs:
               raise SystemExit("Missing, unsafe or oversized ESP named log")
           (Path(os.environ["RUNNER_TEMP"]) / "esp-evidence/named-test.log").write_bytes(source.read_bytes())
           PY
-              test "${statuses[1]}" = 0
-              test "${statuses[0]}" = 0
+              esp_log_status=$?
+              [ "${esp_log_status}" = 0 ] || suite_status=1
+              [ "${statuses[1]}" = 0 ] || suite_status=1
+              [ "${statuses[0]}" = 0 ] || suite_status=1
             else
-              make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST="${suite}" test-debug
+              make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST="${suite}" test-debug ||
+                suite_status=1
             fi
-            if [ "${suite}" = linux_cp ]; then
-              python3 - "${recovery_log}" <<'PY'
+            set -e
+            if [ "${suite_status}" = 0 ] && [ "${suite}" = linux_cp ]; then
+              python3 - "${recovery_log}" <<'PY' || suite_status=1
           import re
           import sys
           from pathlib import Path
@@ -849,7 +969,76 @@ jobs:
               print(f"Verified {method}: addSuccess")
           PY
             fi
+            if [ "${suite_status}" = 0 ]; then
+              results+=("${suite}: pass")
+              echo "${suite}: pass" >> "${summary_file}"
+              echo "Suite result: ${suite}: pass"
+            else
+              results+=("${suite}: fail")
+              failed+=("${suite}")
+              echo "${suite}: fail" >> "${summary_file}"
+              echo "Suite result: ${suite}: fail"
+              # The next make test-debug runs the framework's reset, which
+              # removes /tmp/vpp-unittest-* and /tmp/vpp-failed-unittests, so
+              # this suite's evidence is copied now. The copy is per suite
+              # because two suites can share a test-class directory name. It
+              # runs while errexit is off; every internal error is already
+              # recorded in the report, and a non-zero exit marks the suite, not
+              # the step.
+              SUITE="${suite}" OUTPUT="${RUNNER_TEMP}/vpp-test-diagnostics/${suite}" python3 - <<'PY'
+          import os
+          import re
+          import shutil
+          import stat
+          from pathlib import Path
+
+          suite, output = os.environ["SUITE"], Path(os.environ["OUTPUT"])
+          limit = 32 * 1024 * 1024
+          reserved = {"log.txt", "vpp_stdout.txt", "vpp_stderr.txt", "failed_tests.txt"}
+          destination = output
+          destination.mkdir(parents=True, exist_ok=True)
+          originals = [Path("/tmp/vpp-failed-unittests")] + sorted(Path("/tmp").glob("vpp-unittest-*"))
+          copied = []
+          for original in originals:
+              if original.is_symlink() or not original.is_dir():
+                  copied.append(f"MISSING OR UNSAFE directory: {original}")
+                  continue
+              for directory, subdirs, names in os.walk(original, followlinks=False):
+                  subdirs[:] = sorted(name for name in subdirs
+                                      if not (Path(directory) / name).is_symlink())
+                  for name in sorted(names):
+                      source = Path(directory) / name
+                      keep = (name in reserved or name.startswith("vpp_api_trace")
+                              or re.fullmatch(r"api_post_mortem\.[0-9]+", name) is not None
+                              or name.endswith(".log"))
+                      if not keep or not stat.S_ISREG(source.lstat().st_mode):
+                          continue
+                      if source.stat().st_size > limit:
+                          copied.append(f"SKIPPED (over 32 MiB): {source}")
+                          continue
+                      target = destination / f"{len(copied):04d}{source.suffix}"
+                      try:
+                          shutil.copyfile(source, target)
+                      except OSError as error:
+                          copied.append(f"SKIPPED ({error}): {source}")
+                          continue
+                      copied.append(f"COPIED: {source} -> {target.name}")
+                      if sum(line.startswith("COPIED") for line in copied) >= 2000:
+                          break
+                  if sum(line.startswith("COPIED") for line in copied) >= 2000:
+                      break
+          (destination / "collection-report.txt").write_text("\n".join(copied) + "\n")
+          print(f"Copied {sum(line.startswith('COPIED') for line in copied)} file(s) of suite {suite}")
+          PY
+            fi
           done
+          echo "Test suite summary (${#results[@]} suites):"
+          printf '  %s\n' "${results[@]}"
+          if [ "${#failed[@]}" -ne 0 ]; then
+            echo "::error::${#failed[@]} of ${#results[@]} suite(s) failed: ${failed[*]}"
+            exit 1
+          fi
+          echo "All ${#results[@]} suites passed"
 
       - name: Verify complete ESP evidence
         if: always() && needs.test-plan.outputs.tunnel_control == 'true'
@@ -964,6 +1153,21 @@ jobs:
           if-no-files-found: error
           compression-level: 6
 
+      # The suite loop prints its table after the last suite, so a run that
+      # reaches the job's time limit loses the table but not the per-suite
+      # result lines, which the loop appends to this file as each suite ends.
+      - name: Report the suite summary so far
+        if: always() && matrix.variant == 'fixed'
+        run: |
+          summary="${RUNNER_TEMP}/vpp-suite-summary.txt"
+          mkdir -p "${RUNNER_TEMP}/vpp-test-diagnostics"
+          if [ ! -s "${summary}" ]; then
+            echo "No suite finished before this step ran" > "${summary}"
+          fi
+          echo "Per-suite results recorded so far:"
+          cat "${summary}"
+          cp "${summary}" "${RUNNER_TEMP}/vpp-test-diagnostics/suite-summary.txt"
+
       - name: Collect failed test diagnostics
         if: failure()
         run: |
@@ -975,6 +1179,8 @@ jobs:
 
           output = Path(os.environ["RUNNER_TEMP"]) / "vpp-test-diagnostics"
           output.mkdir(parents=True, exist_ok=True)
+          suite_dirs = {path for path in output.iterdir()
+                        if path.is_dir() and not path.is_symlink()} if output.is_dir() else set()
           # Retry directories are real siblings of the current test directory.
           # Do not rely on upload-artifact following the -FAILED symlinks.
           failed = Path("/tmp/vpp-failed-unittests")
@@ -985,7 +1191,8 @@ jobs:
                     "Collect .txt/.log/.pcap/.pcapng and api_post_mortem.<pid>; exclude cores/sockets.",
                     "Symlinks are recorded, never traversed.",
                     "Staged filenames use unique numeric IDs with safe extensions; this report maps back to originals.",
-                    "Copied paths below map original -> staged, relative to this report."]
+                    "Copied paths below map original -> staged, relative to this report.",
+                    "Per-suite copies made when each suite failed live in vpp-test-diagnostics/<suite>/ and are kept as they are."]
           if failed.is_dir() and not failed.is_symlink():
               for link in sorted(failed.iterdir()):
                   if link.is_symlink():
@@ -998,6 +1205,8 @@ jobs:
           for root in roots:
               if root.is_symlink() or not root.is_dir():
                   report.append(f"MISSING OR UNSAFE directory: {root}")
+                  continue
+              if Path(root).resolve() == output.resolve() or Path(root) in suite_dirs:
                   continue
               for directory, subdirs, names in os.walk(root, followlinks=False):
                   subdirs[:] = sorted(name for name in subdirs
@@ -1052,6 +1261,16 @@ jobs:
         with:
           name: vpp-test-diagnostics-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/vpp-test-diagnostics/
+          retention-days: 7
+          if-no-files-found: warn
+          compression-level: 6
+
+      - name: Upload the suite summary
+        if: always() && matrix.variant == 'fixed'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpp-suite-summary-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/vpp-suite-summary.txt
           retention-days: 7
           if-no-files-found: warn
           compression-level: 6
