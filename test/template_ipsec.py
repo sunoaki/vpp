@@ -2237,6 +2237,7 @@ class IpsecTun4(IpsecCounterWindowMixin, VppTestCase):
         self.vapi.cli("clear errors")
         self.vapi.cli("clear ipsec counters")
         self.vapi.cli("clear ipsec sa")
+        counters = self.open_tunnel_counters(4)
         if not n_rx:
             n_rx = count
         try:
@@ -2272,7 +2273,6 @@ class IpsecTun4(IpsecCounterWindowMixin, VppTestCase):
 
         self.logger.info(self.vapi.ppcli("show ipsec sa 0"))
         self.logger.info(self.vapi.ppcli("show ipsec sa 4"))
-        counters = self.open_tunnel_counters(4)
         self.verify_counters4(p, count, n_rx, counters=counters)
 
     def verify_tun_dropped_44(self, p, count=1, payload_size=64, n_rx=None):
