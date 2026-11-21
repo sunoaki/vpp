@@ -204,7 +204,16 @@ class ARPTestCase(VppTestCase):
         the next table.
         """
         self.pg1.generate_remote_hosts(1)
-        nbr_addr = self.pg1.remote_hosts[0].ip4
+
+        #
+        # the neighbour's address is deliberately outside the interface's own
+        # prefix. Removing an address destroys every neighbour that address
+        # covers, static entries included, so a neighbour inside
+        # 172.16.N.0/24 would be destroyed by the unconfig_ip4 below and the
+        # case would never reach the binding walk. Outside the prefix it
+        # survives the address going away and is carried into table 100.
+        #
+        nbr_addr = "192.0.2.1"
         table = VppIpTable(self, 100).add_vpp_config()
 
         nbr = VppNeighbor(
@@ -254,7 +263,21 @@ class ARPTestCase(VppTestCase):
             self.vapi.sw_interface_get_table(self.pg1.sw_if_index).vrf_id, 0
         )
         self.pg1.config_ip4()
-        self.pg1.remote_hosts[0].resolve_arp()
+
+        #
+        # a dynamic entry for the neighbour, learned at the address the
+        # interface has been given back. It comes before the route so the
+        # route resolves through it rather than probing for an address no
+        # host answers for, and it is dynamic because what the case checks
+        # after the table is gone is a neighbour resolved through the table
+        # the interface was moved back to.
+        #
+        VppNeighbor(
+            self,
+            self.pg1.sw_if_index,
+            self.pg1.remote_hosts[0].mac,
+            nbr_addr,
+        ).add_vpp_config()
 
         VppIpRoute(
             self,
@@ -1824,6 +1847,15 @@ class ARPTestCase(VppTestCase):
         covers.
         """
         self.pg2.generate_remote_hosts(2)
+
+        #
+        # the case forwards packets out of pg2, so the interface needs an
+        # address: without one it is in no table, has no connected route to
+        # the neighbour, and ip4-not-enabled drops the packet before lookup,
+        # whatever MAC the adjacency names
+        #
+        self.pg2.config_ip4()
+
         p = (
             Ether(dst=self.pg2.local_mac, src=self.pg2.remote_mac)
             / IP(src=self.pg2.remote_ip4, dst=self.pg2.remote_hosts[0].ip4)
@@ -1918,6 +1950,7 @@ class ARPTestCase(VppTestCase):
         # clean-up
         #
         static_arp.remove_vpp_config()
+        self.pg2.unconfig_ip4()
 
     def test_arp_incomplete(self):
         """ARP Incomplete"""
@@ -3126,7 +3159,12 @@ class NeighborChurnTestCase(VppTestCase):
             i.admin_up()
             i.config_ip4()
 
-        self.pg0.generate_remote_hosts(self.N_HOSTS + 1)
+        #
+        # the recycle case needs addresses the first batch did not use, so
+        # that each add is a new neighbour and the limit is what evicts the
+        # oldest one
+        #
+        self.pg0.generate_remote_hosts(self.N_HOSTS + self.N_CYCLES + 1)
 
     def tearDown(self):
         super(NeighborChurnTestCase, self).tearDown()
@@ -3241,14 +3279,19 @@ class NeighborChurnTestCase(VppTestCase):
         #
         # ip_neighbor_force_reuse destroys the oldest neighbour to make room
         # for each new one; the sorted list must stay at the limit rather
-        # than growing by one stale row per recycle
+        # than growing by one stale row per recycle.
+        #
+        # Each add names an address the first batch did not use. Re-adding one
+        # of those twenty would find the entry already there, update it, and
+        # never allocate, so nothing would be evicted and the case would pass
+        # or fail on the re-add rather than on recycling.
         #
         for n in range(1, self.N_CYCLES + 1):
             VppNeighbor(
                 self,
                 self.pg0.sw_if_index,
-                self.pg0.remote_hosts[n].mac,
-                self.pg0.remote_hosts[n].ip4,
+                self.pg0.remote_hosts[self.N_HOSTS + n].mac,
+                self.pg0.remote_hosts[self.N_HOSTS + n].ip4,
             ).add_vpp_config()
 
             self.assertEqual(len(self.sorted_nbr_rows()), self.N_HOSTS)
