@@ -832,6 +832,9 @@ else:
             listeners = self.vapi.cli(command)
             self.assertEqual(listeners.count("[Q]"), original + 1, listeners)
             self.assertIn("h3", listeners)
+            default_listeners = self.vapi.cli("show session listeners quic")
+            self.assertIn("[Q]", default_listeners)
+            self.assertNotIn("h3", default_listeners)
             reply = self.vapi.cli_return_response(
                 f"http static listener del uri {uri} http3"
             )
