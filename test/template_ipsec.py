@@ -193,6 +193,22 @@ def config_tra_params(p, encryption_type):
     )
 
 
+class IpsecCounterWindowMixin(object):
+    """The node counter window of an IPsec check.
+
+    A mixin rather than a method of the classes that run a check, because
+    these checks run on VppTestCase through IpsecTra4, IpsecTra6, IpsecTun4
+    and IpsecTun6, and on TemplateIpsec through TemplateIpsecAh, and both
+    groups need it.
+    """
+
+    def open_node_counter_window(self, *nodes):
+        counters = NodeCounterWindow(self)
+        for node in nodes:
+            counters.open(node, "rx_pkts")
+        return counters
+
+
 class TemplateIpsec(IpsecCounterWindowMixin, VppTestCase):
     """
     TRANSPORT MODE::
@@ -367,22 +383,6 @@ class NodeCounterWindow(object):
         path = self.path(node, counter)
         counted = self.total(node, counter) - self.opened[path]
         self.test.assert_equal(counted, expected, path)
-
-
-class IpsecCounterWindowMixin(object):
-    """The node counter window of an IPsec check.
-
-    A mixin rather than a method of the classes that run a check, because
-    these checks run on VppTestCase through IpsecTra4, IpsecTra6, IpsecTun4
-    and IpsecTun6, and on TemplateIpsec through TemplateIpsecAh, and both
-    groups need it.
-    """
-
-    def open_node_counter_window(self, *nodes):
-        counters = NodeCounterWindow(self)
-        for node in nodes:
-            counters.open(node, "rx_pkts")
-        return counters
 
 
 class IpsecTra4(IpsecCounterWindowMixin, VppTestCase):
