@@ -1098,6 +1098,7 @@ nat44_ed_add_static_mapping_internal (ip4_address_t l_addr,
     {
       if (nat44_ed_sm_i2o_lookup (sm, l_addr, l_port, fib_index, proto))
 	{
+	  fib_table_unlock (fib_index, FIB_PROTOCOL_IP4, sm->fib_src_low);
 	  return VNET_API_ERROR_VALUE_EXIST;
 	}
     }
@@ -1203,8 +1204,12 @@ nat44_ed_del_static_mapping_internal (ip4_address_t l_addr,
 	    {
 	      local = pool_elt_at_index (m->locals, local - m->locals);
 	      fib_index = local->fib_index;
+	      /* the walk ends at the record it removes: it has nothing
+	       * left to look for, and pool_put frees and poisons the slot
+	       * it is standing on */
 	      pool_put (m->locals, local);
 	      found = 1;
+	      break;
 	    }
 	}
 
@@ -1530,6 +1535,7 @@ nat44_ed_add_del_lb_static_mapping_local (ip4_address_t e_addr, u16 e_port,
 				   proto))
 	    {
 	      nat_log_err ("sm i2o key add failed");
+	      fib_table_unlock (local->fib_index, FIB_PROTOCOL_IP4, sm->fib_src_low);
 	      pool_put (m->locals, local);
 	      return VNET_API_ERROR_UNSPECIFIED;
 	    }
