@@ -544,10 +544,11 @@ error_counter_name (vlib_error_entry_t *entry)
  * the format string below fixes at 10, 35, 35 and 10 characters; verbose adds
  * the error index at 6, and the Counter column trails all of them. Those come
  * to 10 + 35 + 35 + 10 + 1 + 32 = 123 characters, where the one is the space
- * the Counter column puts before its name, and 129 with the index. A count at
- * its full twenty digits adds ten more and the newline one, so a line needs 140.
- * The margin past that covers a line that runs past its columns, because the
- * Reason column is cut at its width but neither a count nor a node name is. */
+ * the Counter column puts before its name, and 129 with the index. justify()
+ * cuts every column at its width, the count included, so no column of a line
+ * runs past it and the line is at most those 129 characters and the newline:
+ * 10 + 35 + 35 + 10 + 6 + 1 + 32 + 1 = 130 bytes. The room below is that, with
+ * margin. */
 #define VLIB_ERROR_FORMAT_LINE_BYTES 160
 
 /* The counts the report shows, the nodes it shows them under, and the entries
