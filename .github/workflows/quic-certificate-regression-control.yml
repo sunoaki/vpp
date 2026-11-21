@@ -20,6 +20,13 @@ jobs:
   # runner.temp and passes TMP_DIR and FAILED_DIR into the harness; artifacts
   # are named per matrix job and carry run-context.json. A run whose evidence
   # shows cross-job interference is not valid evidence.
+  #
+  # runner.temp is outside both the frozen checkout and the source clone, so
+  # harness temporary directories and failure links created under the evidence
+  # root cannot be mistaken for, or written into, product source. The runner
+  # context is not available in a job-level env, so every step that reads
+  # EVIDENCE or QUIC_CRYPTO_ARTIFACTS declares them in its own env, at the same
+  # paths for all four jobs.
   control:
     name: ${{ matrix.source }} workers-${{ matrix.workers }}
     runs-on: ubuntu-24.04
@@ -43,11 +50,6 @@ jobs:
       FIXED: 40b52275db082d350158684cdb117e9f43450418
       ORIGINAL: b332ab4cd6fb4a26d15685b9da0f9250f83d2c3c
       QUIC_CRYPTO_EXPECT: ${{ matrix.source }}
-      # Evidence lives outside both the frozen checkout and the source clone, so
-      # harness temporary directories and failure links created under it cannot
-      # be mistaken for, or written into, product source.
-      EVIDENCE: ${{ runner.temp }}/evidence
-      QUIC_CRYPTO_ARTIFACTS: ${{ runner.temp }}/evidence/runtime
       SOURCE_KIND: ${{ matrix.source }}
       WORKERS: ${{ matrix.workers }}
       MATRIX_JOB: ${{ matrix.source }}-workers-${{ matrix.workers }}
@@ -64,6 +66,8 @@ jobs:
           path: frozen
 
       - name: Freeze identical regression inputs and exact product source
+        env:
+          EVIDENCE: ${{ runner.temp }}/evidence
         run: |
           set -Eeuo pipefail
           mkdir -p "$EVIDENCE"
@@ -126,6 +130,8 @@ jobs:
 
       - name: Install dependencies remotely
         working-directory: source
+        env:
+          EVIDENCE: ${{ runner.temp }}/evidence
         run: |
           set -Eeuo pipefail
           timeout -k 30s 20m make UNATTENDED=yes install-dep 2>&1 | tee "$EVIDENCE/dependencies.log"
@@ -138,12 +144,17 @@ jobs:
 
       - name: Build exact debug product remotely
         working-directory: source
+        env:
+          EVIDENCE: ${{ runner.temp }}/evidence
         run: |
           set -Eeuo pipefail
           timeout -k 30s 45m make UNATTENDED=yes build 2>&1 | tee "$EVIDENCE/build.log"
 
       - name: Run 100 attempts with strict witnesses
         working-directory: source
+        env:
+          EVIDENCE: ${{ runner.temp }}/evidence
+          QUIC_CRYPTO_ARTIFACTS: ${{ runner.temp }}/evidence/runtime
         run: |
           set -Eeuo pipefail
           mkdir -p "$QUIC_CRYPTO_ARTIFACTS" "$EVIDENCE/tmp" "$EVIDENCE/failed"
@@ -207,6 +218,8 @@ jobs:
 
       - name: Preserve logs and cleanup outcomes
         if: always()
+        env:
+          EVIDENCE: ${{ runner.temp }}/evidence
         run: |
           set +e
           mkdir -p "$EVIDENCE/harness"
