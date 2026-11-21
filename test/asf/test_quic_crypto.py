@@ -393,11 +393,16 @@ class QUICCredentialFailure(VppAsfTestCase):
         return any(FORMAT_FRAME.search(frame) for frame in record["traceback"])
 
     def hostname_signatures(self, records, baseline=None):
-        """Buckets allocated through a format call, optionally new or grown.
+        """Buckets a format call allocated into, optionally only those grown.
 
-        Passing a baseline keeps only the buckets whose counters advanced since
-        it, which is how the connect's own allocations are told apart from
-        format buckets that were already live.
+        Passing a baseline keeps only the buckets that gained both an
+        allocation and bytes since it, which is how the connect's own
+        allocation is told apart from a format bucket that was already live and
+        only got bigger. Such a bucket can grow in bytes alone: an in-place
+        realloc keeps the block offset, so clib_mem_heap_realloc_aligned()
+        updates the byte count through clib_mem_trace_put()/clib_mem_trace_get()
+        without changing the allocation count (src/vppinfra/mem_dlmalloc.c).
+        Requiring both counters matches what the assertions below require.
         """
         seen = {}
         for record in records:
@@ -414,7 +419,7 @@ class QUICCredentialFailure(VppAsfTestCase):
             name
             for name, current in seen.items()
             if current[0] > before.get(name, (0, 0))[0]
-            or current[1] > before.get(name, (0, 0))[1]
+            and current[1] > before.get(name, (0, 0))[1]
         }
 
     def hostname_records(self, records, signatures):
@@ -477,9 +482,11 @@ class QUICCredentialFailure(VppAsfTestCase):
         # src/vppinfra/mem.h), which is why the format frames are the key.
         # vec_terminate_c_string() then appends the NUL; format's growth leaves
         # spare capacity (50% on realloc, allocator rounding on first
-        # allocation), so that append normally does not reallocate. If it ever
-        # did, the vector would move to a non-format bucket and the guard below
-        # fails loudly instead of passing silently.
+        # allocation), so that append normally does not reallocate. If it did,
+        # the vector would move to a bucket no format frame allocated, this set
+        # would be empty and the guard below fails loudly. The same blind spot
+        # in the credential loop is covered by the context-pool assertion in
+        # snapshot(), not by the hostname counters; see that branch.
         live_signatures = self.hostname_signatures(records, before)
         # An empty result describes the measurement, not the rollback. Fail on
         # that fact alone so a missing attribution can never be reported later
@@ -505,13 +512,19 @@ class QUICCredentialFailure(VppAsfTestCase):
                 f"probes; format buckets are "
                 f"{sorted(list(item) for item in live_signatures)}",
             )
+            # Keep only the reused buckets that grew in this probe. A reused
+            # bucket whose counters dropped between the two traces would
+            # otherwise subtract its negative delta from a growing bucket's
+            # gain and hide the growth the assertions below look for. A bucket
+            # that merely stayed the same adds the same counts to both sides,
+            # so it is harmless but is dropped too.
+            signatures = live_signatures & signatures
         before_totals = self.hostname_totals(before, signatures)
         live_totals = self.hostname_totals(records, signatures)
-        # The selected buckets were chosen because they advanced, so this is the
-        # same fact viewed as totals; asserting it here keeps the evidence file
-        # and the assertion in step. The property under test is the teardown
-        # equality below: those buckets must return to where they started, which
-        # a leaked srv_hostname breaks.
+        # Every selected bucket grew in count and in bytes, so the totals must
+        # advance on both. The property under test is the teardown equality
+        # below: those buckets must return to where they started, which a
+        # leaked srv_hostname breaks.
         self.assertGreater(live_totals[0], before_totals[0])
         self.assertGreater(live_totals[1], before_totals[1])
         (self.evidence / "hostname-callsite.json").write_text(
@@ -642,7 +655,7 @@ class QUICCredentialFailure(VppAsfTestCase):
             preapp["certificates"].splitlines() + [expected_cert],
         )
         thread = str(min(1, self.vpp_worker_count))
-        count_per_attempt = bytes_per_attempt = None
+        bytes_per_attempt = None
         for attempt in range(1, ATTEMPTS + 1):
             self.assertEqual(self.snapshot(), baseline)
             start = len("".join(self.vpp_stderr_deque))
@@ -678,6 +691,14 @@ class QUICCredentialFailure(VppAsfTestCase):
             totals = self.hostname_totals(records, signatures)
             grown = [totals[0] - hostname_zero[0], totals[1] - hostname_zero[1]]
             if not LEAKS[mode]:
+                # The context-pool counters in this snapshot are the safety net
+                # for an unfreed vector this selection cannot see: a leak that
+                # moved srv_hostname onto a non-format bucket leaves the
+                # hostname counters at zero but still leaves the QUIC context
+                # allocated, and snapshot() reads "Thread N: ctx pool used/cap"
+                # for every thread. A record-existence guard would be wrong
+                # here, because a correct rollback frees the vector and so must
+                # leave no hostname record behind.
                 self.assertEqual(actual, baseline)
                 self.assertEqual(
                     grown,
