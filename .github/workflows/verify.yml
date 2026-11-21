@@ -144,23 +144,245 @@ jobs:
             extras/scripts/check_commit_msg.sh
             checked=$((checked + 1))
           done
-          echo "Checked the commit message of ${checked} commit(s) for head ${head}"
+
+      # The rules that map a changed path to a test module are written once,
+      # into a file the plan job downloads, so the plan job and the self-check
+      # below run that one file instead of restating the rules.
+      - name: Write the test-suite derivation helper
+        id: helper
+        run: |
+          cat > "${RUNNER_TEMP}/derive-suites.sh" <<'HELPER'
+          # One push runs at most SUITE_CAP test suites. The suites that do not
+          # fit are named in the log instead of being dropped without a word, so
+          # the selection and the drop report both read this one value.
+          SUITE_CAP=3
+
+          # A bare suite name resolves to test/test_<name>.py or
+          # test/asf/test_<name>.py. A rule that resolves to no module selects
+          # no test at all, so it reports itself instead of returning nothing.
+          suite_module_exists() {
+            [ -f "test/test_$1.py" ] || [ -f "test/asf/test_$1.py" ]
+          }
+
+          # src/vnet/<dir> directories whose test module is named differently
+          # from the directory. Every other directory keeps its own name.
+          suite_module_alias() {
+            case "$1" in
+              ip-neighbor) printf '%s\n' neighbor ;;
+              mfib) printf '%s\n' ip_mcast ;;
+            esac
+          }
+
+          report_uncovered() {
+            local path="$1" candidate looked=""
+            shift
+            for candidate in "$@"; do
+              looked="${looked}${looked:+, }test/test_${candidate}.py or test/asf/test_${candidate}.py"
+            done
+            printf 'UNCOVERED %s: looked for %s\n' "${path}" "${looked}" >&2
+          }
+
+          # Print the module that covers one changed path and return success, or
+          # print an UNCOVERED report on stderr and return failure.
+          derive_suite_for_path() {
+            local path="$1" rest dir sub name
+            local -a candidates=()
+            case "${path}" in
+              src/plugins/*/*)
+                rest=${path#src/plugins/}
+                dir=${rest%%/*}
+                sub=${rest#*/}
+                sub=${sub%%/*}
+                # The subdirectory is tried first, so
+                # src/plugins/nat/nat64/nat64_db.c selects nat64 rather than the
+                # package name nat, which has no module of its own. Only a
+                # directory is a candidate: in src/plugins/gre/gre.c the second
+                # path component is the file that changed.
+                if [ -d "src/plugins/${dir}/${sub}" ]; then
+                  candidates+=("${sub//-/_}")
+                fi
+                candidates+=("${dir//-/_}")
+                for name in "${candidates[@]}"; do
+                  if suite_module_exists "${name}"; then
+                    printf '%s\n' "${name}"
+                    return 0
+                  fi
+                done
+                report_uncovered "${path}" "${candidates[@]}"
+                return 1
+                ;;
+              src/vnet/*/*)
+                rest=${path#src/vnet/}
+                dir=${rest%%/*}
+                name=$(suite_module_alias "${dir}")
+                if [ -z "${name}" ]; then
+                  name=${dir//-/_}
+                fi
+                if suite_module_exists "${name}"; then
+                  printf '%s\n' "${name}"
+                  return 0
+                fi
+                report_uncovered "${path}" "${name}"
+                return 1
+                ;;
+            esac
+            return 1
+          }
+
+          # Read the changed paths from stdin and print the TEST filter: a suite
+          # whose own test module also changed goes first, alphabetical order
+          # within each group, at most SUITE_CAP suites, ip4 when nothing
+          # derives. A suite the cap drops is named on stderr rather than
+          # vanishing.
+          derive_test_suites() {
+            local changed path name suite suites prioritized remaining selected dropped
+            local -a paths=()
+            changed=$(cat)
+            mapfile -t paths <<< "${changed}"
+            suites=""
+            for path in "${paths[@]}"; do
+              [ -n "${path}" ] || continue
+              if name=$(derive_suite_for_path "${path}"); then
+                suites="${suites} ${name}"
+              fi
+            done
+            suites=$(printf '%s\n' "${suites}" | tr ' ' '\n' | sed '/^$/d' | sort -u)
+            prioritized=""
+            remaining=""
+            for suite in ${suites}; do
+              case $'\n'"${changed}"$'\n' in
+                *$'\n'"test/test_${suite}.py"$'\n'*|*$'\n'"test/asf/test_${suite}.py"$'\n'*)
+                  prioritized="${prioritized} ${suite}"
+                  ;;
+                *) remaining="${remaining} ${suite}" ;;
+              esac
+            done
+            suites=$(printf '%s %s\n' "${prioritized}" "${remaining}" |
+                     tr ' ' '\n' | sed '/^$/d')
+            selected=$(printf '%s\n' "${suites}" | head -n "${SUITE_CAP}" | tr '\n' ' ')
+            selected=${selected% }
+            dropped=$(printf '%s\n' "${suites}" | sed "1,${SUITE_CAP}d" | tr '\n' ' ')
+            if [ -n "${dropped% }" ]; then
+              printf 'Not selected: the suite cap of %s drops %s\n' \
+                "${SUITE_CAP}" "${dropped% }" >&2
+            fi
+            if [ -z "${selected}" ]; then
+              printf 'No test derives from the changed paths; using the ip4 smoke suite\n' >&2
+              selected="ip4"
+            fi
+            printf '%s\n' "${selected}"
+          }
+
+          # Every suite of the checked-out tree: the module names of
+          # test/test_*.py and test/asf/test_*.py, without the test_ prefix and
+          # the .py suffix, sorted and deduplicated, one name per line. It is
+          # read from the tree so the list cannot fall behind a new test module.
+          all_test_suites() {
+            local paths
+            paths=$(ls test/test_*.py test/asf/test_*.py 2>/dev/null || true)
+            if [ -n "${paths}" ]; then
+              printf '%s\n' "${paths}"
+            fi | sed 's#.*/test_##; s#\.py$##' | sort -u
+          }
+
+          # Print the number of suites all_test_suites lists. The names go
+          # through a file so the count is words of a file, never file
+          # arguments to wc, and the count is printed as a bare integer.
+          all_test_suites_count() {
+            local listing="$1/listing.txt"
+            all_test_suites > "${listing}"
+            grep -c '[^[:space:]]' "${listing}"
+          }
+
+          # Expand a workflow_dispatch suites input: the token "all" becomes
+          # every suite of the tree, and any other name is kept as given. The
+          # result is the sorted union of both, so an explicit name lands in
+          # its place even when it sits next to "all". An input without "all"
+          # is returned unchanged, so an explicit list behaves as before.
+          expand_manual_suites() {
+            local input="$1" token expanded="" others=""
+            for token in ${input}; do
+              if [ "${token}" = all ]; then
+                expanded="${expanded} $(all_test_suites | tr '\n' ' ')"
+              else
+                others="${others} ${token}"
+              fi
+            done
+            if [ -z "${expanded}" ]; then
+              printf '%s\n' "${others# }"
+              return 0
+            fi
+            printf '%s\n' ${expanded} ${others} | sed '/^$/d' | sort -u |
+              tr '\n' ' ' | sed 's/ *$//'
+            printf '\n'
+          }
+          HELPER
+          # The file is handed to another job as an artifact, so its length
+          # goes into the job output for the log to name.
+          echo "hash=$(sha256sum "${RUNNER_TEMP}/derive-suites.sh" | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      # The plan job downloads this file; no other job writes it.
+      - name: Upload the suite derivation helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: derive-suites-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/derive-suites.sh
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
+
+      # make install-dep installs $(DEB_DEPENDS), which is defined in the
+      # Makefile, so key the apt archive cache on that file: the key moves when
+      # the package list moves, and the run that first needs a new package is
+      # the run that stores it. The install step rewrites the Makefile
+      # afterwards, so the hash is taken into an output before that and both
+      # cache steps read the same value.
+      - name: Hash the dependency list
+        id: deps
+        run: |
+          git config --global --add safe.directory "$PWD"
+          echo "hash=$(git hash-object Makefile)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore apt archive cache
+        id: apt-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-debian13-${{ runner.arch }}-${{ github.job }}-${{ steps.deps.outputs.hash }}
+          restore-keys: |
+            apt-debian13-${{ runner.arch }}-${{ github.job }}-
+
+      - name: Install VPP build dependencies
+        run: |
+          sed -i '/^\s*git config commit\.template/s/^\(\s*\)/\1-/' Makefile
+          make UNATTENDED=yes install-dep
+
+      # Saving is skipped when the exact key was restored: that entry already
+      # holds what this run would store, and asking to save a key that exists
+      # fails the step with "Unable to reserve cache".
+      - name: Save apt archive cache
+        if: steps.apt-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-debian13-${{ runner.arch }}-${{ github.job }}-${{ steps.deps.outputs.hash }}
+
+      # Keyed by commit rather than by ref alone: a fixed key lets only the
 
   test-plan:
-    # The derivation helper is an artifact the style job uploads, so this job
-    # cannot start before that job has finished.
+    # The style job writes and uploads the derivation helper this job reads,
+    # so needs: style orders the upload before the download.
     needs: style
     runs-on: ubuntu-24.04
     outputs:
       variants: ${{ steps.plan.outputs.variants }}
       tunnel_control: ${{ steps.plan.outputs.tunnel_control }}
       # The build job is a matrix, and a matrix job cannot carry outputs to a
-      # later job. The suite list and its batches are produced here, from the
-      # same suite filter the build job derives, so the two jobs agree on
-      # which suites run without one of them reading the other's outputs.
+      # later job. The suite filter is derived here once, and the test job's
+      # matrix reads the shard lists; the build job reads the tunnel flag for
+      # its ESP control so both jobs act on one derivation.
+      tunnel_regression: ${{ steps.tests.outputs.tunnel_regression }}
       batches: ${{ steps.batches.outputs.batches }}
-      # The matrix of the test job reads one suite per entry, because a job
-      # boundary per suite is what survives a cancel.
       suites_json: ${{ steps.batches.outputs.suites_json }}
     steps:
       - uses: actions/checkout@v4
@@ -197,30 +419,59 @@ jobs:
           base = os.environ["PR_BASE"]
           head = os.environ["PR_HEAD"]
           if not base or not head:
-              # A push or a workflow_dispatch run has no pull request context;
-              # compare the branch tip with its parent instead.
-              base = subprocess.run(["git", "rev-parse", "HEAD^"], capture_output=True,
-                                    text=True).stdout.strip()
-              head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
-                                    text=True).stdout.strip()
-          changed = (git("diff", "--name-only", base + "..." + head).decode().splitlines()
-                     if base and head else [])
-          enabled = False
-          if "src/vnet/tunnel/tunnel_dp.h" in changed:
-              path = "test/test_ipsec_esp.py"
-              exists = subprocess.run(["git", "cat-file", "-e",
-                                       head + ":" + path]).returncode == 0
-              if exists:
-                  tree = ast.parse(git("show", head + ":" + path))
-                  enabled = any(isinstance(node, ast.ClassDef) and node.name == "TestIpsecEspTun"
-                                and any(isinstance(method, ast.FunctionDef) and
-                                        method.name == "test_tun_df44" for method in node.body)
-                                for node in tree.body)
-          variants = ["fixed", "original-df"] if enabled else ["fixed"]
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write("variants=" + json.dumps(variants) + "\n")
-              output.write("tunnel_control=" + str(enabled).lower() + "\n")
-          PY
+
+      # The suites this run selects, derived with the helper the style job
+      # wrote. The build job reads the tunnel flag from this step's output, so
+      # the ESP control and the test matrix never disagree about the filter.
+      # The derivation rules are the file the style job wrote, so this step and
+      # the split below read one definition of which paths select which suite.
+      # src/vnet/<dir> resolves through the alias table (ip-neighbor selects
+      # neighbor, mfib selects ip_mcast) and otherwise to <dir>; a prefix match
+      # is never used, because a directory such as ip would pull in every
+      # ip4/ip6/ipip/ipsec suite. A src path that resolves to no test module is
+      # logged as UNCOVERED with the module names that were tried, so a missing
+      # mapping is visible in the log instead of shrinking the run silently.
+      # src/vnet/tunnel/tunnel_dp.h is reported that way too: the ESP control
+      # below selects ipsec_esp for it separately. Changes under src/vppinfra,
+      # src/svm and src/vlib select nothing and use the ip4 fallback.
+      - name: Derive a test filter from the changed paths
+        id: tests
+        env:
+          # A workflow_dispatch run may name the suites itself; a push run
+          # leaves the input empty and derives the suites from its paths.
+          MANUAL_SUITES: ${{ inputs.suites }}
+        run: |
+          set -eu
+          . "${RUNNER_TEMP}/derive/derive-suites.sh"
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          # A push or a workflow_dispatch run has no pull request context;
+          # compare the branch tip with its parent instead.
+          if [ -z "${base}" ] || [ -z "${head}" ]; then
+            base=$(git rev-parse HEAD^ 2>/dev/null || echo "")
+            head=$(git rev-parse HEAD)
+          fi
+          changed=$(git diff --name-only "${base}...${head}" 2>/dev/null ||
+                    git diff --name-only "${base}..${head}" 2>/dev/null || true)
+          if [ -n "${MANUAL_SUITES}" ]; then
+            suites=$(printf '%s' "${MANUAL_SUITES}" | tr -s '[:space:]' ' ' |
+                     sed 's/^ *//; s/ *$//')
+            suites=$(expand_manual_suites "${suites}")
+            echo "Using the suites input of this workflow_dispatch run: ${suites}"
+          else
+            suites=$(printf '%s\n' "${changed}" | derive_test_suites)
+          fi
+          echo "Running TEST suites: ${suites}"
+          echo "suites=${suites}" >> "$GITHUB_OUTPUT"
+          tunnel_regression=false
+          case $'\n'"${changed}"$'\n' in
+            *$'\n'src/vnet/tunnel/tunnel_dp.h$'\n'*)
+              if [ -f test/test_ipsec_esp.py ]; then
+                tunnel_regression=true
+              fi
+              ;;
+          esac
+          echo "tunnel_regression=${tunnel_regression}" >> "$GITHUB_OUTPUT"
 
       # The suites the build job will select, split into the shards its test
       # job runs. The filter is derived here with the same helper the build
@@ -311,6 +562,11 @@ jobs:
           echo "Split ${total} suite(s) into ${shards} shard(s)"
           echo "batches=${batches}" >> "$GITHUB_OUTPUT"
           echo "suites_json=${suites_json}" >> "$GITHUB_OUTPUT"
+
+  build-test:
+    name: build and test (${{ matrix.variant }})
+    needs: test-plan
+    strategy:
 
   build-test:
     name: build and test (${{ matrix.variant }})
@@ -744,56 +1000,6 @@ jobs:
           if ! git describe --tags --long --match 'v[0-9]*' 2>/dev/null; then
             echo "0.0.0-release+$(git log -1 --format=%ct).$(git rev-list --count HEAD)-g$(git rev-parse --short=7 HEAD)" \
               > src/scripts/.version
-          fi
-
-      # Apply the derivation written into ${RUNNER_TEMP}/derive-suites.sh above.
-      # src/vnet/<dir> resolves through the alias table (ip-neighbor selects
-      # neighbor, mfib selects ip_mcast) and otherwise to <dir>; a prefix match
-      # is never used, because a directory such as ip would pull in every
-      # ip4/ip6/ipip/ipsec suite. A src path that resolves to no test module is
-      # logged as UNCOVERED with the module names that were tried, so a missing
-      # mapping is visible in the log instead of shrinking the run silently.
-      # src/vnet/tunnel/tunnel_dp.h is reported that way too: the ESP control
-      # below selects ipsec_esp for it separately. Changes under src/vppinfra,
-      # src/svm and src/vlib select nothing and use the ip4 fallback.
-      - name: Derive a test filter from the changed paths
-        id: tests
-        env:
-          # A workflow_dispatch run may name the suites itself; a push run
-          # leaves the input empty and derives the suites from its paths.
-          MANUAL_SUITES: ${{ inputs.suites }}
-        run: |
-          set -eu
-          . "${RUNNER_TEMP}/derive-suites.sh"
-          base="${{ github.event.pull_request.base.sha }}"
-          head="${{ github.event.pull_request.head.sha }}"
-          # A push or a workflow_dispatch run has no pull request context;
-          # compare the branch tip with its parent instead.
-          if [ -z "${base}" ] || [ -z "${head}" ]; then
-            base=$(git rev-parse HEAD^ 2>/dev/null || echo "")
-            head=$(git rev-parse HEAD)
-          fi
-          changed=$(git diff --name-only "${base}...${head}" 2>/dev/null ||
-                    git diff --name-only "${base}..${head}" 2>/dev/null || true)
-          if [ -n "${MANUAL_SUITES}" ]; then
-            suites=$(printf '%s' "${MANUAL_SUITES}" | tr -s '[:space:]' ' ' |
-                     sed 's/^ *//; s/ *$//')
-            suites=$(expand_manual_suites "${suites}")
-            echo "Using the suites input of this workflow_dispatch run: ${suites}"
-          else
-            suites=$(printf '%s\n' "${changed}" | derive_test_suites)
-          fi
-          echo "Running TEST suites: ${suites}"
-          echo "suites=${suites}" >> "$GITHUB_OUTPUT"
-          tunnel_regression=false
-          case $'\n'"${changed}"$'\n' in
-            *$'\n'src/vnet/tunnel/tunnel_dp.h$'\n'*)
-              if [ -f test/test_ipsec_esp.py ]; then
-                tunnel_regression=true
-              fi
-              ;;
-          esac
-          echo "tunnel_regression=${tunnel_regression}" >> "$GITHUB_OUTPUT"
 
       - name: Prepare exact ESP source variant and provenance
         if: contains(format(' {0} ', steps.tests.outputs.tunnel_regression), ' true ')
@@ -1478,29 +1684,32 @@ jobs:
           if-no-files-found: warn
           compression-level: 6
 
-  # One job per suite, all taken from the flat suite list the plan job
-  # produced. The shard lists the plan job also writes are not read here.
-  # A job boundary per suite is what survives a cancel: cancelling a suite
-  # leaves its own job, and its record is the artifact that job already
-  # uploaded.
+  # Twelve shard jobs, each running a slice of the selected suites in order.
+  # The shard is the unit a cancel stops and the unit that pays the fixed cost
+  # of a test runner, so twelve pay it twelve times instead of once per suite.
   test:
-    name: test (${{ matrix.suite }})
+    name: test (${{ matrix.variant }} shard ${{ matrix.batch }})
     needs: [test-plan, build-test]
     # A skipped build has no image, so these runners would only fail on the
-    # download; everything else is left to the suite's own steps.
+    # download; everything else is left to the shard's own steps.
     if: always() && needs.build-test.result != 'skipped' && needs.build-test.result != 'cancelled'
     strategy:
-      # A failing suite does not stop the others, and a suite that was
+      # A failing suite does not stop the other shards, and a shard that was
       # cancelled does not stop the dispatch from reaching the rest.
       fail-fast: false
-      # Every entry is queued at once, so a red suite starts no later than a
-      # green one and a failure cannot push the rest to the end of the queue.
+      # Twelve runners take the shards; the others wait in the queue instead of
+      # all of them installing packages and building the test environment at
+      # once.
+      max-parallel: 12
       matrix:
         variant: ${{ fromJSON(needs.test-plan.outputs.variants) }}
-        suite: ${{ fromJSON(needs.test-plan.outputs.suites_json) }}
+        # One entry per shard: its index, and the suites it runs in order. The
+        # two lists come from one split, so entry N of each names the same shard.
+        batch: ${{ fromJSON(needs.test-plan.outputs.shard_indexes) }}
+        suites: ${{ fromJSON(needs.test-plan.outputs.batches) }}
     runs-on: ubuntu-24.04
-    # A suite that hangs is cut off here rather than holding a runner until
-    # the platform ceiling, and its record is the last artifact it uploaded.
+    # A shard that hangs is cut off here rather than holding a runner until the
+    # platform ceiling, and its summary is the last artifact it uploaded.
     timeout-minutes: 180
     container:
       image: debian:trixie
@@ -1516,10 +1725,19 @@ jobs:
     defaults:
       run:
         shell: bash
+    # Both steps that read these names are steps of this job, so the variables
+    # live here rather than in one step's env.
     env:
       CCACHE_COMPRESS: "true"
       CCACHE_MAXSIZE: 2G
+      # This shard's own directory: its summary and its per-suite evidence.
+      SHARD_DIAGNOSTICS: ${{ runner.temp }}/shard-diagnostics
+      # The ESP evidence check and the suite loop both read this flag.
+      TUNNEL_REGRESSION: ${{ needs.test-plan.outputs.tunnel_regression }}
+      # Set only on the negative-control variant, whose shard runs no suite.
+      ESP_VARIANT: ${{ matrix.variant == 'original-df' && 'original-df' || '' }}
     steps:
+
       - name: Disable APT cache cleanup
         run: rm -f /etc/apt/apt.conf.d/docker-clean
 
@@ -1574,13 +1792,29 @@ jobs:
           name: vpp-debug-image-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/image
 
-      - name: Restore the built image
+      - name: Extract the built image
         run: |
           set -eu
           image="${RUNNER_TEMP}/image/vpp-debug-image-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}.tar.zst"
+          # The archive holds all of build-root, so the installed external
+          # dependencies and every build timestamp travel with the trees.
           tar --zstd -xf "${image}"
-          test -x build-root/install-vpp_debug-native/vpp/bin/vpp
-          test -f build-root/build-vpp_debug-native/vpp/CMakeCache.txt
+          ls -l build-root/build-vpp_debug-native/vpp/.mu_build_install_timestamp
+          test -f build-root/install-vpp_debug-native/external/lib/pkgconfig/libdpdk.pc
+          # A source file newer than its own install timestamp is exactly what
+          # makes build-root/Makefile re-run vpp-install. This tree is the one
+          # the build job built, so the check must find nothing; if it finds
+          # something, the shard would rebuild VPP with whatever toolchain it
+          # has instead of running the suites against the built tree.
+          stale=$(find src build-data build-root/Makefile \
+                    -newer build-root/build-vpp_debug-native/vpp/.mu_build_install_timestamp \
+                    -type f 2>/dev/null || true)
+          if [ -n "${stale}" ]; then
+            echo "::error::this tree is newer than the archived install; test-debug would rebuild:"
+            printf '%s\n' "${stale}"
+            exit 1
+          fi
+          echo "No source file is newer than the archived install timestamp"
 
       - name: Remount /dev/shm for the test harness
         uses: ./.github/actions/vpp-docker-runtime-setup
@@ -1590,157 +1824,275 @@ jobs:
           LOG_DIR: ${{ github.workspace }}/build-root/test-logs
 
       # The suite runs as a background child so a monitor can note which test
-      # methods it is inside while it runs. `/tmp` survives a job that is
-      # cancelled, but only while its runner lives, so what matters for the
-      # record is the artifact below: a cancelled job has no step that runs,
-      # and this design does not pretend otherwise — the job's own log shows
-      # how far it reached.
-      - name: Run the suite
-        id: suite
+
+      - name: Run the shard's suites
+        if: env.ESP_VARIANT == '' || matrix.variant == env.ESP_VARIANT
         env:
-          TEST: ${{ matrix.suite }}
+          SUITES: ${{ matrix.suites }}
         run: |
-          set -eu
           git config --global --add safe.directory "$PWD"
-          set +e
-          make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST="${TEST}" test-debug &
-          suite_pid=$!
-          monitor_pid=""
-          if command -v strace >/dev/null 2>&1; then
-            # One line per test method the suite enters. The file is read
-            # after the suite ends, and a cancelled suite leaves the lines
-            # it managed to write.
-            strace -f -qq -e trace=execve -o "${RUNNER_TEMP}/suite-exec.trace" \
-              -p "${suite_pid}" >/dev/null 2>&1 &
-            monitor_pid=$!
-          fi
-          set -e
-          status=0
-          wait "${suite_pid}" || status=$?
-          # The monitor is a child of this shell, so stopping it here keeps a
-          # job that is cancelled later from leaving it behind.
-          if [ -n "${monitor_pid}" ]; then
-            kill "${monitor_pid}" 2>/dev/null || true
-            wait "${monitor_pid}" 2>/dev/null || true
-          fi
-          python3 - "${RUNNER_TEMP}/suite-record.json" "${TEST}" "${status}" <<'PY'
-          import json
-          import os
-          import sys
-          from datetime import datetime, timezone
-          from pathlib import Path
-
-          record_path, suite, status = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
-          trace = record_path.with_name("suite-exec.trace")
-          timeouts = sum(1 for line in trace.read_text(errors="replace").splitlines()
-                         if "TimeoutExpired" in line) if trace.is_file() else 0
-          failed = Path("/tmp/vpp-unittest-__main__/failed_tests.txt")
-          names = [line.strip() for line in failed.read_text().splitlines() if line.strip()] \
-              if failed.is_file() and not failed.is_symlink() else []
-          record = {"test": suite, "lifecycle": "finished",
-                    "outcome": "pass" if status == 0 else "fail",
-                    "exit_status": status, "timeouts": timeouts,
-                    "failed_tests": names[-50:],
-                    "observed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
-          record_path.write_text(json.dumps(record) + "\n")
-          print(json.dumps(record))
-          PY
-          echo "status=${status}" >> "$GITHUB_OUTPUT"
-          exit "${status}"
-
-      # `make` wipes /tmp/vpp-unittest-* and /tmp/vpp-failed-unittests at the
-      # start of the next suite. Each suite is its own job here, so nothing
-      # follows this copy, but a retry inside the same suite still resets, so
-      # the copy runs immediately after the suite and names itself after it.
-      - name: Collect the suite diagnostics
-        if: always()
-        run: |
           set -eu
-          SUITE="${{ matrix.suite }}" OUTPUT="${RUNNER_TEMP}/vpp-suite-diagnostics" python3 - <<'PY'
-          import os
-          import re
-          import shutil
-          import stat
-          from pathlib import Path
+          read -ra suites <<< "${SUITES}"
+          if [ "${#suites[@]}" -eq 0 ]; then
+            echo "::error::The shard matrix entry names no suite"
+            exit 1
+          fi
+          summary_file="${SHARD_DIAGNOSTICS}/suite-summary.txt"
+          mkdir -p "${SHARD_DIAGNOSTICS}"
+          : > "${summary_file}"
+          results=()
+          failed=()
+          # errexit would end the step at the first failing suite, so it is off
+          # for the suite bodies and every command records its own status.
+          for suite in "${suites[@]}"; do
+            echo "Running TEST=${suite}"
+            suite_status=0
+            if [ "${suite}" = linux_cp ]; then
+              recovery_log=/tmp/vpp-unittest-TestLinuxCPNetlinkRecovery/log.txt
+              rm -f "${recovery_log}"
+            fi
+            set +e
+            if [ "${suite}" = ipsec_esp ] && [ "${TUNNEL_REGRESSION}" = true ]; then
+              rm -f /tmp/vpp-unittest-TestIpsecEspTun/log.txt
+              evidence="${RUNNER_TEMP}/esp-evidence/suite"
+              mkdir -p "${evidence}"
+              make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST="${suite}" test-debug 2>&1 |
+                (ulimit -f 32768; tee "${evidence}/command.log")
+              statuses=("${PIPESTATUS[@]}")
+              printf '%s\n' "${statuses[0]}" > "${evidence}/raw-returncode.txt"
+              printf '%s\n' "${statuses[1]}" > "${evidence}/capture-returncode.txt"
+              printf '%s\n' 'make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST=ipsec_esp test-debug' > "${evidence}/command.txt"
+              python3 - <<'PY'
+              import os
+              from pathlib import Path
 
-          suite, output = os.environ["SUITE"], Path(os.environ["OUTPUT"])
-          limit = 32 * 1024 * 1024
-          reserved = {"log.txt", "vpp_stdout.txt", "vpp_stderr.txt", "failed_tests.txt"}
-          output.mkdir(parents=True, exist_ok=True)
-          originals = [Path("/tmp/vpp-failed-unittests")] + sorted(Path("/tmp").glob("vpp-unittest-*"))
-          copied = []
-          copied_count = 0
-          for original in originals:
-              if original.is_symlink() or not original.is_dir():
-                  copied.append(f"MISSING OR UNSAFE directory: {original}")
-                  continue
-              for directory, subdirs, names in os.walk(original, followlinks=False):
-                  subdirs[:] = sorted(name for name in subdirs
-                                      if not (Path(directory) / name).is_symlink())
-                  for name in sorted(names):
-                      source = Path(directory) / name
-                      keep = (name in reserved or name.startswith("vpp_api_trace")
-                              or re.fullmatch(r"api_post_mortem\.[0-9]+", name) is not None
-                              or name.endswith(".log"))
-                      if not keep:
-                          continue
-                      # The harness removes its temporary trees between
-                      # retries, so a file can vanish between the walk and the
-                      # copy. The size check and the copy share one try.
-                      try:
-                          if not stat.S_ISREG(source.lstat().st_mode):
+              source = Path("/tmp/vpp-unittest-TestIpsecEspTun/log.txt")
+              if not source.is_file() or source.is_symlink() or source.stat().st_size > 8 * 1024 * 1024:
+                  raise SystemExit("Missing, unsafe or oversized ESP named log")
+              (Path(os.environ["RUNNER_TEMP"]) / "esp-evidence/suite/named-test.log").write_bytes(source.read_bytes())
+              PY
+              esp_log_status=$?
+              [ "${esp_log_status}" = 0 ] || suite_status=1
+              [ "${statuses[1]}" = 0 ] || suite_status=1
+              [ "${statuses[0]}" = 0 ] || suite_status=1
+              # The evidence step reads this file for the one suite it covers,
+              # instead of taking the whole step's aggregate outcome.
+              if [ "${suite_status}" = 0 ]; then
+                echo success > "${evidence}/esp-suite-outcome.txt"
+              else
+                echo failure > "${evidence}/esp-suite-outcome.txt"
+              fi
+            else
+              make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST="${suite}" test-debug ||
+                suite_status=1
+            fi
+            if [ "${suite_status}" = 0 ] && [ "${suite}" = linux_cp ]; then
+              python3 - "${recovery_log}" <<'PY' || suite_status=1
+              import re
+              import sys
+              from pathlib import Path
+
+              path = Path(sys.argv[1])
+              if not path.is_file():
+                  sys.exit(f"::error::Missing recovery test results: {path}")
+              results = {}
+              # VppTestResult.log_result records the callback and exact test name.
+              pattern = (r" --- (add\w+)\(\) TestLinuxCPNetlinkRecovery\."
+                         r"(\w+)\(")
+              for callback, method in re.findall(pattern, path.read_text()):
+                  results.setdefault(method, []).append(callback)
+              for method in ("test_netlink_poll_error_recovery",
+                             "test_netlink_poll_error_invalid_fd"):
+                  callbacks = results.get(method, [])
+                  if callbacks != ["addSuccess"]:
+                      sys.exit(f"::error::{method}: expected addSuccess, "
+                               f"got {callbacks}; see {path}")
+                  print(f"Verified {method}: addSuccess")
+              PY
+            fi
+            if [ "${suite_status}" = 0 ]; then
+              results+=("${suite}: pass")
+              echo "${suite}: pass" >> "${summary_file}"
+              echo "Suite result: ${suite}: pass"
+            else
+              results+=("${suite}: fail")
+              failed+=("${suite}")
+              echo "${suite}: fail" >> "${summary_file}"
+              echo "Suite result: ${suite}: fail"
+            fi
+            # The next make test-debug runs the framework's reset, which removes
+            # /tmp/vpp-unittest-* and /tmp/vpp-failed-unittests, so this suite's
+            # evidence is copied now. The copy is per suite because two suites
+            # can share a test-class directory name. It runs while errexit is
+            # off; every internal error is recorded in the report, and a
+            # non-zero exit marks the suite, not the shard.
+            SUITE="${suite}" OUTPUT="${SHARD_DIAGNOSTICS}/${suite}" python3 - <<'PY'
+              import os
+              import re
+              import shutil
+              import stat
+              from pathlib import Path
+
+              suite, output = os.environ["SUITE"], Path(os.environ["OUTPUT"])
+              limit = 32 * 1024 * 1024
+              reserved = {"log.txt", "vpp_stdout.txt", "vpp_stderr.txt", "failed_tests.txt"}
+              output.mkdir(parents=True, exist_ok=True)
+              originals = [Path("/tmp/vpp-failed-unittests")] + sorted(Path("/tmp").glob("vpp-unittest-*"))
+              copied = []
+              copied_count = 0
+              for original in originals:
+                  if original.is_symlink() or not original.is_dir():
+                      copied.append(f"MISSING OR UNSAFE directory: {original}")
+                      continue
+                  for directory, subdirs, names in os.walk(original, followlinks=False):
+                      subdirs[:] = sorted(name for name in subdirs
+                                          if not (Path(directory) / name).is_symlink())
+                      for name in sorted(names):
+                          source = Path(directory) / name
+                          keep = (name in reserved or name.startswith("vpp_api_trace")
+                                  or re.fullmatch(r"api_post_mortem\.[0-9]+", name) is not None
+                                  or name.endswith(".log"))
+                          if not keep:
                               continue
-                          if source.stat().st_size > limit:
-                              copied.append(f"SKIPPED (over 32 MiB): {source}")
+                          # The harness removes its temporary trees between
+                          # suites, so a file can vanish between the walk and
+                          # the copy. The size check and the copy share one try:
+                          # a file that disappears is recorded, not raised.
+                          try:
+                              if not stat.S_ISREG(source.lstat().st_mode):
+                                  continue
+                              if source.stat().st_size > limit:
+                                  copied.append(f"SKIPPED (over 32 MiB): {source}")
+                                  continue
+                              target = output / f"{copied_count:04d}{source.suffix}"
+                              shutil.copyfile(source, target)
+                          except OSError as error:
+                              copied.append(f"SKIPPED ({error}): {source}")
                               continue
-                          target = output / f"{copied_count:04d}{source.suffix}"
-                          shutil.copyfile(source, target)
-                      except OSError as error:
-                          copied.append(f"SKIPPED ({error}): {source}")
-                          continue
-                      copied.append(f"COPIED: {source} -> {target.name}")
-                      copied_count += 1
+                          copied.append(f"COPIED: {source} -> {target.name}")
+                          copied_count += 1
+                          if copied_count >= 2000:
+                              break
                       if copied_count >= 2000:
                           break
-                  if copied_count >= 2000:
-                      break
-          (output / "collection-report.txt").write_text("\n".join(copied) + "\n")
-          print(f"Copied {copied_count} file(s) of suite {suite}")
-          PY
+              (output / "collection-report.txt").write_text("\n".join(copied) + "\n")
+              print(f"Copied {copied_count} file(s) of suite {suite}")
+              PY
+            if [ "${suite_status}" -ne 0 ]; then
+              echo "::error::TEST=${suite} failed; its evidence is in ${SHARD_DIAGNOSTICS}/${suite}"
+            fi
+          done
+          set -e
+          echo "Shard summary (${#results[@]} suite(s)):"
+          printf '  %s\n' "${results[@]}"
+          if [ "${#failed[@]}" -ne 0 ]; then
+            echo "::error::${#failed[@]} of ${#results[@]} suite(s) failed in this shard: ${failed[*]}"
+            exit 1
+          fi
+          echo "All ${#results[@]} suite(s) of this shard passed"
 
-      - name: Record the suite outcome
+      # The shard prints its table after its last suite, so a shard that
+      # reaches the job's time limit loses the table but not the per-suite
+      # result lines, which the loop appends as each suite ends. This step
+      # reads the same job-level SHARD_DIAGNOSTICS the loop writes.
+      - name: Report the shard summary so far
         if: always()
         run: |
-          set -eu
-          python3 - "${{ matrix.suite }}" "${{ steps.suite.outputs.status }}" <<'PY'
-          import json
-          import os
-          import sys
-          from datetime import datetime, timezone
-          from pathlib import Path
+          summary="${SHARD_DIAGNOSTICS}/suite-summary.txt"
+          mkdir -p "${SHARD_DIAGNOSTICS}"
+          if [ ! -s "${summary}" ]; then
+            echo "No suite of this shard finished before this step ran" > "${summary}"
+          fi
+          echo "Per-suite results recorded by this shard so far:"
+          cat "${summary}"
+      - name: Upload failed test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpp-test-diagnostics-${{ matrix.variant }}-batch${{ matrix.batch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/shard-diagnostics/
+          retention-days: 7
+          if-no-files-found: warn
+          compression-level: 6
 
-          suite, status = sys.argv[1], sys.argv[2]
-          path = Path(os.environ["RUNNER_TEMP"]) / "suite-record.json"
-          record = json.loads(path.read_text()) if path.is_file() else {"test": suite}
-          if not record.get("finished"):
-              # The run step did not reach its own record, so this one states
-              # what is known: the suite failed or was cancelled.
-              record.update({"test": suite, "lifecycle": "finished", "finished": True,
-                             "outcome": "pass" if status == "0" else "fail" if status else "cancelled",
-                             "exit_status": status or None, "failed_tests": [],
-                             "observed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
-              path.write_text(json.dumps(record) + "\n")
-          print(json.dumps(record))
-          PY
-
-      - name: Upload the suite record and diagnostics
+      # Every shard uploads its own table: a cancelled run stops the shards, and
+      # this artifact is what survives that.
+      - name: Upload the suite summary
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vpp-suite-${{ matrix.suite }}-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/suite-record.json
-            ${{ runner.temp }}/vpp-suite-diagnostics/
+          name: vpp-suite-summary-${{ matrix.variant }}-batch${{ matrix.batch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/shard-diagnostics/suite-summary.txt
+          retention-days: 7
+          if-no-files-found: warn
+          compression-level: 6
+
+  # The shard jobs report into their own artifacts, and a run that is
+  # cancelled stops the shards without any job starting afterwards. This job
+  # runs while the shards are still reporting, after the first suite and after
+  # the last, so a reader gets the union table in the job summary and in one
+  # log instead of opening twelve jobs. When the run is cancelled this job goes
+  # with it: the table then lives in the per-shard artifact
+  # vpp-suite-summary-<variant>-batch<N>-<run_id>-<run_attempt>, and each shard
+  # job's own log shows how far that shard reached.
+  aggregate:
+    name: report the run
+    needs: [test-plan, build-test, test]
+    if: always() && needs.test.result != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download the shard summaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vpp-suite-summary-*
+          path: ${{ runner.temp }}/shard-summaries
+          merge-multiple: false
+
+      - name: Print the union table
+        run: |
+          set -eu
+          output="${RUNNER_TEMP}/run-summary.txt"
+          : > "${output}"
+          # Two matrices produce two families of summaries, and a suite can
+          # appear in both; the table names the family so a pass and a failure
+          # of the same suite are both visible.
+          top=0
+          for family in "${RUNNER_TEMP}"/shard-summaries/*; do
+            [ -d "${family}" ] || continue
+            file="${family}/suite-summary.txt"
+            if [ ! -s "${file}" ]; then
+              echo "No summary from $(basename "${family}")" >> "${output}"
+              continue
+            fi
+            while IFS= read -r line; do
+              [ -n "${line}" ] || continue
+              echo "$(basename "${family}"): ${line}" >> "${output}"
+            done < "${file}"
+            top=$((top + 1))
+          done
+          if [ "${top}" -eq 0 ]; then
+            echo "No shard reported a summary" >> "${output}"
+          fi
+          {
+            echo "## Test results of this run"
+            echo
+            echo '```'
+            sort "${output}"
+            echo '```'
+          } > "${RUNNER_TEMP}/step-summary.txt"
+          cat "${RUNNER_TEMP}/step-summary.txt" >> "$GITHUB_STEP_SUMMARY"
+          cat "${output}"
+
+      - name: Upload the run summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpp-run-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/run-summary.txt
           retention-days: 7
           if-no-files-found: warn
           compression-level: 6
