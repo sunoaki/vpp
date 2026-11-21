@@ -510,14 +510,13 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       variants: ${{ steps.plan.outputs.variants }}
-      tunnel_control: ${{ steps.plan.outputs.tunnel_control }}
       # The build job is a matrix, and a matrix job cannot carry outputs to a
       # later job. The suite filter is derived here once; the build job reads
-      # the tunnel flag for its ESP control and this job's namespace check, and
-      # the test job's matrix reads the shards, so every job acts on one
-      # derivation.
+      # the tunnel flag for its ESP control, and the test job reads the same
+      # flag for its ESP check and the shards for its matrix, so every job acts
+      # on one derivation.
       tunnel_regression: ${{ steps.tests.outputs.tunnel_regression }}
-      # The suites this run selected, for the build job's namespace check.
+      # The suites this run selected, for the test job's namespace check.
       suites: ${{ steps.tests.outputs.suites }}
       # The test job's matrix: one entry per shard, each an object pairing the
       # shard's number with the suites it runs, so the matrix has one dimension
@@ -580,7 +579,6 @@ jobs:
           variants = ["fixed", "original-df"] if enabled else ["fixed"]
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write("variants=" + json.dumps(variants) + "\n")
-              output.write("tunnel_control=" + str(enabled).lower() + "\n")
           PY
 
       - name: Derive a test filter from the changed paths
@@ -729,9 +727,11 @@ jobs:
       image: debian:trixie
       # The test framework reserves SHM_PER_PROCESS per worker on top of a
       # 1 GiB minimum; the 64 MiB container default is far too small.
-      # ip netns needs mount/unshare/setns; link and TAP setup need NET_ADMIN.
+      # ip netns needs mount/unshare/setns; link setup needs NET_ADMIN.
       # Docker's default seccomp permits these calls with SYS_ADMIN, but its
-      # AppArmor profile denies mount. Allow only the TAP/vhost misc devices.
+      # AppArmor profile denies mount. Allow only the TAP/vhost misc devices;
+      # this job creates neither node, the suites that open them run in the
+      # test job.
       options: >-
         --shm-size=2g
         --cap-add=SYS_ADMIN
@@ -975,26 +975,31 @@ jobs:
           # build-root as a whole is 1.8 GiB here, and two of its trees are
           # never read by a shard: .ccache is only used by this build job's own
           # ccache steps, and build-vpp-native is the release tree. Leaving them
-          # out keeps the download near 1.2 GiB per shard instead of 1.8 GiB,
+          # out keeps the payload near 1.2 GiB per shard instead of 1.8 GiB,
           # and the shard's Extract step asserts that every tree it does need
           # arrived.
-          tar --zstd --exclude='build-root/.ccache' \
+          #
+          # tar writes a plain archive and the upload step compresses it. GNU
+          # tar does not link libzstd: `--zstd` execs a separate `zstd` program,
+          # which the trixie image does not carry (it has libzstd1 only), so
+          # compressing here would fail before the upload.
+          tar --exclude='build-root/.ccache' \
             --exclude='build-root/build-vpp-native' \
             --exclude='build-root/install-vpp-native' \
-            -cf "${RUNNER_TEMP}/${name}.tar.zst" build-root
-          ls -l "${RUNNER_TEMP}/${name}.tar.zst"
+            -cf "${RUNNER_TEMP}/${name}.tar" build-root
+          ls -l "${RUNNER_TEMP}/${name}.tar"
 
       - name: Upload the built image
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: vpp-debug-image-fixed-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/${{ steps.image.outputs.name }}.tar.zst
+          path: ${{ runner.temp }}/${{ steps.image.outputs.name }}.tar
           retention-days: 3
           if-no-files-found: error
-          # The archive is already compressed; a second pass would only spend
-          # minutes re-compressing it.
-          compression-level: 0
+          # The archive leaves the archive step uncompressed, so this level is
+          # what decides the download size.
+          compression-level: 6
 
       - name: Remount /dev/shm for the test harness
         uses: ./.github/actions/vpp-docker-runtime-setup
@@ -1002,47 +1007,6 @@ jobs:
           WORKSPACE: ${{ github.workspace }}
           SHM_SIZE: 2G
           LOG_DIR: ${{ github.workspace }}/build-root/test-logs
-
-      - name: Check namespace support for linux_cp
-        if: contains(format(' {0} ', needs.test-plan.outputs.suites), ' linux_cp ')
-        run: |
-          set -Eeuo pipefail
-          namespace="vpp-ci-netns-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          cleanup() {
-            result=$?
-            trap - EXIT
-            if [ -e "/run/netns/${namespace}" ]; then
-              ip netns del "${namespace}" || result=1
-            fi
-            exit "${result}"
-          }
-          trap cleanup EXIT
-          trap 'echo "::error::Namespace preflight: ${BASH_COMMAND}" >&2' ERR
-          command -v ip
-          id
-          # Report the effective capabilities and active security filters.
-          sed -n '/^Cap/p; /^NoNewPrivs:/p; /^Seccomp/p' /proc/self/status
-          if [ -r /proc/self/attr/current ]; then
-            cat /proc/self/attr/current || true
-          fi
-          set -x
-          ip netns add "${namespace}"
-          ip netns exec "${namespace}" ip link set lo up
-          ip netns exec "${namespace}" ip link show lo
-          # VPP's TAP backend opens both devices when it creates an LCP pair.
-          mkdir -p /dev/net
-          if [ ! -e /dev/net/tun ]; then
-            mknod /dev/net/tun c 10 200
-          fi
-          if [ ! -e /dev/vhost-net ]; then
-            mknod /dev/vhost-net c 10 238
-          fi
-          for device in /dev/net/tun /dev/vhost-net; do
-            test -c "${device}"
-            (: <> "${device}")
-          done
-          ip netns exec "${namespace}" ip tuntap add dev vpp-ci-tap mode tap
-          ip netns exec "${namespace}" ip link del vpp-ci-tap
 
       - name: Run the original DF checksum control
         id: negative
@@ -1346,8 +1310,8 @@ jobs:
       - name: Extract the built image
         run: |
           set -eu
-          image="${RUNNER_TEMP}/image/vpp-debug-image-fixed-${{ github.run_id }}-${{ github.run_attempt }}.tar.zst"
-          tar --zstd -xf "${image}"
+          image="${RUNNER_TEMP}/image/vpp-debug-image-fixed-${{ github.run_id }}-${{ github.run_attempt }}.tar"
+          tar -xf "${image}"
           test -f build-root/build-vpp_debug-native/vpp/.mu_build_install_timestamp
           test -f build-root/build-vpp_debug-native/external/.mu_build_install_timestamp
           test -f build-root/install-vpp_debug-native/external/lib/pkgconfig/libdpdk.pc
@@ -1389,6 +1353,57 @@ jobs:
           WORKSPACE: ${{ github.workspace }}
           SHM_SIZE: 2G
           LOG_DIR: ${{ github.workspace }}/build-root/test-logs
+
+      # The cgroup rules above let this container open the two misc devices,
+      # but they do not create them and a plain container has neither. VPP's
+      # TAP backend opens /dev/net/tun when it creates an LCP pair
+      # (src/plugins/tap/tap.c:529, src/vnet/unix/tuntap.c:510), and its vhost
+      # backend opens /dev/vhost-net (src/plugins/tap/tap.c:667); the suites
+      # run in this job, so the nodes are made here.
+      - name: Create the TAP and vhost device nodes
+        run: |
+          set -eu
+          # VPP's TAP backend opens both devices when it creates an LCP pair.
+          mkdir -p /dev/net
+          if [ ! -e /dev/net/tun ]; then
+            mknod /dev/net/tun c 10 200
+          fi
+          if [ ! -e /dev/vhost-net ]; then
+            mknod /dev/vhost-net c 10 238
+          fi
+          for device in /dev/net/tun /dev/vhost-net; do
+            test -c "${device}"
+            (: <> "${device}")
+          done
+
+      - name: Check namespace support for linux_cp
+        if: contains(format(' {0} ', needs.test-plan.outputs.suites), ' linux_cp ')
+        run: |
+          set -Eeuo pipefail
+          namespace="vpp-ci-netns-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            result=$?
+            trap - EXIT
+            if [ -e "/run/netns/${namespace}" ]; then
+              ip netns del "${namespace}" || result=1
+            fi
+            exit "${result}"
+          }
+          trap cleanup EXIT
+          trap 'echo "::error::Namespace preflight: ${BASH_COMMAND}" >&2' ERR
+          command -v ip
+          id
+          # Report the effective capabilities and active security filters.
+          sed -n '/^Cap/p; /^NoNewPrivs:/p; /^Seccomp/p' /proc/self/status
+          if [ -r /proc/self/attr/current ]; then
+            cat /proc/self/attr/current || true
+          fi
+          set -x
+          ip netns add "${namespace}"
+          ip netns exec "${namespace}" ip link set lo up
+          ip netns exec "${namespace}" ip link show lo
+          ip netns exec "${namespace}" ip tuntap add dev vpp-ci-tap mode tap
+          ip netns exec "${namespace}" ip link del vpp-ci-tap
 
       # Every suite of this shard is run by a recorder step and a fixer step,
       # and the checks that read a suite's own evidence are helper scripts, so
@@ -1764,7 +1779,7 @@ jobs:
   #
   # When the whole run is cancelled this job never starts, because nothing
   # starts after a cancel. The table then lives in the per-shard artifact
-  # vpp-suite-summary-<variant>-batch<N>-<run_id>-<run_attempt>, which each
+  # vpp-suite-summary-batch<N>-<run_id>-<run_attempt>, which each
   # shard uploads under `always()`, and each shard's own log shows how far that
   # shard reached.
   aggregate:
@@ -1793,9 +1808,8 @@ jobs:
           set -eu
           output="${RUNNER_TEMP}/run-summary.txt"
           : > "${output}"
-          # Two matrices produce two families of summaries, and a suite can
-          # appear in both; the table names the family so a pass and a failure
-          # of the same suite are both visible.
+          # One suite-bearing matrix, and the shard number in each name is
+          # unique, so every suite occurs in one family only.
           top=0
           shopt -s nullglob
           for family in "${RUNNER_TEMP}"/shard-summaries/*; do
