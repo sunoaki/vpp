@@ -205,8 +205,11 @@ out:
     {
       if (!i)
 	{
-	  det44_log_err ("det44 is not enabled on this interface");
-	  return VNET_API_ERROR_INVALID_VALUE;
+	  /* A delete of an interface that is not registered removes nothing,
+	     so it is a no-op rather than a failed request. The feature and the
+	     reassembly refcnt fall with the registration that added them. */
+	  det44_log_info ("det44 is not enabled on this interface");
+	  return 0;
 	}
 
       rv = vnet_feature_enable_disable ("ip4-unicast", feature_name, sw_if_index, 0, 0, 0);
@@ -352,7 +355,7 @@ det44_plugin_enable (det44_config_t c)
   if (plugin_enabled () == 1)
     {
       det44_log_info ("plugin already enabled, skipping");
-      return 1;
+      return 0;
     }
 
   det44_log_info ("inside %u, outside %u", c.inside_vrf_id, c.outside_vrf_id);
@@ -376,16 +379,16 @@ int
 det44_plugin_disable ()
 {
   det44_main_t *dm = &det44_main;
-  det44_interface_t *i, *interfaces;
+  det44_interface_t *i;
   det44_identity_mapping_t *identity_mapping;
   snat_det_map_t *mp;
   const char *feature_name;
-  int rv = 0;
+  det44_interface_t *interfaces;
 
   if (plugin_enabled () == 0)
     {
-      det44_log_err ("plugin already disabled!");
-      return 1;
+      det44_log_info ("plugin already disabled, skipping");
+      return 0;
     }
 
   dm->enabled = 0;
@@ -395,30 +398,26 @@ det44_plugin_disable ()
   // 2) free sessions and identity mappings
   // 3) free maps
 
-  interfaces = vec_dup (dm->interfaces);
+  /* det44_interface_add_del frees the pool entry it removes, so the walk
+     runs over a copy of the registered entries instead of the pool. The
+     copy has to hold the entries themselves: vec_dup on a pool copies the
+     pool vector, whose freed slots no longer hold an interface. */
+  interfaces = 0;
+  pool_foreach (i, dm->interfaces)
+    vec_add1 (interfaces, *i);
+
   vec_foreach (i, interfaces)
   {
     vnet_main_t *vnm = vnet_get_main ();
+    u8 is_inside = (i->flags & DET44_INTERFACE_FLAG_IS_INSIDE) != 0;
 
-    if (i->flags & DET44_INTERFACE_FLAG_IS_INSIDE)
+    /* The disable completes whatever the delete of one interface reports:
+       the pool is freed below and every registered interface goes with it,
+       so a failure here is logged rather than turned into a failed disable. */
+    if (det44_interface_add_del (i->sw_if_index, i->flags, 1))
       {
-	rv = det44_interface_add_del (i->sw_if_index, i->flags, 1);
-	if (rv)
-	  {
-	    det44_log_err ("inside interface %U del failed", format_vnet_sw_if_index_name, vnm,
-			   i->sw_if_index);
-	  }
-      }
-
-    if (i->flags & DET44_INTERFACE_FLAG_IS_OUTSIDE)
-      {
-	rv = det44_interface_add_del (i->sw_if_index, i->flags, 1);
-	if (rv)
-	  {
-	    det44_log_err ("outside interface %U del failed", format_vnet_sw_if_index_name, vnm,
-			   i->sw_if_index);
-	  }
-
+	det44_log_err ("%s interface %U del failed", is_inside ? "inside" : "outside",
+		       format_vnet_sw_if_index_name, vnm, i->sw_if_index);
       }
   }
   vec_free (interfaces);
@@ -452,7 +451,7 @@ det44_plugin_disable ()
   fib_table_unlock (dm->outside_fib_index, FIB_PROTOCOL_IP4, dm->fib_src_hi);
   fib_table_unlock (dm->inside_fib_index, FIB_PROTOCOL_IP4, dm->fib_src_hi);
 
-  return rv;
+  return 0;
 }
 
 static void
