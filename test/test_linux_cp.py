@@ -23,6 +23,7 @@ from scapy.data import IP_PROTOS
 from util import reassemble4
 from host_interface import HostInterface
 from vpp_object import VppObject
+from vpp_papi import VppEnum
 from framework import VppTestCase
 from asfframework import (
     VppTestRunner,
@@ -3326,6 +3327,13 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
         super().setUpClass()
         cls.create_loopback_interfaces(1)
         cls.vapi.cli(f"lcp create loop0 host-if hloop0 netns {cls.ns_name}")
+        # The kernel keeps no neighbour record for an address no connected
+        # prefix covers, and the neighbour tests install records, so hloop0
+        # needs a prefix of its own.
+        cls.loop0_prefix_v4 = "10.10.1.2/24"
+        cls.vapi.sw_interface_add_del_address(
+            sw_if_index=cls.lo_interfaces[0].sw_if_index, prefix=cls.loop0_prefix_v4
+        )
         cls.lo_interfaces[0].admin_up()
 
     def _netlink_stats(self):
@@ -3470,6 +3478,252 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
         for step in steps:
             self.vapi.cli(f"test lcp router neigh {step}")
 
+    def _neigh_totals(self):
+        """Return the plugin's neighbour outcome totals from `show lcp neighbors`."""
+        totals = {}
+        for line in self.vapi.cli("show lcp neighbors").splitlines():
+            key, separator, value = line.partition(":")
+            if not separator:
+                continue
+            totals[key.strip().lower()] = int(value.strip())
+        for name in ("refused", "replaced", "stale skipped"):
+            self.assertIn(
+                name, totals, f"'{name}' missing from 'show lcp neighbors': {totals}"
+            )
+        return totals
+
+    def _namespace_neighbor(self, *extra):
+        """Run ip neigh in the namespace, returning the completed process."""
+        return subprocess.run(
+            ["ip", "netns", "exec", self.ns_name, "ip", "neigh", *extra],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def _del_kernel_neighbor(self, address):
+        """Remove a kernel neighbour record, tolerating one already gone."""
+        self._namespace_neighbor("del", address, "dev", "hloop0")
+
+    def _neigh_counter(self, path):
+        """Read a gauge under /lcp/neighbor/ from the statistics segment.
+
+        The number is a gauge, which reads as one value, unlike a counter that
+        reads as one value per thread. The statistics client caches the
+        directory for the epoch it read, and a gauge is written without moving
+        the epoch, so the cache is dropped here rather than relying on some
+        later write: a value read through a stale cache would make the
+        assertion meaningless.
+        """
+        if not self.statistics.connected:
+            self.statistics.connect()
+        self.statistics.refresh()
+        return self.statistics.get_counter(path)
+
+    def _add_kernel_neighbor(self, address, mac, state):
+        """Install a neighbour record in the kernel with the requested state.
+
+        `ip neigh replace` creates a record the kernel does not hold with the
+        requested state and moves a held one to it. The kernel's own copy is
+        read back, because a request that leaves a record as it was is not
+        reported to the plugin, and a test must not assume a state the kernel
+        did not apply.
+        """
+        added = self._namespace_neighbor(
+            "replace", address, "dev", "hloop0", "lladdr", mac, "nud", state
+        )
+        if added.returncode != 0:
+            self.logger.info("ip neigh replace failed: %s", added.stderr)
+            return False
+
+        shown = self._namespace_neighbor("show", address, "dev", "hloop0")
+        expected = state.upper()
+        # The state is not the last word of the line once a flag such as
+        # `router` or `offload` follows it, so the word is looked for anywhere.
+        return any(
+            address in line.split() and expected in line.split()
+            for line in shown.stdout.splitlines()
+        )
+
+    def test_neigh_stale_record_is_not_synced(self):
+        """A kernel neighbour marked stale is not promoted to a fresh VPP entry"""
+        sw_if_index = self.lo_interfaces[0].sw_if_index
+        address = "10.10.1.111"
+        mac = "02:01:02:03:04:11"
+        stale_before = self._neigh_totals()["stale skipped"]
+
+        # The kernel keeps the link layer address but wants to revalidate it.
+        self.assertTrue(
+            self._add_kernel_neighbor(address, mac, "stale"),
+            "the kernel did not keep the neighbour in STALE",
+        )
+
+        self.poll_for(
+            "stale neighbour reported to the plugin",
+            lambda: self._neigh_totals()["stale skipped"] > stale_before,
+            True,
+        )
+        self.assertFalse(
+            find_nbr(self, sw_if_index, address),
+            "a kernel neighbour in STALE was synced into VPP as a confirmed entry",
+        )
+
+        # The kernel confirming the same address is what reaches VPP. A record
+        # for an address VPP does not hold is added whatever its state, which
+        # is why this step is here: the skip above must not be a skip forever.
+        self.assertTrue(self._add_kernel_neighbor(address, mac, "reachable"))
+        self.poll_for(
+            f"{address} in VPP once the kernel confirms it",
+            lambda: find_nbr(self, sw_if_index, address, mac=mac),
+            True,
+        )
+
+        del_namespace_neighbor(self.ns_name, "hloop0", address)
+        self.poll_for(
+            f"{address} removed from VPP",
+            lambda: find_nbr(self, sw_if_index, address),
+            False,
+        )
+
+    def test_neigh_stale_skips_update_of_a_held_entry(self):
+        """A stale record does not refresh a VPP entry that already exists"""
+        sw_if_index = self.lo_interfaces[0].sw_if_index
+        address = "10.10.1.112"
+        mac = "02:01:02:03:04:12"
+        stale_before = self._neigh_totals()["stale skipped"]
+
+        # The address is in VPP from a confirmed record ...
+        self.assertTrue(self._add_kernel_neighbor(address, mac, "reachable"))
+        self.poll_for(
+            f"{address} in VPP",
+            lambda: find_nbr(self, sw_if_index, address, mac=mac),
+            True,
+        )
+
+        # ... and the kernel then only revalidates it. Nothing changes in VPP,
+        # which is the point: the entry is not stamped fresh by the record that
+        # says the kernel no longer knows it is current.
+        self.assertTrue(self._add_kernel_neighbor(address, mac, "stale"))
+        self.poll_for(
+            "the stale record was skipped",
+            lambda: self._neigh_totals()["stale skipped"] > stale_before,
+            True,
+        )
+        self.assertTrue(
+            find_nbr(self, sw_if_index, address, mac=mac),
+            "the confirmed entry was lost when the kernel only revalidated it",
+        )
+
+        del_namespace_neighbor(self.ns_name, "hloop0", address)
+        self.poll_for(
+            f"{address} removed from VPP",
+            lambda: find_nbr(self, sw_if_index, address),
+            False,
+        )
+
+    def test_neigh_refusal_is_counted(self):
+        """A refused sync is counted, and does not overwrite a foreign static entry"""
+        sw_if_index = self.lo_interfaces[0].sw_if_index
+        address = "10.10.1.113"
+        kernel_mac = "02:01:02:03:04:13"
+        operator_mac = "02:01:02:03:04:14"
+        refused_before = self._neigh_totals()["refused"]
+        refused_stat_before = self._neigh_counter("/lcp/neighbor/refused")
+
+        # A static entry no kernel record put there: an operator's, which no
+        # record may change. The plugin has no ownership record for it.
+        self.vapi.ip_neighbor_add_del(
+            sw_if_index,
+            operator_mac,
+            address,
+            is_add=1,
+            flags=VppEnum.vl_api_ip_neighbor_flags_t.IP_API_NEIGHBOR_FLAG_STATIC,
+        )
+        self.addCleanup(
+            self.vapi.ip_neighbor_add_del,
+            sw_if_index,
+            operator_mac,
+            address,
+            is_add=0,
+            flags=VppEnum.vl_api_ip_neighbor_flags_t.IP_API_NEIGHBOR_FLAG_STATIC,
+        )
+        self.assertTrue(
+            find_nbr(self, sw_if_index, address, is_static=1, mac=operator_mac)
+        )
+
+        # The kernel now claims the same address with a different MAC, and its
+        # record is one it learns rather than one it was told, which is what
+        # linux-cp receives for a device that was replaced. The add is refused,
+        # and both the refusal and the unchanged entry are checked: a counter
+        # nobody asserts on is how the silence came back before.
+        self.assertTrue(self._add_kernel_neighbor(address, kernel_mac, "reachable"))
+
+        self.poll_for(
+            "the refused sync was counted",
+            lambda: self._neigh_totals()["refused"] > refused_before,
+            True,
+        )
+        self.assertGreater(
+            self._neigh_counter("/lcp/neighbor/refused"),
+            refused_stat_before,
+            "the refusal is not visible in the stat segment",
+        )
+        self.assertTrue(
+            find_nbr(self, sw_if_index, address, is_static=1, mac=operator_mac),
+            "the plugin overwrote a static entry it did not install",
+        )
+        self.assertFalse(
+            find_nbr(self, sw_if_index, address, mac=kernel_mac),
+            "the kernel's MAC replaced the operator's static entry",
+        )
+
+    def test_neigh_kernel_replaced_static_entry_is_corrected(self):
+        """A static entry the plugin installed follows the kernel's new MAC"""
+        sw_if_index = self.lo_interfaces[0].sw_if_index
+        address = "10.10.1.115"
+        old_mac = "02:01:02:03:04:15"
+        new_mac = "02:01:02:03:04:16"
+        replaced_before = self._neigh_totals()["replaced"]
+        replaced_stat_before = self._neigh_counter("/lcp/neighbor/replaced")
+
+        self.assertTrue(self._add_kernel_neighbor(address, old_mac, "permanent"))
+        self.poll_for(
+            f"{address} in VPP with {old_mac}",
+            lambda: find_nbr(self, sw_if_index, address, is_static=1, mac=old_mac),
+            True,
+        )
+
+        # The device behind the address is replaced. One replace devolves the
+        # record the plugin wrote into one the kernel learned, with the new
+        # device's MAC, and what reaches the plugin is a dynamic record. That
+        # is the refusal an operator works around by deleting the entry by
+        # hand. The record is not deleted first: a delete reaches the plugin as
+        # a delete of the entry, and there would be nothing left to correct.
+        self.assertTrue(self._add_kernel_neighbor(address, new_mac, "reachable"))
+
+        self.poll_for(
+            f"{address} follows the kernel to {new_mac}",
+            lambda: find_nbr(self, sw_if_index, address, mac=new_mac),
+            True,
+        )
+        self.assertGreater(
+            self._neigh_totals()["replaced"],
+            replaced_before,
+            "the corrected entry was not counted as replaced",
+        )
+        self.assertGreater(
+            self._neigh_counter("/lcp/neighbor/replaced"),
+            replaced_stat_before,
+            "the correction is not visible in the stat segment",
+        )
+
+        del_namespace_neighbor(self.ns_name, "hloop0", address)
+        self.poll_for(
+            f"{address} removed from VPP",
+            lambda: find_nbr(self, sw_if_index, address),
+            False,
+        )
+
     def test_neigh_resync_keeps_unsynced_dynamic_neighbor(self):
         """A dynamic neighbour the kernel never dumped survives with the flag off"""
         sw_if_index = self._add_unsynced_neighbor("10.10.1.101", "02:01:02:03:04:07")
@@ -3497,6 +3751,61 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
         self.assertFalse(
             find_nbr(self, sw_if_index, "10.10.1.103"),
             "dynamic neighbour absent from the dump survived the sweep",
+        )
+
+    def test_neigh_resync_keeps_revalidated_neighbor_with_flag_on(self):
+        """A revalidating record keeps its entry across a sweeping resync"""
+        sw_if_index = self.lo_interfaces[0].sw_if_index
+        address = "10.10.1.118"
+        mac = "02:01:02:03:04:18"
+        unsynced = "10.10.1.117"
+        self._set_link_down_flag("del-dynamic-on-link-down", True)
+        self.addCleanup(self._del_kernel_neighbor, address)
+
+        # The kernel confirms the address, so VPP holds a dynamic entry for
+        # it, and then only revalidates it. The revalidating record is not
+        # synced, and the entry it leaves alone is what a resynchronization
+        # would sweep if the record were treated as one the kernel dropped.
+        self.assertTrue(self._add_kernel_neighbor(address, mac, "reachable"))
+        self.poll_for(
+            f"{address} in VPP",
+            lambda: find_nbr(self, sw_if_index, address, mac=mac),
+            True,
+        )
+        self.assertTrue(self._add_kernel_neighbor(address, mac, "stale"))
+
+        # A dynamic neighbour the kernel does not know is what the sweep has
+        # to remove. Checking it is gone is what makes the entry above
+        # surviving meaningful: the sweep ran and destroyed the marked
+        # entries it did not see reported.
+        self._add_unsynced_neighbor(unsynced, "02:01:02:03:04:17")
+
+        completed_before = self._netlink_completed()
+        self._force_resync()
+        self.poll_for(
+            "synchronization did not end",
+            lambda: self._netlink_completed() > completed_before,
+            True,
+            timeout=self.NETLINK_RECOVERY_TIMEOUT,
+            interval=0.25,
+        )
+
+        self.assertFalse(
+            find_nbr(self, sw_if_index, unsynced),
+            "the sweep did not run: a dynamic neighbour the kernel never "
+            "reported is still in VPP",
+        )
+        self.assertTrue(
+            find_nbr(self, sw_if_index, address, mac=mac),
+            "a neighbour the kernel still holds was deleted by the sweep "
+            "because its revalidating record was skipped",
+        )
+
+        self._del_kernel_neighbor(address)
+        self.poll_for(
+            f"{address} removed from VPP",
+            lambda: find_nbr(self, sw_if_index, address),
+            False,
         )
 
     def _router(self, arguments):
