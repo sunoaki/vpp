@@ -1112,15 +1112,22 @@ class IpsecTra4(VppTestCase):
         self.assertEqual(p.tra_sa_out.get_err("lost"), 0)
         self.assertEqual(p.tra_sa_in.get_err("lost"), 0)
 
-        counters = open_node_counters(
-            self,
-            (
-                (self.tra4_encrypt_node_name, "rx_pkts"),
-                (self.tra4_decrypt_node_name[0], "rx_pkts"),
-            ),
-        )
-        counters.assert_equal(self.tra4_encrypt_node_name, "rx_pkts", count)
-        counters.assert_equal(self.tra4_decrypt_node_name[0], "rx_pkts", count)
+        counters = open_node_counters(self)
+        for node in (
+            self.tra4_encrypt_node_name,
+            self.tra4_decrypt_node_name[0],
+        ):
+            read = counters.read(node, "rx_pkts")
+            self.logger.info(
+                "M298 %s before %d after %d count %d"
+                % (
+                    node,
+                    counters.opened.get(counters.path(node, "rx_pkts")),
+                    read,
+                    count,
+                )
+            )
+            counters.assert_equal(node, "rx_pkts", count)
 
     def _verify_tra_anti_replay_algorithm_esn(self):
         def seq_num(seqh, seql):
