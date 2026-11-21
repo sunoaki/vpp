@@ -226,6 +226,50 @@ format_session (u8 *s, va_list *args)
   return s;
 }
 
+/*
+ * Format one listener row: the session description, the owning application,
+ * and, for verbose levels that request transport detail, the detail lines the
+ * transport formatter appended to the description.
+ *
+ * The description is not printed through a width limited field because a field
+ * is truncated at its width, which would drop the state column and every
+ * detail line.
+ */
+static u8 *
+format_session_listener_row (u8 *s, va_list *args)
+{
+  session_t *ss = va_arg (*args, session_t *);
+  const u8 *app_name = va_arg (*args, u8 *);
+  int verbose = va_arg (*args, int);
+  u8 *str = format (0, "%U", format_session, ss, verbose);
+  u8 *detail = 0;
+  u32 descr_len;
+
+  descr_len = 0;
+  while (descr_len < vec_len (str) && str[descr_len] != '\n')
+    descr_len++;
+
+  if (descr_len < vec_len (str))
+    {
+      vec_add (detail, str + descr_len, vec_len (str) - descr_len);
+      vec_set_len (str, descr_len);
+    }
+
+  s = format (s, "%v", str);
+  if (descr_len <= SESSION_CLI_ID_WIDTH)
+    s = format (s, "%U", format_white_space, SESSION_CLI_ID_WIDTH - descr_len);
+  else
+    s = format (s, " ");
+  if (vec_len (detail))
+    s = format (s, "%v%v", app_name, detail);
+  else
+    s = format (s, "%-25v", app_name);
+
+  vec_free (str);
+  vec_free (detail);
+  return s;
+}
+
 uword
 unformat_stream_session_id (unformat_input_t *input, va_list *args)
 {
@@ -1000,7 +1044,7 @@ show_session_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	    continue;
 	  app_wrk = app_worker_get (s->app_wrk_index);
 	  app_name = application_name_from_index (app_wrk->app_index);
-	  vlib_cli_output (vm, "%-" SESSION_CLI_ID_LEN "U%-25v%", format_session, s, 0, app_name);
+	  vlib_cli_output (vm, "%U", format_session_listener_row, s, app_name, verbose);
 	}
       goto done;
     }
