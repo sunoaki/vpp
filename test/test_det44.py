@@ -208,8 +208,14 @@ class TestDET44(VppTestCase):
 
     def collect_ipfix_session_events(self):
         """
-        Return the NAT44 session records exported to the collector on pg2
-        after this call started
+        Return the NAT44 session records the collector on pg2 holds
+
+        The snapshot starts from the packets the collector already holds: the
+        process that exports runs on its own clock, so the cycle that carries
+        the record of an event can run before the caller asks for the
+        snapshot. Dropping those packets loses the record of an event that
+        happened after configure_ipfix_collector, which is the record a caller
+        looking for it needs.
 
         The caller has to have called configure_ipfix_collector before the
         traffic whose events are collected: logging is what writes a record,
@@ -221,32 +227,34 @@ class TestDET44(VppTestCase):
         template of every report before the data of the report, and the two
         messages are separate packets, so the packets that arrive right
         after a flush are the templates of every report and the data of the
-        cycle follows in a later burst. The collector is drained and then
-        polled with the clock moved forward one second per poll, up to
-        IPFIX_EXPORT_POLLS polls, until a data record decodes. A cycle
-        slower than the budget fails the test, it never passes with fewer
-        records.
+        cycle follows in a later burst. The packets the collector holds are
+        read first, then the burst that follows the flush, and the clock
+        moves forward one second per empty poll, up to IPFIX_EXPORT_POLLS
+        polls, while that burst is still to come. A cycle slower than the
+        budget fails the test, it never passes with fewer records.
 
-        A snapshot of a cycle that wrote no record holds templates and no
-        data set, so the assertion covers only a snapshot that carried a
-        data set: the snapshot is allowed to hold no record, the data set of
-        the session stream is not.
+        The records are decoded from every packet of the snapshot, so a
+        record that arrived before the flush and one that arrived after it
+        are both part of the result. A snapshot that carried no data set
+        holds no record and the assertion below does not run, because an
+        empty data set does not exist: the exporter only sends the data of a
+        report that has records.
 
-        The polling has a second effect that keeps snapshots apart. The
-        process that exports waits on a clock event, so its cycle only
-        advances while the clock moves, and the clock moves one second per
-        empty poll. A record written after this snapshot waits for a later
-        snapshot to move the clock far enough for its cycle to run.
+        The polling keeps the snapshots that follow apart. The process that
+        exports waits on a clock event, so its cycle only advances while the
+        clock moves, and the clock moves one second per empty poll. A record
+        written after this snapshot waits for a later snapshot to move the
+        clock far enough for its cycle to run.
 
         :returns: Decoded NAT44 session records
         """
-        self.drain_ipfix_collector()
+        capture = self.drain_ipfix_collector()
         self.vapi.ipfix_flush()
-        capture = []
         ipfix = IPFIXDecoder()
-        records = []
-        has_data = False
+        has_data = self.read_ipfix_packets(ipfix, capture)
         for _ in range(self.IPFIX_EXPORT_POLLS):
+            if has_data:
+                break
             p = self.ipfix_collector_packet()
             if p is None:
                 # the process that exports waits on a clock, so time passes
@@ -255,18 +263,13 @@ class TestDET44(VppTestCase):
                 # given the clock step that sends its data set.
                 self.virtual_sleep(1)
                 continue
-            for packet in [p] + self.drain_ipfix_collector():
-                self.assertTrue(packet.haslayer(IPFIX))
-                capture.append(packet)
-                if packet.haslayer(Template):
-                    ipfix.add_template(packet.getlayer(Template))
-                if packet.haslayer(Data):
-                    has_data = True
-            if has_data:
-                records = self.ipfix_data_records(ipfix, capture)
-                records += self.ipfix_stream_records(capture)
-                break
+            burst = [p] + self.drain_ipfix_collector()
+            capture.extend(burst)
+            has_data = self.read_ipfix_packets(ipfix, burst)
+        records = []
         if has_data:
+            records = self.ipfix_data_records(ipfix, capture)
+            records += self.ipfix_stream_records(capture)
             self.assertTrue(
                 records,
                 "the snapshot holds a data set but no data set decodes "
@@ -279,6 +282,24 @@ class TestDET44(VppTestCase):
             <= scapy.compat.orb(record[230])
             <= self.NAT_EVENT_SESSION_DELETE
         ]
+
+    def read_ipfix_packets(self, ipfix, packets):
+        """
+        Collect the templates of a snapshot and report whether it carried a
+        data set
+
+        :param ipfix: Decoder collecting the templates of the stream
+        :param packets: Captured IPFIX packets
+        :returns: True when one of the packets carried a data set
+        """
+        has_data = False
+        for packet in packets:
+            self.assertTrue(packet.haslayer(IPFIX))
+            if packet.haslayer(Template):
+                ipfix.add_template(packet.getlayer(Template))
+            if packet.haslayer(Data):
+                has_data = True
+        return has_data
 
     def ipfix_data_records(self, ipfix, packets):
         """
@@ -1205,20 +1226,10 @@ class TestDET44(VppTestCase):
         )
         records = self.collect_ipfix_session_events()
         self.verify_ipfix_no_session_event(
-            records,
-            self.NAT_EVENT_SESSION_CREATE,
-            IP_PROTOS.tcp,
-            self.pg0.remote_ip4,
-            self.nat_addr,
-            port_pair,
+            records, self.NAT_EVENT_SESSION_CREATE, IP_PROTOS.tcp, port_pair
         )
         self.verify_ipfix_no_session_event(
-            records,
-            self.NAT_EVENT_SESSION_DELETE,
-            IP_PROTOS.tcp,
-            self.pg0.remote_ip4,
-            self.nat_addr,
-            port_pair,
+            records, self.NAT_EVENT_SESSION_DELETE, IP_PROTOS.tcp, port_pair
         )
 
         # the FIN/ACK handshake closes the session from the node
@@ -1678,51 +1689,6 @@ class TestDET44IdentityMapping(TestDET44):
             / UDP(sport=sport, dport=self.udp_external_port)
         )
 
-    def det44_forward_port(self, in_addr, in_port, ext_addr, ext_port):
-        """Return the outside port deterministic NAT picks for an inside 5-tuple.
-
-        Mirrors the port loop in det44_in2out.c: a session whose source is
-        already recorded for the same external host address and port keeps its
-        outside port, otherwise the first candidate in the range starting at
-        lo_port that no session of the same user holds for that external host
-        address and port is used.
-
-        :param in_addr: Inside source address
-        :param in_port: Inside source port
-        :param ext_addr: Destination address of the inside packet
-        :param ext_port: Destination port of the inside packet
-        """
-        dms = self.vapi.det44_map_dump()
-        self.assertEqual(1, len(dms))
-        forwarded = self.vapi.det44_forward(in_addr)
-        self.assertEqual(self.nat_ip, str(forwarded.out_addr))
-        # The handler stores ntohs (lo_port) in the reply field
-        # (det44_api.c), and the binding decodes the u16 as network order, so
-        # the value needs one more swap to read back as the host port.
-        lo_port = socket.ntohs(forwarded.out_port_lo)
-        ports_per_host = dms[0].ports_per_host
-        used = set()
-        existing = None
-        for s in self.vapi.det44_session_dump(in_addr):
-            # det44_in2out.c skips a candidate port while a session of this
-            # user still holds it for the same external host address AND the
-            # same external host port, so both halves of key0 are filtered on
-            # before a port is counted as taken.
-            if str(s.ext_addr) != ext_addr:
-                continue
-            if s.ext_port != ext_port:
-                continue
-            used.add(int(s.out_port))
-            if s.in_port == in_port:
-                existing = int(s.out_port)
-        if existing is not None:
-            return existing
-        for i in range(ports_per_host):
-            out_port = lo_port + (i + in_port) % ports_per_host
-            if out_port not in used:
-                return out_port
-        raise AssertionError("no free outside port for %d" % in_port)
-
     def test_identity_mapping_first_match_addr_only_first(self):
         """A mapping added before another on the same address is matched first"""
         mapped_port = 6312
@@ -1786,9 +1752,10 @@ class TestDET44IdentityMapping(TestDET44):
         reachable_ip = self.pg1.remote_hosts[0].ip4
 
         self.configure_det44(mapped_ip, in_plen=32)
-        # The address-only entry bypasses every port of this address, so the
-        # two entries only produce different captures if the per-port one is
-        # consulted first for its own port.
+        # Both entries bypass, so the captures do not tell the two apart. The
+        # insertion order is read from the listing instead, which is the order
+        # det44_in2out.c walks: the first match wins, so the per-port entry
+        # answers for its own port when it is stored first.
         self.add_identity_mapping(mapped_ip, "udp", mapped_port)
         self.add_identity_mapping(mapped_ip)
 
@@ -1797,9 +1764,10 @@ class TestDET44IdentityMapping(TestDET44):
             ["%s udp %d" % (mapped_ip, mapped_port), "%s" % mapped_ip], listed
         )
 
-        # Ports the address-only entry matches bypass the det map, so both
-        # packets leave with the inside address. Both have to arrive, so a
-        # first match that instead translated them fails on the set of
+        # Ports the per-port entry does not cover fall to the address-only
+        # entry, which matches every port of this address. Both bypass, so
+        # both packets leave with the inside address and both have to arrive:
+        # a first match that instead translated them fails on the set of
         # packets rather than on a timeout.
         pkts = [
             self.create_untouched_udp(
@@ -1816,26 +1784,25 @@ class TestDET44IdentityMapping(TestDET44):
             self.assertEqual(mapped_ip, p[IP].src)
             self.assertEqual(port, p[UDP].sport)
 
-        # The mapped udp port: no bypass, so the det map translates it. If the
-        # address-only entry answered first, this packet would leave with the
-        # inside address instead.
+        # The mapped udp port: the per-port entry matches it first, and a
+        # match bypasses the det map just like an address-only entry does
+        # (det44_in2out.c:548-553), so the packet leaves untranslated. The
+        # order of the two entries is therefore not visible in the capture:
+        # both of them keep this packet's source. The listing above is what
+        # shows which entry was stored first.
         p = self.create_untouched_udp(self.pg0, mapped_ip, mapped_port, reachable_ip)
         capture = self.send_and_capture(self.pg0, self.pg1, [p], 1)
 
         self.assertEqual(1, len(capture))
         p = capture[0]
         self.assert_packet_checksums_valid(p)
-        self.assertEqual(self.nat_ip, p[IP].src)
+        self.assertEqual(mapped_ip, p[IP].src)
+        self.assertEqual(mapped_port, p[UDP].sport)
         self.assertEqual(reachable_ip, p[IP].dst)
         self.assertEqual(self.udp_external_port, p[UDP].dport)
-        expected_port = self.det44_forward_port(
-            mapped_ip, mapped_port, reachable_ip, self.udp_external_port
-        )
-        self.assertEqual(expected_port, int(p[UDP].sport))
 
-        # Reversing the order of the same two entries makes the per-port one
-        # irrelevant for every port: an address-only entry now answers first,
-        # so even the mapped udp port bypasses.
+        # Reversing the order of the same two entries puts the address-only
+        # entry first, and it answers for every port of this address.
         self.delete_identity_mapping(mapped_ip, "udp", mapped_port)
         self.delete_identity_mapping(mapped_ip)
         self.add_identity_mapping(mapped_ip)
