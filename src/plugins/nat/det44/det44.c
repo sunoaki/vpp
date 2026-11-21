@@ -405,8 +405,8 @@ det44_plugin_disable ()
 	rv = det44_interface_add_del (i->sw_if_index, i->flags, 1);
 	if (rv)
 	  {
-	    det44_log_err ("inside interface %U del failed",
-			   unformat_vnet_sw_interface, vnm, i->sw_if_index);
+	    det44_log_err ("inside interface %U del failed", format_vnet_sw_if_index_name, vnm,
+			   i->sw_if_index);
 	  }
       }
 
@@ -415,8 +415,8 @@ det44_plugin_disable ()
 	rv = det44_interface_add_del (i->sw_if_index, i->flags, 1);
 	if (rv)
 	  {
-	    det44_log_err ("outside interface %U del failed",
-			   unformat_vnet_sw_interface, vnm, i->sw_if_index);
+	    det44_log_err ("outside interface %U del failed", format_vnet_sw_if_index_name, vnm,
+			   i->sw_if_index);
 	  }
 
       }
