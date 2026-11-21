@@ -320,7 +320,7 @@ class ARPTestCase(VppTestCase):
             raise AssertionError("the FIB has no adjacency source to look up")
 
         return [
-            route.route.prefix.address
+            str(route.route.prefix.network_address)
             for route in self.vapi.ip_route_v2_dump(table.table_id, src=adj_source.id)
         ]
 
