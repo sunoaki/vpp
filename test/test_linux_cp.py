@@ -1029,13 +1029,23 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
         return self.vapi.cli(f"test lcp router {self._base(table_id)} state")
 
     def _table_state(self, table_id=None):
+        """The table's own reference and multicast route counts.
+
+        The state carries the broadcast route's counters after the table's,
+        and one of those is named refs as well; the table's value is the one
+        read first, so the first of a repeated name wins. The word broadcast
+        names no value and carries no colon, so a field without one says
+        nothing about the table.
+        """
         output = self._router_state(table_id)
         self.assertNotIn("absent", output, output)
-        state = dict(
-            field.split(":", 1)
-            for line in output.splitlines()
-            for field in line.split()
-        )
+        state = {}
+        for line in output.splitlines():
+            for field in line.split():
+                if ":" not in field:
+                    continue
+                key, _, value = field.partition(":")
+                state.setdefault(key, value)
         return {
             "refs": int(state["refs"]),
             "mcast-routes": int(state["mcast-routes"]),
