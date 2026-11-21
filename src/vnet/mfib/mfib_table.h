@@ -320,6 +320,20 @@ extern void mfib_table_flush(u32 fib_index,
 
 /**
  * @brief
+ *  Remove the entries a table still holds, for the table's own destroyers
+ *
+ *  Called by ip4_mfib_table_destroy and ip6_mfib_table_destroy once they have
+ *  removed the entries they install themselves, before they assert that the
+ *  table is empty. A source that never locked the table has had no flush, so
+ *  what it installed is still here and has no owner left to release it.
+ *
+ * @param mfib_table
+ *  The table about to be freed
+ */
+extern void mfib_table_destroy_entries(mfib_table_t *mfib_table);
+
+/**
+ * @brief
  *  Resync all entries from a table for the source
  *  this is the mark part of the mark and sweep algorithm.
  *  All entries in this FIB that are sourced by 'source' are marked
