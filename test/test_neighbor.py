@@ -191,11 +191,13 @@ class ARPTestCase(VppTestCase):
         """deleting a table takes the adj-fibs it holds with it
 
         The neighbour is static, so removing the interface address leaves it
-        alone, and it is the binding walk that carries its adj-fib from table
-        0 to table 100. That is what makes the case worth testing: the
-        adj-fib is in the table the interface names now, and the neighbour's
-        FIB_SOURCE_ADJ lock is what keeps that table alive once the API gives
-        up its own lock.
+        alone, and it is the binding walk that carries this neighbour's adj-fib
+        from table 0 to table 100. Table 0 is not left empty by the move: it
+        keeps the adj-fibs of the neighbours on every other interface, which
+        is why the checks below are scoped to this one. That is what makes the
+        case worth testing: this adj-fib is in the table the interface names
+        now, and the neighbour's FIB_SOURCE_ADJ lock is what keeps that table
+        alive once the API gives up its own lock.
 
         The table is then deleted while the interface is still bound to it, in
         both the unicast FIB and the multicast one. The table has to go from
@@ -234,9 +236,14 @@ class ARPTestCase(VppTestCase):
         self.pg1.set_table_ip4(100)
 
         self.assertTrue(find_nbr(self, self.pg1.sw_if_index, nbr_addr, is_static=1))
-        self.assertEqual(self.get_adj_sourced_routes(table), [nbr_addr])
         self.assertEqual(
-            self.get_adj_sourced_routes(VppIpTable(self, 0, register=False)), []
+            self.get_adj_sourced_routes(table, self.pg1.sw_if_index), [nbr_addr]
+        )
+        self.assertEqual(
+            self.get_adj_sourced_routes(
+                VppIpTable(self, 0, register=False), self.pg1.sw_if_index
+            ),
+            [],
         )
 
         #
@@ -250,7 +257,7 @@ class ARPTestCase(VppTestCase):
         self.assertNotIn(100, self.ip_table_ids())
         self.assertFalse(find_mroute(self, "224.0.0.0", "0.0.0.0", 4, table_id=100))
         self.assertFalse(find_nbr(self, self.pg1.sw_if_index, nbr_addr, is_static=1))
-        self.assertEqual(self.get_adj_sourced_routes(table), [])
+        self.assertEqual(self.get_adj_sourced_routes(table, self.pg1.sw_if_index), [])
 
         #
         # the interface was moved off the deleted table as part of deleting
@@ -279,6 +286,20 @@ class ARPTestCase(VppTestCase):
             nbr_addr,
         ).add_vpp_config()
 
+        #
+        # the adj-fib is asked about before the API route goes in, because a
+        # route dump filtered by source reports an entry under its best
+        # source, and the adjacency source is lower priority than API on
+        # purpose: once both sit on 192.0.2.1/32 there, the dump attributes
+        # the entry to the API route and this check would read as empty
+        #
+        self.assertEqual(
+            self.get_adj_sourced_routes(
+                VppIpTable(self, 0, register=False), self.pg1.sw_if_index
+            ),
+            [nbr_addr],
+        )
+
         VppIpRoute(
             self,
             nbr_addr,
@@ -299,9 +320,6 @@ class ARPTestCase(VppTestCase):
                 mac=self.pg1.remote_hosts[0].mac,
             )
         )
-        self.assertEqual(
-            self.get_adj_sourced_routes(VppIpTable(self, 0, register=False)), [nbr_addr]
-        )
 
     def ip_table_ids(self):
         """The IPv4 table ids the FIB has a table for"""
@@ -309,8 +327,20 @@ class ARPTestCase(VppTestCase):
             t.table.table_id for t in self.vapi.ip_table_dump() if not t.table.is_ip6
         ]
 
-    def get_adj_sourced_routes(self, table):
-        """The addresses table holds a route for from the adjacency source"""
+    def get_adj_sourced_routes(self, table, sw_if_index):
+        """The addresses table has an adjacency-sourced route for
+
+        An adjacency-sourced route names the interface its path resolves
+        through, which for a neighbour is the neighbour's own interface, so
+        the answer is scoped to that interface: the default table also holds
+        the neighbour setUp learns on pg0, and a table-wide answer could not
+        be checked against a fixed list.
+
+        The route dump reports each entry under its best source, so this
+        answers for entries the adjacency source still wins. A control-plane
+        route for the same prefix is higher priority and takes the entry
+        over, dropping it from this answer.
+        """
         adj_source = None
         for source in self.vapi.fib_source_dump():
             if source.src.name == "adjacency":
@@ -322,6 +352,7 @@ class ARPTestCase(VppTestCase):
         return [
             str(route.route.prefix.network_address)
             for route in self.vapi.ip_route_v2_dump(table.table_id, src=adj_source.id)
+            if any(path.sw_if_index == sw_if_index for path in route.route.paths)
         ]
 
     def test_arp(self):
