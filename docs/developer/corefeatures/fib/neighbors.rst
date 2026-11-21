@@ -47,6 +47,46 @@ several addresses that share a prefix does not discard neighbours the others
 still resolve. A dynamic entry is removed with the address and is learned
 again from the next packet.
 
+Aging is off by default. Both address families start with an age of 0, which
+means no neighbour is ever probed or expired: a dynamic entry stays until
+the interface address that covers it is removed, the interface goes down, the
+control plane deletes it, or the table it resolves through is deleted. The
+counter of neighbours per interface is bounded by *limit* instead (50000 per
+address family by default), and with aging off a full table refuses new learns
+rather than expiring old ones unless *recycle* is set. Aging is enabled per
+address family with ``set ip neighbor-config ip4|ip6 age <seconds>``, and an
+entry is then probed once its age has passed and destroyed after three
+unanswered probes.
+
+Moving an address from one interface to another is two operations, and the
+order decides what happens to the neighbours of the old interface. Deleting
+the address from the old interface first destroys every neighbour that address
+covered, static ones included, before the address exists on the new interface:
+the traffic is blackholed for the interval between the two calls, and after the
+second call a dynamic entry is learned again while a static entry is not, so a
+control plane that programs static neighbours has to program them again on the
+new interface. Adding the address to the new interface first leaves the old
+interface's neighbours alone until the delete, which then removes them the
+same way. Nothing migrates a neighbour between interfaces, because the
+interface is part of its key.
+
+A complete adjacency forwards to its rewrite and never asks ARP or ND for the
+address again, so the MAC of a static entry is only ever replaced by the
+control plane. When the device behind a static neighbour is replaced and the
+new device answers with a different MAC, the data plane's learn is refused in
+order to keep the entry the control plane programmed, and the entry keeps
+forwarding to the old MAC. The refusal is not silent: it is logged, it
+increments the ``/net/ip-neighbor/refused-learn`` counter for the interface,
+and the entry carries the *refused* flag until the control plane rewrites or
+deletes it, or a learn confirms the MAC it already holds. ``show ip neighbors``
+prints that flag as an ``R`` in its Flags column, and ``show ip neighbor-stats``
+prints the counter as ``if:`` on the interface's line. An entry carrying that
+flag is the one to look at when traffic to an address keeps reaching a device
+that was replaced. The flag is internal to this module and deliberately absent
+from the binary API, because it describes what the data plane observed rather
+than configuration, and adding it to the API would change the wire format of
+messages that downstream users already encode against.
+
 Adjacency
 ---------
 
