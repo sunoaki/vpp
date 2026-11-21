@@ -143,20 +143,41 @@ jobs:
           echo "Checked the commit message of ${checked} commit(s) for head ${head}"
 
   test-plan:
+    # The derivation helper is an artifact the style job uploads, so this job
+    # cannot start before that job has finished.
+    needs: style
     runs-on: ubuntu-24.04
     outputs:
       variants: ${{ steps.plan.outputs.variants }}
       tunnel_control: ${{ steps.plan.outputs.tunnel_control }}
+      # The build job is a matrix, and a matrix job cannot carry outputs to a
+      # later job. The batch list the test matrix reads is produced here, from
+      # the same suite filter the build job derives, so the two jobs agree on
+      # which suites run without one of them reading the other's outputs.
+      batches: ${{ steps.batches.outputs.batches }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # The derivation rules are written by the style job; this job reads the
+      # same file instead of restating them.
+      - name: Download the suite derivation helper
+        uses: actions/download-artifact@v4
+        with:
+          name: derive-suites-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/derive
+
       - name: Plan isolated ESP builds from the committed candidate
         id: plan
         env:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          # The same suites input the build job's derive step reads.
+          MANUAL_SUITES: ${{ inputs.suites }}
         run: |
+          set -eu
+          . "${RUNNER_TEMP}/derive/derive-suites.sh"
           python3 - <<'PY'
           import ast
           import json
@@ -193,6 +214,81 @@ jobs:
               output.write("variants=" + json.dumps(variants) + "\n")
               output.write("tunnel_control=" + str(enabled).lower() + "\n")
           PY
+
+      # The suites the build job will select, split into the shards its test
+      # job runs. The filter is derived here with the same helper the build
+      # job reads: the suites input on a dispatch run, the changed paths
+      # otherwise.
+      - name: Split the selected suites into test shards
+        id: batches
+        env:
+          MANUAL_SUITES: ${{ inputs.suites }}
+        run: |
+          set -eu
+          . "${RUNNER_TEMP}/derive/derive-suites.sh"
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          if [ -z "${base}" ] || [ -z "${head}" ]; then
+            base=$(git rev-parse HEAD^ 2>/dev/null || echo "")
+            head=$(git rev-parse HEAD)
+          fi
+          changed=$(git diff --name-only "${base}...${head}" 2>/dev/null ||
+                    git diff --name-only "${base}..${head}" 2>/dev/null || true)
+          if [ -n "${MANUAL_SUITES}" ]; then
+            suites=$(printf '%s' "${MANUAL_SUITES}" | tr -s '[:space:]' ' ' |
+                     sed 's/^ *//; s/ *$//')
+            suites=$(expand_manual_suites "${suites}")
+          else
+            suites=$(printf '%s\n' "${changed}" | derive_test_suites)
+          fi
+          # Every selected suite is handed to exactly one shard. The count is
+          # fixed at twelve and the split follows the list order, so the shards
+          # of two runs hold the same suites in the same order. A hash over the
+          # names would scramble that order for no benefit, because the suites
+          # differ widely in duration and no assignment by name balances them.
+          # A dispatch that selects all 201 suites puts 201 // 12 = 16 in each
+          # shard and gives one more, 17, to the leading 201 % 12 = 9 shards.
+          # Fewer suites shrink the split instead of leaving empty shards that
+          # would start a runner to run nothing.
+          shard_count=12
+          per_shard=0
+          remainder=0
+          total=0
+          for suite in ${suites}; do
+            total=$((total + 1))
+          done
+          # The split reads one suite per line, so the filter becomes a list
+          # before the arithmetic turns it into shard sizes.
+          suites=$(printf '%s\n' "${suites}" | tr ' ' '\n' | sed '/^$/d')
+          if [ "${total}" -ne 0 ]; then
+            per_shard=$((total / shard_count))
+            remainder=$((total % shard_count))
+          fi
+          # Each shard is written as one JSON array of suite names, and the
+          # arrays are joined with commas between them. The suites are read one
+          # per line in list order, so the shards hold the same suites in the
+          # same order on every run.
+          batches=""
+          offset=0
+          index=0
+          while [ "${index}" -lt "${total}" ]; do
+            size="${per_shard}"
+            if [ "${index}" -lt "${remainder}" ]; then
+              size=$((size + 1))
+            fi
+            shard=$(printf '%s\n' "${suites}" | sed -n "$((offset + 1)),$((offset + size))p" |
+                    sed 's/^/"/; s/$/"/' | tr '\n' ',' | sed 's/,$//')
+            batches="${batches}${batches:+,}[${shard}]"
+            echo "Shard ${index} holds ${size} suite(s): $(printf '%s\n' "${suites}" |
+              sed -n "$((offset + 1)),$((offset + size))p" | tr '\n' ' ')"
+            offset=$((offset + size))
+            index=$((index + 1))
+          done
+          batches="${batches}]"
+          count=$(printf '%s' "${batches}" | grep -o '\["' | wc -l)
+          echo "Split ${total} suite(s) into ${count} shard(s)"
+          echo "batches=${batches}" >> "$GITHUB_OUTPUT"
+          echo "batch_count=${count}" >> "$GITHUB_OUTPUT"
 
   build-test:
     name: build and test (${{ matrix.variant }})
@@ -246,6 +342,7 @@ jobs:
       # into a file in the runner's temporary directory, so the self-check below
       # and the derive step run the same code.
       - name: Write the test-suite derivation helper
+        id: helper
         run: |
           cat > "${RUNNER_TEMP}/derive-suites.sh" <<'HELPER'
           # One push runs at most SUITE_CAP test suites. The suites that do not
@@ -413,6 +510,20 @@ jobs:
             printf '\n'
           }
           HELPER
+          # The file is handed to another job as an artifact, so its length
+          # goes into the job output for the log to name.
+          echo "hash=$(sha256sum "${RUNNER_TEMP}/derive-suites.sh" | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      # The build and plan jobs each read this file, so the rules that map a
+      # changed path to a test module are stated once for all three jobs.
+      - name: Upload the suite derivation helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: derive-suites-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/derive-suites.sh
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
 
       # The derivation decides which suites the pull request runs, and a rule
       # that resolves to no module selects nothing instead of failing, so its
@@ -528,7 +639,9 @@ jobs:
             count=$(all_test_suites_count "${RUNNER_TEMP}")
             case "${count}" in
               ''|*[!0-9]*)
-                echo "::error::the suite enumeration counted '${count}', not a number"
+                # The complaint goes to stderr, so the only text this function
+                # writes to stdout is the count the caller compares.
+                >&2 echo "::error::the suite enumeration counted '${count}', not a number"
                 failures=$((failures + 1))
                 count=0
                 ;;
@@ -658,9 +771,48 @@ jobs:
               ;;
           esac
           echo "tunnel_regression=${tunnel_regression}" >> "$GITHUB_OUTPUT"
+          SUITES="${suites}" python3 - <<'PY'
+          import json
+          import os
+
+          # Every suite the build-test job selected is handed to one shard of
+          # the test job. The count is fixed at twelve and the split follows
+          # the list order, so a suite that sorts early runs in an early shard
+          # and the shards of two runs hold the same suites in the same order;
+          # a hash over the names would scramble that order for no benefit,
+          # because the suites differ widely in duration and no assignment can
+          # balance them by name. A whole dispatch selects about 201 suites, so
+          # a shard holds 201 // 12 = 16 suites, and the 201 % 12 = 9 leading
+          # shards hold one more, for 17 suites each. With fewer suites than
+          # shards the split shrinks: the 201 // 12 = 16 ceiling becomes the
+          # suite count, the leading 201 % 12 = 9 shards become 201 % 16 = 9,
+          # and empty shards are dropped rather than started.
+          shard_count = 12
+          suites = os.environ.get("SUITES", "").split()
+          per_shard, remainder = divmod(len(suites), shard_count)
+          batches = []
+          start = 0
+          for index in range(shard_count):
+              size = per_shard + (1 if index < remainder else 0)
+              if size:
+                  batches.append(suites[start:start + size])
+              start += size
+          # The matrix reads one entry per shard, and the flat list names every
+          # suite once, so a suite missing from the batches shows up against
+          # the suite count instead of vanishing.
+          total = sum(len(batch) for batch in batches)
+          assert total == len(suites), f"{total} batched of {len(suites)} suites"
+          assert sorted(sum(batches, [])) == sorted(suites), "batches do not hold the suites once"
+          print(f"Split {len(suites)} suite(s) into {len(batches)} shard(s) of "
+                f"{per_shard} or {per_shard + 1}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("batches=" + json.dumps(batches, separators=(",", ":")) + "\n")
+              output.write("batch_count=" + str(len(batches)) + "\n")
+              output.write("suite_count=" + str(len(suites)) + "\n")
+          PY
 
       - name: Prepare exact ESP source variant and provenance
-        if: needs.test-plan.outputs.tunnel_control == 'true'
+        if: contains(format(' {0} ', steps.tests.outputs.tunnel_regression), ' true ')
         env:
           ESP_VARIANT: ${{ matrix.variant }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
@@ -781,6 +933,33 @@ jobs:
         with:
           path: build-root/.ccache
           key: ccache-debug-debian13-${{ runner.arch }}-${{ matrix.variant }}-${{ github.ref_name }}-${{ github.sha }}
+
+      # make test-debug consumes the installed tree and the build tree, so both
+      # travel to the test job as one archive. It is written as soon as the
+      # build succeeds, before any test runs, so the test job does not depend
+      # on the build job's own tests passing.
+      - name: Archive the built image for the test job
+        id: image
+        if: steps.build.outcome == 'success'
+        run: |
+          set -eu
+          name="vpp-debug-image-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          tar --zstd -cf "${RUNNER_TEMP}/${name}.tar.zst" \
+            build-root/build-vpp_debug-native build-root/install-vpp_debug-native
+          ls -l "${RUNNER_TEMP}/${name}.tar.zst"
+
+      - name: Upload the built image
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.image.outputs.name }}
+          path: ${{ runner.temp }}/${{ steps.image.outputs.name }}.tar.zst
+          retention-days: 3
+          if-no-files-found: error
+          # The archive is already compressed; a second pass would only spend
+          # minutes re-compressing it.
+          compression-level: 0
 
       - name: Remount /dev/shm for the test harness
         uses: ./.github/actions/vpp-docker-runtime-setup
@@ -918,7 +1097,7 @@ jobs:
             # errexit would end the step at the first failing command, so it is
             # off for the suite body and every command records its own status.
             set +e
-            if [ "${suite}" = ipsec_esp ] && [ '${{ needs.test-plan.outputs.tunnel_control }}' = true ]; then
+            if [ "${suite}" = ipsec_esp ] && [ '${{ steps.tests.outputs.tunnel_regression }}' = true ]; then
               rm -f /tmp/vpp-unittest-TestIpsecEspTun/log.txt
               evidence="${RUNNER_TEMP}/esp-evidence"
               make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST="${suite}" test-debug 2>&1 |
@@ -940,6 +1119,13 @@ jobs:
               [ "${esp_log_status}" = 0 ] || suite_status=1
               [ "${statuses[1]}" = 0 ] || suite_status=1
               [ "${statuses[0]}" = 0 ] || suite_status=1
+              # The evidence step reads this file for the one suite it covers,
+              # instead of taking the whole step's aggregate outcome.
+              if [ "${suite_status}" = 0 ]; then
+                echo success > "${evidence}/esp-suite-outcome.txt"
+              else
+                echo failure > "${evidence}/esp-suite-outcome.txt"
+              fi
             else
               make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST="${suite}" test-debug ||
                 suite_status=1
@@ -999,6 +1185,7 @@ jobs:
           destination.mkdir(parents=True, exist_ok=True)
           originals = [Path("/tmp/vpp-failed-unittests")] + sorted(Path("/tmp").glob("vpp-unittest-*"))
           copied = []
+          copied_count = 0
           for original in originals:
               if original.is_symlink() or not original.is_dir():
                   copied.append(f"MISSING OR UNSAFE directory: {original}")
@@ -1011,24 +1198,31 @@ jobs:
                       keep = (name in reserved or name.startswith("vpp_api_trace")
                               or re.fullmatch(r"api_post_mortem\.[0-9]+", name) is not None
                               or name.endswith(".log"))
-                      if not keep or not stat.S_ISREG(source.lstat().st_mode):
+                      if not keep:
                           continue
-                      if source.stat().st_size > limit:
-                          copied.append(f"SKIPPED (over 32 MiB): {source}")
-                          continue
-                      target = destination / f"{len(copied):04d}{source.suffix}"
+                      # The harness removes its temporary trees between suites,
+                      # so a file can vanish between the walk and the copy. The
+                      # size check and the copy share one try: a file that
+                      # disappears is recorded as SKIPPED, not raised.
                       try:
+                          if not stat.S_ISREG(source.lstat().st_mode):
+                              continue
+                          if source.stat().st_size > limit:
+                              copied.append(f"SKIPPED (over 32 MiB): {source}")
+                              continue
+                          target = destination / f"{copied_count:04d}{source.suffix}"
                           shutil.copyfile(source, target)
                       except OSError as error:
                           copied.append(f"SKIPPED ({error}): {source}")
                           continue
                       copied.append(f"COPIED: {source} -> {target.name}")
-                      if sum(line.startswith("COPIED") for line in copied) >= 2000:
+                      copied_count += 1
+                      if copied_count >= 2000:
                           break
-                  if sum(line.startswith("COPIED") for line in copied) >= 2000:
+                  if copied_count >= 2000:
                       break
           (destination / "collection-report.txt").write_text("\n".join(copied) + "\n")
-          print(f"Copied {sum(line.startswith('COPIED') for line in copied)} file(s) of suite {suite}")
+          print(f"Copied {copied_count} file(s) of suite {suite}")
           PY
             fi
           done
@@ -1041,11 +1235,10 @@ jobs:
           echo "All ${#results[@]} suites passed"
 
       - name: Verify complete ESP evidence
-        if: always() && needs.test-plan.outputs.tunnel_control == 'true'
+        if: always() && contains(format(' {0} ', steps.tests.outputs.tunnel_regression), ' true ')
         env:
           ESP_VARIANT: ${{ matrix.variant }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
-          TEST_OUTCOME: ${{ matrix.variant == 'fixed' && steps.positive.outcome || steps.negative.outcome }}
         run: |
           python3 - <<'PY'
           import hashlib
@@ -1057,8 +1250,7 @@ jobs:
 
           output = Path(os.environ["RUNNER_TEMP"]) / "esp-evidence"
           output.mkdir(exist_ok=True)
-          result = {"accepted": False, "build": os.environ["BUILD_OUTCOME"],
-                    "test_step": os.environ["TEST_OUTCOME"]}
+          result = {"accepted": False, "build": os.environ["BUILD_OUTCOME"]}
           try:
               if not (output / "named-test.log").exists():
                   source = Path("/tmp/vpp-unittest-TestIpsecEspTun/log.txt")
@@ -1095,7 +1287,12 @@ jobs:
               result["raw_returncode"] = rc
               assert int((output / "capture-returncode.txt").read_text()) == 0
               assert os.environ["BUILD_OUTCOME"] == "success", "build did not succeed"
-              assert os.environ["TEST_OUTCOME"] == "success", "command/capture step failed"
+              # The suite loop records the ipsec_esp result from that suite's
+              # three statuses, so this never reads a step outcome for a step
+              # that does not exist under these names.
+              suite_outcome = (output / "esp-suite-outcome.txt").read_text().strip()
+              result["ipsec_esp_suite"] = suite_outcome
+              assert suite_outcome == "success", f"ipsec_esp suite recorded {suite_outcome!r}"
               assert (output / "command.txt").stat().st_size > 0 and raw and named
               assert (output / "command.log").stat().st_size <= 32 * 1024 * 1024
               callbacks = re.findall(r" --- (add\w+)\(\) TestIpsecEspTun\.test_tun_df44\(", named)
@@ -1144,7 +1341,7 @@ jobs:
           PY
 
       - name: Upload ESP evidence
-        if: always() && needs.test-plan.outputs.tunnel_control == 'true'
+        if: always() && contains(format(' {0} ', steps.tests.outputs.tunnel_regression), ' true ')
         uses: actions/upload-artifact@v4
         with:
           name: esp-evidence-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1271,6 +1468,179 @@ jobs:
         with:
           name: vpp-suite-summary-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/vpp-suite-summary.txt
+          retention-days: 7
+          if-no-files-found: warn
+          compression-level: 6
+
+  # The suites the build job selected, split across twelve runners. Each shard
+  # keeps its own summary and uploads it in a step that runs whatever the
+  # shard's outcome is, so a cancelled or timed-out shard still leaves a
+  # readable record.
+  test:
+    name: test (${{ matrix.variant }} shard)
+    needs: [test-plan, build-test]
+    # A failed or cancelled build has no image for these runners. A failed
+    # build job whose build step succeeded is still unreadable from here, so
+    # the job runs and the image download reports its own failure.
+    if: always() && needs.build-test.result != 'skipped' && needs.build-test.result != 'cancelled'
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(needs.test-plan.outputs.variants) }}
+        batch: ${{ fromJSON(needs.test-plan.outputs.batches) }}
+    runs-on: ubuntu-24.04
+    # The build job's ceiling covers one job for every suite; a shard runs a
+    # twelfth of them, so the same wall clock applies to a full dispatch.
+    timeout-minutes: 360
+    container:
+      image: debian:trixie
+      # Copied from the build job: the framework and the namespace, TAP and
+      # vhost tests need the same shared memory, capabilities and devices.
+      options: >-
+        --shm-size=2g
+        --cap-add=SYS_ADMIN
+        --cap-add=NET_ADMIN
+        --security-opt=apparmor=unconfined
+        --device-cgroup-rule="c 10:200 rwm"
+        --device-cgroup-rule="c 10:238 rwm"
+    defaults:
+      run:
+        shell: bash
+    # The matrix holds one entry per shard, and this value is that entry: the
+    # artifact names and the summary lines read it, so two shards cannot
+    # write over each other's record. The summary path is built in the steps
+    # because the runner's temporary directory is not available at job level.
+    env:
+      SHARD: ${{ toJSON(matrix.batch) }}
+    steps:
+      - name: Disable APT cache cleanup
+        run: rm -f /etc/apt/apt.conf.d/docker-clean
+
+      - name: Install base tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq sudo make git bash iproute2
+
+      - name: Check out the pull request
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download the built image
+        uses: actions/download-artifact@v4
+        with:
+          name: vpp-debug-image-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/image
+
+      # The image replaces build-root/build-vpp_debug-native and
+      # build-root/install-vpp_debug-native. `make test-debug` reaches the
+      # suites through vpp-install, which runs `cmake --build . -- install`
+      # again, so the installed tree is moved aside before that runs: whatever
+      # the rebuild produces, the suites this shard runs are the ones the build
+      # job produced. The move sits inside the shard, between vpp-install and
+      # the harness, so the harness reads the build tree and the image's
+      # installed tree together.
+      - name: Restore the built image
+        run: |
+          set -eu
+          image="${RUNNER_TEMP}/image/vpp-debug-image-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}.tar.zst"
+          tar --zstd -xf "${image}"
+          test -x build-root/install-vpp_debug-native/vpp/bin/vpp
+          test -f build-root/build-vpp_debug-native/vpp/CMakeCache.txt
+          cp -a build-root/install-vpp_debug-native "${RUNNER_TEMP}/image-install"
+          ls -l --time-style=+%Y-%m-%dT%H:%M:%S "${RUNNER_TEMP}/image-install/vpp/bin/vpp"
+
+      - name: Remount /dev/shm for the test harness
+        uses: ./.github/actions/vpp-docker-runtime-setup
+        with:
+          WORKSPACE: ${{ github.workspace }}
+          SHM_SIZE: 2G
+          LOG_DIR: ${{ github.workspace }}/build-root/test-logs
+
+      # The suites run one after another on this runner, and each result
+      # reaches the summary file as soon as its suite ends, so a shard that is
+      # cancelled halfway still names the suites that finished.
+      - name: Run the suites of this shard
+        id: suites
+        env:
+          TEST: ${{ join(matrix.batch, ' ') }}
+        run: |
+          set -eu
+          git config --global --add safe.directory "$PWD"
+          # One summary per shard: the shard's position in the matrix keeps two
+          # shards from writing over each other's file.
+          SUMMARY_FILE="${RUNNER_TEMP}/vpp-shard-summary-${{ strategy.job-index }}.txt"
+          read -ra suites <<< "${TEST}"
+          if [ "${#suites[@]}" -eq 0 ]; then
+            echo "::error::This shard holds no suite"
+            exit 1
+          fi
+          printf 'Shard %s runs %s suite(s): %s\n' "${SUMMARY_FILE}" "${#suites[@]}" \
+            "${suites[*]}" | tee "${SUMMARY_FILE}"
+          # vpp-install rebuilds for the first suite only: the make tree skips
+          # it once its install timestamp is younger than the sources, and the
+          # first run leaves that timestamp behind. The installed tree is put
+          # back once, right after that run, not before.
+          restored=""
+          failed=0
+          for suite in "${suites[@]}"; do
+            echo "Running TEST=${suite}"
+            # errexit would end the shard at the first failing suite, so it is
+            # off around the run and the status is recorded for the summary.
+            set +e
+            make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST="${suite}" test-debug &
+            runner=$!
+            if [ "${restored}" != true ]; then
+              # The recursive make touches the install timestamp only after
+              # vpp-install returns, so waiting for the timestamp is waiting
+              # for the install to finish.
+              stamp="build-root/build-vpp_debug-native/vpp/.mu_build_install_timestamp"
+              deadline=$((SECONDS + 3600))
+              until [ -e "${stamp}" ]; do
+                kill -0 "${runner}" 2>/dev/null || break
+                [ "${SECONDS}" -lt "${deadline}" ] || break
+                sleep 5
+              done
+              rm -rf build-root/install-vpp_debug-native
+              cp -a "${RUNNER_TEMP}/image-install" build-root/install-vpp_debug-native
+              echo "Restored the installed tree from the image"
+              restored=true
+            fi
+            wait "${runner}"
+            status=$?
+            set -e
+            if [ "${status}" -eq 0 ]; then
+              echo "${suite}: pass" >> "${SUMMARY_FILE}"
+              echo "Suite result: ${suite}: pass"
+            else
+              echo "${suite}: fail (exit ${status})" >> "${SUMMARY_FILE}"
+              echo "Suite result: ${suite}: fail"
+              failed=$((failed + 1))
+            fi
+          done
+          if [ "${failed}" -ne 0 ]; then
+            echo "::error::${failed} of ${#suites[@]} suite(s) failed in this shard"
+            exit 1
+          fi
+          echo "All ${#suites[@]} suite(s) of this shard passed"
+
+      - name: Report the shard summary
+        if: always()
+        run: |
+          SUMMARY_FILE="${RUNNER_TEMP}/vpp-shard-summary-${{ strategy.job-index }}.txt"
+          if [ ! -s "${SUMMARY_FILE}" ]; then
+            echo "No suite finished before this step ran" > "${SUMMARY_FILE}"
+          fi
+          echo "Per-suite results recorded by this shard:"
+          cat "${SUMMARY_FILE}"
+
+      - name: Upload the shard summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpp-shard-summary-${{ matrix.variant }}-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/vpp-shard-summary-*.txt
           retention-days: 7
           if-no-files-found: warn
           compression-level: 6
