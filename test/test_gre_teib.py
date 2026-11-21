@@ -154,23 +154,29 @@ class TestGreTeib(VppTestCase):
         )
 
     def test_gre_teib_unbound_peer(self):
-        """a peer's adj fib leaves its own table once the binding is gone
+        """a peer's adj fib is removed from the table the entry put it in
 
         A TEIB entry's adj fib is installed on the tunnel the entry is keyed on,
         in the table that tunnel is bound to, so the tunnel is what the
         subtests bind and what the adj fib has to name.
 
-        An unbind only removes the address, so the peer added before it stays,
-        in table 1, while the tunnel is bound to table 0 again by the time the
-        peer goes. Deleting the peer then has to take its adj fib out of table
-        1, and release what it holds there, rather than out of table 0, which is
-        where the tunnel is bound by then.
+        The peer is deleted while the tunnel is still bound to table 1, so the
+        delete path is what takes the adj fib out of table 1: no binding move
+        has run, so teib_walk_table_bind has not re-homed it first. The unbind
+        comes after the delete, and then has to carry the re-added adj fib out
+        of table 1 through that walk.
 
-        Before the fix the delete looked the adj fib up in table 0, where there
-        was nothing to remove, so the path stayed in table 1 and the
-        FIB_SOURCE_ADJ lock table 1 was given on the way in was kept for good.
-        The double add is exercised too: the second add is refused with the
-        existing entry and leaves the adj fib as it was.
+        What this does not pin, and the ordering it replaces pinned even less:
+        with the tunnel still bound to table 1, the table recorded with the
+        entry and the binding resolved at delete time are the same table, so a
+        remove that resolved the binding again would also name table 1 and pass
+        here. The two differ only for a peer whose adj fib was never added, and
+        that is test_gre_teib_sourced_peer_unbound, where the bind to table 0
+        runs before the delete. A live adj fib cannot be made to separate them
+        through the public API: moving the binding first re-homes the adj fib in
+        teib_walk_table_bind, which leaves the delete with the two tables equal
+        again. The FIB_SOURCE_ADJ lock count would separate them, and no route
+        dump exposes it.
 
         Every subTest stands on its own: table 1 is created empty for it, and
         the tunnel named here is the one that moves, since the adj fib follows
@@ -191,15 +197,15 @@ class TestGreTeib(VppTestCase):
                     self.assertTrue(self.peer_has_adj_fib(is_ip6, 1, peer, tunnel))
                     with self.assertRaisesRegex(Exception, "ALREADY_EXISTS"):
                         self.add_peer_raw(tunnel, is_ip6, peer)
-                    self.bind_to_table(tunnel, is_ip6, 0)
                     entry.remove_vpp_config()
                     self.assertFalse(entry.query_vpp_config())
                     self.assertFalse(self.peer_has_adj_fib(is_ip6, 1, peer, tunnel))
-                    self.bind_to_table(tunnel, is_ip6, 1)
                     self.assertTrue(
                         self.add_peer_raw(tunnel, is_ip6, peer).query_vpp_config()
                     )
+                    self.assertTrue(self.peer_has_adj_fib(is_ip6, 1, peer, tunnel))
                     self.bind_to_table(tunnel, is_ip6, 0)
+                    self.assertFalse(self.peer_has_adj_fib(is_ip6, 1, peer, tunnel))
                     self.delete_tunnel(tunnel)
                 finally:
                     self.registry.unregister(table.object_id(), self.logger)
