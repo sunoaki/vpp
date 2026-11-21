@@ -8,7 +8,6 @@ from scapy.layers.l2 import Ether
 from scapy.packet import Raw
 from scapy.layers.inet import IP, UDP
 from random import randint
-import re  # for finding counters in "sh errors" output
 
 
 class SFlowDropTestCase(VppTestCase):
@@ -78,13 +77,12 @@ class SFlowDropTestCase(VppTestCase):
         return packets
 
     def get_sflow_counter(self, counter):
-        counters = self.vapi.cli("sh errors").split("\n")
-        for i in range(1, len(counters) - 1):
-            results = counters[i].split()
-            if results[1] == "sflow":
-                if re.search(counter, counters[i]) is not None:
-                    return int(results[0])
-        return None
+        # the plugin increments these counters on the "sflow" node even when a
+        # sample is dropped or egress-sampled, so read them all from there
+        try:
+            return self.get_node_counter("sflow", counter)
+        except KeyError:
+            return None
 
     def verify_sflow(self, count):
         ctr_pk_proc = "sflow packets processed"
@@ -116,9 +114,9 @@ class SFlowDropTestCase(VppTestCase):
         self.logger.info(ctr_dm_fail + "=" + str(dm_fail))
         self.assert_equal(pk_proc, count, ctr_pk_proc)
         self.assert_equal(pk_samp, count, ctr_pk_samp)
-        self.assert_equal(pk_drop, None, ctr_pk_drop)
+        self.assert_equal(pk_drop, 0, ctr_pk_drop)
         self.assert_equal(di_proc, 1, ctr_di_proc)
-        self.assert_equal(di_drop, None, ctr_di_drop)
+        self.assert_equal(di_drop, 0, ctr_di_drop)
         # sending to PSAMPLE or DROPMON will fail if not
         # running with root privileges. So do not insist
         # on these numbers:
