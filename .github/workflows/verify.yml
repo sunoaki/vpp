@@ -1046,6 +1046,10 @@ jobs:
         if: matrix.variant == 'fixed'
         env:
           SUITES: ${{ steps.tests.outputs.suites }}
+          # The suite summary and the per-suite diagnostics are uploaded under
+          # fixed names, and the suite jobs upload their own, so this job keeps
+          # its copies in a directory of their own.
+          DIAGNOSTICS: ${{ runner.temp }}/build-test-diagnostics
         run: |
           git config --global --add safe.directory "$PWD"
           set -eu
@@ -1067,8 +1071,9 @@ jobs:
           # red suite does not hide the state of the rest. RETRIES and TEST_JOBS
           # stay those the suites already use. The summary file survives a job
           # timeout that kills this step before the table is printed.
-          summary_file="${RUNNER_TEMP}/vpp-suite-summary.txt"
+          summary_file="${DIAGNOSTICS}/suite-summary.txt"
           echo "Selected ${#suites[@]} suite(s): ${suites[*]}"
+          mkdir -p "${DIAGNOSTICS}"
           : > "${summary_file}"
           results=()
           failed=()
@@ -1157,7 +1162,7 @@ jobs:
               # runs while errexit is off; every internal error is already
               # recorded in the report, and a non-zero exit marks the suite, not
               # the step.
-              SUITE="${suite}" OUTPUT="${RUNNER_TEMP}/vpp-test-diagnostics/${suite}" python3 - <<'PY'
+              SUITE="${suite}" OUTPUT="${DIAGNOSTICS}/${suite}" python3 - <<'PY'
           import os
           import re
           import shutil
@@ -1356,14 +1361,13 @@ jobs:
       - name: Report the suite summary so far
         if: always() && matrix.variant == 'fixed'
         run: |
-          summary="${RUNNER_TEMP}/vpp-suite-summary.txt"
-          mkdir -p "${RUNNER_TEMP}/vpp-test-diagnostics"
+          summary="${DIAGNOSTICS}/suite-summary.txt"
+          mkdir -p "${DIAGNOSTICS}"
           if [ ! -s "${summary}" ]; then
             echo "No suite finished before this step ran" > "${summary}"
           fi
           echo "Per-suite results recorded so far:"
           cat "${summary}"
-          cp "${summary}" "${RUNNER_TEMP}/vpp-test-diagnostics/suite-summary.txt"
 
       - name: Collect failed test diagnostics
         if: failure()
@@ -1374,7 +1378,7 @@ jobs:
           import re
           import stat
 
-          output = Path(os.environ["RUNNER_TEMP"]) / "vpp-test-diagnostics"
+          output = Path(os.environ["RUNNER_TEMP"]) / "build-test-diagnostics"
           output.mkdir(parents=True, exist_ok=True)
           suite_dirs = {path for path in output.iterdir()
                         if path.is_dir() and not path.is_symlink()} if output.is_dir() else set()
@@ -1389,7 +1393,7 @@ jobs:
                     "Symlinks are recorded, never traversed.",
                     "Staged filenames use unique numeric IDs with safe extensions; this report maps back to originals.",
                     "Copied paths below map original -> staged, relative to this report.",
-                    "Per-suite copies made when each suite failed live in vpp-test-diagnostics/<suite>/ and are kept as they are."]
+                    "Per-suite copies made when each suite failed live in <suite>/ and are kept as they are."]
           if failed.is_dir() and not failed.is_symlink():
               for link in sorted(failed.iterdir()):
                   if link.is_symlink():
@@ -1457,7 +1461,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vpp-test-diagnostics-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/vpp-test-diagnostics/
+          path: ${{ runner.temp }}/build-test-diagnostics/
           retention-days: 7
           if-no-files-found: warn
           compression-level: 6
@@ -1467,7 +1471,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vpp-suite-summary-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/vpp-suite-summary.txt
+          path: ${{ runner.temp }}/build-test-diagnostics/suite-summary.txt
           retention-days: 7
           if-no-files-found: warn
           compression-level: 6
