@@ -7,7 +7,7 @@ import scapy.compat
 from time import sleep
 from config import config
 from framework import VppTestCase
-from ipfix import IPFIX, Set, Template, Data, IPFIXDecoder
+from ipfix import IPFIX, Template, Data, IPFIXDecoder
 from scapy.data import IP_PROTOS
 from scapy.layers.inet import IP, TCP, UDP, ICMP
 from scapy.layers.inet import IPerror, UDPerror
@@ -43,21 +43,20 @@ class TestDET44(VppTestCase):
 
     # The NAT44 session data record: observationTimeMilliseconds, then the
     # template fields of nat_template_rewrite, 26 octets as NAT44_SESSION_CREATE_LEN
-    # in src/plugins/nat/lib/ipfix_logging.c
+    # in src/plugins/nat/lib/ipfix_logging.c. Each entry is the information
+    # element, its offset in the record and its length.
     NAT44_SESSION_RECORD_LAYOUT = [
-        (230, 1),  # natEvent
-        (8, 4),  # sourceIPv4Address
-        (225, 4),  # postNATSourceIPv4Address
-        (4, 1),  # protocolIdentifier
-        (7, 2),  # sourceTransportPort
-        (227, 2),  # postNAPTSourceTransportPort
-        (234, 4),  # ingressVRFID
+        (153, 0, 8),  # observationTimeMilliseconds
+        (230, 8, 1),  # natEvent
+        (8, 9, 4),  # sourceIPv4Address
+        (225, 13, 4),  # postNATSourceIPv4Address
+        (4, 17, 1),  # protocolIdentifier
+        (7, 18, 2),  # sourceTransportPort
+        (227, 20, 2),  # postNAPTSourceTransportPort
+        (234, 22, 4),  # ingressVRFID
     ]
-    NAT44_SESSION_RECORD_FIELDS = (153,) + tuple(
-        f for f, _ in NAT44_SESSION_RECORD_LAYOUT
-    )
-    NAT44_SESSION_RECORD_LEN = 8 + sum(
-        length for _, length in NAT44_SESSION_RECORD_LAYOUT
+    NAT44_SESSION_RECORD_LEN = sum(
+        length for _, _, length in NAT44_SESSION_RECORD_LAYOUT
     )
 
     # Polls of one second that a collector snapshot waits for the exporter to
@@ -275,21 +274,26 @@ class TestDET44(VppTestCase):
         capture names are used, so a data set of another stream in the same
         packets cannot shift the records of this one.
 
+        A data set is read from the set that encloses p[Data], not from
+        p[Set], which returns the first Set layer of the packet whatever it
+        is.
+
         :param ipfix: Decoder collecting the templates of the stream
         :param packets: Captured IPFIX packets
         :returns: Decoded data records
         """
-        template_id = next(
-            (int(p[Set].setID) for p in packets if p.haslayer(Template)), None
-        )
+        template_ids = {
+            int(p[Template].templateID) for p in packets if p.haslayer(Template)
+        }
         records = []
         for p in packets:
             if not p.haslayer(Data):
                 continue
+            data_set = p[Data].underlayer
             # a capture without any template is decoded by ipfix_stream_records
-            if template_id is not None:
-                self.assertEqual(template_id, int(p[Set].setID))
-            records.extend(ipfix.decode_data_set(p.getlayer(Set)))
+            if template_ids and int(data_set.setID) not in template_ids:
+                continue
+            records.extend(ipfix.decode_data_set(data_set))
         return records
 
     def ipfix_stream_records(self, packets):
@@ -298,8 +302,8 @@ class TestDET44(VppTestCase):
         sends, whether or not the capture carried its template
 
         The template is only in a capture when the stream sends it, and the
-        stream sends it as a set with a data set, so a snapshot of one
-        message after the template normally holds a bare data set.
+        exporter sends it as its own message, so a snapshot of one message
+        after the template normally holds a bare data set.
 
         :param packets: Captured IPFIX packets
         :returns: Decoded data records
@@ -312,7 +316,11 @@ class TestDET44(VppTestCase):
                 known_ids.add(int(p[Template].templateID))
         records = []
         for p in packets:
-            if not p.haslayer(Data) or int(p[Set].setID) in known_ids:
+            if not p.haslayer(Data):
+                continue
+            # a data set of a template in the capture is decoded by
+            # ipfix_data_records, so it is not counted here as well
+            if int(p[Data].underlayer.setID) in known_ids:
                 continue
             data = p[Data].data
             for offset in range(0, len(data), self.NAT44_SESSION_RECORD_LEN):
@@ -320,15 +328,10 @@ class TestDET44(VppTestCase):
                 if len(raw) < self.NAT44_SESSION_RECORD_LEN:
                     break
                 records.append(
-                    dict(
-                        zip(
-                            self.NAT44_SESSION_RECORD_FIELDS,
-                            [
-                                raw[o : o + length]
-                                for o, length in self.NAT44_SESSION_RECORD_LAYOUT
-                            ],
-                        )
-                    )
+                    {
+                        ie: raw[start : start + length]
+                        for ie, start, length in self.NAT44_SESSION_RECORD_LAYOUT
+                    }
                 )
         return records
 
@@ -1381,7 +1384,7 @@ class TestDET44(VppTestCase):
         # verify events in data set
         for p in capture:
             if p.haslayer(Data):
-                data = ipfix.decode_data_set(p.getlayer(Set))
+                data = ipfix.decode_data_set(p[Data].underlayer)
                 self.verify_ipfix_max_entries_per_user(data, 1000, self.pg0.remote_ip4)
         self.vapi.nat_ipfix_enable_disable(domain_id=1, src_port=4739, enable=0)
 
