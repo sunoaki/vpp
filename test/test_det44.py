@@ -229,7 +229,7 @@ class TestDET44(VppTestCase):
         self.drain_ipfix_collector()
         self.vapi.ipfix_flush()
         capture = []
-        for _ in range(IPFIX_EXPORT_POLLS):
+        for _ in range(self.IPFIX_EXPORT_POLLS):
             p = self.ipfix_collector_packet()
             if p is None:
                 # the process that exports waits on a clock, so time passes
@@ -255,9 +255,9 @@ class TestDET44(VppTestCase):
         return [
             record
             for record in records
-            if NAT_EVENT_SESSION_CREATE
+            if self.NAT_EVENT_SESSION_CREATE
             <= scapy.compat.orb(record[230])
-            <= NAT_EVENT_SESSION_DELETE
+            <= self.NAT_EVENT_SESSION_DELETE
         ]
 
     def ipfix_data_records(self, ipfix, packets):
@@ -308,17 +308,17 @@ class TestDET44(VppTestCase):
             if not p.haslayer(Data) or int(p[Set].setID) in known_ids:
                 continue
             data = p[Data].data
-            for offset in range(0, len(data), NAT44_SESSION_RECORD_LEN):
-                raw = data[offset : offset + NAT44_SESSION_RECORD_LEN]
-                if len(raw) < NAT44_SESSION_RECORD_LEN:
+            for offset in range(0, len(data), self.NAT44_SESSION_RECORD_LEN):
+                raw = data[offset : offset + self.NAT44_SESSION_RECORD_LEN]
+                if len(raw) < self.NAT44_SESSION_RECORD_LEN:
                     break
                 records.append(
                     dict(
                         zip(
-                            NAT44_SESSION_RECORD_FIELDS,
+                            self.NAT44_SESSION_RECORD_FIELDS,
                             [
                                 raw[o : o + length]
-                                for o, length in NAT44_SESSION_RECORD_LAYOUT
+                                for o, length in self.NAT44_SESSION_RECORD_LAYOUT
                             ],
                         )
                     )
@@ -1158,7 +1158,7 @@ class TestDET44(VppTestCase):
         port_pair = (self.tcp_port_in, self.tcp_port_out)
         self.verify_ipfix_session_event(
             self.collect_ipfix_session_events(),
-            NAT_EVENT_SESSION_CREATE,
+            self.NAT_EVENT_SESSION_CREATE,
             IP_PROTOS.tcp,
             self.pg0.remote_ip4,
             self.nat_addr,
@@ -1180,7 +1180,7 @@ class TestDET44(VppTestCase):
         records = self.collect_ipfix_session_events()
         self.verify_ipfix_no_session_event(
             records,
-            NAT_EVENT_SESSION_CREATE,
+            self.NAT_EVENT_SESSION_CREATE,
             IP_PROTOS.tcp,
             self.pg0.remote_ip4,
             self.nat_addr,
@@ -1188,7 +1188,7 @@ class TestDET44(VppTestCase):
         )
         self.verify_ipfix_no_session_event(
             records,
-            NAT_EVENT_SESSION_DELETE,
+            self.NAT_EVENT_SESSION_DELETE,
             IP_PROTOS.tcp,
             self.pg0.remote_ip4,
             self.nat_addr,
@@ -1201,7 +1201,7 @@ class TestDET44(VppTestCase):
         self.assertEqual([], self.tcp_sessions())
         self.verify_ipfix_session_event(
             self.collect_ipfix_session_events(),
-            NAT_EVENT_SESSION_DELETE,
+            self.NAT_EVENT_SESSION_DELETE,
             IP_PROTOS.tcp,
             self.pg0.remote_ip4,
             self.nat_addr,
@@ -1220,7 +1220,7 @@ class TestDET44(VppTestCase):
         port_pair = (self.icmp_id_in, out_id)
         self.verify_ipfix_session_event(
             self.collect_ipfix_session_events(),
-            NAT_EVENT_SESSION_CREATE,
+            self.NAT_EVENT_SESSION_CREATE,
             IP_PROTOS.icmp,
             self.pg0.remote_ip4,
             self.nat_addr,
@@ -1238,7 +1238,7 @@ class TestDET44(VppTestCase):
         # wake; the snapshot polls the clock for that cycle.
         self.verify_ipfix_session_event(
             self.collect_ipfix_session_events(),
-            NAT_EVENT_SESSION_DELETE,
+            self.NAT_EVENT_SESSION_DELETE,
             IP_PROTOS.icmp,
             self.pg0.remote_ip4,
             self.nat_addr,
@@ -1268,7 +1268,7 @@ class TestDET44(VppTestCase):
         port_pair = (self.tcp_port_in, self.tcp_port_out)
         self.verify_ipfix_session_event(
             self.collect_ipfix_session_events(),
-            NAT_EVENT_SESSION_CREATE,
+            self.NAT_EVENT_SESSION_CREATE,
             IP_PROTOS.tcp,
             self.pg0.remote_ip4,
             self.nat_addr,
@@ -1284,7 +1284,7 @@ class TestDET44(VppTestCase):
         self.assertEqual([], self.tcp_sessions())
         self.verify_ipfix_session_event(
             self.collect_ipfix_session_events(),
-            NAT_EVENT_SESSION_DELETE,
+            self.NAT_EVENT_SESSION_DELETE,
             IP_PROTOS.tcp,
             self.pg0.remote_ip4,
             self.nat_addr,
