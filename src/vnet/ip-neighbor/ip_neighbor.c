@@ -219,6 +219,17 @@ ip_neighbor_list_remove (ip_neighbor_t * ipn)
     }
 }
 
+/*
+ * Every path that changes an entry's kind (dynamic vs static) ends here, which
+ * makes this the one place that keeps the age-list membership in step with the
+ * entry.
+ *
+ * That list is the age queue: the age process probes the entries on it and
+ * destroys the ones that stay silent, and ip_neighbor_force_reuse() takes its
+ * entries when the limit is reached. An entry on the list is therefore one VPP
+ * may remove on its own. Only dynamic entries go on it. A static entry was
+ * programmed by the control plane and is removed by it, so it is taken off.
+ */
 static void
 ip_neighbor_refresh (ip_neighbor_t * ipn)
 {
@@ -230,26 +241,28 @@ ip_neighbor_refresh (ip_neighbor_t * ipn)
   ipn->ipn_time_last_updated = vlib_time_now (vlib_get_main ());
   ipn->ipn_n_probes = 0;
 
-  if (ip_neighbor_is_dynamic (ipn))
+  if (!ip_neighbor_is_dynamic (ipn))
     {
-      if (~0 == ipn->ipn_elt)
-	/* first time insertion */
-	pool_get_zero (ip_neighbor_elt_pool, elt);
-      else
-	{
-	  /* already inserted - extract first */
-	  elt = pool_elt_at_index (ip_neighbor_elt_pool, ipn->ipn_elt);
-
-	  clib_llist_remove (ip_neighbor_elt_pool, ipne_anchor, elt);
-	}
-      head = pool_elt_at_index (ip_neighbor_elt_pool,
-				ip_neighbor_list_head[ip_neighbor_get_af
-						      (ipn)]);
-
-      elt->ipne_index = ip_neighbor_get_index (ipn);
-      clib_llist_add (ip_neighbor_elt_pool, ipne_anchor, elt, head);
-      ipn->ipn_elt = elt - ip_neighbor_elt_pool;
+      ip_neighbor_list_remove (ipn);
+      return;
     }
+
+  if (~0 == ipn->ipn_elt)
+    /* first time insertion */
+    pool_get_zero (ip_neighbor_elt_pool, elt);
+  else
+    {
+      /* already inserted - extract first */
+      elt = pool_elt_at_index (ip_neighbor_elt_pool, ipn->ipn_elt);
+
+      clib_llist_remove (ip_neighbor_elt_pool, ipne_anchor, elt);
+    }
+
+  head = pool_elt_at_index (ip_neighbor_elt_pool, ip_neighbor_list_head[ip_neighbor_get_af (ipn)]);
+
+  elt->ipne_index = ip_neighbor_get_index (ipn);
+  clib_llist_add (ip_neighbor_elt_pool, ipne_anchor, elt, head);
+  ipn->ipn_elt = elt - ip_neighbor_elt_pool;
 }
 
 static void
@@ -791,11 +804,11 @@ ip_neighbor_add (const ip_address_t * ip,
 
       /* A dynamic entry can become static, but not vice-versa.
        * i.e. since if it was programmed by the CP then it must
-       * be removed by the CP */
+       * be removed by the CP. The refresh below takes the promoted entry
+       * off the age list, so the age process no longer destroys it. */
       if ((flags & IP_NEIGHBOR_FLAG_STATIC) &&
 	  !(ipn->ipn_flags & IP_NEIGHBOR_FLAG_STATIC))
 	{
-	  ip_neighbor_list_remove (ipn);
 	  ipn->ipn_flags |= IP_NEIGHBOR_FLAG_STATIC;
 	  ipn->ipn_flags &= ~IP_NEIGHBOR_FLAG_DYNAMIC;
 	}
@@ -1135,7 +1148,7 @@ ip_neighbor_sort (void *a1, void *a2)
 }
 
 static index_t *
-ip_neighbor_entries (u32 sw_if_index, ip_address_family_t af)
+ip_neighbor_entries (u32 sw_if_index, ip_address_family_t af, int (*sort) (void *, void *))
 {
   index_t *ipnis = NULL;
   ip_neighbor_t *ipn;
@@ -1151,8 +1164,29 @@ ip_neighbor_entries (u32 sw_if_index, ip_address_family_t af)
 
 
   if (ipnis)
-    vec_sort_with_function (ipnis, ip_neighbor_sort);
+    vec_sort_with_function (ipnis, sort);
   return ipnis;
+}
+
+static int
+ip_neighbor_sort_by_age (void *a1, void *a2)
+{
+  index_t *ipni1 = a1, *ipni2 = a2;
+  ip_neighbor_t *ipn1, *ipn2;
+
+  ipn1 = ip_neighbor_get (*ipni1);
+  ipn2 = ip_neighbor_get (*ipni2);
+
+  if (ipn1->ipn_time_last_updated < ipn2->ipn_time_last_updated)
+    return -1;
+  if (ipn1->ipn_time_last_updated > ipn2->ipn_time_last_updated)
+    return 1;
+
+  /* two entries can carry the same timestamp, since the clock is read once
+   * per refresh; the index keeps the order of the display stable */
+  if (*ipni1 == *ipni2)
+    return 0;
+  return (*ipni1 < *ipni2 ? -1 : 1);
 }
 
 static clib_error_t *
@@ -1160,21 +1194,27 @@ ip_neighbor_show_sorted_i (vlib_main_t * vm,
 			   unformat_input_t * input,
 			   vlib_cli_command_t * cmd, ip_address_family_t af)
 {
-  ip_neighbor_elt_t *elt, *head;
+  index_t *ipni, *ipnis;
   f64 now;
 
-  head = pool_elt_at_index (ip_neighbor_elt_pool, ip_neighbor_list_head[af]);
   now = vlib_time_now (vm);
 
   vlib_cli_output (vm, "%=12s%=40s%=6s%=20s%=24s", "Age", "IP", "Flags",
 		   "Ethernet", "Interface");
 
-  /* the list is time sorted, newest first, so start from the back
-   * and work forwards. Stop when we get to one that is alive */
-  clib_llist_foreach_reverse (ip_neighbor_elt_pool, ipne_anchor, head, elt, ({
-				vlib_cli_output (vm, "%U", format_ip_neighbor,
-						 now, elt->ipne_index);
-			      }));
+  /*
+   * The age list holds only the dynamic entries, so walking it would hide
+   * every static entry from this display. Reading the pool instead shows all
+   * of them and leaves the age list to the two things that remove entries
+   * from it.
+   */
+  ipnis = ip_neighbor_entries (~0, af, ip_neighbor_sort_by_age);
+
+  vec_foreach (ipni, ipnis)
+    {
+      vlib_cli_output (vm, "%U", format_ip_neighbor, now, *ipni);
+    }
+  vec_free (ipnis);
 
   return (NULL);
 }
@@ -1193,7 +1233,7 @@ ip_neighbor_show_i (vlib_main_t * vm,
   (void) unformat_user (input, unformat_vnet_sw_interface, vnet_get_main (),
 			&sw_if_index);
 
-  ipnis = ip_neighbor_entries (sw_if_index, af);
+  ipnis = ip_neighbor_entries (sw_if_index, af, ip_neighbor_sort);
   now = vlib_time_now (vm);
 
   if (ipnis)
