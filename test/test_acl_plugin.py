@@ -2017,23 +2017,27 @@ class TestACLplugin(VppTestCase):
         This scenario gives pg1, which stays, the session that joined last,
         and pg0, which is deleted, the session that joined before it, one
         step towards the head. The walk meets pg1's session, has no clear for
-        it, and has to go on to pg0's. pg0 stops sending once its session
-        exists, so a packet pg0 reflects cannot come back to it and move that
-        session to another list.
+        it, and has to go on to pg0's.
+
+        The bridge domain never sends a frame back out of the interface it
+        came in on: `l2_fwd.c` drops the frame (`REFLECT_DROP`) when the
+        lookup resolves to the receiving interface, and `l2_flood.c` leaves
+        that interface out of the flood members. So each session here is
+        created by a SYN that arrives on its interface and leaves through the
+        other one, and each session sees the SYN alone and stays on the
+        transient list.
 
         Two assertions follow the deletion. The count of active sessions
         drops when a worker deactivates a session, and deactivation keeps the
         session, with its list slot held, until the reclaim that waits for
         the purge timeout; the unfixed walk never reaches pg0's session, so
         that count stays one above the baseline this scenario took until the
-        wait gives up. That is the assertion that fails first. The figures
-        per interface are cumulative for the lifetime of the run, every
-        worker prints them, and they move only at the reclaim that follows
-        deactivation, so `add - del` for pg0 reads one until the session is
-        reclaimed and zero afterwards, whichever worker owned it. That is the
-        figure that tells the two walks apart, and it still reports the
-        defect when the count of active sessions happens to reach the value
-        the wait expects.
+        wait gives up. That is the assertion that fails first. The transient
+        list that remains then names pg1's session alone, so the walk stepped
+        over it and took pg0's off the list. The per-interface figures of a
+        deleted interface are no longer printed, because `show acl-plugin
+        sessions` lists the counters of the interfaces in the pool, so the
+        list is what reports the deletion.
         """
         self.logger.info("ACLP_TEST_START_0402")
 
@@ -2094,20 +2098,18 @@ class TestACLplugin(VppTestCase):
             forwarded=1,
         )
         self.assertEqual(self._session_adds_delta(before, pg0_index), 1)
-        # pg0 sends no more, which keeps its session from seeing the SYN|ACK
-        # that would move it to the idle list
-        self.pg0.admin_down()
         # pg0's session is the only one on the transient list, so it is both
-        # its head and its tail
+        # its head and its tail. The frame the next step sends leaves through
+        # pg0 and the packet generator only records it there, so no packet
+        # comes back into pg0's input and the session stays where it is.
         sessions = self._list_sessions(self._TCP_TRANSIENT_LIST)
         self.assertEqual(len(sessions), 1)
         self.assertEqual(self._session_link(sessions[0], "sw_if_index"), pg0_index)
 
         # the surviving interface's session last, so it is the tail the walk
-        # meets first. pg1 sends into itself, so the packet it reflects comes
-        # back through the bridge domain into its own ACL, which sees the SYN
-        # and the SYN|ACK of the same session and leaves it on the transient
-        # list
+        # meets first. pg1 sends a SYN to pg0, and its own ACL sees that SYN on
+        # the way in; the frame leaves through pg0 and never comes back, so the
+        # session never sees a SYN|ACK and stays on the transient list
         before = self._sessions_snapshot()
         self._apply_acl(pg1_index, self._permit_reflect_rules(), "pg1")
         self._send_packets(
@@ -2115,13 +2117,13 @@ class TestACLplugin(VppTestCase):
             [
                 self._tcp_packet(
                     pg1_host,
-                    pg1_host,
+                    pg0_host,
                     self.tcp_sport_from_2,
                     self.tcp_dport_from_2,
                     "c",
                 )
             ],
-            self.pg1,
+            self.pg0,
             forwarded=1,
         )
         self.assertEqual(self._session_adds_delta(before, pg1_index), 1)
@@ -2138,15 +2140,21 @@ class TestACLplugin(VppTestCase):
         # pg0 goes away. The walk meets pg1's session, which it does not
         # clear, and reaches pg0's behind it; pg1's session stays
         pg1_sessions = self._sessions_by_interface()[pg1_index]
-        pg0_sessions = self._sessions_by_interface()[pg0_index]
         self.pg0.remove_vpp_config()
         self._forget_acl_interface(pg0_index)
         type(self).pg_interfaces = [self.pg1]
+        # the count drops only once a worker deactivated pg0's session, so
+        # reaching the baseline is what tells a walk that stopped at pg1's
+        # session from one that went on to pg0's
         self._wait_for_active_sessions(baseline + 1)
 
         self.assertNotIn(pg0_index, self._sessions_by_interface())
         self.assertEqual(self._sessions_by_interface()[pg1_index], pg1_sessions)
-        self.assertEqual(pg0_sessions[0] - pg0_sessions[1], 0)
+        # pg0's session left the list, and only pg1's is still on it, since
+        # the walk had no clear for that one and kept it
+        remaining = self._list_sessions(self._TCP_TRANSIENT_LIST)
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(self._session_link(remaining[0], "sw_if_index"), pg1_index)
 
         self.logger.info("ACLP_TEST_FINISH_0402")
 
