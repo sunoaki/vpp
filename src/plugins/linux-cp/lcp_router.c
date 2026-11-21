@@ -1858,7 +1858,7 @@ lcp_router_table_mcast_find (lcp_router_table_t *nlt, const mfib_prefix_t *prefi
 			    sizeof (prefix->fp_grp_addr)))
 	continue;
       /* (*,G) stops here; (S,G) also has to name the same source */
-      if (prefix->fp_len > 2 * sizeof (ip4_address_t) * 8 &&
+      if (mfib_prefix_is_host (&entry->lcme_prefix) &&
 	  0 != clib_memcmp (&entry->lcme_prefix.fp_src_addr, &prefix->fp_src_addr,
 			    sizeof (prefix->fp_src_addr)))
 	continue;
@@ -2070,6 +2070,16 @@ lcp_router_route_mk_prefix (struct rtnl_route *r, fib_prefix_t *p)
  * Build the mfib_prefix_t for a multicast netlink route. Either the group or
  * the source address is rejected when the netlink attribute is longer than
  * its ip46_address_t field can hold.
+ *
+ * An MFIB prefix is keyed by the length it is stored under: the table keeps a
+ * hash per length, ip4_mfib_table_entry_insert() indexes it with fp_len, and
+ * ip4_mfib_table_lookup_exact_match() reads it back the same way. A (S,G)
+ * entry is the host length of both addresses, 64 for IPv4 and 256 for IPv6,
+ * which is what ip4_mfib_table_lookup() and mfib_prefix_is_host() expect; a
+ * (*,G) entry keeps the group's own length. The destination's prefix length is
+ * the group mask, so using it for a route that names a source files the entry
+ * in the group's bucket, where nothing looks for it and where it collides with
+ * the (*,G) entry for the same group.
  */
 static int
 lcp_router_route_mk_mprefix (struct rtnl_route *r, mfib_prefix_t *p)
@@ -2090,6 +2100,7 @@ lcp_router_route_mk_mprefix (struct rtnl_route *r, mfib_prefix_t *p)
       if (lcp_router_mk_addr46 (addr, &p->fp_src_addr, &fproto))
 	return -1;
       p->fp_proto = fproto;
+      p->fp_len = 2 * fib_prefix_get_host_length (fproto);
     }
 
   return 0;
