@@ -666,6 +666,14 @@ lcp_router_proto_k2f (uint32_t k)
       return FIB_PROTOCOL_IP4;
     case AF_MPLS:
       return FIB_PROTOCOL_MPLS;
+    /* A multicast route names a routing family of its own,
+     * RTNL_FAMILY_IPMR for IPv4 and RTNL_FAMILY_IP6MR for IPv6. It is the
+     * family the kernel reports such a route under, and the one its group
+     * and source addresses are built in. */
+    case RTNL_FAMILY_IPMR:
+      return FIB_PROTOCOL_IP4;
+    case RTNL_FAMILY_IP6MR:
+      return FIB_PROTOCOL_IP6;
     default:
       /* Not a family this plugin can translate. Return the sentinel instead
        * of aborting on a message the kernel can send; the callers either gate
@@ -723,16 +731,17 @@ lcp_router_mk_addr46 (const struct nl_addr *rna, ip46_address_t *ia, fib_protoco
   fib_protocol_t fproto;
   unsigned int alen;
 
-  /* Same gate as lcp_router_mk_addr(): an address that is neither IPv4 nor
-   * IPv6 has no ip46_address_t representation, so the callers drop the path
-   * rather than copy a foreign buffer. */
-  if (AF_INET != family && AF_INET6 != family)
+  /* Same gate as lcp_router_mk_addr(): a family whose address is not an IP
+   * address has no ip46_address_t representation, so the callers drop the
+   * path rather than copy a foreign buffer. AF_MPLS is one such family: it
+   * translates to a protocol, but its bytes are a label stack. The
+   * multicast families carry an IPv4 or an IPv6 address and pass. */
+  fproto = lcp_router_proto_k2f (family);
+  if (FIB_PROTOCOL_IP4 != fproto && FIB_PROTOCOL_IP6 != fproto)
     {
       LCP_ROUTER_ERROR ("ignore address of family %u", family);
       return -1;
     }
-
-  fproto = lcp_router_proto_k2f (family);
 
   ip46_address_reset (ia);
   alen = nl_addr_get_len (rna);
@@ -1329,15 +1338,21 @@ static void lcp_router_table_mcast_release (lcp_router_table_t *nlt);
  * multicast routes' references, the special routes of the table, the table
  * reference, and the FIB and MFIB locks. Nothing else names the table at this
  * point, so the FIB index the record still holds is the table it locked.
+ *
+ * A recorded multicast route holds one reference of the table, and that is
+ * the reference this gives back for it. The record has no reference of its
+ * own beyond those: a table whose record was made by an interface binding
+ * and holds no route yet counts the binding's reference, which is not the
+ * record's to spend here.
  */
 static void
 lcp_router_table_forget (lcp_router_table_t *nlt)
 {
-  ASSERT (nlt->nlt_refs >= 1 + vec_len (nlt->nlt_mcast_entries));
+  ASSERT (nlt->nlt_refs >= vec_len (nlt->nlt_mcast_entries));
 
   lcp_router_table_mcast_release (nlt);
   lcp_router_table_special_routes_del (nlt);
-  nlt->nlt_refs -= 1 + vec_len (nlt->nlt_mcast_entries);
+  nlt->nlt_refs -= vec_len (nlt->nlt_mcast_entries);
 
   fib_table_unlock (nlt->nlt_fib_index, nlt->nlt_proto, nlt->nlt_fib_src);
   if (nlt->nlt_mfib_index != ~0)
@@ -2742,7 +2757,13 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
 	   * entry away with it. */
 	  mfib_table_entry_paths_update (nlt->nlt_mfib_index, &mpfx, MFIB_SOURCE_PLUGIN_LOW,
 					 MFIB_ENTRY_FLAG_ACCEPT_ALL_ITF, np.paths);
+	  /* The record now holds what the route needs: its entry in the list of
+	   * the table's routes and the reference that goes with it. The
+	   * reference taken for this call is given back here, as the unicast
+	   * arm gives back its own below, so a route that comes and goes leaves
+	   * the table's count as it found it. */
 	  lcp_router_table_mcast_record (nlt, &mpfx);
+	  lcp_router_table_unlock (nlt);
 	}
       else
 	{
@@ -2856,12 +2877,15 @@ lcp_router_route_sync_end (void)
   vec_foreach (index, indices)
     {
       nlt = pool_elt_at_index (lcp_router_table_pool, *index);
-      /* Before the reference below, which keeps the table alive while the
-       * routes go: what the multicast routes hold is what keeps the table
-       * removed once nothing else does. */
+      /* The reference keeps the table alive while its routes go. It has to be
+       * taken before the walk below, not after: every recorded route holds one
+       * reference of its own, and a table whose only references are those
+       * routes loses the last of them to the last route removed. The removal
+       * then frees the record, and the sweep below would read a freed one. */
+      nlt->nlt_refs++;
+
       lcp_router_table_mcast_sync_end (nlt);
 
-      nlt->nlt_refs++;
       u32 before = lcp_router_table_source_count (nlt, lcp_rt_fib_src) +
 		   lcp_router_table_source_count (nlt, lcp_rt_fib_src_dynamic);
       fib_table_sweep (nlt->nlt_fib_index, nlt->nlt_proto, lcp_rt_fib_src);
