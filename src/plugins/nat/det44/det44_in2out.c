@@ -480,6 +480,7 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
       u8 created0 = 0, created1 = 0;
       u8 session_created0 = 0, session_created1 = 0;
       ip4_address_t icmp_addr0, icmp_addr1, out_addr0, out_addr1;
+      ip4_address_t in_addr0, in_addr1;
       icmp46_header_t *icmp0, *icmp1;
       u8 identity0 = 0, identity1 = 0;
 
@@ -676,9 +677,12 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 
       if (PREDICT_FALSE (created0))
 	{
-	  nat_ipfix_logging_nat44_ses_create (thread_index, ip0->src_address.as_u32,
-					      new_addr0.as_u32, ses0->proto, ses0->in_port,
-					      ses0->out.out_port, dm->outside_fib_index);
+	  /* The header holds the translated address by now, so take both
+	     addresses from the session, as the ICMP path does. */
+	  snat_det_session_addresses (mp0, ses0, &in_addr0, &out_addr0);
+	  nat_ipfix_logging_nat44_ses_create (thread_index, in_addr0.as_u32, out_addr0.as_u32,
+					      ses0->proto, ses0->in_port, ses0->out.out_port,
+					      dm->outside_fib_index);
 	}
 
     trace0:
@@ -866,9 +870,12 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 
       if (PREDICT_FALSE (created1))
 	{
-	  nat_ipfix_logging_nat44_ses_create (thread_index, ip1->src_address.as_u32,
-					      new_addr1.as_u32, ses1->proto, ses1->in_port,
-					      ses1->out.out_port, dm->outside_fib_index);
+	  /* The header holds the translated address by now, so take both
+	     addresses from the session, as the ICMP path does. */
+	  snat_det_session_addresses (mp1, ses1, &in_addr1, &out_addr1);
+	  nat_ipfix_logging_nat44_ses_create (thread_index, in_addr1.as_u32, out_addr1.as_u32,
+					      ses1->proto, ses1->in_port, ses1->out.out_port,
+					      dm->outside_fib_index);
 	}
 
     trace1:
@@ -913,6 +920,7 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
       u8 created0 = 0;
       u8 session_created0 = 0;
       ip4_address_t icmp_addr0, out_addr0;
+      ip4_address_t in_addr0;
       u8 identity0 = 0;
 
       b0 = *b;
@@ -1088,9 +1096,12 @@ VLIB_NODE_FN (det44_in2out_node) (vlib_main_t * vm,
 
       if (PREDICT_FALSE (created0))
 	{
-	  nat_ipfix_logging_nat44_ses_create (thread_index, ip0->src_address.as_u32,
-					      new_addr0.as_u32, ses0->proto, ses0->in_port,
-					      ses0->out.out_port, dm->outside_fib_index);
+	  /* The header holds the translated address by now, so take both
+	     addresses from the session, as the ICMP path does. */
+	  snat_det_session_addresses (mp0, ses0, &in_addr0, &out_addr0);
+	  nat_ipfix_logging_nat44_ses_create (thread_index, in_addr0.as_u32, out_addr0.as_u32,
+					      ses0->proto, ses0->in_port, ses0->out.out_port,
+					      dm->outside_fib_index);
 	}
 
     trace00:
