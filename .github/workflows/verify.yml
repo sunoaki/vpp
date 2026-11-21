@@ -154,10 +154,13 @@ jobs:
       variants: ${{ steps.plan.outputs.variants }}
       tunnel_control: ${{ steps.plan.outputs.tunnel_control }}
       # The build job is a matrix, and a matrix job cannot carry outputs to a
-      # later job. The batch list the test matrix reads is produced here, from
-      # the same suite filter the build job derives, so the two jobs agree on
+      # later job. The suite list and its batches are produced here, from the
+      # same suite filter the build job derives, so the two jobs agree on
       # which suites run without one of them reading the other's outputs.
       batches: ${{ steps.batches.outputs.batches }}
+      # The matrix of the test job reads one suite per entry, because a job
+      # boundary per suite is what survives a cancel.
+      suites_json: ${{ steps.batches.outputs.suites_json }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -279,7 +282,7 @@ jobs:
           # arrays are joined with commas between them. The size of a shard is
           # decided by the shard's own index, not by how many suites are already
           # placed: the leading `remainder` shards take one suite more.
-          batches="["
+          suites_json="["
           offset=0
           shard=0
           while [ "${shard}" -lt "${shards}" ]; do
@@ -292,13 +295,19 @@ jobs:
             if [ "${shard}" -ne 0 ]; then
               batches="${batches},"
             fi
+            if [ "${shard}" -ne 0 ]; then
+              suites_json="${suites_json},"
+            fi
             batches="${batches}[${names}]"
+            suites_json="${suites_json}${names}"
             offset=$((offset + size))
             shard=$((shard + 1))
           done
           batches="${batches}]"
+          suites_json="${suites_json}]"
           echo "Split ${total} suite(s) into ${shards} shard(s)"
           echo "batches=${batches}" >> "$GITHUB_OUTPUT"
+          echo "suites_json=${suites_json}" >> "$GITHUB_OUTPUT"
           echo "batch_count=${shards}" >> "$GITHUB_OUTPUT"
 
   build-test:
@@ -1444,27 +1453,29 @@ jobs:
           if-no-files-found: warn
           compression-level: 6
 
-  # The suites the build job selected, split across twelve runners. Each shard
-  # keeps its own summary and uploads it in a step that runs whatever the
-  # shard's outcome is, so a cancelled or timed-out shard still leaves a
-  # readable record.
+  # One job per suite, all taken from the batch list the plan job produced.
+  # A job boundary per suite is what survives a cancel: cancelling a suite
+  # leaves its own job, and its record is the artifact that job already
+  # uploaded.
   test:
-    # Each shard is its own matrix entry, so it is its own job in the run list.
-    name: test (${{ matrix.variant }} shard)
+    name: test (${{ matrix.suite }})
     needs: [test-plan, build-test]
-    # A failed or cancelled build has no image for these runners. A failed
-    # build job whose build step succeeded is still unreadable from here, so
-    # the job runs and the image download reports its own failure.
+    # A skipped build has no image, so these runners would only fail on the
+    # download; everything else is left to the suite's own steps.
     if: always() && needs.build-test.result != 'skipped' && needs.build-test.result != 'cancelled'
     strategy:
+      # A failing suite does not stop the others, and a suite that was
+      # cancelled does not stop the dispatch from reaching the rest.
       fail-fast: false
+      # The deeper queue starts the suites of a failed shard first, so a red
+      # run still finishes the suites that were waiting behind it.
       matrix:
         variant: ${{ fromJSON(needs.test-plan.outputs.variants) }}
-        batch: ${{ fromJSON(needs.test-plan.outputs.batches) }}
+        suite: ${{ fromJSON(needs.test-plan.outputs.suites_json) }}
     runs-on: ubuntu-24.04
-    # The build job's ceiling covers one job for every suite; a shard runs a
-    # twelfth of them, so the same wall clock applies to a full dispatch.
-    timeout-minutes: 360
+    # A suite that hangs is cut off here rather than holding a runner until
+    # the platform ceiling, and its record is the last artifact it uploaded.
+    timeout-minutes: 180
     container:
       image: debian:trixie
       # Copied from the build job: the framework and the namespace, TAP and
@@ -1479,12 +1490,9 @@ jobs:
     defaults:
       run:
         shell: bash
-    # The matrix holds one entry per shard, and this value is that entry: the
-    # artifact names and the summary lines read it, so two shards cannot
-    # write over each other's record. The summary path is built in the steps
-    # because the runner's temporary directory is not available at job level.
     env:
-      SHARD: ${{ toJSON(matrix.batch) }}
+      CCACHE_COMPRESS: "true"
+      CCACHE_MAXSIZE: 2G
     steps:
       - name: Disable APT cache cleanup
         run: rm -f /etc/apt/apt.conf.d/docker-clean
@@ -1500,20 +1508,38 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      # `make test-debug` installs $(DEB_DEPENDS) and builds the test virtual
+      # environment itself; the image carries neither. This job therefore
+      # runs the same two steps the build job runs, with the same apt archive
+      # cache, so the packages come from the cache the build job filled. The
+      # cache key is deliberately the same one: pressing the Makefile this
+      # way keeps it byte-identical to the build job's.
+      - name: Hash the dependency list
+        id: deps
+        run: |
+          git config --global --add safe.directory "$PWD"
+          echo "hash=$(git hash-object Makefile)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore apt archive cache
+        id: apt-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-debian13-${{ runner.arch }}-${{ matrix.variant == 'fixed' && 'build-test-fixed' || 'build-test-original-df' }}-${{ steps.deps.outputs.hash }}
+          restore-keys: |
+            apt-debian13-${{ runner.arch }}-build-test-
+
+      - name: Install VPP build and test dependencies
+        run: |
+          sed -i '/^\s*git config commit\.template/s/^\(\s*\)/\1-/' Makefile
+          make UNATTENDED=yes install-dep
+
       - name: Download the built image
         uses: actions/download-artifact@v4
         with:
           name: vpp-debug-image-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/image
 
-      # The image replaces build-root/build-vpp_debug-native and
-      # build-root/install-vpp_debug-native. `make test-debug` reaches the
-      # suites through vpp-install, which runs `cmake --build . -- install`
-      # again, so the installed tree is moved aside before that runs: whatever
-      # the rebuild produces, the suites this shard runs are the ones the build
-      # job produced. The move sits inside the shard, between vpp-install and
-      # the harness, so the harness reads the build tree and the image's
-      # installed tree together.
       - name: Restore the built image
         run: |
           set -eu
@@ -1521,8 +1547,6 @@ jobs:
           tar --zstd -xf "${image}"
           test -x build-root/install-vpp_debug-native/vpp/bin/vpp
           test -f build-root/build-vpp_debug-native/vpp/CMakeCache.txt
-          cp -a build-root/install-vpp_debug-native "${RUNNER_TEMP}/image-install"
-          ls -l --time-style=+%Y-%m-%dT%H:%M:%S "${RUNNER_TEMP}/image-install/vpp/bin/vpp"
 
       - name: Remount /dev/shm for the test harness
         uses: ./.github/actions/vpp-docker-runtime-setup
@@ -1531,89 +1555,163 @@ jobs:
           SHM_SIZE: 2G
           LOG_DIR: ${{ github.workspace }}/build-root/test-logs
 
-      # The suites run one after another on this runner, and each result
-      # reaches the summary file as soon as its suite ends, so a shard that is
-      # cancelled halfway still names the suites that finished.
-      - name: Run the suites of this shard
-        id: suites
+      # The suite is started in the background so this job can record how far
+      # it got while it is still running. `make test-debug` rebuilds and
+      # installs the tree from its own sources, so the binaries the suite runs
+      # are the ones the build job produced, not a stale installed copy from
+      # the image.
+      - name: Run the suite
+        id: suite
         env:
-          TEST: ${{ join(matrix.batch, ' ') }}
+          TEST: ${{ matrix.suite }}
         run: |
           set -eu
           git config --global --add safe.directory "$PWD"
-          # One summary per shard, named after the shard's position in its
-          # matrix, so two shards never write over each other's file.
-          SUMMARY_FILE="${RUNNER_TEMP}/vpp-shard-summary-${{ strategy.job-index }}-${{ strategy.job-total }}.txt"
-          read -ra suites <<< "${TEST}"
-          if [ "${#suites[@]}" -eq 0 ]; then
-            echo "::error::This shard holds no suite"
-            exit 1
-          fi
-          printf 'Shard %s runs %s suite(s): %s\n' "${SUMMARY_FILE}" "${#suites[@]}" \
-            "${suites[*]}" | tee "${SUMMARY_FILE}"
-          # vpp-install rebuilds for the first suite only: the make tree skips
-          # it once its install timestamp is younger than the sources, and the
-          # first run leaves that timestamp behind. The installed tree is put
-          # back once, right after that run, not before.
-          restored=""
-          failed=0
-          for suite in "${suites[@]}"; do
-            echo "Running TEST=${suite}"
-            # errexit would end the shard at the first failing suite, so it is
-            # off around the run and the status is recorded for the summary.
-            set +e
-            make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST="${suite}" test-debug &
-            runner=$!
-            if [ "${restored}" != true ]; then
-              # The recursive make touches the install timestamp only after
-              # vpp-install returns, so waiting for the timestamp is waiting
-              # for the install to finish.
-              stamp="build-root/build-vpp_debug-native/vpp/.mu_build_install_timestamp"
-              deadline=$((SECONDS + 3600))
-              until [ -e "${stamp}" ]; do
-                kill -0 "${runner}" 2>/dev/null || break
-                [ "${SECONDS}" -lt "${deadline}" ] || break
-                sleep 5
-              done
-              rm -rf build-root/install-vpp_debug-native
-              cp -a "${RUNNER_TEMP}/image-install" build-root/install-vpp_debug-native
-              echo "Restored the installed tree from the image"
-              restored=true
+          heartbeat='{"test":"${{ matrix.suite }}","lifecycle":"running","outcome":null,' \
+            '"finished":false,"failed_tests":[],"observed_at_utc":null}'
+          echo "${heartbeat}" > "${RUNNER_TEMP}/suite-record.json"
+          set +e
+          make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST="${TEST}" test-debug &
+          runner=$!
+          set -e
+          # The runner's last successful step is the copy in this loop. A job
+          # that is cancelled loses the steps after this one, but every copy
+          # that already happened survives in the artifact it uploaded, and
+          # the copy names the suite that was still running and the reason.
+          while kill -0 "${runner}" 2>/dev/null; do
+            status="cancelled"
+            if [ -f "${RUNNER_TEMP}/vpp-suite-finished" ]; then
+              status="finished"
             fi
-            wait "${runner}"
-            status=$?
-            set -e
-            if [ "${status}" -eq 0 ]; then
-              echo "${suite}: pass" >> "${SUMMARY_FILE}"
-              echo "Suite result: ${suite}: pass"
-            else
-              echo "${suite}: fail (exit ${status})" >> "${SUMMARY_FILE}"
-              echo "Suite result: ${suite}: fail"
-              failed=$((failed + 1))
-            fi
-          done
-          if [ "${failed}" -ne 0 ]; then
-            echo "::error::${failed} of ${#suites[@]} suite(s) failed in this shard"
-            exit 1
-          fi
-          echo "All ${#suites[@]} suite(s) of this shard passed"
+            python3 - "${heartbeat}" "${status}" "${TEST}" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
 
-      - name: Report the shard summary
+          record = json.loads(sys.argv[1])
+          record["lifecycle"] = sys.argv[2]
+          failed = Path("/tmp/vpp-unittest-__main__/failed_tests.txt")
+          internet = Path("/tmp/vpp-failed-unittests")
+          names = []
+          if failed.is_file() and not failed.is_symlink():
+              names = [line.strip() for line in failed.read_text().splitlines() if line.strip()]
+          if not names and internet.is_dir():
+              for link in sorted(internet.iterdir()):
+                  target = os.readlink(link) if link.is_symlink() else str(link)
+                  names.append(Path(target).name)
+          record["failed_tests"] = names[-50:]
+          record["observed_at_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+          Path(os.environ["RUNNER_TEMP"], "suite-record.json").write_text(json.dumps(record) + "\n")
+          PY
+            sleep 20
+          done
+          wait "${runner}"
+          status=$?
+          touch "${RUNNER_TEMP}/vpp-suite-finished"
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          exit "${status}"
+
+      - name: Record the suite outcome
         if: always()
         run: |
-          SUMMARY_FILE="${RUNNER_TEMP}/vpp-shard-summary-${{ strategy.job-index }}-${{ strategy.job-total }}.txt"
-          if [ ! -s "${SUMMARY_FILE}" ]; then
-            echo "No suite finished before this step ran" > "${SUMMARY_FILE}"
-          fi
-          echo "Per-suite results recorded by this shard:"
-          cat "${SUMMARY_FILE}"
+          set -eu
+          touch "${RUNNER_TEMP}/vpp-suite-finished"
+          python3 - "${RUNNER_TEMP}/suite-record.json" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
 
-      - name: Upload the shard summary
+          path = Path(sys.argv[1])
+          record = json.loads(path.read_text()) if path.is_file() else {}
+          outcome = os.environ.get("SUITE_STATUS", "")
+          record.update({"test": os.environ.get("TEST"), "lifecycle": "finished",
+                         "outcome": "pass" if outcome == "0" else "fail" if outcome else "cancelled",
+                         "finished": True})
+          path.write_text(json.dumps(record) + "\n")
+          print(json.dumps(record))
+          PY
+        env:
+          TEST: ${{ matrix.suite }}
+          SUITE_STATUS: ${{ steps.suite.outputs.status }}
+
+      # `make` wipes /tmp/vpp-unittest-* and /tmp/vpp-failed-unittests at the
+      # start of the next suite. Each suite is its own job here, so nothing
+      # follows this copy, but a retry inside the same suite still resets, so
+      # the copy runs immediately after the suite and names itself after it.
+      - name: Collect the suite diagnostics
+        if: always()
+        run: |
+          set -eu
+          SUITE="${TEST}" OUTPUT="${RUNNER_TEMP}/vpp-suite-diagnostics" python3 - <<'PY'
+          import os
+          import re
+          import shutil
+          import stat
+          from pathlib import Path
+
+          suite, output = os.environ["SUITE"], Path(os.environ["OUTPUT"])
+          limit = 32 * 1024 * 1024
+          reserved = {"log.txt", "vpp_stdout.txt", "vpp_stderr.txt", "failed_tests.txt"}
+          output.mkdir(parents=True, exist_ok=True)
+          originals = [Path("/tmp/vpp-failed-unittests")] + sorted(Path("/tmp").glob("vpp-unittest-*"))
+          copied = []
+          copied_count = 0
+          for original in originals:
+              if original.is_symlink() or not original.is_dir():
+                  copied.append(f"MISSING OR UNSAFE directory: {original}")
+                  continue
+              for directory, subdirs, names in os.walk(original, followlinks=False):
+                  subdirs[:] = sorted(name for name in subdirs
+                                      if not (Path(directory) / name).is_symlink())
+                  for name in sorted(names):
+                      source = Path(directory) / name
+                      keep = (name in reserved or name.startswith("vpp_api_trace")
+                              or re.fullmatch(r"api_post_mortem\.[0-9]+", name) is not None
+                              or name.endswith(".log"))
+                      if not keep:
+                          continue
+                      # The harness removes its temporary trees between
+                      # retries, so a file can vanish between the walk and the
+                      # copy. The size check and the copy share one try.
+                      try:
+                          if not stat.S_ISREG(source.lstat().st_mode):
+                              continue
+                          if source.stat().st_size > limit:
+                              copied.append(f"SKIPPED (over 32 MiB): {source}")
+                              continue
+                          target = output / f"{copied_count:04d}{source.suffix}"
+                          shutil.copyfile(source, target)
+                      except OSError as error:
+                          copied.append(f"SKIPPED ({error}): {source}")
+                          continue
+                      copied.append(f"COPIED: {source} -> {target.name}")
+                      copied_count += 1
+                      if copied_count >= 2000:
+                          break
+                  if copied_count >= 2000:
+                      break
+          (output / "collection-report.txt").write_text("\n".join(copied) + "\n")
+          print(f"Copied {copied_count} file(s) of suite {suite}")
+          PY
+        env:
+          TEST: ${{ matrix.suite }}
+
+      # The record, the collection report and the logs leave the runner in
+      # this single artifact, uploaded even when the suite failed, so the
+      # next reader of the run does not have to guess which suite stopped
+      # where.
+      - name: Upload the suite record and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vpp-shard-summary-${{ strategy.job-index }}-of-${{ strategy.job-total }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/vpp-shard-summary-*.txt
+          name: vpp-suite-${{ matrix.suite }}-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/suite-record.json
+            ${{ runner.temp }}/vpp-suite-diagnostics/
           retention-days: 7
           if-no-files-found: warn
           compression-level: 6
