@@ -230,6 +230,11 @@ class TestIp4VrfMultiInst(VppTestCase):
         """
         Reset required FIB table / VRF and remove it from VRF list.
 
+        The table is flushed and left in place. VRFState.reset describes a
+        table that still exists with no routes in it, which is what verify_vrf
+        reads from ip_route_dump; deleting the table here would leave it
+        indistinguishable from one that was never created.
+
         :param int vrf_id: The FIB table / VRF ID to be reset.
         """
         if if_set_id is None:
@@ -249,7 +254,6 @@ class TestIp4VrfMultiInst(VppTestCase):
         self.logger.info("IPv4 VRF ID %d reset finished" % vrf_id)
         self.logger.debug(self.vapi.ppcli("show ip fib"))
         self.logger.debug(self.vapi.ppcli("show ip neighbors"))
-        self.vapi.ip_table_add_del_v2(is_add=0, table={"table_id": vrf_id})
 
     def create_stream(self, src_if, packet_sizes):
         """
@@ -369,15 +373,24 @@ class TestIp4VrfMultiInst(VppTestCase):
         """
         Check if the FIB table / VRF ID is configured.
 
+        Whether the table exists and whether it has routes are asked of the
+        API separately: ip_route_dump sends nothing for a table that is not
+        there, so its reply alone cannot tell a table that was never created
+        from one that was deleted. The routes of the table's remote hosts say
+        which of the two states a table that does exist is in.
+
         :param int vrf_id: The FIB table / VRF ID to be verified.
-        :return: 1 if the FIB table / VRF ID is configured, otherwise return 0.
+        :return: the VRFState of the FIB table / VRF ID.
         """
         if if_set_id is None:
             if_set_id = vrf_id
-        ip_fib_dump = self.vapi.ip_route_dump(vrf_id)
-        vrf_exist = len(ip_fib_dump)
+        vrf_exist = vrf_id in [
+            table.table.table_id
+            for table in self.vapi.ip_table_dump()
+            if not table.table.is_ip6
+        ]
         vrf_count = 0
-        for ip_fib_details in ip_fib_dump:
+        for ip_fib_details in self.vapi.ip_route_dump(vrf_id):
             addr = ip_fib_details.route.prefix.network_address
             found = False
             for pg_if in self.pg_if_sets[if_set_id]:
