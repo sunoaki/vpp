@@ -117,3 +117,18 @@ format_ip_neighbor_counters (u8 *s, va_list *args)
 
   return (s);
 }
+
+u8 *
+format_ip_neighbor_if_counters (u8 *s, va_list *args)
+{
+  u32 sw_if_index = va_arg (*args, u32);
+
+#define _(a, b)                                                                                    \
+  s = format (                                                                                     \
+    s, " %s:%lld", b,                                                                              \
+    vlib_get_simple_counter (&ip_neighbor_if_counters[IP_NEIGHBOR_IF_CTR_##a], sw_if_index));
+  foreach_ip_neighbor_if_counter_type
+#undef _
+
+    return (s);
+}

@@ -85,6 +85,23 @@ ip_neighbor_counters_t ip_neighbor_counters[] =
  },
 };
 
+/*
+ * Per-interface counters for the events this module makes, one per type in
+ * foreach_ip_neighbor_if_counter_type. The stat segment name is what makes
+ * them readable from outside, and it is fixed here rather than built from the
+ * type name so that a rename of the C enumerator does not move the counter an
+ * operator's dashboard reads.
+ */
+vlib_simple_counter_main_t ip_neighbor_if_counters[N_IP_NEIGHBOR_IF_CTRS] = {
+#define _(a, b)                                                                                    \
+  [IP_NEIGHBOR_IF_CTR_##a] = {                                                                     \
+    .name = "ip neighbor " b,                                                                      \
+    .stat_segment_name = "/net/ip-neighbor/" b,                                                    \
+  },
+  foreach_ip_neighbor_if_counter_type
+#undef _
+};
+
 /** Pool for All IP neighbors */
 static ip_neighbor_t *ip_neighbor_pool;
 
@@ -164,10 +181,16 @@ ip_neighbor_get_index (const ip_neighbor_t * ipn)
   return (ipn - ip_neighbor_pool);
 }
 
+/*
+ * A touch is a confirmation: whatever made it saw the entry still answers for
+ * the MAC it holds. That also clears a refusal, because a learn that matches
+ * the entry's MAC is the data plane confirming the entry, and a rewrite from
+ * the control plane replaces the MAC the refusal was about.
+ */
 static void
 ip_neighbor_touch (ip_neighbor_t * ipn)
 {
-  ipn->ipn_flags &= ~IP_NEIGHBOR_FLAG_STALE;
+  ipn->ipn_flags &= ~(IP_NEIGHBOR_FLAG_STALE | IP_NEIGHBOR_FLAG_REFUSED);
 }
 
 static bool
@@ -787,15 +810,31 @@ ip_neighbor_add (const ip_address_t * ip,
 	  /*
 	   * The entry exists, it is static, and the new MAC differs. Refusing
 	   * is deliberate: a static entry is programmed by the control plane
-	   * and must be removed by it. Report the refusal with the error code
-	   * that describes it, and log it, so that a data-plane learning
-	   * attempt cannot fail silently. The log class rate-limits at
-	   * log_main.default_rate_limit messages per second.
+	   * and must be removed by it.
+	   *
+	   * Refusing is also the only choice that does not lose the event: a
+	   * complete adjacency hands the packet to the rewrite and never asks
+	   * ARP again, so this refusal is the last code path that sees the new
+	   * device at all. It therefore has to leave a record an operator can
+	   * find later, when the report from the site is a black hole and not
+	   * this log line. The flag marks the entry, so that 'show ip
+	   * neighbors' shows it as refused next to its neighbours instead of
+	   * looking exactly like one that resolves, and it stays set until the
+	   * control plane rewrites or deletes the entry, which is the only
+	   * thing that can clear the MAC. The counter is what survives the log
+	   * rate limit below.
 	   */
+	  ipn->ipn_flags |= IP_NEIGHBOR_FLAG_REFUSED;
+
+	  vlib_increment_simple_counter (&ip_neighbor_if_counters[IP_NEIGHBOR_IF_CTR_REFUSED],
+					 vlib_get_thread_index (), sw_if_index, 1);
+
 	  IP_NEIGHBOR_WARN ("static entry %U on %U not updated by learning "
-			    "with mac %U",
+			    "with mac %U; it keeps mac %U and packets to it "
+			    "still go to that device",
 			    format_ip_address, ip, format_vnet_sw_if_index_name, vnet_get_main (),
-			    sw_if_index, format_mac_address_t, mac);
+			    sw_if_index, format_mac_address_t, mac, format_mac_address_t,
+			    &ipn->ipn_mac);
 
 	  return (VNET_API_ERROR_ENTRY_ALREADY_EXISTS);
 	}
@@ -1689,8 +1728,24 @@ ip_neighbor_add_del_sw_interface (vnet_main_t *vnm, u32 sw_if_index,
 
   if (is_add)
     {
+      ip_neighbor_if_counter_type_t type;
+
       ip_neighbor_alloc_ctr (&ip_neighbor_counters[AF_IP4], sw_if_index);
       ip_neighbor_alloc_ctr (&ip_neighbor_counters[AF_IP6], sw_if_index);
+
+      /*
+       * Called for every interface as it appears, so a refusal is countable
+       * from the first learn on the interface rather than only after the
+       * first address is configured on it. The index is zeroed as well as
+       * validated: an interface that takes over an sw_if_index from a deleted
+       * one would otherwise inherit its refusal count, which is a false
+       * positive in the signal this adds.
+       */
+      FOREACH_IP_NEIGHBOR_IF_CTR (type)
+      {
+	vlib_validate_simple_counter (&ip_neighbor_if_counters[type], sw_if_index);
+	vlib_zero_simple_counter (&ip_neighbor_if_counters[type], sw_if_index);
+      }
     }
 
   return (NULL);
@@ -2012,34 +2067,74 @@ ip_neighbor_age_loop (vlib_main_t * vm,
 	    ip_neighbor_elt_t *elt, *head;
 	    f64 wait;
 
+	    /*
+	     * Aging off. With age 0 every ttl is greater than 0, so the walk
+	     * below would probe every neighbour on the list and, three wakes
+	     * later, destroy all of them. Turning aging off signals this
+	     * process, and the signal stops the timer it is waiting on, so the
+	     * wake that reports it usually arrives as
+	     * IP_NEIGHBOR_AGE_PROCESS_WAKEUP. This check covers the case where
+	     * the clock is what resumed this process instead, and leaves the
+	     * process parked until something arms a timer again.
+	     */
+	    if (0 == ip_neighbor_db[af].ipndb_age)
+	      {
+		timeout = IP_NEIGHBOR_PROCESS_SLEEP_LONG;
+		break;
+	      }
+
 	    timeout = ip_neighbor_db[af].ipndb_age;
 	    head = pool_elt_at_index (ip_neighbor_elt_pool,
 				      ip_neighbor_list_head[af]);
 
-          /* the list is time sorted, newest first, so start from the back
-           * and work forwards. Stop when we get to one that is alive */
-          restart:
-          clib_llist_foreach_reverse(ip_neighbor_elt_pool,
-                                     ipne_anchor, head, elt,
-          ({
-            ip_neighbor_age_state_t res;
+	    /*
+	     * The list is time sorted, newest first, so the oldest entry is at
+	     * the back and the walk starts there. The age process may destroy
+	     * the entry it is looking at, so each pass restarts from the back
+	     * rather than carrying an iterator across the destroy. Every entry
+	     * newer than an alive one is younger still, so reaching an alive
+	     * entry ends the walk for this wake.
+	     */
+	  restart:
+	    elt = clib_llist_prev (ip_neighbor_elt_pool, ipne_anchor, head);
+	    while (elt != head)
+	      {
+		ip_neighbor_age_state_t res;
 
-            res = ip_neighbour_age_out(elt->ipne_index, now, &wait);
+		res = ip_neighbour_age_out (elt->ipne_index, now, &wait);
 
-            if (IP_NEIGHBOR_AGE_ALIVE == res) {
-              /* the oldest neighbor has not yet expired, go back to sleep */
-              timeout = clib_min (wait, timeout);
-              break;
-            }
-            else if (IP_NEIGHBOR_AGE_DEAD == res) {
-              /* the oldest neighbor is dead, pop it, then restart the walk
-               * again from the back */
-              ip_neighbor_destroy (ip_neighbor_get(elt->ipne_index));
-              goto restart;
-            }
+		/*
+		 * ALIVE: the oldest entry has not expired, and every entry
+		 * newer than it is younger, so none of them has either. The
+		 * wake-up time is the shortest of the ones the entries this
+		 * walk has already handled asked for.
+		 */
+		if (IP_NEIGHBOR_AGE_ALIVE == res)
+		  {
+		    timeout = clib_min (wait, timeout);
+		    break;
+		  }
 
-            timeout = clib_min (wait, timeout);
-          }));
+		/*
+		 * DEAD: the oldest entry is gone. Take it off the list and
+		 * start again from the new oldest. Its wait is not folded in:
+		 * the timer it asked for was about an entry that no longer
+		 * exists, and the restarted walk computes the next deadline
+		 * from the entries that are left.
+		 */
+		if (IP_NEIGHBOR_AGE_DEAD == res)
+		  {
+		    ip_neighbor_destroy (ip_neighbor_get (elt->ipne_index));
+		    goto restart;
+		  }
+
+		/*
+		 * PROBE: a probe went out, and newer entries may have
+		 * expired too, so keep walking.
+		 */
+		timeout = clib_min (wait, timeout);
+		elt = clib_llist_prev (ip_neighbor_elt_pool, ipne_anchor, elt);
+	      }
 	    break;
 	  }
 	case IP_NEIGHBOR_AGE_PROCESS_WAKEUP:
@@ -2196,6 +2291,7 @@ ip_neighbor_stats_show_one (vlib_main_t *vm, vnet_main_t *vnm, u32 sw_if_index)
 		   &ip_neighbor_counters[AF_IP4], sw_if_index);
   vlib_cli_output (vm, "    nd: %U", format_ip_neighbor_counters,
 		   &ip_neighbor_counters[AF_IP6], sw_if_index);
+  vlib_cli_output (vm, "    if:%U", format_ip_neighbor_if_counters, sw_if_index);
 }
 
 static walk_rc_t

@@ -2,6 +2,9 @@
 
 import unittest
 import os
+import re
+
+from ipaddress import ip_address
 
 from config import config
 from framework import VppTestCase
@@ -19,6 +22,7 @@ from vpp_ip_route import (
 )
 from vpp_papi import VppEnum, MACAddress
 from vpp_ip import VppIpPuntRedirect
+from vpp_lo_interface import VppLoInterface
 from vpp_sub_interface import VppDot1ADSubint, VppDot1QSubint
 
 from scapy.packet import Raw
@@ -182,6 +186,47 @@ class ARPTestCase(VppTestCase):
     def get_arp_rx_garp(self, itf):
         """Get ARP RX grat stats for and interface"""
         return self.statistics["/net/arp/rx/gratuitous"][:, itf.sw_if_index].sum()
+
+    def get_refused_learns(self, itf):
+        """Learns the data plane made against a static entry that refused them"""
+        return self.statistics["/net/ip-neighbor/refused-learn"][
+            :, itf.sw_if_index
+        ].sum()
+
+    def nbr_cli_flags(self, itf, nbr_addr):
+        """Flag letters 'show ip neighbors' prints for this entry
+
+        The refused flag is not part of the binary API, so the only place to
+        read it is the Flags column of the CLI, which prints one letter per
+        flag set. A real row is age, ip, flags, mac, interface; an entry with
+        no flag set prints an empty column, and split() then yields four
+        tokens. Anything else means the parse itself is wrong, so it raises
+        rather than reporting the entry as unflagged.
+        """
+        addr = ip_address(str(nbr_addr))
+
+        for line in self.vapi.cli("show ip neighbors %s" % itf.name).splitlines():
+            tokens = line.split()
+            if len(tokens) not in (4, 5):
+                continue
+            try:
+                if ip_address(tokens[1]) != addr:
+                    continue
+            except ValueError:
+                continue
+
+            mac_index = len(tokens) - 2
+            if not re.fullmatch(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", tokens[mac_index]):
+                raise AssertionError(
+                    "cannot read the flags of %s from %r" % (nbr_addr, line)
+                )
+            return "".join(tokens[2:mac_index])
+
+        raise AssertionError("no neighbour %s to read the flags from" % nbr_addr)
+
+    def nbr_is_refused(self, itf, nbr_addr):
+        """Whether the neighbour carries the flag a refused learn leaves"""
+        return "R" in self.nbr_cli_flags(itf, nbr_addr)
 
     def get_arp_tx_garp(self, itf):
         """Get ARP RX grat stats for and interface"""
@@ -1983,6 +2028,232 @@ class ARPTestCase(VppTestCase):
         static_arp.remove_vpp_config()
         self.pg2.unconfig_ip4()
 
+    def test_arp_static_device_replaced(self):
+        """A static neighbour whose device was replaced says so
+
+        This is the sequence the operator reports as a black hole. The address
+        stays on the interface, the device behind it is swapped for one that
+        answers with a different MAC, and the entry is static, so the data
+        plane may not write the MAC it learns over the one the control plane
+        programmed. The entry keeps the old MAC, and because a complete
+        adjacency never asks ARP for the address again, nothing else ever
+        reports that the device in front of the entry changed.
+
+        The entry has to become findable once that has happened: the new MAC
+        shows up as a refused-learn on the interface, and the entry itself
+        carries the refused flag, which 'show ip neighbors' prints as an R in
+        its Flags column. Without that, the entry in 'show ip neighbors' is
+        indistinguishable from one that resolves.
+        """
+        self.pg2.generate_remote_hosts(2)
+
+        #
+        # the learns that get refused arrive as ARP frames on pg2, and ARP is
+        # only processed on an interface that has an address: without one the
+        # frames are dropped at arp-disabled and nothing is ever refused. The
+        # address also installs the connected route that covers the static
+        # entry, which is what makes the gratuitous ARP match the entry's
+        # adj-fib and reach the learn.
+        #
+        self.pg2.config_ip4()
+
+        static_arp = VppNeighbor(
+            self,
+            self.pg2.sw_if_index,
+            self.pg2.remote_hosts[0].mac,
+            self.pg2.remote_hosts[0].ip4,
+            is_static=1,
+        )
+        static_arp.add_vpp_config()
+
+        refused_before = self.get_refused_learns(self.pg2)
+
+        #
+        # the device behind the address is replaced: a host on the same link
+        # announces the address the static entry covers, with its own MAC
+        #
+        p = Ether(dst="ff:ff:ff:ff:ff:ff", src=self.pg2.remote_hosts[1].mac) / ARP(
+            op="is-at",
+            hwdst=self.pg2.local_mac,
+            hwsrc=self.pg2.remote_hosts[1].mac,
+            pdst=self.pg2.remote_hosts[0].ip4,
+            psrc=self.pg2.remote_hosts[0].ip4,
+        )
+
+        self.pg2.add_stream(p)
+        self.pg_enable_capture(self.pg_interfaces)
+        self.pg_start()
+
+        #
+        # the entry keeps the MAC the control plane gave it, and that is by
+        # design: a static entry is removed by the control plane, not by a
+        # packet
+        #
+        self.assertTrue(
+            find_nbr(
+                self,
+                self.pg2.sw_if_index,
+                self.pg2.remote_hosts[0].ip4,
+                is_static=1,
+                mac=self.pg2.remote_hosts[0].mac,
+            )
+        )
+
+        #
+        # ... and the refusal is counted, so it survives the log rate limit
+        #
+        self.assertEqual(refused_before + 1, self.get_refused_learns(self.pg2))
+
+        #
+        # the entry is marked where a control plane reads it, so that a
+        # neighbour whose device was swapped is not reported like one that
+        # resolves
+        #
+        self.assertTrue(self.nbr_is_refused(self.pg2, self.pg2.remote_hosts[0].ip4))
+
+        #
+        # a learn that agrees with the entry is a confirmation: it clears the
+        # flag, because the device in front of the entry is the one the entry
+        # names again
+        #
+        p = Ether(dst="ff:ff:ff:ff:ff:ff", src=self.pg2.remote_hosts[0].mac) / ARP(
+            op="is-at",
+            hwdst=self.pg2.local_mac,
+            hwsrc=self.pg2.remote_hosts[0].mac,
+            pdst=self.pg2.remote_hosts[0].ip4,
+            psrc=self.pg2.remote_hosts[0].ip4,
+        )
+
+        self.pg2.add_stream(p)
+        self.pg_enable_capture(self.pg_interfaces)
+        self.pg_start()
+
+        self.assertTrue(
+            find_nbr(
+                self,
+                self.pg2.sw_if_index,
+                self.pg2.remote_hosts[0].ip4,
+                is_static=1,
+                mac=self.pg2.remote_hosts[0].mac,
+            )
+        )
+        self.assertFalse(self.nbr_is_refused(self.pg2, self.pg2.remote_hosts[0].ip4))
+
+        #
+        # and the data plane still may not move the entry to the other MAC:
+        # clearing the flag is not permission to write it
+        #
+        p = Ether(dst="ff:ff:ff:ff:ff:ff", src=self.pg2.remote_hosts[1].mac) / ARP(
+            op="is-at",
+            hwdst=self.pg2.local_mac,
+            hwsrc=self.pg2.remote_hosts[1].mac,
+            pdst=self.pg2.remote_hosts[0].ip4,
+            psrc=self.pg2.remote_hosts[0].ip4,
+        )
+
+        self.pg2.add_stream(p)
+        self.pg_enable_capture(self.pg_interfaces)
+        self.pg_start()
+
+        self.assertTrue(
+            find_nbr(
+                self,
+                self.pg2.sw_if_index,
+                self.pg2.remote_hosts[0].ip4,
+                is_static=1,
+                mac=self.pg2.remote_hosts[0].mac,
+            )
+        )
+        self.assertEqual(refused_before + 2, self.get_refused_learns(self.pg2))
+        self.assertTrue(self.nbr_is_refused(self.pg2, self.pg2.remote_hosts[0].ip4))
+
+        #
+        # the control plane rewriting the entry is what clears it: the entry
+        # moves to the new MAC, and the refusal goes with the old one
+        #
+        static_arp.mac_addr = self.pg2.remote_hosts[1].mac
+        static_arp.add_vpp_config()
+
+        self.assertTrue(
+            find_nbr(
+                self,
+                self.pg2.sw_if_index,
+                self.pg2.remote_hosts[0].ip4,
+                is_static=1,
+                mac=self.pg2.remote_hosts[1].mac,
+            )
+        )
+        self.assertFalse(self.nbr_is_refused(self.pg2, self.pg2.remote_hosts[0].ip4))
+
+        #
+        # clean-up
+        #
+        static_arp.remove_vpp_config()
+        self.pg2.unconfig_ip4()
+
+    def test_refused_learn_counter_reused_sw_if_index(self):
+        """An interface that reuses an sw_if_index starts at zero refused learns
+
+        The refused-learn counter is per sw_if_index, and sw_if_index values
+        are returned to the interface pool on delete and handed to the next
+        interface that is created. Validating the counter on creation only
+        grows the vector and zeroes the elements it adds, so without an
+        explicit zero the new interface inherits the previous one's count and
+        reports a refusal that never happened on it.
+
+        A refusal needs no packets: a static entry followed by a learn with a
+        different MAC and without the static flag takes the refusal branch.
+        """
+        e = VppEnum.vl_api_ip_neighbor_flags_t
+        addr = "10.99.99.1"
+
+        lo_first = VppLoInterface(self)
+        first_index = lo_first.sw_if_index
+
+        self.vapi.ip_neighbor_add_del(
+            first_index,
+            MACAddress("02:00:00:00:00:01"),
+            addr,
+            is_add=1,
+            flags=e.IP_API_NEIGHBOR_FLAG_STATIC,
+        )
+
+        #
+        # the learn differs from the static entry and does not carry the
+        # static flag, so it is refused and counted
+        #
+        with self.vapi.assert_known_api_retval(
+            retvals=[self.VNET_API_ERROR_ENTRY_ALREADY_EXISTS]
+        ):
+            reply = self.vapi.ip_neighbor_add_del(
+                first_index,
+                MACAddress("02:00:00:00:00:02"),
+                addr,
+                is_add=1,
+                flags=e.IP_API_NEIGHBOR_FLAG_NONE,
+            )
+        self.assertEqual(self.VNET_API_ERROR_ENTRY_ALREADY_EXISTS, reply.retval)
+        self.assertEqual(1, self.get_refused_learns(lo_first))
+
+        #
+        # the interface goes away and its index comes back with the next one
+        #
+        lo_first.remove_vpp_config()
+
+        lo_second = VppLoInterface(self)
+        try:
+            self.assertEqual(first_index, lo_second.sw_if_index)
+            self.assertEqual(0, self.get_refused_learns(lo_second))
+        finally:
+            lo_second.remove_vpp_config()
+
+        #
+        # the static entry went with the interface it was added on
+        #
+        self.assertFalse(
+            find_nbr(self, first_index, addr, is_static=1),
+        )
+
     def test_arp_incomplete(self):
         """ARP Incomplete"""
         self.pg1.generate_remote_hosts(4)
@@ -3329,6 +3600,60 @@ class NeighborChurnTestCase(VppTestCase):
             self.assertFalse(
                 find_nbr(self, self.pg0.sw_if_index, self.pg0.remote_hosts[0].ip4)
             )
+
+        self.vapi.ip_neighbor_flush(af.ADDRESS_IP4, 0xFFFFFFFF)
+        self.assert_age_list_empty()
+
+    def test_age_disabled_wake(self):
+        """Turning aging off with neighbours present destroys none of them
+
+        This is the production configuration: age 0, so no neighbour is ever
+        probed or expired. The age process arms its timer with the age in
+        force when it goes to sleep, so a wake can land after aging was turned
+        off. At that point every ttl is greater than 0, so a wake that walks
+        the list probes every entry and destroys them one by one, none of
+        which the operator asked for.
+
+        Turning aging off signals the process, which is what stops the armed
+        timer, so this does not reproduce the race. It pins the invariant the
+        guard in the timer path keeps: after aging is off and time has moved
+        past the age the timer was armed with, the table is untouched.
+        """
+
+        af = VppEnum.vl_api_address_family_t
+
+        #
+        # arm the timer while aging is on, then turn it off with the timer
+        # still pending
+        #
+        self.vapi.ip_neighbor_config(
+            af=af.ADDRESS_IP4, max_number=50000, max_age=self.AGE, recycle=False
+        )
+        self.add_dynamic_neighbors()
+        self.assertEqual(len(self.sorted_nbr_rows()), self.N_HOSTS)
+
+        self.vapi.ip_neighbor_config(
+            af=af.ADDRESS_IP4, max_number=50000, max_age=0, recycle=False
+        )
+
+        #
+        # well past the age the timer was armed with, and past the three
+        # probe wake-ups that follow a first expiry: none of the neighbours
+        # may be gone
+        #
+        self.virtual_sleep(self.AGE + 6)
+
+        self.assertEqual(len(self.sorted_nbr_rows()), self.N_HOSTS)
+        self.assertTrue(
+            find_nbr(self, self.pg0.sw_if_index, self.pg0.remote_hosts[0].ip4)
+        )
+        self.assertTrue(
+            find_nbr(
+                self,
+                self.pg0.sw_if_index,
+                self.pg0.remote_hosts[self.N_HOSTS - 1].ip4,
+            )
+        )
 
         self.vapi.ip_neighbor_flush(af.ADDRESS_IP4, 0xFFFFFFFF)
         self.assert_age_list_empty()

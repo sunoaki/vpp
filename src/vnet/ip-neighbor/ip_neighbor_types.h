@@ -11,12 +11,26 @@
 #include <vnet/ethernet/mac_address.h>
 #include <vnet/fib/fib_types.h>
 
-#define foreach_ip_neighbor_flag                 \
-  _(STATIC, 1 << 0, "static", "S")               \
-  _(DYNAMIC, 1 << 1, "dynamic", "D")             \
-  _(NO_FIB_ENTRY, 1 << 2, "no-fib-entry", "N")   \
-  _(PENDING, 1 << 3, "pending", "P")             \
-  _(STALE, 1 << 4, "stale", "A")                 \
+/*
+ * REFUSED records that the data plane learned a different MAC for this entry
+ * and the entry kept the one it holds. Only a static entry can carry it:
+ * a dynamic entry follows the data plane. It stays set until the control
+ * plane rewrites or deletes the entry, and it is what makes an entry whose
+ * device was replaced distinguishable from a healthy one in 'show ip
+ * neighbors'. It is not one of the flags the binary API encodes, because it
+ * describes this module's view of an entry rather than its configuration.
+ *
+ * STALE is deliberately not reused for this. STALE is what ip_neighbor_sweep
+ * and the age process destroy entries by, so marking a static entry STALE
+ * would let this module delete control-plane configuration on its own.
+ */
+#define foreach_ip_neighbor_flag                                                                   \
+  _ (STATIC, 1 << 0, "static", "S")                                                                \
+  _ (DYNAMIC, 1 << 1, "dynamic", "D")                                                              \
+  _ (NO_FIB_ENTRY, 1 << 2, "no-fib-entry", "N")                                                    \
+  _ (PENDING, 1 << 3, "pending", "P")                                                              \
+  _ (STALE, 1 << 4, "stale", "A")                                                                  \
+  _ (REFUSED, 1 << 5, "refused", "R")
 
 typedef enum ip_neighbor_flags_t_
 {
@@ -142,7 +156,34 @@ typedef struct ip_neighbor_counters_t_
   vlib_simple_counter_main_t ipnc[VLIB_N_DIR][N_IP_NEIGHBOR_CTRS];
 } ip_neighbor_counters_t;
 
+/*
+ * Counted per interface, indexed by sw_if_index. These are not the RX/TX
+ * protocol counters above, which are per interface and per direction.
+ *
+ * REFUSED: the data plane learned a MAC that differs from the MAC of a static
+ *          entry on the interface, so the entry kept the MAC it holds and a
+ *          packet to that neighbour still goes to the old device. The entry
+ *          itself carries IP_NEIGHBOR_FLAG_REFUSED until the control plane
+ *          rewrites or deletes it, so this counts the refusals and the flag
+ *          says which entries are affected.
+ */
+#define foreach_ip_neighbor_if_counter_type _ (REFUSED, "refused-learn")
+
+typedef enum ip_neighbor_if_counter_type_t_
+{
+#define _(a, b) IP_NEIGHBOR_IF_CTR_##a,
+  foreach_ip_neighbor_if_counter_type
+#undef _
+} ip_neighbor_if_counter_type_t;
+
+#define N_IP_NEIGHBOR_IF_CTRS (IP_NEIGHBOR_IF_CTR_REFUSED + 1)
+
+#define FOREACH_IP_NEIGHBOR_IF_CTR(_type) for (_type = 0; _type < N_IP_NEIGHBOR_IF_CTRS; _type++)
+
+extern vlib_simple_counter_main_t ip_neighbor_if_counters[N_IP_NEIGHBOR_IF_CTRS];
+
 extern u8 *format_ip_neighbor_counters (u8 *s, va_list *args);
+extern u8 *format_ip_neighbor_if_counters (u8 *s, va_list *args);
 
 extern void ip_neighbor_alloc_ctr (ip_neighbor_counters_t *ctr,
 				   u32 sw_if_index);
