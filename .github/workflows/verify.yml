@@ -826,12 +826,26 @@ jobs:
       # four arguments". Synthesise a version in the same format the DEB
       # workflow uses, whose ordering is already thought through, whenever no
       # tag is reachable.
+      #
+      # The test job cannot inherit this file: the archive carries build-root
+      # only, so it writes the same bytes from the same commit with the same
+      # step name before it runs a suite. Both steps read the result back
+      # through the script the configure runs.
       - name: Provide a version when origin has no tag
         run: |
+          set -eu
           if ! git describe --tags --long --match 'v[0-9]*' 2>/dev/null; then
             echo "0.0.0-release+$(git log -1 --format=%ct).$(git rev-list --count HEAD)-g$(git rev-parse --short=7 HEAD)" \
               > src/scripts/.version
           fi
+          version=$(src/scripts/version)
+          # One non-empty word: an empty expansion is the argument CMake counts
+          # as missing, and a line break would split the value in two.
+          if [ -z "${version}" ] || [ "${version#* }" != "${version}" ]; then
+            echo "::error::src/scripts/version printed '${version}'; CMake cannot configure without a version"
+            exit 1
+          fi
+          echo "Build version: ${version}"
 
       - name: Prepare exact ESP source variant and provenance
         if: needs.test-plan.outputs.tunnel_regression == 'true'
@@ -1261,6 +1275,40 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      # The archive carries build-root only, so this job checks src/ out again
+      # and src/scripts/.version, which the build job wrote, is not here. On a
+      # commit no v* tag describes, git describe fails, src/scripts/version
+      # exits 1, and src/CMakeLists.txt:94 expands the empty VPP_VERSION into
+      # `string(REPLACE "-" ";" VPP_LIB_VERSION )`; CMake rejects that call with
+      # "string sub-command REPLACE requires at least four arguments" and the
+      # configure is incomplete. The suite loop makes the source tree newer than
+      # the archived timestamps, so every suite after the first reconfigures and
+      # hits it, which is why a whole shard fails after its first suite passes.
+      #
+      # The version is therefore written here, in the format the build job's
+      # "Provide a version when origin has no tag" step uses, and read back
+      # through the script the configure runs, so a version that would leave the
+      # REPLACE call without an argument stops this job with a message naming
+      # the cause instead of surfacing as a CMake error per suite. Keep this
+      # step in step with that one; both derive the value from the same commit,
+      # so they write the same bytes.
+      - name: Provide a version when origin has no tag
+        run: |
+          set -eu
+          git config --global --add safe.directory "$PWD"
+          if ! git describe --tags --long --match 'v[0-9]*' 2>/dev/null; then
+            echo "0.0.0-release+$(git log -1 --format=%ct).$(git rev-list --count HEAD)-g$(git rev-parse --short=7 HEAD)" \
+              > src/scripts/.version
+          fi
+          version=$(src/scripts/version)
+          # One non-empty word: an empty expansion is the argument CMake counts
+          # as missing, and a line break would split the value in two.
+          if [ -z "${version}" ] || [ "${version#* }" != "${version}" ]; then
+            echo "::error::src/scripts/version printed '${version}'; CMake cannot configure without a version"
+            exit 1
+          fi
+          echo "Build version: ${version}"
+
       # `make test-debug` installs $(DEB_DEPENDS) and builds the test virtual
       # environment itself; the image carries neither. This job therefore
       # runs the same two steps the build job runs, with the same apt archive
@@ -1645,11 +1693,52 @@ jobs:
           : > "${summary_file}"
           results=()
           failed=()
+          # `make test-debug` runs `pip install -e src/vpp-api/python`
+          # (test/Makefile:106-110,138), which leaves build/, vpp_papi.egg-info
+          # and __pycache__ inside src/vpp-api/python, and importing vpp_papi
+          # writes more __pycache__ beneath the package, tests/ included.
+          # build_check_timestamp (build-root/Makefile:683-697) compares every
+          # file of the package source against .mu_build_build_timestamp, and
+          # find_filter (build-root/Makefile:407-414) excludes neither, nor does
+          # find read .gitignore. A suite therefore leaves the source newer than
+          # the stamp, and the next suite's vpp-install rebuilds and
+          # reconfigures CMake. This removes what the previous suite generated.
+          #
+          # The paths are the Makefile's own, not a copy of them: PAPI_WIPE_DIST
+          # is what `make test-wipe-papi` deletes (test/Makefile:510-512), and
+          # PAPI_PYTHON_SRC_DIR is the directory the install writes into, which
+          # needs the bytecode sweep because the list names one __pycache__ of
+          # the several a package produces. Nothing removed here is tracked:
+          # `git ls-files src/vpp-api` holds no build/, *.egg-info or
+          # __pycache__.
+          papi_src_dir=$(make -s -C test WS_ROOT="${PWD}" \
+            --eval='print-papi-source: ; @echo $(PAPI_PYTHON_SRC_DIR)' print-papi-source 2>/dev/null || true)
+          papi_dists=$(make -s -C test WS_ROOT="${PWD}" \
+            --eval='print-papi-dists: ; @echo $(PAPI_WIPE_DIST)' print-papi-dists 2>/dev/null || true)
+          # A warning rather than a failure: the version written above keeps a
+          # reconfigure correct, so a shard still reports its suites when the
+          # makefile stops naming these paths. The message is what says the
+          # shard is then rebuilding between suites, which the runner's log for
+          # the run would otherwise show only as repeated "Building vpp in".
+          if [ -n "${papi_src_dir}" ] && [ -z "${papi_dists}" ]; then
+            echo "::warning::test/Makefile names no PAPI_WIPE_DIST; each suite will reconfigure"
+          elif [ -n "${papi_dists}" ] && [ -z "${papi_src_dir}" ]; then
+            echo "::warning::test/Makefile names no PAPI_PYTHON_SRC_DIR; nested __pycache__ stays"
+          fi
           # errexit would end the step at the first failing suite, so it is off
           # for the suite bodies and every command records its own status.
           for suite in "${suites[@]}"; do
             echo "Running TEST=${suite}"
             suite_status=0
+            if [ -n "${papi_src_dir}" ]; then
+              # PAPI_WIPE_DIST needs no quoting: it is the makefile's list of
+              # paths under this checkout, and the suite loop runs unquoted by
+              # design.
+              # shellcheck disable=SC2086
+              rm -rf ${papi_dists}
+              find "${papi_src_dir}" -depth -type d -name __pycache__ \
+                -exec rm -rf {} + 2>/dev/null || true
+            fi
             touch "${records}/${suite}.status"
             trace="${RUNNER_TEMP}/suite-exec-${suite}.trace"
             rm -f "${trace}"
