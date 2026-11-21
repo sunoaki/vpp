@@ -666,6 +666,14 @@ lcp_router_proto_k2f (uint32_t k)
       return FIB_PROTOCOL_IP4;
     case AF_MPLS:
       return FIB_PROTOCOL_MPLS;
+    /* A multicast route names a routing family of its own,
+     * RTNL_FAMILY_IPMR for IPv4 and RTNL_FAMILY_IP6MR for IPv6. It is the
+     * family the kernel reports such a route under, and the one its group
+     * and source addresses are built in. */
+    case RTNL_FAMILY_IPMR:
+      return FIB_PROTOCOL_IP4;
+    case RTNL_FAMILY_IP6MR:
+      return FIB_PROTOCOL_IP6;
     default:
       /* Not a family this plugin can translate. Return the sentinel instead
        * of aborting on a message the kernel can send; the callers either gate
@@ -723,16 +731,17 @@ lcp_router_mk_addr46 (const struct nl_addr *rna, ip46_address_t *ia, fib_protoco
   fib_protocol_t fproto;
   unsigned int alen;
 
-  /* Same gate as lcp_router_mk_addr(): an address that is neither IPv4 nor
-   * IPv6 has no ip46_address_t representation, so the callers drop the path
-   * rather than copy a foreign buffer. */
-  if (AF_INET != family && AF_INET6 != family)
+  /* Same gate as lcp_router_mk_addr(): a family whose address is not an IP
+   * address has no ip46_address_t representation, so the callers drop the
+   * path rather than copy a foreign buffer. AF_MPLS is one such family: it
+   * translates to a protocol, but its bytes are a label stack. The
+   * multicast families carry an IPv4 or an IPv6 address and pass. */
+  fproto = lcp_router_proto_k2f (family);
+  if (FIB_PROTOCOL_IP4 != fproto && FIB_PROTOCOL_IP6 != fproto)
     {
       LCP_ROUTER_ERROR ("ignore address of family %u", family);
       return -1;
     }
-
-  fproto = lcp_router_proto_k2f (family);
 
   ip46_address_reset (ia);
   alen = nl_addr_get_len (rna);

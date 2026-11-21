@@ -557,19 +557,51 @@ lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
       nl_addr_put (dst);
       return clib_error_return (0, "expected route protocol");
     }
+
+  /*
+   * A multicast route travels in a routing family of its own: the kernel
+   * reports one under RTNL_FAMILY_IPMR for IPv4 and RTNL_FAMILY_IP6MR for
+   * IPv6, and builds its group and source there too. The family is also what
+   * lets the source attach at all: rtnl_route_set_src() refuses an AF_INET
+   * address with NLE_SRCRT_NOSUPPORT and stores nothing, so a route built in
+   * AF_INET reaches the plugin with no source and installs as the (*,G)
+   * entry.
+   */
+  rtype = RTN_UNICAST;
+  if (unformat (input, "multicast"))
+    {
+      struct nl_addr *group;
+
+      if (FIB_PROTOCOL_MPLS == proto)
+	{
+	  nl_addr_put (dst);
+	  return clib_error_return (0, "a multicast route has no mpls family");
+	}
+      if (FIB_PROTOCOL_IP4 != proto)
+	{
+	  nl_addr_put (dst);
+	  return clib_error_return (0, "the fixture builds IPv4 multicast routes only");
+	}
+      family = RTNL_FAMILY_IPMR;
+      rtype = RTN_MULTICAST;
+
+      group = nl_addr_build (family, nl_addr_get_binary_addr (dst), nl_addr_get_len (dst));
+      nl_addr_put (dst);
+      if (!group)
+	return clib_error_return (0, "failed to build the multicast group");
+      dst = group;
+      nl_addr_set_prefixlen (dst, 32);
+    }
+
   route = rtnl_route_alloc ();
-  rtnl_route_set_family (route, family);
+  /* rtnl_route_set_family() accepts only the unicast families; for a
+   * multicast route rtnl_route_set_dst() is what records the family. */
+  if (RTN_MULTICAST != rtype)
+    rtnl_route_set_family (route, family);
   rtnl_route_set_table (route, table);
   rtnl_route_set_protocol (route, protocol);
   rtnl_route_set_dst (route, dst);
   nl_addr_put (dst);
-  rtype = RTN_UNICAST;
-  if (unformat (input, "multicast"))
-    {
-      /* An IPv4 multicast destination names the group and nothing else. */
-      rtype = RTN_MULTICAST;
-      nl_addr_set_prefixlen (rtnl_route_get_dst (route), 32);
-    }
   if (unformat (input, "drop"))
     rtnl_route_set_type (route, RTN_BLACKHOLE);
   else
@@ -579,9 +611,11 @@ lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
       rtnl_route_set_type (route, rtype);
       if (RTN_MULTICAST == rtype)
 	{
-	  /* The destination is the group; a netlink multicast route carries
-	   * its source where every route carries the address it selects on. */
+	  /* The destination is the group; the source is the address the route
+	   * selects its senders on. Both are in the multicast family. */
 	  ip4_address_t source = {};
+	  struct nl_addr *nl_source;
+	  int rv;
 
 	  if (unformat_check_input (input) != UNFORMAT_END_OF_INPUT &&
 	      !unformat (input, "source %U", unformat_ip4_address, &source))
@@ -589,9 +623,20 @@ lcp_router_test_cmd (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
 	      rtnl_route_put (route);
 	      return clib_error_return (0, "expected multicast source");
 	    }
-	  struct nl_addr *nl_source = nl_addr_build (AF_INET, &source, sizeof (source));
-	  rtnl_route_set_src (route, nl_source);
+	  nl_source = nl_addr_build (family, &source, sizeof (source));
+	  if (!nl_source)
+	    {
+	      rtnl_route_put (route);
+	      return clib_error_return (0, "failed to build the multicast source");
+	    }
+	  nl_addr_set_prefixlen (nl_source, 32);
+	  rv = rtnl_route_set_src (route, nl_source);
 	  nl_addr_put (nl_source);
+	  if (rv < 0)
+	    {
+	      rtnl_route_put (route);
+	      return clib_error_return (0, "libnl rejected the multicast source: %d", rv);
+	    }
 	}
       while (unformat (input, "vif %u", &vif))
 	{
