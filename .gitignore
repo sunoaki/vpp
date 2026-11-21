@@ -120,6 +120,14 @@ compile_commands.json
 # vppctl command list
 /src/scripts/vppctl-cmd-list
 
+# Version synthesised by the workflows when no v* tag describes the commit.
+# Untracked on purpose: src/scripts/version reads it in preference to
+# `git describe`, and nothing should commit it. Ignoring it keeps a
+# maintainer's local build from showing it as an untracked file. It has no
+# effect on the build decision, which is make's, not git's: `find` does not
+# read this file.
+/src/scripts/.version
+
 # No core files
 **/core
 
