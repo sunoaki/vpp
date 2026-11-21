@@ -169,9 +169,14 @@ class TestTracefilter(TemplateTraceFilter):
         ori = raw(tmpl)
 
         # the mask
+        # A session spans skip plus match vectors, and that sum may not
+        # exceed VNET_CLASSIFY_MAX_N_VECTORS, eight.  The outer headers this
+        # packet nests put the first significant byte at offset 96, so skip
+        # is 6 and at most two vectors remain.  Mask the VNI and the network
+        # of the innermost source, not all four of its bytes.
         tmpl[GENEVE].vni = 0xFFFFFF
         user = tmpl[GENEVE].payload
-        user[IP].src = "255.255.255.255"
+        user[IP].src = "255.255.0.0"
         new = raw(tmpl)
         mask = "".join(("{:02x}".format(o ^ n) for o, n in zip(ori, new)))
 
