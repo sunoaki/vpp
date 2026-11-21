@@ -261,6 +261,8 @@ jobs:
           per_shard=0
           remainder=0
           total=0
+          batches=""
+          suites_json="["
           for suite in ${suites}; do
             total=$((total + 1))
           done
@@ -293,10 +295,10 @@ jobs:
             fi
             names=$(printf '%s\n' "${suites}" | sed -n "$((offset + 1)),$((offset + size))p" |
                     sed 's/^/"/; s/$/"/' | sed ':a;N;$!ba;s/\n/,/g')
+            # The first shard starts the list; every later shard is preceded by
+            # one comma, so no trailing comma is left behind.
             if [ "${shard}" -ne 0 ]; then
               batches="${batches},"
-            fi
-            if [ "${shard}" -ne 0 ]; then
               suites_json="${suites_json},"
             fi
             batches="${batches}[${names}]"
