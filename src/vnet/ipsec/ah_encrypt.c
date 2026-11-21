@@ -354,6 +354,10 @@ ah_encrypt_inline (vlib_main_t * vm,
   pd = pkt_data;
   b = bufs;
 
+  /* The packets of the frame, whatever next the early exits chose. The stats
+   * segment adds the count to the whole-process total of the counter and
+   * keeps no point a reader can measure from, so a caller reads one window by
+   * subtracting the total it read when the window opened. */
   vlib_node_increment_counter (vm, node->node_index,
 			       AH_ENCRYPT_ERROR_RX_PKTS, n_left);
   vlib_increment_combined_counter (&ipsec_sa_counters, thread_index,
