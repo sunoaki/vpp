@@ -149,6 +149,24 @@ class TestPPPoE(VppTestCase):
         # return the created packet list
         return pkts
 
+    def create_session(self, port, session_id=None):
+        """Create a session on the port its client is reached on.
+
+        The link table is only taught by frames arriving on a port paired with
+        a control plane port, and none of these cases creates a pairing, so a
+        session added without its port would be left with a table that never
+        learned this client.
+        """
+        session = VppPppoeInterface(
+            self,
+            port.remote_ip4,
+            port.remote_mac,
+            self.session_id if session_id is None else session_id,
+            encap_if_index=port.sw_if_index,
+        )
+        session.add_vpp_config()
+        return session
+
     def verify_decapped_pppoe(self, src_if, capture, sent):
         self.assertEqual(len(capture), len(sent))
 
@@ -222,10 +240,7 @@ class TestPPPoE(VppTestCase):
         self.pg_start()
 
         # Create PPPoE session
-        pppoe_if = VppPppoeInterface(
-            self, self.pg0.remote_ip4, self.pg0.remote_mac, self.session_id
-        )
-        pppoe_if.add_vpp_config()
+        pppoe_if = self.create_session(self.pg0)
         pppoe_if.set_unnumbered(self.pg0.sw_if_index)
         #
         # Send tunneled packets that match the created tunnel and
@@ -291,10 +306,7 @@ class TestPPPoE(VppTestCase):
         self.pg_start()
 
         # Create PPPoE session
-        pppoe_if = VppPppoeInterface(
-            self, self.pg0.remote_ip4, self.pg0.remote_mac, self.session_id
-        )
-        pppoe_if.add_vpp_config()
+        pppoe_if = self.create_session(self.pg0)
         pppoe_if.set_unnumbered(self.pg0.sw_if_index)
 
         #
@@ -359,22 +371,36 @@ class TestPPPoE(VppTestCase):
         self.pg_start()
 
         # Create PPPoE session
-        pppoe_if = VppPppoeInterface(
-            self, self.pg0.remote_ip4, self.pg0.remote_mac, self.session_id
-        )
-        pppoe_if.add_vpp_config()
+        pppoe_if = self.create_session(self.pg0)
         pppoe_if.set_unnumbered(self.pg0.sw_if_index)
 
         #
-        # The double create (create the same session twice) should fail,
-        # and we should still be able to use the original
+        # A repeat add that carries an address is the address arriving after the
+        # session exists, which IPCP and IPv6CP do, so the plugin applies it to
+        # the session the client already has: the same interface comes back and
+        # the table still holds one session.
         #
-        try:
-            pppoe_if.add_vpp_config()
-        except Exception:
-            pass
-        else:
-            self.fail("Double GRE tunnel add does not fail")
+        again = self.vapi.pppoe_add_del_session_v2(
+            pppoe_if.client_ip,
+            pppoe_if.client_mac,
+            session_id=pppoe_if.session_id,
+            encap_if_index=self.pg0.sw_if_index,
+        )
+        self.assertEqual(pppoe_if.sw_if_index, again.sw_if_index)
+        self.assertEqual(1, len(self.vapi.pppoe_session_dump()))
+
+        #
+        # A repeat add that names no address is a second session for the same
+        # client key, which the plugin refuses with VNET_API_ERROR_TUNNEL_EXIST.
+        #
+        with self.vapi.assert_known_api_retval(retvals=[-75]):
+            self.vapi.pppoe_add_del_session_v2(
+                "0.0.0.0",
+                pppoe_if.client_mac,
+                session_id=pppoe_if.session_id,
+                encap_if_index=self.pg0.sw_if_index,
+            )
+        self.assertEqual(1, len(self.vapi.pppoe_session_dump()))
 
         #
         # test case cleanup
@@ -390,18 +416,11 @@ class TestPPPoE(VppTestCase):
         """PPPoE Session Created On The Interface The Caller Names Test"""
 
         #
-        # The client is known to the control plane from its frames on pg0, and
-        # those frames are what the binding records. No frame is sent here, so
-        # the binding names pg0 only when the caller asks for it.
+        # No frame is sent here, so the client is known to the control plane
+        # only from the port the caller names: the session sits on pg0 and the
+        # dump reads it back from the interface the add answered with.
         #
-        pppoe_if = VppPppoeInterface(
-            self,
-            self.pg0.remote_ip4,
-            self.pg0.remote_mac,
-            self.session_id,
-            encap_if_index=self.pg0.sw_if_index,
-        )
-        pppoe_if.add_vpp_config()
+        pppoe_if = self.create_session(self.pg0)
         self.assertTrue(pppoe_if.sw_if_index > 0)
         self.assertNotEqual(pppoe_if.sw_if_index, self.pg0.sw_if_index)
 
@@ -424,26 +443,12 @@ class TestPPPoE(VppTestCase):
         """PPPoE Delete All Sessions Deletes Every Session Test"""
 
         #
-        # Both sessions name the port they sit on, so no frame has to be sent
-        # to bind their clients first.
+        # Each session names the port it sits on, so neither depends on a frame
+        # having taught the link table its client first.
         #
-        pppoe_if1 = VppPppoeInterface(
-            self,
-            self.pg0.remote_ip4,
-            self.pg0.remote_mac,
-            self.session_id,
-            encap_if_index=self.pg0.sw_if_index,
-        )
-        pppoe_if1.add_vpp_config()
+        pppoe_if1 = self.create_session(self.pg0)
 
-        pppoe_if2 = VppPppoeInterface(
-            self,
-            self.pg2.remote_ip4,
-            self.pg2.remote_mac,
-            self.session_id + 1,
-            encap_if_index=self.pg2.sw_if_index,
-        )
-        pppoe_if2.add_vpp_config()
+        pppoe_if2 = self.create_session(self.pg2, self.session_id + 1)
 
         sessions = self.vapi.pppoe_session_dump()
         self.assertEqual(2, len(sessions))
@@ -466,25 +471,19 @@ class TestPPPoE(VppTestCase):
         """PPPoE Delete Naming No Port Deletes The Session Test"""
 
         #
-        # The session names its port, and the client sent no frame, so the
-        # binding knows neither the client nor the port it was reached on.
+        # The session names its port while the client has sent no frame, so the
+        # link table knows neither the client nor the port it was reached on.
         #
-        pppoe_if = VppPppoeInterface(
-            self,
-            self.pg0.remote_ip4,
-            self.pg0.remote_mac,
-            self.session_id,
-            encap_if_index=self.pg0.sw_if_index,
-        )
-        pppoe_if.add_vpp_config()
+        pppoe_if = self.create_session(self.pg0)
 
         sessions = self.vapi.pppoe_session_dump(sw_if_index=pppoe_if.sw_if_index)
         self.assertEqual(1, len(sessions))
 
         #
-        # The older message names no port, so a delete through it is left with
-        # the binding. The session is there under the key the delete names, and
-        # the port it was created on is what the delete releases it from.
+        # The older message names no port, so the delete has no port of its
+        # own. A key that leads to a live session carries the port that session
+        # was created on, which is what the delete is left with: the link table
+        # is not consulted, and it never learned this client anyway.
         #
         self.vapi.pppoe_add_del_session(
             pppoe_if.client_ip,
@@ -502,10 +501,10 @@ class TestPPPoE(VppTestCase):
         """PPPoE Add With No Port Fails Through The API Test"""
 
         #
-        # No frame is sent, so the binding knows nothing about this client, and
-        # the message names no port, so the session add fails with the invalid
-        # interface index master answers. The handler has to carry that code
-        # back in the reply; one that drops it answers 0 and this fails.
+        # No frame is sent and the message names no port, so the link table is
+        # asked and has nothing for this client: the add fails with the invalid
+        # interface index. The handler has to carry that code back in the reply;
+        # one that drops it answers 0 and this fails.
         #
         pppoe_if = VppPppoeInterface(
             self, self.pg0.remote_ip4, self.pg0.remote_mac, self.session_id
@@ -549,19 +548,7 @@ class TestPPPoE(VppTestCase):
         self.pg_start()
 
         # Create PPPoE session
-        #
-        # The session names the port, so the delete below is left with the
-        # port the session was created on rather than with the binding, which
-        # learning has moved to pg1 by now.
-        #
-        pppoe_if = VppPppoeInterface(
-            self,
-            self.pg0.remote_ip4,
-            self.pg0.remote_mac,
-            self.session_id,
-            encap_if_index=self.pg0.sw_if_index,
-        )
-        pppoe_if.add_vpp_config()
+        pppoe_if = self.create_session(self.pg0)
 
         # Delete PPPoE session
         pppoe_if.remove_vpp_config()
@@ -616,10 +603,7 @@ class TestPPPoE(VppTestCase):
         self.pg_start()
 
         # Create PPPoE session 1
-        pppoe_if1 = VppPppoeInterface(
-            self, self.pg0.remote_ip4, self.pg0.remote_mac, self.session_id
-        )
-        pppoe_if1.add_vpp_config()
+        pppoe_if1 = self.create_session(self.pg0)
         pppoe_if1.set_unnumbered(self.pg0.sw_if_index)
 
         # Send PPPoE Discovery 2
@@ -637,10 +621,7 @@ class TestPPPoE(VppTestCase):
         self.pg_start()
 
         # Create PPPoE session 2
-        pppoe_if2 = VppPppoeInterface(
-            self, self.pg2.remote_ip4, self.pg2.remote_mac, self.session_id + 1
-        )
-        pppoe_if2.add_vpp_config()
+        pppoe_if2 = self.create_session(self.pg2, self.session_id + 1)
         pppoe_if2.set_unnumbered(self.pg0.sw_if_index)
 
         #
@@ -723,10 +704,7 @@ class TestPPPoE(VppTestCase):
         self.pg_start()
 
         # Create PPPoE session 1
-        pppoe_if1 = VppPppoeInterface(
-            self, self.pg0.remote_ip4, self.pg0.remote_mac, self.session_id
-        )
-        pppoe_if1.add_vpp_config()
+        pppoe_if1 = self.create_session(self.pg0)
 
         # Send PPPoE Discovery 2
         tx3 = self.create_stream_pppoe_discovery(
@@ -743,10 +721,7 @@ class TestPPPoE(VppTestCase):
         self.pg_start()
 
         # Create PPPoE session 2
-        pppoe_if2 = VppPppoeInterface(
-            self, self.pg2.remote_ip4, self.pg2.remote_mac, self.session_id + 1
-        )
-        pppoe_if2.add_vpp_config()
+        pppoe_if2 = self.create_session(self.pg2, self.session_id + 1)
 
         #
         # Send a packet stream that is routed into the session
@@ -881,10 +856,7 @@ class TestPPPoE(VppTestCase):
         #
         sessions = []
         for client_session_id in range(self.session_id, self.session_id + 64):
-            session = VppPppoeInterface(
-                self, self.pg0.remote_ip4, self.pg0.remote_mac, client_session_id
-            )
-            session.add_vpp_config()
+            session = self.create_session(self.pg0, client_session_id)
             sessions.append(session)
             if session.sw_if_index > loops[-1].sw_if_index:
                 break
@@ -972,21 +944,23 @@ class TestPPPoE(VppTestCase):
         pexpect_path = config.vpp + "_api_test"
 
         #
-        # vat refuses the command itself and prints why (pppoe_test.c:145-149
-        # returns -99, src/vat/main.c:167-169 prints it), so this covers the
-        # error path of the command that carries the byte order fix. The
-        # success path is not covered by any test on this branch: a session
-        # add over the API cannot succeed, because vat names no interface and
-        # the handler falls back to a link table that only learns a client MAC
-        # from a frame received on a port paired with a control plane port
-        # (pppoe_cp_node.c:424-432, pppoe.c:683-686).
+        # vat refuses the command itself and prints why: api_pppoe_add_del_session
+        # returns -99 after errmsg, and src/vat/main.c prints the return value
+        # through the error text table. The success path is not covered here: a
+        # session add over the API cannot name its port, and the link table only
+        # learns a client MAC from a frame received on a port paired with a
+        # control plane port, which this test does not create.
+        #
+        # The session id is decimal: "%d" in src/vppinfra/unformat.c reads base
+        # 10, so a 0x-prefixed value parses as 0 and leaves "x1234" as an
+        # unknown token, which returns -99 before the missing mac is reported.
         #
         # errmsg carries no newline, so both parts of the reason share a line.
-        # the return value is printed through the error text table, which
-        # names 99 "Misc" (src/vat/main.c:53, :201), not as a bare number.
+        # the return value is printed through the error text table, which names
+        # 99 "Misc" (src/vat/main.c:53, :201), not as a bare number.
         #
         reply = self.run_vat_command(
-            pexpect_path, "pppoe_add_del_session client-ip 192.0.2.1 session_id 0x1234"
+            pexpect_path, "pppoe_add_del_session client-ip 192.0.2.1 session_id 4660"
         )
         self.assertIn("client mac not specified", reply)
         self.assertIn("error: Misc", reply)

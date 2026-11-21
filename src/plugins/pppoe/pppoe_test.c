@@ -198,7 +198,7 @@ api_pppoe_add_del_session_v2 (vat_main_t *vam)
 {
   unformat_input_t *line_input = vam->input;
   vl_api_pppoe_add_del_session_v2_t *mp;
-  u16 session_id = 0;
+  u32 session_id = 0;
   ip46_address_t client_ip;
   u8 is_add = 1;
   u8 client_ip_set = 0;
@@ -237,8 +237,7 @@ api_pppoe_add_del_session_v2 (vat_main_t *vam)
 	;
       else if (unformat (line_input, "client-mac %U", unformat_ethernet_address, client_mac))
 	client_mac_set = 1;
-      else if (unformat (line_input, "encap-if-index %U", unformat_vnet_sw_interface,
-			 vnet_get_main (), &sw_if_index))
+      else if (unformat (line_input, "encap-if-index %U", unformat_sw_if_index, vam, &sw_if_index))
 	encap_if_index = sw_if_index;
       else if (unformat (line_input, "disable_fib"))
 	disable_fib = 1;
@@ -277,9 +276,9 @@ api_pppoe_add_del_session_v2 (vat_main_t *vam)
       ip_address_encode (&client_ip, IP46_TYPE_IP4, &mp->client_ip);
     }
 
-  mp->decap_vrf_id = ntohl (decap_vrf_id);
-  mp->session_id = ntohl (session_id);
-  mp->encap_if_index = ntohl (encap_if_index);
+  mp->decap_vrf_id = htonl (decap_vrf_id);
+  mp->session_id = htons ((u16) session_id);
+  mp->encap_if_index = htonl (encap_if_index);
   mp->disable_fib = disable_fib;
   mp->is_add = is_add;
   memcpy (mp->client_mac, client_mac, 6);
