@@ -251,8 +251,8 @@ jobs:
           # differ widely in duration and no assignment by name balances them.
           # A dispatch that selects all 201 suites puts 201 // 12 = 16 in each
           # shard and gives one more, 17, to the leading 201 % 12 = 9 shards.
-          # Fewer suites shrink the split instead of leaving empty shards that
-          # would start a runner to run nothing.
+          # Fewer suites shrink the shard count instead of leaving empty
+          # shards that would start a runner to run nothing.
           shard_count=12
           per_shard=0
           remainder=0
@@ -263,43 +263,43 @@ jobs:
           # The split reads one suite per line, so the filter becomes a list
           # before the arithmetic turns it into shard sizes.
           suites=$(printf '%s\n' "${suites}" | tr ' ' '\n' | sed '/^$/d')
-          if [ "${total}" -ne 0 ]; then
-            per_shard=$((total / shard_count))
-            remainder=$((total % shard_count))
-          fi
-          # Each shard is written as one JSON array of suite names, and the
-          # arrays are joined with commas between them. The suites are read one
-          # per line in list order, so the shards hold the same suites in the
-          # same order on every run.
-          batches="["
-          offset=0
-          placed=0
-          while [ "${placed}" -lt "${total}" ]; do
-            size="${per_shard}"
-            if [ "${placed}" -lt "${remainder}" ]; then
-              size=$((size + 1))
-            fi
-            shard=$(printf '%s\n' "${suites}" | sed -n "$((offset + 1)),$((offset + size))p" |
-                    sed 's/^/"/; s/$/"/' | sed ':a;N;$!ba;s/\n/,/g')
-            # The outer array opened above, so every shard but the first takes
-            # a comma before its own bracket.
-            if [ "${placed}" -ne 0 ]; then
-              batches="${batches},"
-            fi
-            batches="${batches}[${shard}]"
-            offset=$((offset + size))
-            placed=$((placed + size))
-          done
-          batches="${batches}]"
           # An empty matrix is a workflow error, so a filter that selects
           # nothing stops the run here with the reason instead.
           if [ "${total}" -eq 0 ]; then
             echo "::error::The suite filter selected no suite; the test matrix would be empty"
             exit 1
           fi
-          echo "Split ${total} suite(s) into ${shard_count} shard(s)"
+          per_shard=$((total / shard_count))
+          remainder=$((total % shard_count))
+          shards="${shard_count}"
+          if [ "${total}" -lt "${shard_count}" ]; then
+            shards="${total}"
+          fi
+          # Each shard is written as one JSON array of suite names, and the
+          # arrays are joined with commas between them. The size of a shard is
+          # decided by the shard's own index, not by how many suites are already
+          # placed: the leading `remainder` shards take one suite more.
+          batches="["
+          offset=0
+          shard=0
+          while [ "${shard}" -lt "${shards}" ]; do
+            size="${per_shard}"
+            if [ "${shard}" -lt "${remainder}" ]; then
+              size=$((size + 1))
+            fi
+            names=$(printf '%s\n' "${suites}" | sed -n "$((offset + 1)),$((offset + size))p" |
+                    sed 's/^/"/; s/$/"/' | sed ':a;N;$!ba;s/\n/,/g')
+            if [ "${shard}" -ne 0 ]; then
+              batches="${batches},"
+            fi
+            batches="${batches}[${names}]"
+            offset=$((offset + size))
+            shard=$((shard + 1))
+          done
+          batches="${batches}]"
+          echo "Split ${total} suite(s) into ${shards} shard(s)"
           echo "batches=${batches}" >> "$GITHUB_OUTPUT"
-          echo "batch_count=${shard_count}" >> "$GITHUB_OUTPUT"
+          echo "batch_count=${shards}" >> "$GITHUB_OUTPUT"
 
   build-test:
     name: build and test (${{ matrix.variant }})
@@ -782,45 +782,6 @@ jobs:
               ;;
           esac
           echo "tunnel_regression=${tunnel_regression}" >> "$GITHUB_OUTPUT"
-          SUITES="${suites}" python3 - <<'PY'
-          import json
-          import os
-
-          # Every suite the build-test job selected is handed to one shard of
-          # the test job. The count is fixed at twelve and the split follows
-          # the list order, so a suite that sorts early runs in an early shard
-          # and the shards of two runs hold the same suites in the same order;
-          # a hash over the names would scramble that order for no benefit,
-          # because the suites differ widely in duration and no assignment can
-          # balance them by name. A whole dispatch selects about 201 suites, so
-          # a shard holds 201 // 12 = 16 suites, and the 201 % 12 = 9 leading
-          # shards hold one more, for 17 suites each. With fewer suites than
-          # shards the split shrinks: the 201 // 12 = 16 ceiling becomes the
-          # suite count, the leading 201 % 12 = 9 shards become 201 % 16 = 9,
-          # and empty shards are dropped rather than started.
-          shard_count = 12
-          suites = os.environ.get("SUITES", "").split()
-          per_shard, remainder = divmod(len(suites), shard_count)
-          batches = []
-          start = 0
-          for index in range(shard_count):
-              size = per_shard + (1 if index < remainder else 0)
-              if size:
-                  batches.append(suites[start:start + size])
-              start += size
-          # The matrix reads one entry per shard, and the flat list names every
-          # suite once, so a suite missing from the batches shows up against
-          # the suite count instead of vanishing.
-          total = sum(len(batch) for batch in batches)
-          assert total == len(suites), f"{total} batched of {len(suites)} suites"
-          assert sorted(sum(batches, [])) == sorted(suites), "batches do not hold the suites once"
-          print(f"Split {len(suites)} suite(s) into {len(batches)} shard(s) of "
-                f"{per_shard} or {per_shard + 1}")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write("batches=" + json.dumps(batches, separators=(",", ":")) + "\n")
-              output.write("batch_count=" + str(len(batches)) + "\n")
-              output.write("suite_count=" + str(len(suites)) + "\n")
-          PY
 
       - name: Prepare exact ESP source variant and provenance
         if: contains(format(' {0} ', steps.tests.outputs.tunnel_regression), ' true ')
