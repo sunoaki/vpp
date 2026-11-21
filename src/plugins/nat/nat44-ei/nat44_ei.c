@@ -2643,9 +2643,9 @@ nat44_ei_del_static_mapping_internal (ip4_address_t l_addr,
 	    {
 	      local = pool_elt_at_index (m->locals, local - m->locals);
 	      fib_index = local->fib_index;
-	      /* the walk has to be over before the slot goes: the pool
-	       * hands a freed slot to the next elt, so a foreach that
-	       * went on would read the record after this one out of it */
+	      /* the walk ends at the record it removes: it has nothing
+	       * left to look for, and pool_put frees and poisons the slot
+	       * it is standing on */
 	      pool_put (m->locals, local);
 	      found = 1;
 	      break;
