@@ -2080,6 +2080,13 @@ lcp_router_route_mk_prefix (struct rtnl_route *r, fib_prefix_t *p)
  * the group mask, so using it for a route that names a source files the entry
  * in the group's bucket, where nothing looks for it and where it collides with
  * the (*,G) entry for the same group.
+ *
+ * A source is what makes a route (S,G): netlink can carry the attribute with
+ * an all-zero address, which names no source, and IP4_MFIB_MK_KEY() then folds
+ * nothing into the key. Such a route is the (*,G) entry and keeps the group's
+ * length; keying it at the host length would store it where the (S,G) lookup
+ * has a different key and where the group fallback of ip4_mfib_table_lookup()
+ * does not look, so nothing would find it.
  */
 static int
 lcp_router_route_mk_mprefix (struct rtnl_route *r, mfib_prefix_t *p)
@@ -2100,7 +2107,8 @@ lcp_router_route_mk_mprefix (struct rtnl_route *r, mfib_prefix_t *p)
       if (lcp_router_mk_addr46 (addr, &p->fp_src_addr, &fproto))
 	return -1;
       p->fp_proto = fproto;
-      p->fp_len = 2 * fib_prefix_get_host_length (fproto);
+      if (!ip46_address_is_zero (&p->fp_src_addr))
+	p->fp_len = 2 * fib_prefix_get_host_length (fproto);
     }
 
   return 0;
