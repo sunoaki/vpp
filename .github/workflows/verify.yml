@@ -1644,6 +1644,14 @@ jobs:
             touch "${records}/${suite}.status"
             trace="${RUNNER_TEMP}/suite-exec-${suite}.trace"
             rm -f "${trace}"
+            # The harness wipes these itself, but only from `reset`, which
+            # `$(FAILED_DIR): reset` reaches inside the suite's own make after
+            # vpp-install has run (test/Makefile:358, root Makefile:573). When
+            # that install fails the wipe never happens and the previous
+            # suite's failed_tests.txt would be read as this suite's. The wipe
+            # therefore happens here, before the suite starts, so it can
+            # neither inherit a file nor destroy this suite's own.
+            rm -rf "${FAILED_DIR:-/tmp/vpp-failed-unittests}"
             if [ "${suite}" = linux_cp ]; then
               recovery_log=/tmp/vpp-unittest-TestLinuxCPNetlinkRecovery/log.txt
               rm -f "${recovery_log}"
