@@ -15,6 +15,7 @@
 #include <vnet/mfib/mfib_signal.h>
 
 const static char * mfib_table_flags_strings[] = MFIB_TABLE_ATTRIBUTES;
+static const char *mfib_table_source_names[] = MFIB_SOURCE_NAMES;
 
 mfib_table_t *
 mfib_table_get (fib_node_index_t index,
@@ -843,6 +844,77 @@ mfib_table_sweep (u32 fib_index,
     vec_free(ctx.mftf_entries);
 }
 
+static walk_rc_t
+mfib_table_destroy_entries_cb (fib_node_index_t mfei, void *arg)
+{
+    fib_node_index_t **feis = arg;
+
+    vec_add1(*feis, mfei);
+
+    return (WALK_CONTINUE);
+}
+
+/*
+ * Remove the entries still in a table that is about to be freed.
+ *
+ * A table goes when its last lock does, and each source has its entries
+ * flushed as its own lock goes, so a source that held a lock has nothing left
+ * here. A source can install an entry without locking the table, though:
+ * MFIB_SOURCE_SPECIAL is what an interface's multicast enable and a plugin's
+ * own group routes use, and neither takes a lock. That source's entries stay
+ * when the table does, and the entry outlives the table that indexes it, so it
+ * is stranded with its path-list and interface set, naming a freed table. A
+ * debug build faults on the emptiness the destroyers assert; a release build
+ * leaks the entry. No source holds the table when the destroyers run, so no
+ * one is left to release what remains: take it with the table, and name the
+ * prefix and the source of each so the code that installs it can be found.
+ */
+void
+mfib_table_destroy_entries (mfib_table_t *mfib_table)
+{
+    fib_node_index_t *feis = NULL, *fei;
+
+    if (0 == mfib_table->mft_total_route_counts)
+        return;
+
+    mfib_table_walk(mfib_table->mft_index, mfib_table->mft_proto,
+                    mfib_table_destroy_entries_cb, &feis);
+
+    vec_foreach(fei, feis)
+    {
+        mfib_source_t src;
+        u32 sources;
+
+        /*
+         * Read every source of the entry before deleting any of them: the one
+         * that goes last frees the entry, and a lookup of a freed entry reads
+         * its pool slot's next occupant.
+         */
+        sources = 0;
+        FOREACH_MFIB_SOURCE(src)
+        {
+            if (mfib_entry_is_sourced(*fei, src))
+                sources |= (1 << src);
+        }
+
+        FOREACH_MFIB_SOURCE(src)
+        {
+            if (0 == (sources & (1 << src)))
+                continue;
+
+            clib_warning("%U table %u still holds %U from source %s "
+                         "when it is destroyed",
+                         format_fib_protocol, mfib_table->mft_proto,
+                         mfib_table->mft_table_id,
+                         format_mfib_entry, *fei, MFIB_ENTRY_FORMAT_BRIEF,
+                         mfib_table_source_names[src]);
+            mfib_table_entry_delete_index(*fei, src);
+        }
+    }
+
+    vec_free(feis);
+}
+
 static void
 mfib_table_destroy (mfib_table_t *mfib_table)
 {
@@ -872,6 +944,21 @@ mfib_table_unlock (u32 fib_index,
     mfib_table = mfib_table_get_or_null(fib_index, proto);
 
     if (NULL == mfib_table)
+        return;
+
+    /*
+     * A source that holds no lock has none to give back. The counts are
+     * unsigned, so a release of nothing wraps the source's count to ~0 and
+     * takes the total below the number of sources that do hold the table:
+     * the table is then destroyed while those sources still have their routes
+     * in it, and the flush for the source that never held it finds no count to
+     * reach. ip_table_delete releases the API/CLI source whenever an MFIB
+     * exists, including one another source created for a table the API added
+     * without an MFIB, so a release of nothing is a call this layer is given
+     * and must not let corrupt the accounting. The unicast counterpart
+     * (fib_table_lock_clear) treats the same call the same way.
+     */
+    if (0 == mfib_table->mft_locks[source])
         return;
 
     mfib_table->mft_locks[source]--;

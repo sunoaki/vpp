@@ -212,6 +212,12 @@ ip6_mfib_table_destroy (ip6_mfib_t *mfib)
     mfib_table_entry_delete_index(mfei, MFIB_SOURCE_DEFAULT_ROUTE);
 
     /*
+     * Anything else left here belongs to a source that never held a lock, so
+     * no unlock will flush it. Take it with the table.
+     */
+    mfib_table_destroy_entries(mfib_table);
+
+    /*
      * validate no more routes.
      */
     ASSERT(0 == mfib_table->mft_total_route_counts);
