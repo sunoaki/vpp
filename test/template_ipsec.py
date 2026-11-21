@@ -215,6 +215,9 @@ class TemplateIpsec(VppTestCase):
     tun_spd_id = 1
     tra_spd_id = 2
 
+    def open_node_counters(self):
+        return NodeCounterWindow(self)
+
     def ipsec_select_backend(self):
         """empty method to be overloaded when necessary"""
         pass
@@ -335,8 +338,37 @@ class IpsecTcpTests(IpsecTcp):
         self.verify_tcp_checksum()
 
 
+class NodeCounterWindow(object):
+    """The packets a node counter counted since the window opened.
+
+    The stats segment holds the whole-process total of a counter, which
+    `clear errors` leaves as it is: its text report subtracts the count a
+    thread recorded at the last clear, the segment adds up what every thread
+    counted. A test reads the total when its window opens, after the clear that
+    starts the traffic it counts, and reads each counter again when it asserts,
+    so that it counts its own packets rather than every packet the node handled
+    since the process started.
+    """
+
+    def __init__(self, test):
+        self.test = test
+        self.opened = {}
+
+    def read(self, node, counter):
+        path = self.test.get_node_counter_path(node, counter)
+        total = self.test.statistics.get_err_counter(path)
+        return total - self.opened.get(path, 0)
+
+    def open(self, node, counter):
+        path = self.test.get_node_counter_path(node, counter)
+        self.opened[path] = self.test.statistics.get_err_counter(path)
+
+
 class IpsecTra4(VppTestCase):
     """verify methods for Transport v4"""
+
+    def open_node_counters(self):
+        return NodeCounterWindow(self)
 
     def get_replay_counts(self, p):
         replay_node_name = "/err/%s/replay" % self.tra4_decrypt_node_name[0]
@@ -1030,6 +1062,7 @@ class IpsecTra4(VppTestCase):
         """ipsec v4 transport basic test"""
         self.vapi.cli("clear errors")
         self.vapi.cli("clear ipsec sa")
+        counters = self.open_node_counters()
         try:
             p = self.params[socket.AF_INET]
             send_pkts = self.gen_encrypt_pkts(
@@ -1067,10 +1100,10 @@ class IpsecTra4(VppTestCase):
         self.assertEqual(p.tra_sa_in.get_err("lost"), 0)
 
         self.assert_packet_counter_equal(
-            self.get_node_counter(self.tra4_encrypt_node_name, "rx_pkts"), count
+            counters.read(self.tra4_encrypt_node_name, "rx_pkts"), count
         )
         self.assert_packet_counter_equal(
-            self.get_node_counter(self.tra4_decrypt_node_name[0], "rx_pkts"), count
+            counters.read(self.tra4_decrypt_node_name[0], "rx_pkts"), count
         )
 
     def _verify_tra_anti_replay_algorithm_esn(self):
@@ -1923,6 +1956,7 @@ class IpsecTra6(VppTestCase):
     def verify_tra_basic6(self, count=1, payload_size=54):
         self.vapi.cli("clear errors")
         self.vapi.cli("clear ipsec sa")
+        counters = self.open_node_counters()
         try:
             p = self.params[socket.AF_INET6]
             send_pkts = self.gen_encrypt_pkts6(
@@ -1956,10 +1990,10 @@ class IpsecTra6(VppTestCase):
             pkts, count, "incorrect SA out counts: expected %d != %d" % (count, pkts)
         )
         self.assert_packet_counter_equal(
-            self.get_node_counter(self.tra6_encrypt_node_name, "rx_pkts"), count
+            counters.read(self.tra6_encrypt_node_name, "rx_pkts"), count
         )
         self.assert_packet_counter_equal(
-            self.get_node_counter(self.tra6_decrypt_node_name[0], "rx_pkts"), count
+            counters.read(self.tra6_decrypt_node_name[0], "rx_pkts"), count
         )
 
     def gen_encrypt_pkts_ext_hdrs6(
@@ -2107,7 +2141,9 @@ class IpsecTra46Tests(TemplateIpsec, IpsecTra4Tests, IpsecTra6Tests):
 class IpsecTun4(VppTestCase):
     """verify methods for Tunnel v4"""
 
-    def verify_counters4(self, p, count, n_frags=None, worker=None):
+    def verify_counters4(self, p, count, n_frags=None, worker=None, counters=None):
+        if counters is None:
+            counters = self.open_node_counters()
         if not n_frags:
             n_frags = count
         if hasattr(p, "spd_policy_in_any"):
@@ -2131,10 +2167,10 @@ class IpsecTun4(VppTestCase):
             )
 
         self.assert_packet_counter_equal(
-            self.get_node_counter(self.tun4_encrypt_node_name, "rx_pkts"), n_frags
+            counters.read(self.tun4_encrypt_node_name, "rx_pkts"), n_frags
         )
         self.assert_packet_counter_equal(
-            self.get_node_counter(self.tun4_decrypt_node_name[0], "rx_pkts"), count
+            counters.read(self.tun4_decrypt_node_name[0], "rx_pkts"), count
         )
 
     def verify_decrypted(self, p, rxs):
@@ -2184,6 +2220,7 @@ class IpsecTun4(VppTestCase):
         self.vapi.cli("clear errors")
         self.vapi.cli("clear ipsec counters")
         self.vapi.cli("clear ipsec sa")
+        counters = self.open_node_counters()
         if not n_rx:
             n_rx = count
         try:
@@ -2219,7 +2256,7 @@ class IpsecTun4(VppTestCase):
 
         self.logger.info(self.vapi.ppcli("show ipsec sa 0"))
         self.logger.info(self.vapi.ppcli("show ipsec sa 4"))
-        self.verify_counters4(p, count, n_rx)
+        self.verify_counters4(p, count, n_rx, counters=counters)
 
     def verify_tun_dropped_44(self, p, count=1, payload_size=64, n_rx=None):
         self.vapi.cli("clear errors")
@@ -2251,6 +2288,7 @@ class IpsecTun4(VppTestCase):
 
     def verify_tun_reass_44(self, p):
         self.vapi.cli("clear errors")
+        counters = self.open_node_counters()
         self.vapi.ip_reassembly_enable_disable(
             sw_if_index=self.tun_if.sw_if_index, enable_ip4=True
         )
@@ -2279,7 +2317,7 @@ class IpsecTun4(VppTestCase):
             self.logger.info(self.vapi.ppcli("show error"))
             self.logger.info(self.vapi.ppcli("show ipsec all"))
 
-        self.verify_counters4(p, 1, 1)
+        self.verify_counters4(p, 1, 1, counters=counters)
         self.vapi.ip_reassembly_enable_disable(
             sw_if_index=self.tun_if.sw_if_index, enable_ip4=False
         )
@@ -2287,6 +2325,7 @@ class IpsecTun4(VppTestCase):
     def verify_tun_64(self, p, count=1):
         self.vapi.cli("clear errors")
         self.vapi.cli("clear ipsec sa")
+        counters = self.open_node_counters()
         try:
             send_pkts = self.gen_encrypt_pkts6(
                 p,
@@ -2328,7 +2367,7 @@ class IpsecTun4(VppTestCase):
             self.logger.info(self.vapi.ppcli("show error"))
             self.logger.info(self.vapi.ppcli("show ipsec all"))
 
-        self.verify_counters4(p, count)
+        self.verify_counters4(p, count, counters=counters)
 
     def verify_keepalive(self, p):
         # the sizeof Raw is calculated to pad to the minimum ehternet
@@ -2388,7 +2427,9 @@ class IpsecTun4Tests(IpsecTun4):
 class IpsecTun6(VppTestCase):
     """verify methods for Tunnel v6"""
 
-    def verify_counters6(self, p_in, p_out, count, worker=None):
+    def verify_counters6(self, p_in, p_out, count, worker=None, counters=None):
+        if counters is None:
+            counters = self.open_node_counters()
         if hasattr(p_in, "tun_sa_in"):
             pkts = p_in.tun_sa_in.get_stats(worker)["packets"]
             self.assertEqual(
@@ -2402,10 +2443,10 @@ class IpsecTun6(VppTestCase):
                 "incorrect SA out counts: expected %d != %d" % (count, pkts),
             )
         self.assert_packet_counter_equal(
-            self.get_node_counter(self.tun6_encrypt_node_name, "rx_pkts"), count
+            counters.read(self.tun6_encrypt_node_name, "rx_pkts"), count
         )
         self.assert_packet_counter_equal(
-            self.get_node_counter(self.tun6_decrypt_node_name[0], "rx_pkts"), count
+            counters.read(self.tun6_decrypt_node_name[0], "rx_pkts"), count
         )
 
     def verify_decrypted6(self, p, rxs):
@@ -2471,9 +2512,11 @@ class IpsecTun6(VppTestCase):
         self.verify_drop_tun_tx_66(p_in, count=count, payload_size=payload_size)
         self.verify_drop_tun_rx_66(p_in, count=count, payload_size=payload_size)
 
-    def verify_tun_66(self, p_in, p_out=None, count=1, payload_size=64):
+    def verify_tun_66(self, p_in, p_out=None, count=1, payload_size=64, counters=None):
         self.vapi.cli("clear errors")
         self.vapi.cli("clear ipsec sa")
+        if counters is None:
+            counters = self.open_node_counters()
         if not p_out:
             p_out = p_in
         try:
@@ -2507,10 +2550,11 @@ class IpsecTun6(VppTestCase):
         finally:
             self.logger.info(self.vapi.ppcli("show error"))
             self.logger.info(self.vapi.ppcli("show ipsec all"))
-        self.verify_counters6(p_in, p_out, count)
+        self.verify_counters6(p_in, p_out, count, counters=counters)
 
     def verify_tun_reass_66(self, p):
         self.vapi.cli("clear errors")
+        counters = self.open_node_counters()
         self.vapi.ip_reassembly_enable_disable(
             sw_if_index=self.tun_if.sw_if_index, enable_ip6=True
         )
@@ -2542,7 +2586,7 @@ class IpsecTun6(VppTestCase):
         finally:
             self.logger.info(self.vapi.ppcli("show error"))
             self.logger.info(self.vapi.ppcli("show ipsec all"))
-        self.verify_counters6(p, p, 1)
+        self.verify_counters6(p, p, 1, counters=counters)
         self.vapi.ip_reassembly_enable_disable(
             sw_if_index=self.tun_if.sw_if_index, enable_ip6=False
         )
@@ -2551,6 +2595,7 @@ class IpsecTun6(VppTestCase):
         """ipsec 4o6 tunnel basic test"""
         self.vapi.cli("clear errors")
         self.vapi.cli("clear ipsec sa")
+        counters = self.open_node_counters()
         try:
             send_pkts = self.gen_encrypt_pkts(
                 p,
@@ -2590,7 +2635,7 @@ class IpsecTun6(VppTestCase):
         finally:
             self.logger.info(self.vapi.ppcli("show error"))
             self.logger.info(self.vapi.ppcli("show ipsec all"))
-        self.verify_counters6(p, p, count)
+        self.verify_counters6(p, p, count, counters=counters)
 
     def verify_keepalive(self, p):
         # the sizeof Raw is calculated to pad to the minimum ehternet
