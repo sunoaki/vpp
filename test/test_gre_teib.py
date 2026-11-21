@@ -12,7 +12,7 @@ from config import config
 from framework import VppTestCase
 from asfframework import VppTestRunner
 from vpp_gre_interface import VppGreInterface
-from vpp_ip_route import VppIpRoute, VppIpTable, VppRoutePath
+from vpp_ip_route import VppIpRoute, VppIpTable, VppRoutePath, find_route
 from vpp_papi import VppEnum
 from vpp_teib import VppTeib
 
@@ -108,50 +108,63 @@ class TestGreTeib(VppTestCase):
         self.assertTrue(entry.query_vpp_config())
         return entry
 
-    def bind_pg1_to_table(self, is_ip6, table_id):
-        """bind pg1's family to a table, failing here if VPP declines
+    def bind_to_table(self, interface, is_ip6, table_id):
+        """bind the interface's family to a table, failing here if VPP declines
 
         ip_table_bind answers ADDRESS_FOUND_FOR_INTERFACE for every bind, the
         one back to table 0 included, while the interface still holds a global
-        address of the family, and setUp leaves pg1 holding one of each. So the
-        address comes off before the bind and goes back on after it, and the
-        interface keeps it in whichever table it was moved to.
+        address of the family. So an address the family has comes off before
+        the bind and goes back on after it, and the interface keeps it in
+        whichever table it was moved to. The flags are left alone, so teardown
+        still removes the address. The returned value is asserted, so a refusal
+        fails here, and a zero also proves the destination table existed:
+        ip_table_bind answers NO_SUCH_FIB for a table that does not.
         """
-        interface = self.pg1
         address = self.vapi.sw_interface_add_del_address
         prefix = interface.local_ip6_prefix if is_ip6 else interface.local_ip4_prefix
-        address(sw_if_index=interface.sw_if_index, prefix=prefix, is_add=0)
+        configured = interface.has_ip6_config if is_ip6 else interface.has_ip4_config
+        if configured:
+            address(sw_if_index=interface.sw_if_index, prefix=prefix, is_add=0)
         try:
             bind = self.vapi.sw_interface_set_table(
                 interface.sw_if_index, 1 if is_ip6 else 0, table_id
             )
             self.assertEqual(bind.retval, 0)
         finally:
-            address(sw_if_index=interface.sw_if_index, prefix=prefix)
+            if configured:
+                address(sw_if_index=interface.sw_if_index, prefix=prefix)
 
     def add_peer_raw(self, tunnel, is_ip6, peer):
         """add peer the way make_peer does, without registering or checking"""
         next_hop = self.pg0.remote_ip6 if is_ip6 else self.pg0.remote_ip4
         return VppTeib(self, tunnel, peer, next_hop).add_vpp_config()
 
-    def peer_has_adj_fib(self, is_ip6, table_id, peer):
-        """whether peer has an adj fib on pg1 in the table by that table id"""
-        for route in self.vapi.ip_route_dump(table_id, bool(is_ip6)):
-            if (
-                str(route.route.prefix) == peer
-                and route.route.paths[0].sw_if_index == self.pg1.sw_if_index
-            ):
-                return True
-        return False
+    def peer_has_adj_fib(self, is_ip6, table_id, peer, tunnel):
+        """whether peer has an adj fib on the tunnel in that table
+
+        teib_adj_fib_add installs the adj fib on the TEIB entry's interface,
+        which is the tunnel, so the tunnel is what the path has to name.
+        """
+        return find_route(
+            self,
+            peer,
+            128 if is_ip6 else 32,
+            table_id,
+            sw_if_index=tunnel.sw_if_index,
+        )
 
     def test_gre_teib_unbound_peer(self):
         """a peer's adj fib leaves its own table once the binding is gone
 
+        A TEIB entry's adj fib is installed on the tunnel the entry is keyed on,
+        in the table that tunnel is bound to, so the tunnel is what the
+        subtests bind and what the adj fib has to name.
+
         An unbind only removes the address, so the peer added before it stays,
-        in table 1, while the interface is bound to table 0 again by the time
-        the peer goes. Deleting the peer then has to take its adj fib out of
-        table 1, and release what it holds there, rather than out of table 0,
-        which is where the interface is bound by then.
+        in table 1, while the tunnel is bound to table 0 again by the time the
+        peer goes. Deleting the peer then has to take its adj fib out of table
+        1, and release what it holds there, rather than out of table 0, which is
+        where the tunnel is bound by then.
 
         Before the fix the delete looked the adj fib up in table 0, where there
         was nothing to remove, so the path stayed in table 1 and the
@@ -160,33 +173,33 @@ class TestGreTeib(VppTestCase):
         existing entry and leaves the adj fib as it was.
 
         Every subTest stands on its own: table 1 is created empty for it, and
-        the family under test is bound back to table 0 before it is bound to
-        table 1, because VPP refuses to move an interface that still has a
-        global address, and setUp leaves pg1 holding one of each family. The
-        bind to table 1 is asserted, so a refusal fails here instead of
-        leaving the peer in table 0.
+        the tunnel named here is the one that moves, since the adj fib follows
+        it. Its IPv4 address comes off for the bind because VPP refuses to move
+        an interface that still has a global address, and the bind to table 1
+        is asserted, so a refusal fails here instead of leaving the peer in
+        table 0.
         """
         for is_ip6 in (False, True):
             with self.subTest(is_ip6=is_ip6):
                 table = VppIpTable(self, 1, is_ip6=is_ip6).add_vpp_config()
                 try:
-                    self.bind_pg1_to_table(is_ip6, 0)
-                    self.bind_pg1_to_table(is_ip6, 1)
                     tunnel = self.make_tunnel(is_ip6, 0x12345678, multipoint=True)
+                    self.bind_to_table(tunnel, is_ip6, 1)
+                    self.assert_tunnels(tunnel)
                     peer = "198.19.0.4" if not is_ip6 else "2001:db8::4"
                     entry = self.make_peer(tunnel, is_ip6, peer)
-                    self.assertTrue(self.peer_has_adj_fib(is_ip6, 1, peer))
+                    self.assertTrue(self.peer_has_adj_fib(is_ip6, 1, peer, tunnel))
                     with self.assertRaisesRegex(Exception, "ALREADY_EXISTS"):
                         self.add_peer_raw(tunnel, is_ip6, peer)
-                    self.bind_pg1_to_table(is_ip6, 0)
+                    self.bind_to_table(tunnel, is_ip6, 0)
                     entry.remove_vpp_config()
                     self.assertFalse(entry.query_vpp_config())
-                    self.assertFalse(self.peer_has_adj_fib(is_ip6, 1, peer))
-                    self.bind_pg1_to_table(is_ip6, 1)
+                    self.assertFalse(self.peer_has_adj_fib(is_ip6, 1, peer, tunnel))
+                    self.bind_to_table(tunnel, is_ip6, 1)
                     self.assertTrue(
                         self.add_peer_raw(tunnel, is_ip6, peer).query_vpp_config()
                     )
-                    self.bind_pg1_to_table(is_ip6, 0)
+                    self.bind_to_table(tunnel, is_ip6, 0)
                     self.delete_tunnel(tunnel)
                 finally:
                     self.registry.unregister(table.object_id(), self.logger)
@@ -198,7 +211,9 @@ class TestGreTeib(VppTestCase):
         The adj fib is only ever created for a peer whose prefix the table
         does not source yet, so a static route to the peer added first makes
         that same adj fib a no-op. Deleting the peer then has to leave the
-        static route alone, and release nothing, since nothing was taken.
+        static route alone, and release nothing, since nothing was taken. The
+        table the peer goes in is the one the tunnel is bound to, so that is
+        the table the route is added to and the tunnel that is bound.
 
         Before the fix the delete went at table 0, where VPP then unlocked a
         live table whose FIB_SOURCE_ADJ count was already zero; that count is
@@ -208,28 +223,30 @@ class TestGreTeib(VppTestCase):
         overwrites or drops the peer's source.
 
         Every subTest stands on its own: table 1 is created empty for it, and
-        the family under test is bound back to table 0 before it is bound to
-        table 1, because VPP refuses to move an interface that still has a
-        global address, and setUp leaves pg1 holding one of each family. The
-        bind to table 1 is asserted.
+        the tunnel named here is the one that moves, since the adj fib follows
+        it. Its IPv4 address comes off for the bind because VPP refuses to move
+        an interface that still has a global address, and the bind to table 1
+        is asserted. The route's next hop is picked by family, since a next hop
+        of the other family is not a path VPP accepts.
         """
         for is_ip6 in (False, True):
             with self.subTest(is_ip6=is_ip6):
                 table = VppIpTable(self, 1, is_ip6=is_ip6).add_vpp_config()
                 try:
-                    self.bind_pg1_to_table(is_ip6, 0)
-                    self.bind_pg1_to_table(is_ip6, 1)
+                    tunnel = self.make_tunnel(is_ip6, 0x12345678, multipoint=True)
+                    self.bind_to_table(tunnel, is_ip6, 1)
+                    self.assert_tunnels(tunnel)
                     peer = "198.19.0.5" if not is_ip6 else "2001:db8::5"
+                    next_hop = self.pg0.remote_ip6 if is_ip6 else self.pg0.remote_ip4
                     route = VppIpRoute(
                         self,
                         peer,
                         128 if is_ip6 else 32,
-                        [VppRoutePath(self.pg0.remote_ip4, self.pg0.sw_if_index)],
+                        [VppRoutePath(next_hop, self.pg0.sw_if_index)],
                         table_id=1,
                     ).add_vpp_config()
-                    tunnel = self.make_tunnel(is_ip6, 0x12345678, multipoint=True)
                     entry = self.make_peer(tunnel, is_ip6, peer)
-                    self.bind_pg1_to_table(is_ip6, 0)
+                    self.bind_to_table(tunnel, is_ip6, 0)
                     entry.remove_vpp_config()
                     self.assertFalse(entry.query_vpp_config())
                     self.assertTrue(route.query_vpp_config())
