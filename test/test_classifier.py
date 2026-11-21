@@ -957,6 +957,22 @@ class TestClassifierComplex(TestClassifier):
         self.pg2.assert_nothing_captured(remark="packets forwarded")
         self.pg3.assert_nothing_captured(remark="packets forwarded")
 
+    def installed_input_acl_table(self, intf):
+        """Return the ip4 input ACL table the interface reads, or None.
+
+        `show inacl type ip4` prints one row per interface that holds a
+        table, as the interface index, the table index and the interface
+        name.  Unset interfaces are left out, and the header row's second
+        column is not a number, so a row is selected by its first column.
+        """
+
+        for line in self.vapi.ppcli("show inacl type ip4").splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[0].isdigit():
+                if int(fields[0]) == intf.sw_if_index:
+                    return int(fields[1])
+        return None
+
     def test_iacl_trailing_vectors(self):
         """Input ACL over six, seven and eight match vectors
 
@@ -969,7 +985,9 @@ class TestClassifierComplex(TestClassifier):
             - Create an IPv4 stream for pg0 -> pg1.
             - For each width, create an iACL table over ethernet, IP, UDP
               and payload, add a session for the stream's key and verify it
-              forwards.
+              forwards.  Installing the width's table must also replace the
+              previous width's on the same interface, which the interface's
+              shown table is asserted to be.
             - Send a packet that differs from the key in the last vector
               alone and verify it is dropped.
         """
@@ -1082,6 +1100,20 @@ class TestClassifierComplex(TestClassifier):
                 key_name = "trailing_%d" % match_n_vectors
                 self.acl_tbl_idx[key_name] = table_index
                 self.acl_active_table = key_name
+
+                # An interface holds one table of each type, so installing
+                # this width's table has to displace the previous width's.
+                # The call used to report success while keeping the table
+                # already installed, and the loop then measured the previous
+                # width's compare instead of this one.  Pin the table the
+                # dataplane will read, so an install that is accepted and
+                # then ignored fails here rather than passing on the wrong
+                # table.
+                self.assertEqual(
+                    self.installed_input_acl_table(self.pg0),
+                    table_index,
+                    "the interface must read this width's table",
+                )
 
                 hits_pre = self.statistics.get_err_counter(hit_path)
                 misses_pre = self.statistics.get_err_counter(miss_path)

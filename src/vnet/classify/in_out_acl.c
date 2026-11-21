@@ -108,11 +108,21 @@ vnet_set_in_out_acl_intfc (vlib_main_t *vm, u32 sw_if_index,
 	  return VNET_API_ERROR_NO_SUCH_TABLE;
 	}
 
-      /* Return ok on ADD operaton if feature is already enabled */
+      /* The feature is already enabled on this interface, so there is
+	 nothing to enable.  The table the caller names still has to be the
+	 one the dataplane looks up: an interface holds a single table of
+	 each type, and returning here without storing the new index left
+	 the previous table enforcing while the call reported success, so a
+	 caller that replaced an ACL silently kept the old rules.  Only this
+	 table type is done, so the types after it in the same call still
+	 run. */
       if (is_add &&
 	  am->classify_table_index_by_sw_if_index[is_output][ti][sw_if_index]
 	  != ~0)
-	return 0;
+	{
+	  am->classify_table_index_by_sw_if_index[is_output][ti][sw_if_index] = acl[ti];
+	  continue;
+	}
 
       rv = vnet_in_out_acl_feature_enable (am, sw_if_index, ti, is_add,
 					   is_output);
