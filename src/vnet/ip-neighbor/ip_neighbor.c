@@ -220,8 +220,9 @@ ip_neighbor_list_remove (ip_neighbor_t * ipn)
 }
 
 /*
- * Every path that changes an entry's flags or its MAC ends here, which makes
- * this the one place that keeps the time sorted list in step with the entry.
+ * Every path that changes an entry's kind (dynamic vs static) ends here, which
+ * makes this the one place that keeps the age-list membership in step with the
+ * entry.
  *
  * That list is the age queue: the age process probes the entries on it and
  * destroys the ones that stay silent, and ip_neighbor_force_reuse() takes its
