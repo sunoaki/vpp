@@ -821,8 +821,11 @@ jobs:
           def blob(data):
               return hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
 
-          output = Path(os.environ["RUNNER_TEMP"]) / "esp-evidence"
-          output.mkdir()
+          # Two steps write ESP evidence: this one produces the source
+          # provenance under control/, and the suite loop writes what it ran
+          # under suite/. Neither step can remove the other's files.
+          output = Path(os.environ["RUNNER_TEMP"]) / "esp-evidence" / "control"
+          output.mkdir(parents=True, exist_ok=True)
           production = Path("src/vnet/tunnel/tunnel_dp.h")
           test = Path("test/test_ipsec_esp.py")
           before = production.read_bytes()
@@ -995,8 +998,8 @@ jobs:
         if: matrix.variant == 'original-df'
         run: |
           set -eu
-          evidence="${RUNNER_TEMP}/esp-evidence"
-          mkdir "${RUNNER_TEMP}/esp-observer"
+          evidence="${RUNNER_TEMP}/esp-evidence/control"
+          mkdir -p "${evidence}" "${RUNNER_TEMP}/esp-observer"
           python3 - <<'PY'
           import os
           from pathlib import Path
@@ -1080,7 +1083,8 @@ jobs:
             set +e
             if [ "${suite}" = ipsec_esp ] && [ '${{ steps.tests.outputs.tunnel_regression }}' = true ]; then
               rm -f /tmp/vpp-unittest-TestIpsecEspTun/log.txt
-              evidence="${RUNNER_TEMP}/esp-evidence"
+              evidence="${RUNNER_TEMP}/esp-evidence/suite"
+              mkdir -p "${evidence}"
               make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST="${suite}" test-debug 2>&1 |
                 (ulimit -f 32768; tee "${evidence}/command.log")
               statuses=("${PIPESTATUS[@]}")
@@ -1094,7 +1098,7 @@ jobs:
           source = Path("/tmp/vpp-unittest-TestIpsecEspTun/log.txt")
           if not source.is_file() or source.is_symlink() or source.stat().st_size > 8 * 1024 * 1024:
               raise SystemExit("Missing, unsafe or oversized ESP named log")
-          (Path(os.environ["RUNNER_TEMP"]) / "esp-evidence/named-test.log").write_bytes(source.read_bytes())
+          (Path(os.environ["RUNNER_TEMP"]) / "esp-evidence/suite/named-test.log").write_bytes(source.read_bytes())
           PY
               esp_log_status=$?
               [ "${esp_log_status}" = 0 ] || suite_status=1
@@ -1229,21 +1233,24 @@ jobs:
           import re
           import subprocess
 
-          output = Path(os.environ["RUNNER_TEMP"]) / "esp-evidence"
-          output.mkdir(exist_ok=True)
+          root = Path(os.environ["RUNNER_TEMP"]) / "esp-evidence"
+          control = root / "control"
+          suite = root / "suite"
+          for directory in (control, suite):
+              directory.mkdir(parents=True, exist_ok=True)
           result = {"accepted": False, "build": os.environ["BUILD_OUTCOME"]}
           try:
-              if not (output / "named-test.log").exists():
+              if not (suite / "named-test.log").exists():
                   source = Path("/tmp/vpp-unittest-TestIpsecEspTun/log.txt")
                   assert source.is_file() and not source.is_symlink(), "missing named ESP log"
                   assert source.stat().st_size <= 8 * 1024 * 1024, "named ESP log exceeds 8 MiB"
-                  (output / "named-test.log").write_bytes(source.read_bytes())
-              provenance = json.loads((output / "provenance.json").read_text())
-              manifest = (output / "built-source-manifest.txt").read_bytes()
+                  (suite / "named-test.log").write_bytes(source.read_bytes())
+              provenance = json.loads((control / "provenance.json").read_text())
+              manifest = (control / "built-source-manifest.txt").read_bytes()
               assert hashlib.sha256(manifest).hexdigest() == provenance["built_manifest_sha256"]
               assert manifest == subprocess.check_output(["git", "ls-tree", "-r", "-z", provenance["built_source_tree"]])
               assert subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip() == provenance["checkout"]
-              version_bytes = (output / "build-version.raw").read_bytes()
+              version_bytes = (control / "build-version.raw").read_bytes()
               version_info = provenance["build_version"]
               assert 0 < len(version_bytes) <= 4096, "missing or oversized build version evidence"
               version_blob = hashlib.sha1(b"blob " + str(len(version_bytes)).encode() + b"\0" + version_bytes).hexdigest()
@@ -1262,20 +1269,23 @@ jobs:
                   data = Path(path).read_bytes()
                   actual = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
                   assert actual == provenance[key], "post-build source drift: " + path
-              raw = (output / "command.log").read_text()
-              named = (output / "named-test.log").read_text()
-              rc = int((output / "raw-returncode.txt").read_text())
+              raw = (suite / "command.log").read_text()
+              named = (suite / "named-test.log").read_text()
+              rc = int((suite / "raw-returncode.txt").read_text())
               result["raw_returncode"] = rc
-              assert int((output / "capture-returncode.txt").read_text()) == 0
+              assert int((suite / "capture-returncode.txt").read_text()) == 0
               assert os.environ["BUILD_OUTCOME"] == "success", "build did not succeed"
               # The suite loop records the ipsec_esp result from that suite's
               # three statuses, so this never reads a step outcome for a step
               # that does not exist under these names.
-              suite_outcome = (output / "esp-suite-outcome.txt").read_text().strip()
+              suite_outcome = (suite / "esp-suite-outcome.txt").read_text().strip()
               result["ipsec_esp_suite"] = suite_outcome
               assert suite_outcome == "success", f"ipsec_esp suite recorded {suite_outcome!r}"
-              assert (output / "command.txt").stat().st_size > 0 and raw and named
-              assert (output / "command.log").stat().st_size <= 32 * 1024 * 1024
+              assert (control / "command.txt").stat().st_size > 0
+              assert (control / "command.log").stat().st_size <= 32 * 1024 * 1024
+              assert (suite / "command.txt").stat().st_size > 0
+              assert (suite / "command.log").stat().st_size <= 32 * 1024 * 1024
+              assert raw and named
               callbacks = re.findall(r" --- (add\w+)\(\) TestIpsecEspTun\.test_tun_df44\(", named)
               if os.environ["ESP_VARIANT"] == "fixed":
                   assert rc == 0 and callbacks == ["addSuccess"], "missing exact positive success"
@@ -1285,7 +1295,7 @@ jobs:
                   assert provenance["replacement_count"] == 1
                   assert provenance["built_header"] == provenance["expected_negative"]
                   events = []
-                  for path in sorted(output.glob("subtests-*.jsonl")):
+                  for path in sorted(control.glob("subtests-*.jsonl")):
                       assert path.stat().st_size <= 1024 * 1024
                       events.extend(json.loads(line) for line in path.read_text().splitlines())
                   expected = {(flag, tos, df, size) for flag, tos in ((1, 0), (1, 171), (13, 171), (0, 171))
@@ -1310,7 +1320,7 @@ jobs:
                   assert "AssertionError: 49151 != 0" in first["trace"]
                   assert "FAIL:" in raw and "AssertionError: 49151 != 0" in raw
                   assert not re.search(r"^ERROR:|CoreDump|TimeoutExpired", raw, re.MULTILINE)
-                  (output / "checksum-witness.txt").write_text(first["trace"])
+                  (control / "checksum-witness.txt").write_text(first["trace"])
                   result["subtests"] = len(events)
                   result["checksum_failures"] = len(failures)
               result["accepted"] = True
@@ -1318,7 +1328,7 @@ jobs:
               result["error"] = str(error)
               raise
           finally:
-              (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+              (control / "result.json").write_text(json.dumps(result, indent=2) + "\n")
           PY
 
       - name: Upload ESP evidence
