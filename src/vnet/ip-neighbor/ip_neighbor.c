@@ -1736,11 +1736,15 @@ ip_neighbor_add_del_sw_interface (vnet_main_t *vnm, u32 sw_if_index,
       /*
        * Called for every interface as it appears, so a refusal is countable
        * from the first learn on the interface rather than only after the
-       * first address is configured on it.
+       * first address is configured on it. The index is zeroed as well as
+       * validated: an interface that takes over an sw_if_index from a deleted
+       * one would otherwise inherit its refusal count, which is a false
+       * positive in the signal this adds.
        */
       FOREACH_IP_NEIGHBOR_IF_CTR (type)
       {
 	vlib_validate_simple_counter (&ip_neighbor_if_counters[type], sw_if_index);
+	vlib_zero_simple_counter (&ip_neighbor_if_counters[type], sw_if_index);
       }
     }
 

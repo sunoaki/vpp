@@ -22,6 +22,7 @@ from vpp_ip_route import (
 )
 from vpp_papi import VppEnum, MACAddress
 from vpp_ip import VppIpPuntRedirect
+from vpp_lo_interface import VppLoInterface
 from vpp_sub_interface import VppDot1ADSubint, VppDot1QSubint
 
 from scapy.packet import Raw
@@ -2050,8 +2051,9 @@ class ARPTestCase(VppTestCase):
         # the learns that get refused arrive as ARP frames on pg2, and ARP is
         # only processed on an interface that has an address: without one the
         # frames are dropped at arp-disabled and nothing is ever refused. The
-        # address also puts the static entry's adj-fib in a real table, which
-        # is what makes the gratuitous ARP match it and reach the learn.
+        # address also installs the connected route that covers the static
+        # entry, which is what makes the gratuitous ARP match the entry's
+        # adj-fib and reach the learn.
         #
         self.pg2.config_ip4()
 
@@ -2188,6 +2190,69 @@ class ARPTestCase(VppTestCase):
         #
         static_arp.remove_vpp_config()
         self.pg2.unconfig_ip4()
+
+    def test_refused_learn_counter_reused_sw_if_index(self):
+        """An interface that reuses an sw_if_index starts at zero refused learns
+
+        The refused-learn counter is per sw_if_index, and sw_if_index values
+        are returned to the interface pool on delete and handed to the next
+        interface that is created. Validating the counter on creation only
+        grows the vector and zeroes the elements it adds, so without an
+        explicit zero the new interface inherits the previous one's count and
+        reports a refusal that never happened on it.
+
+        A refusal needs no packets: a static entry followed by a learn with a
+        different MAC and without the static flag takes the refusal branch.
+        """
+        e = VppEnum.vl_api_ip_neighbor_flags_t
+        addr = "10.99.99.1"
+
+        lo_first = VppLoInterface(self)
+        first_index = lo_first.sw_if_index
+
+        self.vapi.ip_neighbor_add_del(
+            first_index,
+            MACAddress("02:00:00:00:00:01"),
+            addr,
+            is_add=1,
+            flags=e.IP_API_NEIGHBOR_FLAG_STATIC,
+        )
+
+        #
+        # the learn differs from the static entry and does not carry the
+        # static flag, so it is refused and counted
+        #
+        with self.vapi.assert_known_api_retval(
+            retvals=[self.VNET_API_ERROR_ENTRY_ALREADY_EXISTS]
+        ):
+            reply = self.vapi.ip_neighbor_add_del(
+                first_index,
+                MACAddress("02:00:00:00:00:02"),
+                addr,
+                is_add=1,
+                flags=e.IP_API_NEIGHBOR_FLAG_NONE,
+            )
+        self.assertEqual(self.VNET_API_ERROR_ENTRY_ALREADY_EXISTS, reply.retval)
+        self.assertEqual(1, self.get_refused_learns(lo_first))
+
+        #
+        # the interface goes away and its index comes back with the next one
+        #
+        lo_first.remove_vpp_config()
+
+        lo_second = VppLoInterface(self)
+        try:
+            self.assertEqual(first_index, lo_second.sw_if_index)
+            self.assertEqual(0, self.get_refused_learns(lo_second))
+        finally:
+            lo_second.remove_vpp_config()
+
+        #
+        # the static entry went with the interface it was added on
+        #
+        self.assertFalse(
+            find_nbr(self, first_index, addr, is_static=1),
+        )
 
     def test_arp_incomplete(self):
         """ARP Incomplete"""

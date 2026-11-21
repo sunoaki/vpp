@@ -51,12 +51,12 @@ Aging is off by default. Both address families start with an age of 0, which
 means no neighbour is ever probed or expired: a dynamic entry stays until
 the interface address that covers it is removed, the interface goes down, the
 control plane deletes it, or the table it resolves through is deleted. The
-counter of neighbours per interface is bounded by *limit* instead (50000 per
-address family by default), and with aging off a full table refuses new learns
-rather than expiring old ones unless *recycle* is set. Aging is enabled per
-address family with ``set ip neighbor-config ip4|ip6 age <seconds>``, and an
-entry is then probed once its age has passed and destroyed after three
-unanswered probes.
+total number of neighbours per address family is bounded by *limit* instead
+(50000 by default), counted across every interface and every table, and with
+aging off reaching that limit refuses new learns rather than expiring old ones
+unless *recycle* is set. Aging is enabled per address family with
+``set ip neighbor-config ip4|ip6 age <seconds>``, and an entry is then probed
+once its age has passed and destroyed after three unanswered probes.
 
 Moving an address from one interface to another is two operations, and the
 order decides what happens to the neighbours of the old interface. Deleting
