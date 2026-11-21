@@ -1238,8 +1238,10 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq sudo make git bash iproute2
 
-      # strace reads the exec calls of the suite process, which is how the
-      # record names the test methods a suite had entered when it stopped.
+      # strace is installed for the suite monitor the loop starts, but its
+      # attach is denied in this container (see record-suite.py), so the
+      # records do not carry a trace today. The install stays because the
+      # monitor's availability is what the record reports on.
       - name: Install the suite monitor
         run: |
           apt-get update -qq
@@ -1413,16 +1415,17 @@ jobs:
       # Every suite of this shard is run by a recorder step and a fixer step,
       # and the checks that read a suite's own evidence are helper scripts, so
       # the suite loop stays shell and each check is a program with arguments.
-      # A suite runs as a background child so the monitor records the test
-      # methods it is inside while it runs. The recorder writes each suite's
-      # record as that suite ends; the fixer runs afterwards for a record the
-      # recorder never wrote, for example because the runner stopped the step
-      # first.
+      # A suite runs as a background child so a monitor can watch it; that
+      # monitor's attach is refused in this container, which the record states
+      # rather than hides. The recorder writes each suite's record as that
+      # suite ends; the fixer runs afterwards for a record the recorder never
+      # wrote, for example because the runner stopped the step first.
       - name: Write the shard's helper programs
         run: |
           set -eu
           cat > "${RUNNER_TEMP}/record-suite.py" <<'RECORDER'
           import json
+          import os
           import sys
           from datetime import datetime, timezone
           from pathlib import Path
@@ -1433,19 +1436,37 @@ jobs:
           output_path, record_path = Path(sys.argv[1]), Path(sys.argv[2])
           trace_path = Path(sys.argv[3])
           suite, status = sys.argv[4], int(sys.argv[5])
-          timeouts = (sum(1 for line in trace_path.read_text(errors="replace").splitlines()
-                          if "TimeoutExpired" in line) if trace_path.is_file() else 0)
-          failed = Path("/tmp/vpp-unittest-__main__/failed_tests.txt")
-          names = ([line.strip() for line in failed.read_text().splitlines() if line.strip()]
-                   if failed.is_file() and not failed.is_symlink() else [])
+          # The harness writes the failed test methods to one comma-separated
+          # line under the directory test/Makefile:17 names. It rewrites that
+          # file only on the last retry attempt, and leaves it alone when the
+          # last attempt has no failures, so a file from an earlier suite would
+          # be attributed to a later passing one. It is therefore read only for
+          # a suite that failed here.
+          failed_dir = Path(os.environ.get("FAILED_DIR", "/tmp/vpp-failed-unittests"))
+          failed = failed_dir / "failed_tests.txt"
+          names = []
+          if status != 0 and failed.is_file() and not failed.is_symlink():
+              names = [name.strip() for line in failed.read_text().splitlines()
+                       for name in line.split(",") if name.strip()]
+          # strace creates the output file before it attaches, so an empty file
+          # means the attach was refused, not that anything was traced, and
+          # only a non-empty one counts as recorded.
+          #
+          # The attach is refused on the runner: the container holds no
+          # CAP_SYS_PTRACE and the target is a sibling of strace rather than its
+          # descendant, so yama's ptrace_scope denies it. Adding that capability
+          # to both container option lists would make the attach succeed, and is
+          # not done: it widens what any process in the container may inspect,
+          # for a field nothing reads. The record keeps saying "unavailable",
+          # which is true.
+          recorded = trace_path.is_file() and trace_path.stat().st_size > 0
           record = {
               "test": suite,
               "lifecycle": "finished",
               "finished": True,
               "outcome": "pass" if status == 0 else "fail",
               "exit_status": status,
-              "monitor": "recorded" if trace_path.is_file() else "unavailable",
-              "timeouts": timeouts,
+              "monitor": "recorded" if recorded else "unavailable",
               "failed_tests": names[-50:],
               "observed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
           }
