@@ -993,7 +993,10 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: vpp-debug-image-fixed-${{ github.run_id }}-${{ github.run_attempt }}
+          # Named from the same variant the archive file is named from: a
+          # tunnel regression runs two matrix legs, and upload-artifact v4
+          # refuses a second upload under an existing name.
+          name: vpp-debug-image-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/${{ steps.image.outputs.name }}.tar
           retention-days: 3
           if-no-files-found: error
@@ -1278,7 +1281,9 @@ jobs:
       - name: Download the built image
         uses: actions/download-artifact@v4
         with:
-          name: vpp-debug-image-fixed-${{ github.run_id }}-${{ github.run_attempt }}
+          # The shard runs the `fixed` leg (matrix include), so this reads the
+          # artifact that leg uploaded.
+          name: vpp-debug-image-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/image
 
       # The archive carries the build and install trees, the external
@@ -1310,7 +1315,7 @@ jobs:
       - name: Extract the built image
         run: |
           set -eu
-          image="${RUNNER_TEMP}/image/vpp-debug-image-fixed-${{ github.run_id }}-${{ github.run_attempt }}.tar"
+          image="${RUNNER_TEMP}/image/vpp-debug-image-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}.tar"
           tar -xf "${image}"
           test -f build-root/build-vpp_debug-native/vpp/.mu_build_install_timestamp
           test -f build-root/build-vpp_debug-native/external/.mu_build_install_timestamp
@@ -1733,6 +1738,21 @@ jobs:
           assert os.environ["BUILD_OUTCOME"] == "success"
           print("ipsec_esp.TestIpsecEspTun.test_tun_df44 passed against the fixed tree")
           PY
+
+      # The evidence above is written on this shard's runner, and the ESP
+      # upload in the build job reads a different runner's temp directory, so
+      # without this step the shard's own log and subtests would survive
+      # nowhere. Only the shard that ran ipsec_esp has the tree; the others
+      # upload nothing and say so.
+      - name: Upload the ESP suite evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp-suite-evidence-batch${{ matrix.entry.batch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/esp-evidence/suite/
+          retention-days: 7
+          if-no-files-found: warn
+          compression-level: 6
 
       # The shard prints its table after its last suite, so a shard that
       # reaches the job's time limit loses the table but not the per-suite
