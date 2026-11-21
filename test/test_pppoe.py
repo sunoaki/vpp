@@ -406,8 +406,28 @@ class TestPPPoE(VppTestCase):
         # test case cleanup
         #
 
+        #
+        # The session is numbered through pg0, so it reads pg0's address list
+        # rather than one of its own. The teardown has to unbind it and leave
+        # that list where it was: pg0 outlives the session, and a teardown that
+        # walks the borrowed list asks to delete each of pg0's addresses from
+        # the session interface, which the address delete refuses without
+        # unlinking anything. A walk that repeated that call grew the heap
+        # until VPP aborted, which is what this reads back.
+        #
+        pg0_addresses = [
+            str(a.prefix) for a in self.vapi.ip_address_dump(self.pg0.sw_if_index)
+        ]
+        self.assertNotEqual([], pg0_addresses)
+
         # Delete PPPoE session
         pppoe_if.remove_vpp_config()
+
+        self.assertEqual([], self.vapi.pppoe_session_dump())
+        self.assertEqual(
+            pg0_addresses,
+            [str(a.prefix) for a in self.vapi.ip_address_dump(self.pg0.sw_if_index)],
+        )
 
         # Delete a route that resolves the server's destination
         route_sever_dst.remove_vpp_config()

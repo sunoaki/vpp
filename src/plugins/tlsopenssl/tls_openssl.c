@@ -132,7 +132,7 @@ openssl_ctx_get_w_thread (u32 ctx_index, u8 thread_index)
 }
 
 static clib_error_t *
-openssl_test_dtls_migration (void)
+openssl_test_dtls_migration (uword *cached_bytes)
 {
   clib_thread_index_t thread_index = vlib_get_thread_index ();
   clib_mem_usage_t owned, migrated;
@@ -182,6 +182,7 @@ openssl_test_dtls_migration (void)
 
   ctx_index = openssl_ctx_attach (thread_index, copy);
   copy = (openssl_ctx_t *) openssl_ctx_get (ctx_index);
+  *cached_bytes = clib_mem_size (copy);
   if (copy->ctx.flags & TLS_CONN_F_MIGRATED)
     error = clib_error_return (error, "DTLS destination inherited migrated flag");
   openssl_ctx_free (&copy->ctx);
@@ -199,6 +200,7 @@ openssl_test_dtls_failures (vnet_connect_args_t *args)
   clib_mem_usage_t before, after;
   openssl_ctx_t *ctx;
   clib_error_t *error;
+  uword before_cached, after_cached, before_rest, after_rest;
   u32 ctx_index, n_contexts, n_sessions, n_half_open;
   app_worker_t *app_wrk;
   int rv;
@@ -243,16 +245,26 @@ openssl_test_dtls_failures (vnet_connect_args_t *args)
 			      before.bytes_used, after.bytes_used, ext->crypto.hostname[0] != 0,
 			      openssl_main.async);
 
-  if ((error = openssl_test_dtls_migration ()))
+  if ((error = openssl_test_dtls_migration (&before_cached)))
     return error;
   clib_mem_get_heap_usage (clib_mem_get_heap (), &before);
   for (u32 iteration = 0; iteration < 64; iteration++)
-    if ((error = openssl_test_dtls_migration ()))
+    if ((error = openssl_test_dtls_migration (&after_cached)))
       return error;
   clib_mem_get_heap_usage (clib_mem_get_heap (), &after);
-  if (before.bytes_used != after.bytes_used)
-    return clib_error_return (0, "DTLS migration/disposal grew heap from %lu to %lu",
-			      before.bytes_used, after.bytes_used);
+  /* A disposed context stays cached in its pool slot, so the loop replaces one
+   * live allocation of sizeof (openssl_ctx_t) on every iteration. dlmalloc
+   * charges whole chunks and absorbs a remainder below its minimum chunk size,
+   * so that one object can legitimately occupy a different number of bytes at
+   * the two boundaries. Subtract its charge from both heap totals and require
+   * the rest of the heap to be unchanged: growth anywhere else is still a leak,
+   * while this single known object is accounted for rather than tolerated. */
+  before_rest = before.bytes_used - before_cached;
+  after_rest = after.bytes_used - after_cached;
+  if (before_rest != after_rest)
+    return clib_error_return (
+      0, "DTLS migration/disposal grew heap from %lu to %lu, cached context %lu to %lu",
+      before.bytes_used, after.bytes_used, before_cached, after_cached);
   return 0;
 }
 
