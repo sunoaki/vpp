@@ -212,6 +212,7 @@ class TestHttpStaticCli(VppAsfTestCase):
         self.vapi.cli(
             "http static server www-root /tmp uri tcp://0.0.0.0/80 cache-size 2m"
         )
+        self.addCleanup(self.vapi.cli, "http static server disable")
         # move file pointer to the beginning
         self.temp.seek(0)
         process = subprocess.run(
