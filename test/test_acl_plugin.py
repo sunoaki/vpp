@@ -1639,7 +1639,6 @@ class TestACLplugin(VppTestCase):
     # how many workers the search for a session's detail block tries before
     # giving up; a worker past the last one rejects the command
     _MAX_WORKERS = 100
-    _session_blocks = {}
 
     def _recreate_pg0(self, index):
         """Create pg0 again for the sw_if_index the deleted interface had.
@@ -1669,7 +1668,19 @@ class TestACLplugin(VppTestCase):
         return pg0
 
     def _apply_acl(self, sw_if_index, rules, tag):
-        """Apply an ACL to the input of an interface."""
+        """Apply an ACL to the input of an interface.
+
+        A scenario that applies a second list to an interface replaces the one
+        it applied there, so the registration of the earlier list goes first.
+        The registry keys an interface's list by its sw_if_index and drops a
+        second registration under the same key, which would keep the entry of
+        the list that is no longer applied and place it where the teardown
+        runs. The teardown removes the registrations in reverse, so the list
+        of an interface has to come after the ACL it applies; otherwise the
+        ACL is deleted while the interface still applies it and `acl_del`
+        answers `VNET_API_ERROR_ACL_IN_USE_INBOUND`.
+        """
+        self.registry.unregister("acl-if-list-%d" % sw_if_index, self.logger)
         acl = VppAcl(self, rules, tag=tag)
         acl.add_vpp_config()
         acl_if = VppAclInterface(self, sw_if_index=sw_if_index, n_input=1, acls=[acl])
@@ -1741,16 +1752,18 @@ class TestACLplugin(VppTestCase):
 
         The block appears under the worker that owns the session, and only
         when that worker is named in the command. Ask each worker in turn and
-        keep the first block that names the session. The block is kept, so
-        the labels of one session are read from the same answer.
+        return the first block that names the session. Nothing is kept from
+        one call to the next: `link next index` and `link prev index` name the
+        sessions around this one on its timeout list, and a session that joins
+        the list sets the next link of the session that was its tail, so a
+        block read before that join reports a link the list no longer has.
+        Session indices also come back into use once a session is reclaimed,
+        so a block kept under an index can describe a session that is gone.
         """
-        block = self._session_blocks.get(session_index)
-        if block is not None:
-            return block
+        block = None
         for thread_index in range(self._MAX_WORKERS):
             block = self._show_sessions(thread_index, session_index)
             if re.search(r"^  session index %d:$" % session_index, block, re.M):
-                self._session_blocks[session_index] = block
                 return block
         self.fail(
             "no worker printed a detail block for session %d, last answer:\n%s"
