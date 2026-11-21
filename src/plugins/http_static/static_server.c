@@ -1578,12 +1578,38 @@ hss_test_pending_accept_command_fn (vlib_main_t *vm, unformat_input_t *input,
   clib_atomic_add_fetch (&hss_listener_get (old_index)->ref_count, 1);
   guard = 1;
   vec_validate (hss_pending_accepts, 0);
-  if (clib_fifo_elts (app_wrk->wrk_evts[0]) != 129 || hss_listener_del (&cfg) ||
-      vec_len (hss_pending_accepts[0]) != 129 || hss_listener_get (old_index)->ref_count != 130 ||
-      hss_preserve_pending_accepts (hss_listener_get (old_index)) ||
-      hss_listener_get (old_index)->ref_count != 130)
+  if (clib_fifo_elts (app_wrk->wrk_evts[0]) != 129)
     {
-      error = clib_error_return (0, "pending accept snapshot/dedup failed");
+      error = clib_error_return (0, "pending accept queue %u, expected 129",
+				 clib_fifo_elts (app_wrk->wrk_evts[0]));
+      goto done;
+    }
+  if (hss_listener_del (&cfg))
+    {
+      error =
+	clib_error_return (0, "pending accept delete failed, queue %u captures %u refs %u",
+			   clib_fifo_elts (app_wrk->wrk_evts[0]), vec_len (hss_pending_accepts[0]),
+			   hss_listener_get (old_index)->ref_count);
+      goto done;
+    }
+  if (vec_len (hss_pending_accepts[0]) != 129 || hss_listener_get (old_index)->ref_count != 130)
+    {
+      error = clib_error_return (0, "pending accept snapshot captures %u refs %u, expected 129/130",
+				 vec_len (hss_pending_accepts[0]),
+				 hss_listener_get (old_index)->ref_count);
+      goto done;
+    }
+  if (hss_preserve_pending_accepts (hss_listener_get (old_index)))
+    {
+      error = clib_error_return (0, "pending accept dedup pass failed, captures %u refs %u",
+				 vec_len (hss_pending_accepts[0]),
+				 hss_listener_get (old_index)->ref_count);
+      goto done;
+    }
+  if (hss_listener_get (old_index)->ref_count != 130)
+    {
+      error = clib_error_return (0, "pending accept dedup refs %u, expected 130",
+				 hss_listener_get (old_index)->ref_count);
       goto done;
     }
   if (hss_listener_add (&cfg))
