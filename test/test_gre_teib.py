@@ -138,9 +138,27 @@ class TestGreTeib(VppTestCase):
                 address(sw_if_index=interface.sw_if_index, prefix=prefix)
 
     def add_peer_raw(self, tunnel, is_ip6, peer):
-        """add peer the way make_peer does, without registering or checking"""
+        """add and register a peer the way make_peer does, without checking"""
         next_hop = self.pg0.remote_ip6 if is_ip6 else self.pg0.remote_ip4
         return VppTeib(self, tunnel, peer, next_hop).add_vpp_config()
+
+    def remove_peer(self, entry):
+        """delete a registered peer, assert it is gone, and unregister it
+
+        VppTeib.remove_vpp_config only calls the API; it does not unregister.
+        The registry keeps one entry per object_id and ignores a later object
+        with the same id, and unregister is keyed on that id, so this removes
+        the registration whichever instance made it: in
+        test_gre_teib_unbound_peer the registry held the object make_peer
+        created, and the one add_peer_raw created beside it was ignored as a
+        duplicate. A registration left behind is queried again at teardown,
+        and a peer whose tunnel has since been deleted names a sw_if_index the
+        API no longer accepts: teib_entry_del is keyed by that index, and
+        teib_api.c validates it before the delete.
+        """
+        entry.remove_vpp_config()
+        self.assertFalse(entry.query_vpp_config())
+        self.registry.unregister(entry.object_id(), self.logger)
 
     def peer_has_adj_fib(self, is_ip6, table_id, peer, tunnel):
         """whether peer has an adj fib on the tunnel in that table
@@ -188,6 +206,16 @@ class TestGreTeib(VppTestCase):
         subTest has no address of the family to take off. The bind to table 1
         is asserted, so a refusal fails here instead of leaving the peer in
         table 0.
+
+        Each peer this case adds is removed by handle, and the second one is
+        removed before the tunnel goes: a TEIB entry outlives the interface it
+        names. vnet_gre_tunnel_delete does walk the interface's entries through
+        teib_walk_itf, but gre_tunnel_delete_teib_walk only drops the
+        multipoint hash alias: it never calls teib_entry_del and never frees
+        the teib_pool element, so the entry survives its tunnel. Left
+        registered, the re-added peer would be deleted at teardown against a
+        sw_if_index that the tunnel delete freed, and teib_api.c rejects such
+        an index before the delete runs.
         """
         for is_ip6 in (False, True):
             with self.subTest(is_ip6=is_ip6):
@@ -203,15 +231,14 @@ class TestGreTeib(VppTestCase):
                         retvals=[self.VNET_API_ERROR_ENTRY_ALREADY_EXISTS]
                     ):
                         self.add_peer_raw(tunnel, is_ip6, peer)
-                    entry.remove_vpp_config()
-                    self.assertFalse(entry.query_vpp_config())
+                    self.remove_peer(entry)
                     self.assertFalse(self.peer_has_adj_fib(is_ip6, 1, peer, tunnel))
-                    self.assertTrue(
-                        self.add_peer_raw(tunnel, is_ip6, peer).query_vpp_config()
-                    )
+                    entry = self.add_peer_raw(tunnel, is_ip6, peer)
+                    self.assertTrue(entry.query_vpp_config())
                     self.assertTrue(self.peer_has_adj_fib(is_ip6, 1, peer, tunnel))
                     self.bind_to_table(tunnel, is_ip6, 0)
                     self.assertFalse(self.peer_has_adj_fib(is_ip6, 1, peer, tunnel))
+                    self.remove_peer(entry)
                     self.delete_tunnel(tunnel)
                 finally:
                     self.registry.unregister(table.object_id(), self.logger)
@@ -276,8 +303,7 @@ class TestGreTeib(VppTestCase):
                     ).add_vpp_config()
                     entry = self.make_peer(tunnel, is_ip6, peer)
                     self.bind_to_table(tunnel, is_ip6, 0)
-                    entry.remove_vpp_config()
-                    self.assertFalse(entry.query_vpp_config())
+                    self.remove_peer(entry)
                     self.assertTrue(route.query_vpp_config())
                     route.remove_vpp_config()
                     self.delete_tunnel(tunnel)
