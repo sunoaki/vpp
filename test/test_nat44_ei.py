@@ -4318,20 +4318,28 @@ class TestNAT44EI(MethodHolder):
                     )
 
                 # nat44_ei_plugin_disable deletes every pool address through
-                # nat44_ei_del_addresses, so each cycle adds its own; the
-                # table is named because the helper's default leaves the
-                # address tenant VRF independent instead of binding it
-                self.nat44_add_address(self.nat_addr, vrf_id=outside_vrf)
+                # nat44_ei_del_addresses, so each cycle adds its own. The
+                # inside table is the tenant one: nat44_ei_alloc_default_cb
+                # hands an address out only when its fib_index is the ingress
+                # interface's table (nat44_ei.c:1859), and the ingress lookup
+                # reads the inside interface's table (nat44_ei_in2out.c:1350),
+                # so an address bound to the outside table is never allocated
+                # and the packet leaves slow_path at out of ports. The
+                # helper's default, ~0, leaves the address tenant VRF
+                # independent, which every tenant matches (nat44_ei.c:1877)
+                self.nat44_add_address(self.nat_addr, vrf_id=inside_vrf)
                 self.assertEqual(
                     self.nat44_ei_pool_addresses(),
-                    [(self.nat_addr, str(outside_vrf))],
+                    [(self.nat_addr, str(inside_vrf))],
                     "cycle %d: pool address missing or not in table %d"
-                    % (cycle, outside_vrf),
+                    % (cycle, inside_vrf),
                 )
                 # nat44_ei_add_address answers a second add of the same address
                 # with VALUE_EXIST, and the caller of this helper expects zero.
-                # The refusal runs first in the handler and locks nothing, so it
-                # cannot hide the locks the disable below is read for
+                # This add names no tenant, so it takes no nat44-ei-low lock,
+                # and the duplicate check runs before anything is added, so the
+                # refusal leaves no second address and no lock the disable
+                # below would be read for
                 self.assertRaises(
                     UnexpectedApiReturnValueError,
                     self.nat44_add_address,
