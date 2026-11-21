@@ -1219,13 +1219,12 @@ jobs:
     defaults:
       run:
         shell: bash
-    # Both steps that read these names are steps of this job, so the variables
-    # live here rather than in one step's env.
+    # A job-level env cannot reference the runner context, so the shard's own
+    # directory is declared in each step that reads it. The remaining names are
+    # read by more than one step and reference nothing but the needs outputs.
     env:
       CCACHE_COMPRESS: "true"
       CCACHE_MAXSIZE: 2G
-      # This shard's own directory: its summary and its per-suite evidence.
-      SHARD_DIAGNOSTICS: ${{ runner.temp }}/shard-diagnostics
       # The ESP evidence check and the suite loop both read this flag.
       TUNNEL_REGRESSION: ${{ needs.test-plan.outputs.tunnel_regression }}
     steps:
@@ -1622,6 +1621,7 @@ jobs:
       - name: Run the shard's suites
         env:
           SUITES: ${{ matrix.entry.suites }}
+          SHARD_DIAGNOSTICS: ${{ runner.temp }}/shard-diagnostics
         run: |
           git config --global --add safe.directory "$PWD"
           set -eu
@@ -1726,6 +1726,7 @@ jobs:
         if: always()
         env:
           SUITES: ${{ matrix.entry.suites }}
+          SHARD_DIAGNOSTICS: ${{ runner.temp }}/shard-diagnostics
         run: |
           set -eu
           read -ra suites <<< "${SUITES}"
@@ -1786,9 +1787,11 @@ jobs:
       # The shard prints its table after its last suite, so a shard that
       # reaches the job's time limit loses the table but not the per-suite
       # result lines, which the loop appends as each suite ends. This step
-      # reads the same job-level SHARD_DIAGNOSTICS the loop writes.
+      # reads the same directory the loop writes.
       - name: Report the shard summary so far
         if: always()
+        env:
+          SHARD_DIAGNOSTICS: ${{ runner.temp }}/shard-diagnostics
         run: |
           summary="${SHARD_DIAGNOSTICS}/suite-summary.txt"
           mkdir -p "${SHARD_DIAGNOSTICS}"
