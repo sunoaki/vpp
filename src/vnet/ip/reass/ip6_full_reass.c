@@ -1259,6 +1259,21 @@ ip6_full_reassembly_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  if (res < 0 ||
 	      hdr_chain.eh[res].protocol != IP_PROTOCOL_IPV6_FRAGMENTATION)
 	    {
+	      u32 truncated_frag_hdr_offset;
+
+	      /* The walk stops at a fragment header the packet does not hold in
+	       * full, so an unfragmented packet and one cut off inside that
+	       * header reach this point alike. Answer the latter instead of
+	       * dropping a packet whose headers could not be parsed.
+	       */
+	      if (!is_custom_app && ip6_reass_truncated_fragment_header (
+				      b0, ip0, &hdr_chain, &truncated_frag_hdr_offset))
+		{
+		  ip6_reass_set_truncated_fragment_header_error (b0, truncated_frag_hdr_offset);
+		  next0 = IP6_FULL_REASSEMBLY_NEXT_ICMP_ERROR;
+		  error0 = IP6_ERROR_REASS_INVALID_FRAG_LEN;
+		  goto skip_reass;
+		}
 	      vlib_node_increment_counter (vm, node->node_index,
 					   IP6_ERROR_REASS_NO_FRAG_HDR, 1);
 	      // this is a mangled packet - no fragmentation
