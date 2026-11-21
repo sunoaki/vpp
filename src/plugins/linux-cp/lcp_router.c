@@ -68,6 +68,9 @@ typedef struct lcp_router_table_t_
   fib_protocol_t nlt_proto;
   /* the source whose lock holds nlt_fib_index, and which the unlock uses */
   fib_source_t nlt_fib_src;
+  /* the table counted an API or CLI lock when the record was made, and that
+   * is the lock a delete of the table spends */
+  u8 nlt_api_owned;
   u32 nlt_fib_index;
   u32 nlt_mfib_index;
   u32 nlt_refs;
@@ -1269,30 +1272,51 @@ lcp_router_neigh_test_end (void)
   lcp_router_neigh_sync_end ();
 }
 
-/* The record's own reference, and the lock it holds on the FIB table. */
-#define LCP_ROUTER_TABLE_RECORD_LOCKS 2
+/*
+ * Whether a table counts a lock of one source. A table that never took the
+ * source has no slot for it, which reads as no lock.
+ */
+static bool
+lcp_router_table_lock_held (const fib_table_t *table, fib_source_t source)
+{
+  return (uword) source < vec_len (table->ft_locks) && 0 != table->ft_locks[source];
+}
 
 /*
- * Whether the FIB table a record names still holds the lock the record took
- * on it. ip_table_delete() unlocks the table under every source it can name,
- * the plugin's own included, so a table the API deleted no longer counts the
- * record's lock.
+ * Whether the FIB index a record names still holds the table the record
+ * locked, for a record the record itself keeps. The record holds a lock on
+ * its own table, so that table is freed only after the record is gone; this
+ * finds a record whose index was reused by a table it never locked, and the
+ * record must then not install into, or remove from, it. The id decides it,
+ * not the lock count: a table the record never locked can still count a lock
+ * this source took for another record.
+ *
+ * A table the API made can also be deleted under the record. ip_table_delete()
+ * clears the lock it took under FIB_SOURCE_API or FIB_SOURCE_CLI, so the
+ * record's own lock keeps the table alive and the id still matches; only that
+ * lock going away tells the record its table is gone. The record asks for it
+ * only when the table counted one as the record was made, which is also what
+ * keeps table 0: the API neither makes nor deletes it, so its record outlives
+ * every delete and must not be read as one. A table the plugin made itself
+ * holds no such lock either and stays as long as the record does.
  *
  * fib_table_find() cannot answer the question: it reads the table id hash of
  * the protocol, and ip4_fib_table_destroy() unsets an entry only for a table
- * whose id is not ~0, so table 0 keeps its stale index there. The lock count
- * is read from the pool element the index still names, which a freed element
- * or a reused one both fail.
+ * whose id is not ~0, so table 0 keeps its stale index there.
  */
 static bool
-lcp_router_table_fib_bound (const lcp_router_table_t *nlt)
+lcp_router_table_fib_owned (const lcp_router_table_t *nlt)
 {
   const fib_table_t *table = fib_table_get_or_null (nlt->nlt_fib_index, nlt->nlt_proto);
 
-  if (NULL == table || nlt->nlt_fib_src >= vec_len (table->ft_locks))
+  if (NULL == table || table->ft_table_id != nlt->nlt_id)
     return false;
 
-  return table->ft_locks[nlt->nlt_fib_src] >= LCP_ROUTER_TABLE_RECORD_LOCKS;
+  if (!nlt->nlt_api_owned)
+    return true;
+
+  return (lcp_router_table_lock_held (table, FIB_SOURCE_API) ||
+	  lcp_router_table_lock_held (table, FIB_SOURCE_CLI));
 }
 
 static void lcp_router_table_special_punt_add_del (lcp_router_table_t *nlt, u8 is_add);
@@ -1301,12 +1325,10 @@ static void lcp_router_table_special_routes_del (lcp_router_table_t *nlt);
 static void lcp_router_table_mcast_release (lcp_router_table_t *nlt);
 
 /*
- * Take a record out of the database after giving up everything it holds. The
- * API deleted its table, which flushed the plugin's entries and freed the
- * MFIB the record names, so what the record still holds is its own: the
+ * Take a record out of the database after giving up everything it holds: the
  * multicast routes' references, the special routes of the table, the table
- * reference, and the two locks. They are released as the last release of a
- * record's references releases them, so nothing outlives the record.
+ * reference, and the FIB and MFIB locks. Nothing else names the table at this
+ * point, so the FIB index the record still holds is the table it locked.
  */
 static void
 lcp_router_table_forget (lcp_router_table_t *nlt)
@@ -1327,17 +1349,11 @@ lcp_router_table_forget (lcp_router_table_t *nlt)
 }
 
 /*
- * Look a record up, dropping it when the API deleted its FIB table. The
- * delete unlocks the table, which goes when nothing else holds it, and the
- * record is never told: the MFIB index it names was freed with the table, and
- * the FIB index may name a table created since. Whatever the record holds
- * went with the table, so the record is dropped, and the next route for the
- * table creates it again.
- *
- * A table the API deleted is found by its lock count, not by its id: the id
- * still resolves to the index the table had, so a record kept for it would
- * install into a table that is gone or, worse, into the element of the pool
- * that the delete freed.
+ * Look a record up, dropping it when the FIB index it names no longer holds the
+ * table it locked. The record holds a lock on its own table, so that table is
+ * freed only after the record is gone and this finds a record whose index was
+ * reused by a table the record never locked. The record is dropped before the
+ * index is read as a table.
  *
  * The record found here is the caller's, and the caller releases it, so a
  * record dropped instead comes back as absent rather than as a freed one.
@@ -1353,11 +1369,11 @@ lcp_router_table_find (uint32_t id, fib_protocol_t fproto)
     return NULL;
 
   nlt = pool_elt_at_index (lcp_router_table_pool, p[0]);
-  if (lcp_router_table_fib_bound (nlt))
+  if (lcp_router_table_fib_owned (nlt))
     return nlt;
 
-  LCP_ROUTER_INFO ("drop the record of %U table %u, whose fib table the api deleted",
-		   format_fib_protocol, fproto, id);
+  LCP_ROUTER_INFO ("drop the record of %U table %u, whose fib index %u names another table",
+		   format_fib_protocol, fproto, id, nlt->nlt_fib_index);
 
   lcp_router_table_forget (nlt);
   return NULL;
@@ -1462,9 +1478,10 @@ lcp_router_table_add_del_special_routes (lcp_router_table_t *nlt, u8 is_add)
 
 /*
  * Give up the special routes of a record whose table the API deleted. The
- * delete took the plugin's entries with it, so only a removal that finds
- * nothing is left; taking them back while the plugin still holds the table
- * would leave a table it created without the routes every new table gets.
+ * delete clears only its own lock, so the plugin's lock keeps the table and
+ * the entries under the plugin's sources are still there; taking them back is
+ * what a table the plugin gives up has to do, or the table it still holds
+ * would keep the routes every new table gets.
  */
 static void
 lcp_router_table_special_routes_del (lcp_router_table_t *nlt)
@@ -1489,9 +1506,8 @@ lcp_router_table_mcast_route_release (lcp_router_table_t *nlt, const mfib_prefix
 }
 
 /*
- * Give up the multicast routes recorded for a table the API deleted, and the
- * MFIB the record names. The MFIB index is one the delete freed, so it is
- * left unreferenced, and the record forgets it.
+ * Give up the multicast routes recorded for a table the record is being
+ * forgotten for, and the lock the record holds on the MFIB it names.
  */
 static void
 lcp_router_table_mcast_release (lcp_router_table_t *nlt)
@@ -1528,6 +1544,18 @@ lcp_router_table_add_or_lock (uint32_t id, fib_protocol_t fproto)
 	fib_table_find_or_create_and_lock (nlt->nlt_proto, nlt->nlt_id, nlt->nlt_fib_src);
       nlt->nlt_mfib_index = mfib_table_find_or_create_and_lock (
 	nlt->nlt_proto, nlt->nlt_id, MFIB_SOURCE_PLUGIN_LOW);
+
+      /*
+       * A table the API made counts the lock its delete then clears, and one
+       * it did not make, table 0 above all, never does. The record asks about
+       * that lock from here on, so the answer is taken while the table is
+       * certainly the one the plugin locked.
+       */
+      {
+	const fib_table_t *table = fib_table_get_or_null (nlt->nlt_fib_index, nlt->nlt_proto);
+	nlt->nlt_api_owned = NULL != table && (lcp_router_table_lock_held (table, FIB_SOURCE_API) ||
+					       lcp_router_table_lock_held (table, FIB_SOURCE_CLI));
+      }
 
       hash_set (lcp_router_table_db[fproto], nlt->nlt_id,
 		nlt - lcp_router_table_pool);
