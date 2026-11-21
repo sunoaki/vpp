@@ -260,7 +260,7 @@ lcp_router_neigh_static_forget (const ip_address_t *ip, u32 sw_if_index)
     return;
 
   lcp_router_neigh_static_key (&key, ip, sw_if_index);
-  hash_unset_mem_free (lcp_router_neigh_static_db, &key);
+  hash_unset_mem_free (&lcp_router_neigh_static_db, &key);
 }
 
 /* The link layer address the plugin wrote for the entry at a key. */
@@ -400,7 +400,7 @@ lcp_router_neigh_static_flush_if (u32 sw_if_index)
 		     }));
 
   for (i = 0; i < vec_len (doomed); i++)
-    hash_unset_mem_free (lcp_router_neigh_static_db, doomed[i]);
+    hash_unset_mem_free (&lcp_router_neigh_static_db, doomed[i]);
 
   vec_free (doomed);
 }
