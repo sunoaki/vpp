@@ -169,17 +169,16 @@ class TestGreTeib(VppTestCase):
         comes after the delete, and then has to carry the re-added adj fib out
         of table 1 through that walk.
 
-        What this does not pin, and the ordering it replaces pinned even less:
-        with the tunnel still bound to table 1, the table recorded with the
-        entry and the binding resolved at delete time are the same table, so a
-        remove that resolved the binding again would also name table 1 and pass
-        here. The two differ only for a peer whose adj fib was never added, and
-        that is test_gre_teib_sourced_peer_unbound, where the bind to table 0
-        runs before the delete. A live adj fib cannot be made to separate them
-        through the public API: moving the binding first re-homes the adj fib in
-        teib_walk_table_bind, which leaves the delete with the two tables equal
-        again. The FIB_SOURCE_ADJ lock count would separate them, and no route
-        dump exposes it.
+        What this does not pin: with the tunnel still bound to table 1, the
+        table recorded with the entry and the binding resolved at delete time
+        are the same table, so a remove that resolved the binding again would
+        also name table 1 and pass here. A live adj fib cannot be made to
+        separate them through the public API either: moving the binding first
+        re-homes the adj fib in teib_walk_table_bind, which leaves the delete
+        with the two tables equal again. The FIB_SOURCE_ADJ lock count would
+        separate them, and no route dump exposes it. So this case pins that the
+        adj fib follows the entry's own table through a delete and a binding
+        move; it does not pin which of the two tables the remove consulted.
 
         Every subTest stands on its own: table 1 is created empty for it, and
         the tunnel named here is the one that moves, since the adj fib follows
@@ -217,21 +216,36 @@ class TestGreTeib(VppTestCase):
                     table.remove_vpp_config()
 
     def test_gre_teib_sourced_peer_unbound(self):
-        """a peer whose prefix the route table already holds leaves no lock
+        """a peer whose prefix the route table already holds keeps its route
 
         The adj fib is only ever created for a peer whose prefix the table
         does not source yet, so a static route to the peer added first makes
-        that same adj fib a no-op. Deleting the peer then has to leave the
-        static route alone, and release nothing, since nothing was taken. The
-        table the peer goes in is the one the tunnel is bound to, so that is
-        the table the route is added to and the tunnel that is bound.
+        that same adj fib a no-op: teib_adj_fib_add returns at teib.c:186-190
+        without recording a table on the entry, which keeps INDEX_INVALID from
+        :285. The table the peer goes in is the one the tunnel is bound to, so
+        that is the table the route is added to and the tunnel that is bound.
 
-        Before the fix the delete went at table 0, where VPP then unlocked a
-        live table whose FIB_SOURCE_ADJ count was already zero; that count is
-        visible to no route dump and checked only under a debug build, so what
-        this test pins is the static route surviving the delete, which it does
-        on the old tree too. It guards the install check against a release that
-        overwrites or drops the peer's source.
+        What this pins, and does not pin. Pinned: the static route is still
+        there after the peer is deleted. Not pinned: that nothing was taken and
+        nothing released. The unbind to table 0 runs before the delete, and
+        teib_walk_table_bind's only guard is whether the entry's recorded table
+        already equals the table the interface is going to (teib.c:417).
+        INDEX_INVALID is not a real table, so the walk does not skip this entry:
+        it calls teib_adj_fib_remove, which returns at :224 because the recorded
+        table is INDEX_INVALID, and then teib_adj_fib_add for table 0, where
+        nothing sources the prefix, so that add does install a FIB_SOURCE_ADJ
+        entry, takes a lock and records table 0. By the delete, the recorded
+        table and the binding are therefore the same again, and a lock has been
+        taken and is released on the delete path. This case also cannot separate
+        a remove that consults the recorded table from one that resolves the
+        binding again, for the same reason it cannot in
+        test_gre_teib_unbound_peer.
+
+        So it guards the install check, which decides against taking a count
+        and a lock when the prefix is already sourced, and it guards the static
+        route against a release that drops or overwrites the peer's source.
+        The FIB_SOURCE_ADJ count itself is visible to no route dump and checked
+        only under a debug build, so this case cannot observe it directly.
 
         Every subTest stands on its own: table 1 is created empty for it, and
         the tunnel named here is the one that moves, since the adj fib follows
