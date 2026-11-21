@@ -29,8 +29,9 @@ on:
 # One run per ref: a new push to the same branch cancels the previous run.
 concurrency:
   # A pull request and a dispatch run share their head branch, so the
-  # dispatch is a group of its own: it drives the twelve shards and is not
-  # cancelled by, nor cancels, the run a push to the same branch starts.
+  # dispatch is a group of its own: it drives the build and one job per suite,
+  # and is not cancelled by, nor cancels, the run a push to the same branch
+  # starts.
   group: verify-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
@@ -308,7 +309,6 @@ jobs:
           echo "Split ${total} suite(s) into ${shards} shard(s)"
           echo "batches=${batches}" >> "$GITHUB_OUTPUT"
           echo "suites_json=${suites_json}" >> "$GITHUB_OUTPUT"
-          echo "batch_count=${shards}" >> "$GITHUB_OUTPUT"
 
   build-test:
     name: build and test (${{ matrix.variant }})
@@ -318,10 +318,11 @@ jobs:
       matrix:
         variant: ${{ fromJSON(needs.test-plan.outputs.variants) }}
     runs-on: ubuntu-24.04
-    # GitHub caps a GitHub-hosted job at 360 minutes, and the all-suites
-    # dispatch runs every module of the tree in this one job, so the ceiling is
-    # stated here rather than left implicit. A run that reaches it is truncated
-    # by the platform, and the suite summary is then absent from the log.
+    # GitHub caps a GitHub-hosted job at 360 minutes, and this job still runs
+    # the ipsec_esp suite and the ESP negative control when the tunnel
+    # regression applies, so the ceiling is stated here rather than left
+    # implicit. A run that reaches it is truncated by the platform, and the
+    # suite summary is then absent from the log.
     timeout-minutes: 360
     container:
       image: debian:trixie
@@ -1329,6 +1330,14 @@ jobs:
               raise
           finally:
               (control / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+              # The original-df variant has no suite job, so the named log of
+              # its negative control is copied here, in the step that asserts
+              # it. The fixed variant gets the same file from the suite job.
+              if not (suite / "named-test.log").exists():
+                  fallback = Path("/tmp/vpp-unittest-TestIpsecEspTun/log.txt")
+                  if fallback.is_file() and not fallback.is_symlink() \
+                          and fallback.stat().st_size <= 8 * 1024 * 1024:
+                      (suite / "named-test.log").write_bytes(fallback.read_bytes())
           PY
 
       - name: Upload ESP evidence
@@ -1463,7 +1472,8 @@ jobs:
           if-no-files-found: warn
           compression-level: 6
 
-  # One job per suite, all taken from the batch list the plan job produced.
+  # One job per suite, all taken from the flat suite list the plan job
+  # produced. The shard lists the plan job also writes are not read here.
   # A job boundary per suite is what survives a cancel: cancelling a suite
   # leaves its own job, and its record is the artifact that job already
   # uploaded.
@@ -1477,8 +1487,8 @@ jobs:
       # A failing suite does not stop the others, and a suite that was
       # cancelled does not stop the dispatch from reaching the rest.
       fail-fast: false
-      # The deeper queue starts the suites of a failed shard first, so a red
-      # run still finishes the suites that were waiting behind it.
+      # Every entry is queued at once, so a red suite starts no later than a
+      # green one and a failure cannot push the rest to the end of the queue.
       matrix:
         variant: ${{ fromJSON(needs.test-plan.outputs.variants) }}
         suite: ${{ fromJSON(needs.test-plan.outputs.suites_json) }}
@@ -1542,8 +1552,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: /var/cache/apt/archives
-          key: apt-debian13-${{ runner.arch }}-${{ matrix.variant == 'fixed' && 'build-test-fixed' || 'build-test-original-df' }}-${{ steps.deps.outputs.hash }}
+          key: apt-debian13-${{ runner.arch }}-test-${{ matrix.variant }}-${{ steps.deps.outputs.hash }}
           restore-keys: |
+            apt-debian13-${{ runner.arch }}-test-${{ matrix.variant }}-
             apt-debian13-${{ runner.arch }}-build-test-
 
       - name: Install VPP build and test dependencies
