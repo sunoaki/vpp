@@ -473,15 +473,28 @@ pppoe_session_attach (pppoe_main_t *pem, pppoe_session_t *t)
   t->is_admin_up = 1;
 }
 
-/* The addresses a session added to its interface, walked from the head of the
- * per-interface list rather than through foreach_ip_interface_address, which
- * would follow an unnumbered interface to another interface's addresses. */
+/*
+ * The addresses the session interface holds, walked along the per-interface
+ * list rather than through foreach_ip_interface_address, which would follow an
+ * unnumbered interface to another interface's addresses.
+ *
+ * The head is only this interface's own list while the interface is numbered.
+ * vnet_sw_interface_update_unnumbered copies the head of the numbered
+ * interface into the unnumbered one's slot, so an unnumbered session is handed
+ * the addresses of the interface it borrows from. Those name a different
+ * sw_if_index, and ip_interface_address_del refuses them without unlinking
+ * anything, so a walk that only stopped on an empty head would delete the same
+ * entry forever and leak an error per attempt until the heap ran out. The walk
+ * therefore advances along the link it saved before the delete, rather than
+ * re-reading a head the delete may have refused to move.
+ */
 static void
 pppoe_ip4_addresses_clear (vnet_main_t *vnm, u32 sw_if_index)
 {
   ip_lookup_main_t *lm = &ip4_main.lookup_main;
-  u32 ia_index;
   ip_interface_address_t *ia;
+  clib_error_t *error;
+  u32 ia_index, next;
 
   if (sw_if_index >= vec_len (lm->if_address_pool_index_by_sw_if_index))
     return;
@@ -490,14 +503,31 @@ pppoe_ip4_addresses_clear (vnet_main_t *vnm, u32 sw_if_index)
 
   while (ia_index != ~0)
     {
+      if (pool_is_free_index (lm->if_address_pool, ia_index))
+	break;
+
       ia = pool_elt_at_index (lm->if_address_pool, ia_index);
 
-      ip4_add_del_interface_address (vnm->vlib_main, sw_if_index,
-				     ip_interface_address_get_address (lm, ia), ia->address_length,
-				     1 /* is_del */);
+      /* the list an unnumbered interface was handed belongs to another one */
+      if (ia->sw_if_index != sw_if_index)
+	break;
 
-      /* the list shrinks under us, so the walk restarts from the head */
-      ia_index = lm->if_address_pool_index_by_sw_if_index[sw_if_index];
+      /* the element goes away under the delete, so the link is read first */
+      next = ia->next_this_sw_interface;
+
+      error = ip4_add_del_interface_address (vnm->vlib_main, sw_if_index,
+					     ip_interface_address_get_address (lm, ia),
+					     ia->address_length, 1 /* is_del */);
+      if (error)
+	{
+	  /* an address that cannot be removed is left where it is: the
+	   * session is torn down either way, and repeating the call cannot
+	   * make it removable */
+	  clib_error_report (error);
+	  break;
+	}
+
+      ia_index = next;
     }
 }
 
@@ -505,8 +535,9 @@ static void
 pppoe_ip6_addresses_clear (vnet_main_t *vnm, u32 sw_if_index)
 {
   ip_lookup_main_t *lm = &ip6_main.lookup_main;
-  u32 ia_index;
   ip_interface_address_t *ia;
+  clib_error_t *error;
+  u32 ia_index, next;
 
   if (sw_if_index >= vec_len (lm->if_address_pool_index_by_sw_if_index))
     return;
@@ -515,13 +546,26 @@ pppoe_ip6_addresses_clear (vnet_main_t *vnm, u32 sw_if_index)
 
   while (ia_index != ~0)
     {
+      if (pool_is_free_index (lm->if_address_pool, ia_index))
+	break;
+
       ia = pool_elt_at_index (lm->if_address_pool, ia_index);
 
-      ip6_add_del_interface_address (vnm->vlib_main, sw_if_index,
-				     ip_interface_address_get_address (lm, ia), ia->address_length,
-				     1 /* is_del */);
+      if (ia->sw_if_index != sw_if_index)
+	break;
 
-      ia_index = lm->if_address_pool_index_by_sw_if_index[sw_if_index];
+      next = ia->next_this_sw_interface;
+
+      error = ip6_add_del_interface_address (vnm->vlib_main, sw_if_index,
+					     ip_interface_address_get_address (lm, ia),
+					     ia->address_length, 1 /* is_del */);
+      if (error)
+	{
+	  clib_error_report (error);
+	  break;
+	}
+
+      ia_index = next;
     }
 }
 
@@ -541,6 +585,18 @@ pppoe_session_detach (pppoe_main_t *pem, pppoe_session_t *t)
     pppoe_session_ip6_route_remove (t);
 
   vnet_reset_interface_l3_output_node (vnm->vlib_main, t->sw_if_index);
+
+  /*
+   * An unnumbered interface reads the address list of the interface it
+   * borrows from, and the teardown must not reach into that list: the
+   * addresses there belong to the numbered interface, which outlives this
+   * session. Unbind first, so the walk below sees the session's own list
+   * rather than the one it was handed.
+   */
+  si = vnet_get_sw_interface (vnm, t->sw_if_index);
+  if (si->flags & VNET_SW_INTERFACE_FLAG_UNNUMBERED)
+    vnet_sw_interface_update_unnumbered (t->sw_if_index, ~0, 0 /* enable */);
+
   pppoe_ip4_addresses_clear (vnm, t->sw_if_index);
   pppoe_ip6_addresses_clear (vnm, t->sw_if_index);
 
@@ -556,6 +612,7 @@ pppoe_session_detach (pppoe_main_t *pem, pppoe_session_t *t)
   t->client_ip4_set = 0;
   t->client_ip6_set = 0;
 
+  /* the clears can grow the interface pools, so the interface is read again */
   si = vnet_get_sw_interface (vnm, t->sw_if_index);
   si->flags |= VNET_SW_INTERFACE_FLAG_HIDDEN;
   vnet_sw_interface_set_flags (vnm, t->sw_if_index, 0 /* down */);
