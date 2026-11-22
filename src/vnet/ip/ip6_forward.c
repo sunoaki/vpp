@@ -1233,6 +1233,58 @@ ip6_tcp_udp_icmp_bad_length (vlib_main_t * vm, vlib_buffer_t * p0)
     return 1;
 }
 
+/*
+ * Attached export copies the receive entry of a local prefix into every
+ * importing table, and the copied entry keeps naming the interface of the
+ * exporting table. A receive DPO speaks for its address only in the table
+ * its interface belongs to, so an entry imported into another table must
+ * not terminate the packet there.
+ *
+ * A link-local destination depends on the table flag test below; that test
+ * is what keeps link-local termination working. The ip6-link-local DPO
+ * rewrites the packet's transmit interface to the receiving interface's own
+ * link-local table (ip6_ll_fib_get), and the lookup in that table sets
+ * ip.fib_index to it. The equality test above compares against the
+ * interface's ordinary table, so it always fails on this path, and only the
+ * FIB_TABLE_FLAG_IP6_LL test lets a link-local receive through.
+ *
+ * That exemption is not a hole. A link-local table carries table id ~0, so
+ * no table id names one, and attached export cannot import into one: a
+ * link-local prefix is never imported, and the fe80::/10 route that sends
+ * link-local packets to the link-local DPO carries
+ * FIB_ENTRY_FLAG_NO_ATTACHED_EXPORT. A packet the lookup finds in a
+ * link-local table therefore belongs to the interface whose table it is.
+ */
+static_always_inline u8
+ip6_receive_dpo_crosses_table (const receive_dpo_t *rd, u32 fib_index)
+{
+  const fib_table_t *ft;
+
+  if (rd->rd_sw_if_index == ~0)
+    return 0;
+
+  if (ip6_fib_table_get_index_for_sw_if_index (rd->rd_sw_if_index) == fib_index)
+    return 0;
+
+  ft = fib_table_get_or_null (fib_index, FIB_PROTOCOL_IP6);
+
+  return (ft == NULL || !(ft->ft_flags & FIB_TABLE_FLAG_IP6_LL));
+}
+
+/*
+ * The guard runs after the transmit interface override has been applied to
+ * ip.fib_index, so that field names the table the packet is looked up in.
+ */
+static_always_inline vl_counter_ip6_enum_t
+ip6_local_receive_error (const receive_dpo_t *rd, vlib_buffer_t *b, vl_counter_ip6_enum_t error)
+{
+  if (PREDICT_FALSE (ip6_receive_dpo_crosses_table (rd, vnet_buffer (b)->ip.fib_index)) &&
+      error == IP6_ERROR_UNKNOWN_PROTOCOL)
+    return IP6_ERROR_DST_LOOKUP_MISS;
+
+  return error;
+}
+
 always_inline uword
 ip6_local_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  vlib_frame_t *frame, int head_of_feature_arc,
@@ -1444,6 +1496,14 @@ ip6_local_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		vnet_buffer (b[0])->ip.rx_sw_if_index = rd0->rd_sw_if_index;
 	      if (rd1->rd_sw_if_index != ~0)
 		vnet_buffer (b[1])->ip.rx_sw_if_index = rd1->rd_sw_if_index;
+
+	      /*
+	       * The L4 checksum check above rewrites error back to
+	       * IP6_ERROR_UNKNOWN_PROTOCOL, so the rejection is applied here,
+	       * after it, or it would be lost.
+	       */
+	      error[0] = ip6_local_receive_error (rd0, b[0], error[0]);
+	      error[1] = ip6_local_receive_error (rd1, b[1], error[1]);
 	    }
 	}			/* head_of_feature_arc */
 
@@ -1584,6 +1644,8 @@ ip6_local_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      rd = receive_dpo_get (vnet_buffer (b[0])->ip.adj_index[VLIB_TX]);
 	      if (rd->rd_sw_if_index != ~0)
 		vnet_buffer (b[0])->ip.rx_sw_if_index = rd->rd_sw_if_index;
+
+	      error = ip6_local_receive_error (rd, b[0], error);
 	    }
 	}			/* head_of_feature_arc */
 

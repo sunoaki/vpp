@@ -4584,5 +4584,144 @@ class TestIP6InterfaceRx(VppTestCase):
         self.send_and_expect(self.pg0, pkts_dst, self.pg2)
 
 
+@unittest.skipIf(
+    "ping" in config.excluded_plugins, "Exclude tests requiring Ping plugin"
+)
+class TestIPv6ReceiveDPOCrossTable(VppTestCase):
+    """IPv6 receive DPO limited to its own table"""
+
+    TABLE_ID = 101
+
+    @classmethod
+    def setUpClass(cls):
+        super(TestIPv6ReceiveDPOCrossTable, cls).setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super(TestIPv6ReceiveDPOCrossTable, cls).tearDownClass()
+
+    def setUp(self):
+        super(TestIPv6ReceiveDPOCrossTable, self).setUp()
+
+        self.create_pg_interfaces(range(3))
+
+        VppIpTable(self, self.TABLE_ID, is_ip6=1).add_vpp_config()
+
+        # pg0 and pg2 stay in the default table, pg1 lives in TABLE_ID
+        self.pg1.set_table_ip6(self.TABLE_ID)
+
+        for i in self.pg_interfaces:
+            i.admin_up()
+            i.config_ip6()
+            i.resolve_ndp(link_layer=True)
+            i.resolve_ndp()
+
+        # An attached route in TABLE_ID covers pg0's prefix, so attached
+        # export imports pg0's local /128 into TABLE_ID as a receive DPO
+        # that still names pg0.
+        self.importer = VppIpRoute(
+            self,
+            self.pg0.local_ip6,
+            64,
+            [VppRoutePath("::", self.pg0.sw_if_index)],
+            table_id=self.TABLE_ID,
+        ).add_vpp_config()
+
+    def tearDown(self):
+        for i in self.pg_interfaces:
+            i.unconfig_ip6()
+            i.admin_down()
+            i.set_table_ip6(0)
+
+        super(TestIPv6ReceiveDPOCrossTable, self).tearDown()
+
+    def _echo_request(self, src_if, dst_addr, src_addr=None):
+        if src_addr is None:
+            src_addr = src_if.remote_ip6
+        return (
+            Ether(src=src_if.remote_mac, dst=src_if.local_mac)
+            / IPv6(src=src_addr, dst=dst_addr)
+            / ICMPv6EchoRequest(id=0xB, seq=5, data=b"\x0a" * 18)
+        )
+
+    def test_cross_table_receive_dpo_does_not_terminate(self):
+        """Receive DPO exported to another table does not terminate there
+
+        Test scenario:
+
+            - Confirm the imported local prefix exists in TABLE_ID as a
+              dpo-receive bound to pg0, whose own table is the default one
+            - Send an ICMPv6 echo request into TABLE_ID addressed to it
+            - Check the packet is dropped as a destination lookup miss and
+              that nothing is delivered or replied
+        """
+        self.assertTrue(find_route(self, self.pg0.local_ip6, 128))
+        self.assertTrue(
+            find_route(self, self.pg0.local_ip6, 128, table_id=self.TABLE_ID)
+        )
+        detail = self.vapi.cli(
+            f"show ip6 fib table {self.TABLE_ID} {self.pg0.local_ip6}/128 detail"
+        )
+        self.assertIn("attached_export", detail)
+        self.assertIn(f"dpo-receive: {self.pg0.local_ip6}", detail)
+        self.assertIn(self.pg0.name, detail)
+
+        misses_before = self.get_node_counter("ip6-input", "dst_lookup_miss")
+
+        p = self._echo_request(self.pg1, self.pg0.local_ip6)
+        self.send_and_assert_no_replies(self.pg1, [p] * 5, "cross table receive")
+
+        self.assertEqual(
+            self.get_node_counter("ip6-input", "dst_lookup_miss"),
+            misses_before + 5,
+            "cross table receive must miss the destination lookup",
+        )
+
+    def test_same_table_receive_dpo_still_terminates(self):
+        """A receive DPO whose interface is in the packet's table terminates
+
+        Test scenario:
+
+            - Send an ICMPv6 echo request from another interface of the same
+              table to pg0's address
+            - Check the echo reply is delivered back to the sender
+            - Send the same request from the interface that owns the address
+            - Check it is delivered as well
+            - Send an echo request to pg0's link-local address, whose receive
+              entry lives in the per-interface link-local table
+            - Check the link-local reply is delivered as well
+        """
+        misses_before = self.get_node_counter("ip6-input", "dst_lookup_miss")
+
+        # pg2 and pg0 share the default table, so the receive DPO names an
+        # interface other than the one the packet arrived on, in the same
+        # table, and must still terminate locally.
+        p = self._echo_request(self.pg2, self.pg0.local_ip6)
+        rx = self.send_and_expect(self.pg2, [p] * 5, self.pg2)
+        for packet in rx:
+            self.assertEqual(in6_ptop(packet[IPv6].src), self.pg0.local_ip6)
+            self.assertEqual(in6_ptop(packet[IPv6].dst), self.pg2.remote_ip6)
+            self.assertEqual(icmp6types[packet[ICMPv6EchoReply].type], "Echo Reply")
+
+        p = self._echo_request(self.pg0, self.pg0.local_ip6)
+        rx = self.send_and_expect(self.pg0, [p] * 5, self.pg0)
+        for packet in rx:
+            self.assertEqual(icmp6types[packet[ICMPv6EchoReply].type], "Echo Reply")
+
+        # A link-local destination is looked up in the per-interface
+        # link-local table, which is the table its receive DPO belongs to.
+        p = self._echo_request(self.pg0, self.pg0.local_ip6_ll)
+        rx = self.send_and_expect(self.pg0, [p] * 5, self.pg0)
+        for packet in rx:
+            self.assertEqual(icmp6types[packet[ICMPv6EchoReply].type], "Echo Reply")
+            self.assertEqual(in6_ptop(packet[IPv6].src), self.pg0.local_ip6_ll)
+
+        self.assertEqual(
+            self.get_node_counter("ip6-input", "dst_lookup_miss"),
+            misses_before,
+            "same table receive must not miss the destination lookup",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=VppTestRunner)
