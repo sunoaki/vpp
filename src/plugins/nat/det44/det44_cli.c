@@ -228,11 +228,11 @@ det44_close_session_out_fn (vlib_main_t * vm,
     vlib_cli_output (vm, "no match");
   else
     {
-      snat_det_reverse (mp, &ext_addr, (u16) out_port, &in_addr);
-      key.ext_host_addr = out_addr;
+      snat_det_reverse (mp, &out_addr, (u16) out_port, &in_addr);
+      key.ext_host_addr = ext_addr;
       key.ext_host_port = ntohs ((u16) ext_port);
       key.out_port = ntohs ((u16) out_port);
-      ses = snat_det_get_ses_by_out (mp, &out_addr, key.as_u64);
+      ses = snat_det_get_ses_by_out (mp, &in_addr, key.as_u64);
       if (!ses)
 	vlib_cli_output (vm, "no match");
       else

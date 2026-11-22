@@ -266,8 +266,7 @@ out:
 u32
 det44_icmp_in2out (vlib_buffer_t *b0, ip4_header_t *ip0, icmp46_header_t *icmp0, u32 sw_if_index0,
 		   u32 rx_fib_index0, vlib_node_runtime_t *node, u32 next0, u32 thread_index,
-		   void *d, void *e, u8 *session_accepted, ip4_address_t *created_addr,
-		   u8 *identity)
+		   void *d, void *e, u8 *session_created, ip4_address_t *created_addr, u8 *identity)
 {
   det44_main_t *dm = &det44_main;
   vlib_main_t *vm = vlib_get_main ();
@@ -282,7 +281,7 @@ det44_icmp_in2out (vlib_buffer_t *b0, ip4_header_t *ip0, icmp46_header_t *icmp0,
   ip_csum_t sum0;
   nat_protocol_t protocol;
 
-  *session_accepted = 0;
+  *session_created = 0;
   *identity = 0;
   identity_found = 0;
   echo0 = (icmp_echo_header_t *) (icmp0 + 1);
@@ -415,7 +414,7 @@ det44_icmp_in2out (vlib_buffer_t *b0, ip4_header_t *ip0, icmp46_header_t *icmp0,
 
   if (vnet_buffer (b0)->sw_if_index[VLIB_TX] == ~0)
     vnet_buffer (b0)->sw_if_index[VLIB_TX] = fib_index;
-  *session_accepted = 1;
+  *session_created = created;
 out:
   return next0;
 }

@@ -1317,10 +1317,12 @@ class TestDET44(VppTestCase):
         )
 
         # The CLI takes the outside address and port first, then the outside
-        # address and port of the external host, and keys the lookup on the
-        # first address (det44_close_session_out_fn, det44_cli.c:212-236). It
-        # closes from the main thread, and the flush that gathers the delete
-        # event reaches that thread through nat_ipfix_flush_from_main.
+        # address and port of the external host, reverses the first address
+        # into the inside address of the user, and keys the lookup on that
+        # address and the external host (det44_close_session_out_fn,
+        # det44_cli.c:226-240). It closes from the main thread, and the flush
+        # that gathers the delete event reaches that thread through
+        # nat_ipfix_flush_from_main.
         self.close_tcp_session_by_cli()
         self.assertEqual([], self.tcp_sessions())
         self.verify_ipfix_session_event(
