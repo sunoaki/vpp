@@ -3765,5 +3765,128 @@ class TestIP4InterfaceRx(VppTestCase):
         self.send_and_expect(self.pg0, pkts_dst, self.pg2)
 
 
+class TestIPv4ReceiveDPOCrossTable(VppTestCase):
+    """IPv4 receive DPO limited to its own table"""
+
+    TABLE_ID = 101
+
+    @classmethod
+    def setUpClass(cls):
+        super(TestIPv4ReceiveDPOCrossTable, cls).setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super(TestIPv4ReceiveDPOCrossTable, cls).tearDownClass()
+
+    def setUp(self):
+        super(TestIPv4ReceiveDPOCrossTable, self).setUp()
+
+        self.create_pg_interfaces(range(3))
+
+        VppIpTable(self, self.TABLE_ID).add_vpp_config()
+
+        # pg0 and pg2 stay in the default table, pg1 lives in TABLE_ID
+        self.pg1.set_table_ip4(self.TABLE_ID)
+
+        for i in self.pg_interfaces:
+            i.admin_up()
+            i.config_ip4()
+            i.resolve_arp()
+
+        # An attached route in TABLE_ID covers pg0's prefix, so attached
+        # export imports pg0's local /32 into TABLE_ID as a receive DPO
+        # that still names pg0.
+        self.importer = VppIpRoute(
+            self,
+            self.pg0.local_ip4,
+            24,
+            [VppRoutePath("0.0.0.0", self.pg0.sw_if_index)],
+            table_id=self.TABLE_ID,
+        ).add_vpp_config()
+
+    def tearDown(self):
+        for i in self.pg_interfaces:
+            i.unconfig_ip4()
+            i.admin_down()
+            i.set_table_ip4(0)
+
+        super(TestIPv4ReceiveDPOCrossTable, self).tearDown()
+
+    def _echo_request(self, src_if, dst_addr):
+        return (
+            Ether(src=src_if.remote_mac, dst=src_if.local_mac)
+            / IP(src=src_if.remote_ip4, dst=dst_addr)
+            / ICMP(id=0xB, seq=5)
+            / Raw(load=b"\x0a" * 18)
+        )
+
+    def test_cross_table_receive_dpo_does_not_terminate(self):
+        """Receive DPO exported to another table does not terminate there
+
+        Test scenario:
+
+            - Confirm the imported local prefix exists in TABLE_ID as a
+              dpo-receive bound to pg0, whose own table is the default one
+            - Send an ICMP echo request into TABLE_ID addressed to it
+            - Check the packet is dropped as a destination lookup miss and
+              that nothing is delivered or replied
+        """
+        self.assertTrue(find_route(self, self.pg0.local_ip4, 32))
+        self.assertTrue(
+            find_route(self, self.pg0.local_ip4, 32, table_id=self.TABLE_ID)
+        )
+        detail = self.vapi.cli(
+            f"show ip fib table {self.TABLE_ID} {self.pg0.local_ip4}/32 detail"
+        )
+        self.assertIn("attached_export", detail)
+        self.assertIn(f"dpo-receive: {self.pg0.local_ip4}", detail)
+        self.assertIn(self.pg0.name, detail)
+
+        misses_before = self.get_node_counter("ip4-local", "dst_lookup_miss")
+
+        p = self._echo_request(self.pg1, self.pg0.local_ip4)
+        self.send_and_assert_no_replies(self.pg1, [p] * 5, "cross table receive")
+
+        self.assertEqual(
+            self.get_node_counter("ip4-local", "dst_lookup_miss"),
+            misses_before + 5,
+            "cross table receive must miss the destination lookup",
+        )
+
+    def test_same_table_receive_dpo_still_terminates(self):
+        """A receive DPO whose interface is in the packet's table terminates
+
+        Test scenario:
+
+            - Send an ICMP echo request from another interface of the same
+              table to pg0's address
+            - Check the echo reply is delivered back to the sender
+            - Send the same request from the interface that owns the address
+            - Check it is delivered as well
+        """
+        misses_before = self.get_node_counter("ip4-local", "dst_lookup_miss")
+
+        # pg2 and pg0 share the default table, so the receive DPO names an
+        # interface other than the one the packet arrived on, in the same
+        # table, and must still terminate locally.
+        p = self._echo_request(self.pg2, self.pg0.local_ip4)
+        rx = self.send_and_expect(self.pg2, [p] * 5, self.pg2)
+        for packet in rx:
+            self.assertEqual(packet[IP].src, self.pg0.local_ip4)
+            self.assertEqual(packet[IP].dst, self.pg2.remote_ip4)
+            self.assertEqual(icmptypes[packet[ICMP].type], "echo-reply")
+
+        p = self._echo_request(self.pg0, self.pg0.local_ip4)
+        rx = self.send_and_expect(self.pg0, [p] * 5, self.pg0)
+        for packet in rx:
+            self.assertEqual(icmptypes[packet[ICMP].type], "echo-reply")
+
+        self.assertEqual(
+            self.get_node_counter("ip4-local", "dst_lookup_miss"),
+            misses_before,
+            "same table receive must not miss the destination lookup",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=VppTestRunner)
