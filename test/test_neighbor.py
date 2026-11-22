@@ -2041,6 +2041,199 @@ class ARPTestCase(VppTestCase):
         static_arp.remove_vpp_config()
         self.pg2.unconfig_ip4()
 
+    def test_arp_relearn_moves_rewrite_and_adj_fib(self):
+        """A dynamic neighbour re-learned with another MAC follows it, adj-fib too
+
+        The operator's sequence is an address that used to be reachable
+        through one device and is now reachable through another. When the
+        data plane learns the address again with the new device's MAC, both
+        things that name the device have to move: the neighbour's MAC, which
+        'show ip neighbors' and the binary API report, and the adjacency
+        rewrite the packet is sent with. The adj-fib is not rebuilt for this
+        because its path names the next hop and the interface, not the MAC,
+        so what is checked of it here is that the re-learn leaves it in place
+        rather than dropping it.
+
+        The second half is the adj-fib that cannot be left to the age timer:
+        an entry the control plane programmed with no-fib-entry holds no
+        path, and a later add that omits the flag asks for one. Nothing else
+        re-runs that add, because the entry already exists, so without the
+        re-add reconciling the flag the neighbour would stay unreachable from
+        the FIB for the rest of its life.
+        """
+        self.pg2.generate_remote_hosts(2)
+        self.pg2.config_ip4()
+
+        nbr_addr = self.pg2.remote_hosts[0].ip4
+        old_mac = self.pg2.remote_hosts[0].mac
+        new_mac = self.pg2.remote_hosts[1].mac
+
+        e = VppEnum.vl_api_ip_neighbor_flags_t
+
+        #
+        # a dynamic entry that forwards to the first device
+        #
+        VppNeighbor(self, self.pg2.sw_if_index, old_mac, nbr_addr).add_vpp_config()
+
+        self.assertTrue(
+            find_nbr(self, self.pg2.sw_if_index, nbr_addr, is_static=0, mac=old_mac)
+        )
+        self.assertEqual(
+            self.get_adj_sourced_routes(
+                VppIpTable(self, 0, register=False), self.pg2.sw_if_index
+            ),
+            [nbr_addr],
+        )
+
+        p = (
+            Ether(dst=self.pg2.local_mac, src=self.pg2.remote_mac)
+            / IP(src=self.pg2.remote_ip4, dst=nbr_addr)
+            / UDP(sport=1234, dport=1234)
+            / Raw()
+        )
+        rx = self.send_and_expect(self.pg2, [p], self.pg2)
+        self.assertEqual(rx[0][Ether].dst, old_mac)
+
+        #
+        # the device behind the address is replaced and the same address is
+        # learned on the same interface with the new MAC: both the table and
+        # the rewrite take it, and the adj-fib stays
+        #
+        VppNeighbor(self, self.pg2.sw_if_index, new_mac, nbr_addr).add_vpp_config()
+
+        self.assertTrue(
+            find_nbr(self, self.pg2.sw_if_index, nbr_addr, is_static=0, mac=new_mac)
+        )
+        rx = self.send_and_expect(self.pg2, [p], self.pg2)
+        self.assertEqual(rx[0][Ether].dst, new_mac)
+        self.assertEqual(
+            self.get_adj_sourced_routes(
+                VppIpTable(self, 0, register=False), self.pg2.sw_if_index
+            ),
+            [nbr_addr],
+        )
+
+        #
+        # an address pinned without a FIB path, for a neighbour that is not
+        # covered by the interface's own prefix so nothing else installs one
+        #
+        no_fib_addr = "192.0.2.21"
+        VppNeighbor(
+            self,
+            self.pg2.sw_if_index,
+            new_mac,
+            no_fib_addr,
+            is_static=True,
+            is_no_fib_entry=True,
+        ).add_vpp_config()
+
+        self.assertTrue(find_nbr(self, self.pg2.sw_if_index, no_fib_addr, is_static=1))
+        self.assertEqual(
+            self.get_adj_sourced_routes(
+                VppIpTable(self, 0, register=False), self.pg2.sw_if_index
+            ),
+            [nbr_addr],
+        )
+
+        #
+        # the same address is pinned again without the flag: the path the
+        # second add asks for has to appear, without waiting for anything
+        #
+        VppNeighbor(
+            self, self.pg2.sw_if_index, new_mac, no_fib_addr, is_static=True
+        ).add_vpp_config()
+
+        self.assertIn(
+            no_fib_addr,
+            self.get_adj_sourced_routes(
+                VppIpTable(self, 0, register=False), self.pg2.sw_if_index
+            ),
+        )
+
+        #
+        # and pinning it back with the flag takes the path away again, so the
+        # flag describes the entry rather than the first add that created it
+        #
+        self.vapi.ip_neighbor_add_del(
+            self.pg2.sw_if_index,
+            new_mac,
+            no_fib_addr,
+            is_add=1,
+            flags=e.IP_API_NEIGHBOR_FLAG_STATIC | e.IP_API_NEIGHBOR_FLAG_NO_FIB_ENTRY,
+        )
+
+        self.assertNotIn(
+            no_fib_addr,
+            self.get_adj_sourced_routes(
+                VppIpTable(self, 0, register=False), self.pg2.sw_if_index
+            ),
+        )
+
+        #
+        # a learn does not move the flag: the address the operator pinned as
+        # no-fib-entry keeps its entry and still gains no path
+        #
+        VppNeighbor(self, self.pg2.sw_if_index, new_mac, no_fib_addr).add_vpp_config()
+
+        self.assertNotIn(
+            no_fib_addr,
+            self.get_adj_sourced_routes(
+                VppIpTable(self, 0, register=False), self.pg2.sw_if_index
+            ),
+        )
+
+        #
+        # clean-up
+        #
+        self.vapi.ip_neighbor_add_del(
+            self.pg2.sw_if_index, new_mac, no_fib_addr, is_add=0
+        )
+
+        #
+        # the same flag on a dynamic entry, which is what the CLI and the API
+        # both produce when no 'static' is named: a later add that omits the
+        # flag must not install the path the operator withheld, or any host
+        # that speaks on the link could hand the address one. This is the
+        # case the static-only gating exists for, and it only reaches the gate
+        # because the entry is dynamic and skips the refusal above.
+        #
+        dyn_no_fib_addr = "192.0.2.22"
+        VppNeighbor(
+            self,
+            self.pg2.sw_if_index,
+            new_mac,
+            dyn_no_fib_addr,
+            is_no_fib_entry=True,
+        ).add_vpp_config()
+
+        self.assertTrue(
+            find_nbr(self, self.pg2.sw_if_index, dyn_no_fib_addr, is_static=0)
+        )
+        self.assertNotIn(
+            dyn_no_fib_addr,
+            self.get_adj_sourced_routes(
+                VppIpTable(self, 0, register=False), self.pg2.sw_if_index
+            ),
+        )
+
+        VppNeighbor(
+            self, self.pg2.sw_if_index, new_mac, dyn_no_fib_addr
+        ).add_vpp_config()
+
+        self.assertNotIn(
+            dyn_no_fib_addr,
+            self.get_adj_sourced_routes(
+                VppIpTable(self, 0, register=False), self.pg2.sw_if_index
+            ),
+        )
+
+        self.vapi.ip_neighbor_add_del(
+            self.pg2.sw_if_index, new_mac, dyn_no_fib_addr, is_add=0
+        )
+
+        VppNeighbor(self, self.pg2.sw_if_index, new_mac, nbr_addr).remove_vpp_config()
+        self.pg2.unconfig_ip4()
+
     def test_arp_static_device_replaced(self):
         """A static neighbour whose device was replaced says so
 

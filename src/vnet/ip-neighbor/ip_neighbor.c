@@ -853,6 +853,43 @@ ip_neighbor_add (const ip_address_t * ip,
 	}
 
       /*
+       * The adj-fib follows the flag, so a re-add that names the flag
+       * differently has to move the path with it: an operator who first
+       * pinned the address with no-fib-entry and then re-pins it without
+       * the flag is asking for the path, and one who adds the flag back is
+       * taking it away. Nothing else clears the flag, so this is the only
+       * place the two can disagree.
+       *
+       * Only a control-plane add is an instruction about the entry. A learn
+       * carries the dynamic flag alone, and a no-fib-entry address the
+       * operator programmed must not gain a path because a host on the link
+       * happened to speak.
+       */
+      if ((flags & IP_NEIGHBOR_FLAG_STATIC) && ((flags & IP_NEIGHBOR_FLAG_NO_FIB_ENTRY) !=
+						(ipn->ipn_flags & IP_NEIGHBOR_FLAG_NO_FIB_ENTRY)))
+	{
+	  ipn->ipn_flags ^= IP_NEIGHBOR_FLAG_NO_FIB_ENTRY;
+
+	  if (ipn->ipn_flags & IP_NEIGHBOR_FLAG_NO_FIB_ENTRY)
+	    ip_neighbor_adj_fib_remove (ipn);
+	  else
+	    ip_neighbor_adj_fib_add (ipn,
+				     fib_table_get_index_for_sw_if_index (fproto, sw_if_index));
+	}
+
+      /*
+       * An entry can hold no adj-fib because the add that installed it was
+       * not given one: ip_neighbor_adj_fib_add() gives up and returns before
+       * recording an index when the table it names is gone. The allocation
+       * path does not run again for an existing entry, so a later add — or a
+       * table bind, which goes through ip_neighbor_walk_table_bind — is what
+       * puts the path in. An entry marked no-fib-entry is left as it is.
+       */
+      else if (FIB_NODE_INDEX_INVALID == ipn->ipn_fib_entry_index &&
+	       !(ipn->ipn_flags & IP_NEIGHBOR_FLAG_NO_FIB_ENTRY))
+	ip_neighbor_adj_fib_add (ipn, fib_table_get_index_for_sw_if_index (fproto, sw_if_index));
+
+      /*
        * prevent a DoS attack from the data-plane that
        * spams us with no-op updates to the MAC address
        */
