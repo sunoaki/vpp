@@ -220,6 +220,9 @@ af_packet_set_rx_queues (vlib_main_t *vm, af_packet_if_t *apif)
 	template.read_function = af_packet_fd_read_ready;
 	template.error_function = af_packet_fd_error;
 	template.file_descriptor = rx_queue->fd;
+	/* the socket is owned by apif->fds and closed by af_packet_delete_if ();
+	   the file registration only programs the poller */
+	template.dont_close = 1;
 	template.private_data = rx_queue->queue_index;
 	template.description =
 	  format (0, "%U queue %u", format_af_packet_device_name,
@@ -892,11 +895,14 @@ af_packet_delete_if (u8 *host_if_name)
     vnet_delete_hw_interface (vnm, apif->hw_if_index);
 
   /* clean up */
+  /* unregister the queues from the poller before closing their sockets: the
+     epoll delete needs the descriptor, and closing first also lets the file
+     teardown close the number a second time */
+  vec_foreach (rx_queue, apif->rx_queues)
+    af_packet_rx_queue_free (apif, rx_queue);
   vec_foreach_index (i, apif->fds)
     if (apif->fds[i] != -1)
       close (apif->fds[i]);
-  vec_foreach (rx_queue, apif->rx_queues)
-    af_packet_rx_queue_free (apif, rx_queue);
   vec_foreach (tx_queue, apif->tx_queues)
     af_packet_tx_queue_free (apif, tx_queue);
   vec_foreach (ring, apif->rings)
