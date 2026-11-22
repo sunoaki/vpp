@@ -3325,7 +3325,7 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.create_loopback_interfaces(1)
+        cls.create_loopback_interfaces(2)
         cls.vapi.cli(f"lcp create loop0 host-if hloop0 netns {cls.ns_name}")
         # The kernel keeps no neighbour record for an address no connected
         # prefix covers, and the neighbour tests install records, so hloop0
@@ -3334,7 +3334,13 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
         cls.vapi.sw_interface_add_del_address(
             sw_if_index=cls.lo_interfaces[0].sw_if_index, prefix=cls.loop0_prefix_v4
         )
-        cls.lo_interfaces[0].admin_up()
+        # A second pair, without an address, for the table-binding test:
+        # ip_table_bind() refuses to change the table of an interface that
+        # holds one (interface_api.c:610-615), and loop0 carries the prefix
+        # above.
+        cls.vapi.cli(f"lcp create loop1 host-if hloop1 netns {cls.ns_name}")
+        for lo in cls.lo_interfaces:
+            lo.admin_up()
 
     def _netlink_stats(self):
         """Return `show lcp netlink` as a dict of normalized field to value."""
@@ -3355,8 +3361,41 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
         self.assertRegex(value, r"^\d+$", f"'{name}' is not a count: {value!r}")
         return int(value)
 
+    def _netlink_attempts(self):
+        return self._netlink_count(self._netlink_stats(), "synchronization attempts")
+
     def _netlink_completed(self):
         return self._netlink_count(self._netlink_stats(), "synchronization completed")
+
+    def _await_netlink_notifications(self):
+        """Wait until the plugin is processing notifications on an open socket.
+
+        A kernel record reaches the plugin only while the notification socket
+        is open and the netlink process node is not inside a synchronization,
+        and lcp_nl.c:611-643 closes the socket, waits out the retry delay and
+        reopens it, all before the attempt is reported as complete. A test
+        that installs a kernel record and expects the plugin to count it has
+        to start from that state, so it is waited for rather than assumed.
+        """
+
+        def processing():
+            """Return the reported state and whether the notification socket is open.
+
+            `Socket` reads as the descriptor number, or -1 while the socket is
+            closed, so it is compared as text rather than through
+            `_netlink_count`, which rejects the negative value.
+            """
+            stats = self._netlink_stats()
+            descriptor = stats.get("socket")
+            return (stats.get("state"), descriptor is not None and descriptor != "-1")
+
+        self.poll_for(
+            "the plugin is not processing notifications on an open socket",
+            processing,
+            (self.NETLINK_STATE_NORMAL, True),
+            timeout=self.NETLINK_RECOVERY_TIMEOUT,
+            interval=0.25,
+        )
 
     def _invoke_netlink_error_callback(self, *args):
         """Invoke the polling error callback registered for the route socket."""
@@ -3433,9 +3472,6 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
         self._check_recovery(attempts_before, completed_before, "invalid-fd")
         self._check_linux_update_reaches_vpp()
 
-    def _netlink_attempts(self):
-        return self._netlink_count(self._netlink_stats(), "synchronization attempts")
-
     def _set_link_down_flag(self, name, enable):
         self.vapi.cli(f"lcp param {name} {'on' if enable else 'off'}")
         self.addCleanup(self.vapi.cli, f"lcp param {name} off")
@@ -3462,16 +3498,22 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
         return sw_if_index
 
     def _force_resync(self):
-        """Run a synchronization cycle by reporting a netlink polling error."""
+        """Run a synchronization cycle and return once it is over.
+
+        The cycle closes the notification socket and discards the queue at
+        lcp_nl.c:611-612, then raises the attempt counter at lcp_nl.c:614 and
+        suspends for the retry delay at lcp_nl.c:623 before reopening the
+        socket at lcp_nl.c:643. Waiting on the attempt counter alone therefore
+        returns with the socket still closed, and a record the kernel reports
+        in that window is queued nowhere and never reaches the plugin. The
+        cycle is over when its completion counter rises and the state reads
+        back as notification processing, which is what _check_recovery waits
+        for.
+        """
         attempts_before = self._netlink_attempts()
+        completed_before = self._netlink_completed()
         self._invoke_netlink_error_callback()
-        self.poll_for(
-            "synchronization did not complete",
-            lambda: self._netlink_attempts() > attempts_before,
-            True,
-            timeout=self.NETLINK_RECOVERY_TIMEOUT,
-            interval=0.25,
-        )
+        self._check_recovery(attempts_before, completed_before, "resynchronization")
 
     def _run_neigh_steps(self, *steps):
         """Drive the neighbour synchronization steps of the plugin directly."""
@@ -3529,6 +3571,7 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
         reported to the plugin, and a test must not assume a state the kernel
         did not apply.
         """
+        self._await_netlink_notifications()
         added = self._namespace_neighbor(
             "replace", address, "dev", "hloop0", "lladdr", mac, "nud", state
         )
@@ -3780,15 +3823,7 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
         # entries it did not see reported.
         self._add_unsynced_neighbor(unsynced, "02:01:02:03:04:17")
 
-        completed_before = self._netlink_completed()
         self._force_resync()
-        self.poll_for(
-            "synchronization did not end",
-            lambda: self._netlink_completed() > completed_before,
-            True,
-            timeout=self.NETLINK_RECOVERY_TIMEOUT,
-            interval=0.25,
-        )
 
         self.assertFalse(
             find_nbr(self, sw_if_index, unsynced),
@@ -4127,7 +4162,9 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
 
     def test_router_bound_table_sweep(self):
         """Sweep releases routes while pair binding preserves table lifetime"""
-        interface = self.lo_interfaces[0]
+        # loop1 is the pair this class keeps free of addresses, which is what
+        # ip_table_bind() requires of an interface whose table is changed.
+        interface = self.lo_interfaces[1]
         for is_ipv6, proto, prefix, table in (
             (False, "ip4", "198.18.94.0/24", 1094),
             (True, "ip6", "2001:db8:95::/64", 1095),
