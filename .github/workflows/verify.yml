@@ -199,6 +199,47 @@ jobs:
           # Such a file stays UNCOVERED, which is the failure mode of this
           # table: a file added later runs only the ip4 fallback until a rule
           # names its suite.
+          #
+          # src/vlib has a module of its own, test/test_vlib.py, but no rule
+          # gives every file of it that module: the module covers the files
+          # listed below and nothing else.
+          #
+          # The criterion a rule applies, in one sentence: a file is ruled
+          # when a test module in this tree issues a command or calls a
+          # function whose implementation is in that file, or includes a header
+          # whose inline bodies it reaches, and the command is not incidental
+          # to another file under test.
+          #
+          # A src/vlib file named by no rule stays UNCOVERED and keeps the ip4
+          # fallback, which is the failure mode of this table: a file added
+          # later runs only the smoke suite until a rule names its suite.
+          #
+          # The files this tree leaves out, each reason checked against the
+          # tree. No test module issues a command defined by file.c (`show
+          # files`), init.c (`show init-function`) or physmem.c (`show
+          # physmem`), nor by handoff_cli.c (`show handoff`, `clear handoff
+          # counters`, `set handoff queue`); time.c defines only `set clock
+          # adjust`, which no test module issues -- asfframework.virtual_sleep
+          # calls it to move time, not to test the file. node.c, node_format.c,
+          # drop.c, lex.c and vlib.h define no command of their own, and every
+          # test module that reaches them does so from a command defined for
+          # another file. cli.c defines `show memory` and `memory-trace`, which
+          # test/asf/test_vppinfra.py issues while testing the memory tracer,
+          # and `show cpu`, `test sleep`, `suspend`, none of them a suite
+          # written for cli.c. log.c's commands are issued by
+          # test/asf/test_vpe_api.py (`test log` and a log_dump read-back) and
+          # its `clear logging`/`set logging class`/`set logging size` by the
+          # nat44_ei, igmp, ipsec_tun_if_esp and neighbor suites, each as a
+          # step inside another feature's test. threads_cli.c's `show threads`
+          # is issued once, in the quic_crypto setup. stats/ is not testless:
+          # test/test_stats_client.py holds the ungated StatsNodeRecycleTestCase,
+          # which configures `per-node-counters on` and `update-interval` (the
+          # words stats/init.c parses) and regresses the node symlinks that
+          # stats/collector.c maintains. But the modules of stats/ define `show
+          # statistics hash` and `show statistics segment`, which no test
+          # issues, and there is no test_stats.py for the directory name, so
+          # no rule names them. The whole of unix/, pci/, dma/, vmbus/,
+          # linux/ and freebsd/ has no test in this tree.
           suite_file_alias() {
             case "$1" in
               # A documentation file is not built into the suites it describes,
@@ -232,6 +273,82 @@ jobs:
                 ;;
               src/vnet/ip/ip4*|src/vnet/ip/icmp4.*) printf '%s\n' ip4 ;;
               src/vnet/ip/ip6*|src/vnet/ip/icmp6.*) printf '%s\n' ip6 ;;
+              # The error counters and the `show errors` and `clear errors`
+              # commands that report them. test/test_vlib_errors.py drives
+              # those commands and reads their columns and totals; it lives on
+              # the change that makes the report yield, so it is absent from
+              # the tree this table was written against and the rule reports
+              # UNCOVERED until that change lands.
+              src/vlib/error.c|src/vlib/error.h|src/vlib/error_funcs.h)
+                printf '%s\n' vlib_errors
+                ;;
+              # The files test_vlib.py names in the docstring of a coverage
+              # command: "Vlib main.c", "Vlib node_cli.c" and "Vlib format.c".
+              # Those methods belong to the TestVlib class, which is skipped
+              # outside a --gcov run, so this suite covers these files only
+              # under coverage; the rule still names the module written for
+              # them rather than a command that does not reach them.
+              src/vlib/main.c|src/vlib/node_cli.c|src/vlib/format.c|\
+                src/vlib/format_funcs.h)
+                printf '%s\n' vlib
+                ;;
+              # TestVlibTimingWheel sends `test vlib timing-wheel`, and the
+              # command it reaches calls vlib_tw_timer_start, vlib_tw_timer_stop,
+              # vlib_tw_timer_expire_timers and vlib_tw_init, which are the
+              # inline bodies of tw_funcs.h. That class is not gcov-gated.
+              src/vlib/tw_funcs.h) printf '%s\n' vlib ;;
+              # TestPoolCache{2,4,8}Workers inherit test_multi_workers_pool,
+              # which sends `test pool-cache`; the command in the unittest
+              # plugin calls pool_cache_init_with_batch, pool_cache_get,
+              # pool_cache_put_index and pool_cache_free of pool_cache.c.
+              # Neither those classes nor the template is gcov-gated.
+              src/vlib/pool_cache.c|src/vlib/pool_cache.h)
+                printf '%s\n' vlib
+                ;;
+              # test_vlib.py runs `show buffers` as its buffer.c coverage
+              # command, and test_buffers.py asserts the pool layout that the
+              # same command prints, so a change to the pool code reaches both.
+              src/vlib/buffer.c) printf '%s\n' vlib buffers ;;
+              # test_buffers.py sends `test chained-buffer-linearization` and
+              # `test buffer scalar-frame-enqueue`, whose nodes in the unittest
+              # plugin call vlib_buffer_chain_linearize and the enqueue
+              # functions these files define.
+              src/vlib/buffer_funcs.*|src/vlib/buffer_node.h)
+                printf '%s\n' buffers
+                ;;
+              # test_counters.py sends `test counter simple expand` and
+              # `test counter combined expand`, which call vlib_validate_*_counter
+              # and vlib_free_*_counter from counter.c and hold the counter
+              # types of counter.h and counter_types.h.
+              src/vlib/counter.c|src/vlib/counter.h|src/vlib/counter_types.h)
+                printf '%s\n' counters
+                ;;
+              # test_punt.py asserts the `show punt client`, `show punt
+              # reasons`, `show punt db` and `show punt stats` output of
+              # punt.c, and counts the punts the punt-dispatch node of
+              # punt_node.c sends to the socket it registers.
+              src/vlib/punt.c|src/vlib/punt.h|src/vlib/punt_node.c)
+                printf '%s\n' punt
+                ;;
+              # test_trace_filter.py runs `clear trace` and `trace add ... filter`
+              # and counts the packets they trace; test_bpf_trace_filter.py runs
+              # `set trace filter function`, `show trace filter function` and
+              # `show trace`. Both drive the commands and the filter of trace.c.
+              src/vlib/trace.c|src/vlib/trace.h|src/vlib/trace_funcs.h)
+                printf '%s\n' trace_filter
+                ;;
+              # test_time.py sends `test time ...` for the clib clock, and its
+              # barrier case asserts that vlib_time_adjust, vlib_time_now and
+              # vlib_worker_thread_barrier_check keep a worker's time monotone.
+              # vlib_time_adjust and vlib_time_now are inline bodies of these
+              # headers, and the barrier inlines of threads.h expand to
+              # vlib_worker_thread_barrier_sync_int and ..._release, whose
+              # bodies are in threads.c, so that file is reached the same way.
+              # time.c itself, the virtual-time node and `set clock adjust`,
+              # has no test of its own.
+              src/vlib/main.h|src/vlib/time.h|src/vlib/threads.h|src/vlib/threads.c)
+                printf '%s\n' time
+                ;;
             esac
           }
 
@@ -244,10 +361,43 @@ jobs:
             printf 'UNCOVERED %s: looked for %s\n' "${path}" "${looked}" >&2
           }
 
+          # The report for a src/vlib file that no rule names. The directory
+          # does have a module, test/test_vlib.py, so naming it as the module
+          # that was looked for would claim coverage the table says is absent.
+          report_uncovered_vlib() {
+            printf 'UNCOVERED %s: no suite names this file\n' "$1" >&2
+          }
+
+          # Resolve one path through the file-level table above and print every
+          # suite it names. Return 0 when at least one named suite has a
+          # module, 1 when a rule matched but none of its suites does, and 2
+          # when no rule matched the path at all. The caller needs the last two
+          # apart: the first is a rule pointing at a module that is gone, and
+          # the second is the table saying it knows nothing about the file.
+          resolve_file_alias() {
+            local path="$1" candidate found=0
+            local -a candidates=()
+            mapfile -t candidates < <(suite_file_alias "${path}")
+            if [ "${#candidates[@]}" -eq 0 ]; then
+              return 2
+            fi
+            for candidate in "${candidates[@]}"; do
+              if suite_module_exists "${candidate}"; then
+                printf '%s\n' "${candidate}"
+                found=1
+              fi
+            done
+            if [ "${found}" -eq 1 ]; then
+              return 0
+            fi
+            report_uncovered "${path}" "${candidates[@]}"
+            return 1
+          }
+
           # Print the module that covers one changed path and return success, or
           # print an UNCOVERED report on stderr and return failure.
           derive_suite_for_path() {
-            local path="$1" rest dir sub name found candidate
+            local path="$1" rest dir sub name candidate alias_status
             local -a candidates=()
             case "${path}" in
               src/plugins/*/*)
@@ -273,6 +423,27 @@ jobs:
                 report_uncovered "${path}" "${candidates[@]}"
                 return 1
                 ;;
+              src/vlib/*|src/vlib/*/*)
+                # src/vlib is resolved by file alone: its directory rule would
+                # name test/test_vlib.py, and the section above says why no
+                # rule hands that module to a file it does not cover. The
+                # nested form is here as well, because `*` does not cross a
+                # slash and src/vlib/dma/, src/vlib/unix/ and the rest would
+                # otherwise fall through without a report.
+                alias_status=0
+                resolve_file_alias "${path}" || alias_status=$?
+                case "${alias_status}" in
+                  0) return 0 ;;
+                  1) return 1 ;;
+                esac
+                # No rule names the file. It stays UNCOVERED, so the run keeps
+                # the ip4 fallback it had before this branch existed. The
+                # message names no module on purpose: test/test_vlib.py exists,
+                # and saying it was "looked for" would suggest it covers the
+                # file when the whole point of the table is that it does not.
+                report_uncovered_vlib "${path}"
+                return 1
+                ;;
               src/vnet/*/*)
                 rest=${path#src/vnet/}
                 dir=${rest%%/*}
@@ -280,21 +451,12 @@ jobs:
                 # directory whose files belong to several modules is resolved
                 # by file. Every suite such a rule names is printed, one per
                 # line, so one path can select more than one suite.
-                mapfile -t candidates < <(suite_file_alias "${path}")
-                if [ "${#candidates[@]}" -gt 0 ]; then
-                  found=0
-                  for candidate in "${candidates[@]}"; do
-                    if suite_module_exists "${candidate}"; then
-                      printf '%s\n' "${candidate}"
-                      found=1
-                    fi
-                  done
-                  if [ "${found}" -eq 1 ]; then
-                    return 0
-                  fi
-                  report_uncovered "${path}" "${candidates[@]}"
-                  return 1
-                fi
+                alias_status=0
+                resolve_file_alias "${path}" || alias_status=$?
+                case "${alias_status}" in
+                  0) return 0 ;;
+                  1) return 1 ;;
+                esac
                 name=$(suite_module_alias "${dir}")
                 if [ -z "${name}" ]; then
                   name=${dir//-/_}
@@ -515,6 +677,20 @@ jobs:
               failures=$((failures + 1))
             fi
           }
+          # A src/vlib file that no rule names reports itself rather than a
+          # module, because the directory's module exists and does not cover it.
+          expect_vlib_uncovered() {
+            local path="$1" module line
+            module=$(derive_suite_for_path "${path}" 2>/dev/null || true)
+            line=$(derive_suite_for_path "${path}" 2>&1 >/dev/null || true)
+            if [ -n "${module}" ]; then
+              echo "::error::${path}: expected no suite, derived '${module}'"
+              failures=$((failures + 1))
+            elif [ "${line}" != "UNCOVERED ${path}: no suite names this file" ]; then
+              echo "::error::${path}: expected the vlib UNCOVERED report, got '${line}'"
+              failures=$((failures + 1))
+            fi
+          }
           # One fixture per rule: the src/vnet alias table, the plain directory
           # rule, the plugin subdirectory candidate, the plugin package-name
           # fallback, and directories that have no module of their own.
@@ -545,6 +721,71 @@ jobs:
           # reports UNCOVERED and so must still fall back to ip4. This is the
           # "must not gain a suite" case: vtep.c has no test in the tree.
           expect_uncovered src/vnet/ip/vtep.c "test/test_ip.py or test/asf/test_ip.py"
+          # The src/vlib table, one assertion per rule member so that dropping
+          # a header from a pattern fails here rather than silently narrowing
+          # the rule. A file of src/vlib that no rule names stays UNCOVERED
+          # with its own report, which is the "must not gain a suite" case.
+          # cli.c is such a file: its commands are issued only as a step
+          # inside another feature's test, so the vlib module that exists must
+          # not be claimed for it.
+          expect_suite src/vlib/main.c vlib
+          expect_suite src/vlib/node_cli.c vlib
+          expect_suite src/vlib/format.c vlib
+          expect_suite src/vlib/format_funcs.h vlib
+          expect_suite src/vlib/tw_funcs.h vlib
+          expect_suite src/vlib/pool_cache.c vlib
+          expect_suite src/vlib/pool_cache.h vlib
+          expect_suite src/vlib/counter.c counters
+          expect_suite src/vlib/counter.h counters
+          expect_suite src/vlib/counter_types.h counters
+          expect_suite src/vlib/punt.c punt
+          expect_suite src/vlib/punt.h punt
+          expect_suite src/vlib/punt_node.c punt
+          expect_suite src/vlib/trace.c trace_filter
+          expect_suite src/vlib/trace.h trace_filter
+          expect_suite src/vlib/trace_funcs.h trace_filter
+          expect_suite src/vlib/main.h time
+          expect_suite src/vlib/time.h time
+          expect_suite src/vlib/threads.h time
+          expect_suite src/vlib/threads.c time
+          expect_suite src/vlib/buffer_funcs.c buffers
+          expect_suite src/vlib/buffer_funcs.h buffers
+          expect_suite src/vlib/buffer_node.h buffers
+          # The buffer pool code is read by both the vlib suite's `show
+          # buffers` coverage command and the buffer suite's pool assertions.
+          expect_suite src/vlib/buffer.c "vlib buffers"
+          expect_vlib_uncovered src/vlib/cli.c
+          expect_vlib_uncovered src/vlib/time.c
+          # A subdirectory has no directory rule either, so the nested form of
+          # the path is resolved by the same table and reported the same way.
+          expect_vlib_uncovered src/vlib/dma/dma.c
+          # The error rule is asserted for the tree it is run on, so this
+          # self-check passes whether or not test_vlib_errors.py has landed.
+          # The fixture below drives the same rule with that module present, so
+          # the mapping itself is covered on either tree.
+          if suite_module_exists vlib_errors; then
+            expect_suite src/vlib/error.c vlib_errors
+            expect_suite src/vlib/error.h vlib_errors
+            expect_suite src/vlib/error_funcs.h vlib_errors
+          else
+            expect_uncovered src/vlib/error.c \
+              "test/test_vlib_errors.py or test/asf/test_vlib_errors.py"
+            expect_uncovered src/vlib/error.h \
+              "test/test_vlib_errors.py or test/asf/test_vlib_errors.py"
+            expect_uncovered src/vlib/error_funcs.h \
+              "test/test_vlib_errors.py or test/asf/test_vlib_errors.py"
+          fi
+          error_tree="${RUNNER_TEMP}/vlib-error-rule"
+          mkdir -p "${error_tree}/src/vlib" "${error_tree}/test"
+          : > "${error_tree}/test/test_vlib_errors.py"
+          for member in src/vlib/error.c src/vlib/error.h src/vlib/error_funcs.h; do
+            derived_error=$(cd "${error_tree}" && \
+              derive_suite_for_path "${member}" || true)
+            if [ "${derived_error}" != "vlib_errors" ]; then
+              echo "::error::${member} with test_vlib_errors.py present: expected 'vlib_errors', derived '${derived_error}'"
+              failures=$((failures + 1))
+            fi
+          done
           # No package in this repository has both test_<pkg>.py and
           # test_<sub>.py, so the subdirectory-first order is unobservable in
           # the real tree. Assert it in a tree that has both.
@@ -579,6 +820,27 @@ jobs:
           # ip4 follows alphabetically inside the remaining group.
           expect_suites "ip6 ip4" \
             src/vnet/ip/ip4_forward.c src/vnet/ip/ip6_forward.c test/test_ip6.py
+          # The aggregate over the src/vlib table: a ruled file selects its
+          # suite, a file no rule names derives nothing and keeps the ip4
+          # fallback, and a multi-suite file contributes both names next to a
+          # vnet suite in the same commit.
+          expect_suites "counters" src/vlib/counter.c
+          expect_suites "ip4" src/vlib/cli.c
+          expect_suites "buffers ip6 vlib" \
+            src/vlib/buffer.c src/vnet/ip/ip6_forward.c
+          # A src/vlib change does not starve a src/vnet suite: the vlib suites
+          # fill one slot of three, counters and buffers, the vnet file adds
+          # ip6, and the cap drops vlib, which is named.
+          expect_suites "ip6 buffers counters" \
+            src/vlib/main.c src/vlib/buffer.c src/vlib/counter.c \
+            src/vnet/ip/ip6_forward.c test/test_ip6.py
+          capped_mixed=$(printf '%s\n' src/vlib/main.c src/vlib/buffer.c \
+            src/vlib/counter.c src/vnet/ip/ip6_forward.c test/test_ip6.py \
+            | derive_test_suites 2>&1 >/dev/null)
+          if [ "${capped_mixed}" != "Not selected: the suite cap of 3 drops vlib" ]; then
+            echo "::error::the mixed vlib/vnet cap report was wrong, got '${capped_mixed}'"
+            failures=$((failures + 1))
+          fi
           # The cap still applies when a single path contributes two suites:
           # ip4 and ip6 from ip_interface.c fill two of three slots, fib takes
           # the third, and ip_mcast and neighbor are named as dropped.
