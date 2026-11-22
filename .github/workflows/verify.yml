@@ -231,8 +231,15 @@ jobs:
           # its `clear logging`/`set logging class`/`set logging size` by the
           # nat44_ei, igmp, ipsec_tun_if_esp and neighbor suites, each as a
           # step inside another feature's test. threads_cli.c's `show threads`
-          # is issued once, in the quic_crypto setup. The whole of unix/,
-          # stats/, pci/, dma/, vmbus/ and freebsd/ has no test in this tree.
+          # is issued once, in the quic_crypto setup. stats/ is not testless:
+          # test/test_stats_client.py holds the ungated StatsNodeRecycleTestCase,
+          # which configures `per-node-counters on` and `update-interval` (the
+          # words stats/init.c parses) and regresses the node symlinks that
+          # stats/collector.c maintains. But the modules of stats/ define `show
+          # statistics hash` and `show statistics segment`, which no test
+          # issues, and there is no test_stats.py for the directory name, so
+          # no rule names them. The whole of unix/, pci/, dma/, vmbus/,
+          # linux/ and freebsd/ has no test in this tree.
           suite_file_alias() {
             case "$1" in
               # A documentation file is not built into the suites it describes,
@@ -717,9 +724,10 @@ jobs:
           # The src/vlib table, one assertion per rule member so that dropping
           # a header from a pattern fails here rather than silently narrowing
           # the rule. A file of src/vlib that no rule names stays UNCOVERED
-          # with its own report, which is the "must not gain a suite" case:
-          # cli.c holds commands no suite calls, and the vlib module that
-          # exists must not be claimed for it.
+          # with its own report, which is the "must not gain a suite" case.
+          # cli.c is such a file: its commands are issued only as a step
+          # inside another feature's test, so the vlib module that exists must
+          # not be claimed for it.
           expect_suite src/vlib/main.c vlib
           expect_suite src/vlib/node_cli.c vlib
           expect_suite src/vlib/format.c vlib
