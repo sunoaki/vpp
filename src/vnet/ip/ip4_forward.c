@@ -1490,6 +1490,44 @@ typedef struct
   u8 first;
 } ip4_local_last_check_t;
 
+/*
+ * Attached export copies the receive entry of a local prefix into every
+ * importing table, and the copied entry keeps naming the interface of the
+ * exporting table. A receive DPO speaks for its address only in the table
+ * its interface belongs to, so an entry imported into another table must
+ * not terminate the packet there.
+ */
+static_always_inline u8
+ip4_receive_dpo_crosses_table (const receive_dpo_t *rd, u32 fib_index)
+{
+  return (rd->rd_sw_if_index != ~0 &&
+	  ip4_fib_table_get_index_for_sw_if_index (rd->rd_sw_if_index) != fib_index);
+}
+
+/*
+ * The table a packet is looked up in, after the transmit interface override
+ * that ip4_local_check_src applies.
+ */
+static_always_inline u32
+ip4_local_buffer_fib_index (vlib_buffer_t *b)
+{
+  if (vnet_buffer (b)->sw_if_index[VLIB_TX] != ~0)
+    return vnet_buffer (b)->sw_if_index[VLIB_TX];
+
+  return vnet_buffer (b)->ip.fib_index;
+}
+
+static_always_inline void
+ip4_local_reject_foreign_receive (vlib_buffer_t *b, u8 *error)
+{
+  const receive_dpo_t *rd;
+
+  rd = receive_dpo_get (vnet_buffer (b)->ip.adj_index[VLIB_TX]);
+  if (PREDICT_FALSE (ip4_receive_dpo_crosses_table (rd, ip4_local_buffer_fib_index (b))) &&
+      *error == IP4_ERROR_UNKNOWN_PROTOCOL)
+    *error = IP4_ERROR_DST_LOOKUP_MISS;
+}
+
 always_inline void
 ip4_local_check_src (vlib_buffer_t *b, ip4_header_t *ip0, ip4_local_last_check_t *last_check,
 		     u8 *error0, int is_receive_dpo)
@@ -1805,6 +1843,12 @@ ip4_local_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *fram
       b[0]->flags |= VNET_BUFFER_F_IS_IP4 | VNET_BUFFER_F_L3_HDR_OFFSET_VALID;
       b[1]->flags |= VNET_BUFFER_F_IS_IP4 | VNET_BUFFER_F_L3_HDR_OFFSET_VALID;
 
+      if (is_receive_dpo)
+	{
+	  ip4_local_reject_foreign_receive (b[0], &error[0]);
+	  ip4_local_reject_foreign_receive (b[1], &error[1]);
+	}
+
       pt[0] = ip4_local_classify (b[0], ip[0], &next[0]);
       pt[1] = ip4_local_classify (b[1], ip[1], &next[1]);
 
@@ -1853,6 +1897,10 @@ ip4_local_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *fram
       ip[0] = vlib_buffer_get_current (b[0]);
       vnet_buffer (b[0])->l3_hdr_offset = b[0]->current_data;
       b[0]->flags |= VNET_BUFFER_F_IS_IP4 | VNET_BUFFER_F_L3_HDR_OFFSET_VALID;
+
+      if (is_receive_dpo)
+	ip4_local_reject_foreign_receive (b[0], &error[0]);
+
       pt[0] = ip4_local_classify (b[0], ip[0], &next[0]);
 
       if (head_of_feature_arc == 0 || pt[0])
