@@ -550,7 +550,15 @@ class QUICCredentialFailure(VppAsfTestCase):
         for peer in (client, server):
             peer.request("close")
         for peer in (client, server):
-            peer.request("destroy")
+            # Each peer attached its own certificate/key pair, and both pairs
+            # live in the global app_crypto_main.cert_key_pair_store in
+            # src/vnet/session/application_crypto.c. Only
+            # vnet_app_del_cert_key_pair removes one; app_destroy reaches
+            # app_crypto_ctx_free, which releases ca-trust stores, TLS profiles
+            # and async requests but never the pair. detach deletes the pair
+            # before destroying the application, so "show app certificate"
+            # returns to the baseline wait_snapshot() compares against.
+            peer.request("detach")
             peer.stop()
         deadline = time.monotonic() + 15
         while True:
