@@ -1025,6 +1025,35 @@ hss_ts_cleanup (session_t *s, session_cleanup_ntf_t ntf)
   hss_session_cleanup (hs);
 }
 
+/** \brief Release a session whose transport is closed.
+ *
+ * A connection this server closes itself, which is every reply without a body
+ * and every protocol error, reaches TCP TIME_WAIT and is deleted only after
+ * timewait_time, 10 s by default. The session layer frees the session at that
+ * delete, so hss_session_cleanup () does not run for that whole window and the
+ * retired listener keeps the reference that holds it in the pool. The
+ * transport reports the close when the connection enters the wait, so release
+ * here instead of after it.
+ *
+ * HTTP copies reply bytes out of the session's tx fifo into the transport's,
+ * and it drops the uword that start_send_data () enqueues for a pointer only
+ * once the bytes behind that pointer are copied. An empty tx fifo therefore
+ * means no reply buffer is still referenced. A reply that is still queued is
+ * left to hss_ts_cleanup (), so this never frees a buffer HTTP may read. */
+static void
+hss_ts_transport_closed_callback (session_t *ts)
+{
+  hss_session_t *hs;
+
+  hs = hss_session_get (ts->thread_index, ts->opaque);
+  if (!hs)
+    return;
+  if (svm_fifo_max_dequeue (ts->tx_fifo))
+    return;
+  ts->opaque = ~0;
+  hss_session_cleanup (hs);
+}
+
 static session_cb_vft_t hss_cb_vft = {
   .session_accept_callback = hss_ts_accept_callback,
   .session_disconnect_callback = hss_ts_disconnect_callback,
@@ -1035,6 +1064,7 @@ static session_cb_vft_t hss_cb_vft = {
   .builtin_app_tx_callback = hss_ts_tx_callback,
   .session_reset_callback = hss_ts_reset_callback,
   .session_cleanup_callback = hss_ts_cleanup,
+  .session_transport_closed_callback = hss_ts_transport_closed_callback,
 };
 
 static int
