@@ -11,8 +11,8 @@ when it sees a change. Unregistering the queue then frees the index while the
 bit survives, and the next drain replays it against the free pool entry.
 
 The test attaches VPP to veth pairs whose peers live in a Linux namespace,
-then pings the VPP side and checks the interface's RX counter, so a dead RX
-path shows up as a counter that does not move.
+then sends frames to the VPP side and checks the interface's RX counter, so a
+dead RX path shows up as a counter that does not move.
 """
 
 import subprocess
@@ -98,18 +98,35 @@ class TestVnetRxQueueUnregister(VppTestCase):
         counters = self.statistics.get_counter("/if/rx")
         return sum(t[self.sw_if_index[vpp_end]]["packets"] for t in counters)
 
-    def ping_from_linux(self, index):
-        subprocess.run(
-            ["ip", "netns", "exec", self.namespace, "ping", "-c", "3", "-i", "0.2"]
-            + ["-W", "1", f"10.10.{index}.1"],
+    def send_packets_from_linux(self, index):
+        """Send frames from the namespace peer without a host ping binary."""
+        # The broadcast address needs no neighbor resolution, so the frames
+        # leave immediately and the RX counter moves without a host tool.
+        script = "\n".join(
+            [
+                "import socket",
+                "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)",
+                "s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)",
+                "for _ in range(3):",
+                f"    s.sendto(b'x' * 32, ('10.10.{index}.255', 9))",
+            ]
+        )
+        result = subprocess.run(
+            ["ip", "netns", "exec", self.namespace, "python3", "-c", script],
             capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"failed to send from the namespace: {result.stderr}",
         )
         # Let the 1 ms TPACKET_V3 block timeout retire the last block.
         time.sleep(0.1)
 
     def assert_receives(self, index, vpp_end):
         before = self.rx_packets(vpp_end)
-        self.ping_from_linux(index)
+        self.send_packets_from_linux(index)
         self.assertGreater(self.rx_packets(vpp_end), before, f"{vpp_end} RX dead")
 
     def test_delete_queue_with_stale_interrupt(self):
