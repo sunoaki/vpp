@@ -1221,6 +1221,27 @@ lcp_router_address_sweep (u32 sw_if_index, u8 is_ip4)
 	  LCP_ROUTER_ERROR ("address sweep: %U failed: %U", format_vnet_sw_if_index_name,
 			    vnet_get_main (), sw_if_index, format_clib_error, error);
 	  clib_error_free (error);
+	  continue;
+	}
+
+      /*
+       * The delete removes the prefix and the local address carved from it,
+       * so it is reported at a level an operator can read without enabling
+       * debug logging. A sweep that finds nothing to delete writes nothing.
+       */
+      if (is_ip4)
+	{
+	  LCP_ROUTER_INFO ("address sweep: %U withdrew %U/%u, marked stale at "
+			   "begin and not re-announced by the replay",
+			   format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index,
+			   format_ip4_address, &ip4_addrs[i], masks[i]);
+	}
+      else
+	{
+	  LCP_ROUTER_INFO ("address sweep: %U withdrew %U/%u, marked stale at "
+			   "begin and not re-announced by the replay",
+			   format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index,
+			   format_ip6_address, &ip6_addrs[i], masks[i]);
 	}
     }
 

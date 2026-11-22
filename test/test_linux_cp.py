@@ -3672,6 +3672,58 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
             del_namespace_route(self.ns_name, route, check=False)
             self.poll_for(f"{route} removed from VPP FIB", route_present, False)
 
+    def _vpp_ipv4_addresses(self, sw_if_index):
+        """Return the IPv4 prefixes VPP holds on an interface."""
+        return [
+            str(address.prefix)
+            for address in self.vapi.ip_address_dump(sw_if_index, is_ipv6=False)
+        ]
+
+    def _del_vpp_address(self, sw_if_index, prefix):
+        """Delete an address the test may already have lost to the sweep."""
+        if prefix in self._vpp_ipv4_addresses(sw_if_index):
+            self.vapi.sw_interface_add_del_address(
+                sw_if_index=sw_if_index, prefix=prefix, is_add=0
+            )
+
+    def test_address_sweep_reports_its_delete(self):
+        """A swept address is reported, at a level readable without debug"""
+        interface = self.lo_interfaces[0]
+        prefix = "10.10.9.2/24"
+
+        # With the VPP-to-Linux push off, the address exists only in VPP. The
+        # address dump of a synchronization then cannot re-announce it, so the
+        # end step sweeps it, which is the delete this test reads back.
+        self.vapi.cli("lcp lcp-sync off")
+        self.addCleanup(self.vapi.cli, "lcp lcp-sync on")
+        self.vapi.sw_interface_add_del_address(
+            sw_if_index=interface.sw_if_index, prefix=prefix
+        )
+        self.addCleanup(self._del_vpp_address, interface.sw_if_index, prefix)
+        self.assertIn(prefix, self._vpp_ipv4_addresses(interface.sw_if_index))
+        self.assertNotIn(
+            _prefix_tuple(prefix),
+            get_interface_addresses(self.ns_name, "hloop0", family="inet"),
+        )
+
+        self._force_resync()
+
+        self.poll_for(
+            f"VPP swept {prefix}",
+            lambda: prefix in self._vpp_ipv4_addresses(interface.sw_if_index),
+            False,
+            timeout=self.NETLINK_RECOVERY_TIMEOUT,
+            interval=0.25,
+        )
+        # The notice level is the default, so the line has to be in the log
+        # without a debug level being enabled.
+        logging = self.vapi.cli("show logging")
+        self.assertIn(
+            f"address sweep: loop0 withdrew {prefix}, marked stale at begin "
+            "and not re-announced by the replay",
+            logging,
+        )
+
     def test_netlink_poll_error_recovery(self):
         """Netlink polling error callback triggers a recovery cycle"""
         stats = self._netlink_stats()
