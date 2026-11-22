@@ -4584,6 +4584,9 @@ class TestIP6InterfaceRx(VppTestCase):
         self.send_and_expect(self.pg0, pkts_dst, self.pg2)
 
 
+@unittest.skipIf(
+    "ping" in config.excluded_plugins, "Exclude tests requiring Ping plugin"
+)
 class TestIPv6ReceiveDPOCrossTable(VppTestCase):
     """IPv6 receive DPO limited to its own table"""
 

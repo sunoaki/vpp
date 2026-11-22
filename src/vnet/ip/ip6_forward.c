@@ -1240,11 +1240,20 @@ ip6_tcp_udp_icmp_bad_length (vlib_main_t * vm, vlib_buffer_t * p0)
  * its interface belongs to, so an entry imported into another table must
  * not terminate the packet there.
  *
- * A link-local destination is the exception. Its receive entry lives in the
- * per-interface link-local table, which the ip6-link-local DPO selects from
- * the receiving interface, and no attached export imports into that table.
- * A packet looked up in one therefore already is in the table its receive
- * DPO belongs to.
+ * A link-local destination depends on the table flag test below; that test
+ * is what keeps link-local termination working. The ip6-link-local DPO
+ * rewrites the packet's transmit interface to the receiving interface's own
+ * link-local table (ip6_ll_fib_get), and the lookup in that table sets
+ * ip.fib_index to it. The equality test above compares against the
+ * interface's ordinary table, so it always fails on this path, and only the
+ * FIB_TABLE_FLAG_IP6_LL test lets a link-local receive through.
+ *
+ * That exemption is not a hole. A link-local table carries table id ~0, so
+ * no table id names one, and attached export cannot import into one: a
+ * link-local prefix is never imported, and the fe80::/10 route that sends
+ * link-local packets to the link-local DPO carries
+ * FIB_ENTRY_FLAG_NO_ATTACHED_EXPORT. A packet the lookup finds in a
+ * link-local table therefore belongs to the interface whose table it is.
  */
 static_always_inline u8
 ip6_receive_dpo_crosses_table (const receive_dpo_t *rd, u32 fib_index)
