@@ -202,24 +202,37 @@ jobs:
           #
           # src/vlib has a module of its own, test/test_vlib.py, but no rule
           # gives every file of it that module: the module covers the files
-          # listed below and nothing else. Each rule names the suite whose
-          # test module issues the command that reaches the file, read from
-          # the tree; several of those commands sit in the gcov-gated TestVlib
-          # class, and the pool-cache and timing-wheel classes are not gated.
+          # listed below and nothing else.
+          #
+          # The criterion a rule applies, in one sentence: a file is ruled
+          # when a test module in this tree issues a command or calls a
+          # function whose implementation is in that file, or includes a header
+          # whose inline bodies it reaches, and the command is not incidental
+          # to another file under test.
           #
           # A src/vlib file named by no rule stays UNCOVERED and keeps the ip4
           # fallback, which is the failure mode of this table: a file added
           # later runs only the smoke suite until a rule names its suite.
-          # The files this tree leaves out, and why: file.c (`show files`),
-          # init.c (`show init-function`) and time.c (the virtual-time node and
-          # `set clock adjust`, which only asfframework.virtual_sleep drives)
-          # have no command any test module issues; log.c is read by the
-          # linux_cp and neighbor suites for the log lines they themselves
-          # write, and threads_cli.c by the quic_crypto suite in its setup,
-          # not as a test of the file; node*.c, handoff*.c, drop.c, lex.c,
-          # physmem.c, vlib.h and the headers included everywhere have no
-          # command of their own; and unix/, stats/, pci/, dma/, vmbus/ and
-          # freebsd/ have no test in this tree.
+          #
+          # The files this tree leaves out, each reason checked against the
+          # tree. No test module issues a command defined by file.c (`show
+          # files`), init.c (`show init-function`) or physmem.c (`show
+          # physmem`), nor by handoff_cli.c (`show handoff`, `clear handoff
+          # counters`, `set handoff queue`); time.c defines only `set clock
+          # adjust`, which no test module issues -- asfframework.virtual_sleep
+          # calls it to move time, not to test the file. node.c, node_format.c,
+          # drop.c, lex.c and vlib.h define no command of their own, and every
+          # test module that reaches them does so from a command defined for
+          # another file. cli.c defines `show memory` and `memory-trace`, which
+          # test/asf/test_vppinfra.py issues while testing the memory tracer,
+          # and `show cpu`, `test sleep`, `suspend`, none of them a suite
+          # written for cli.c. log.c's commands are issued by
+          # test/asf/test_vpe_api.py (`test log` and a log_dump read-back) and
+          # its `clear logging`/`set logging class`/`set logging size` by the
+          # nat44_ei, igmp, ipsec_tun_if_esp and neighbor suites, each as a
+          # step inside another feature's test. threads_cli.c's `show threads`
+          # is issued once, in the quic_crypto setup. The whole of unix/,
+          # stats/, pci/, dma/, vmbus/ and freebsd/ has no test in this tree.
           suite_file_alias() {
             case "$1" in
               # A documentation file is not built into the suites it describes,
@@ -320,10 +333,13 @@ jobs:
               # test_time.py sends `test time ...` for the clib clock, and its
               # barrier case asserts that vlib_time_adjust, vlib_time_now and
               # vlib_worker_thread_barrier_check keep a worker's time monotone.
-              # Those are inlines of these headers, so the header is what the
-              # suite reaches; time.c itself, the virtual-time node and
-              # `set clock adjust`, has no test of its own.
-              src/vlib/main.h|src/vlib/time.h|src/vlib/threads.h)
+              # vlib_time_adjust and vlib_time_now are inline bodies of these
+              # headers, and the barrier inlines of threads.h expand to
+              # vlib_worker_thread_barrier_sync_int and ..._release, whose
+              # bodies are in threads.c, so that file is reached the same way.
+              # time.c itself, the virtual-time node and `set clock adjust`,
+              # has no test of its own.
+              src/vlib/main.h|src/vlib/time.h|src/vlib/threads.h|src/vlib/threads.c)
                 printf '%s\n' time
                 ;;
             esac
@@ -723,6 +739,7 @@ jobs:
           expect_suite src/vlib/main.h time
           expect_suite src/vlib/time.h time
           expect_suite src/vlib/threads.h time
+          expect_suite src/vlib/threads.c time
           expect_suite src/vlib/buffer_funcs.c buffers
           expect_suite src/vlib/buffer_funcs.h buffers
           expect_suite src/vlib/buffer_node.h buffers
