@@ -1586,6 +1586,9 @@ fib_table_get_num_entries (u32 fib_index,
     if (NULL == fib_table)
 	return (0);
 
+    if ((u32) source >= vec_len (fib_table->ft_src_route_counts))
+	return (0);
+
     return (fib_table->ft_src_route_counts[source]);
 }
 
