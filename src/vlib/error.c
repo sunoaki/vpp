@@ -470,51 +470,57 @@ sev2str (enum vl_counter_severity_e s)
 }
 
 /* One counter of the report, copied out of counters_heap while the description
- * lock is held. The counter name and the reason are the pointers counters_heap
- * holds, which point into strings the registration owns, not into the entry:
- * vlib_register_errors copies the table it is given, so the entry holds the
- * error_strings[i] it was passed, or the name and desc of the counters it was
- * passed, and those strings normally outlive the node they were registered for.
- * What the description lock rules out is vlib_unregister_errors deallocating
- * the counters_heap block the entry lives in, which would leave the copied
- * pointers themselves unreadable. The report therefore formats the entry once
- * it holds no lock, and reads only strings the block outlives.
+ * lock is held. The counter name and the reason are strings a registration owns,
+ * and vlib_unregister_errors frees the entries of counters_heap that point at
+ * them, so the report copies those strings into a buffer of its own as it takes
+ * the snapshot. It has to: the report hands the main loop back as it formats,
+ * and a registration or an unregistration that runs between two chunks could
+ * free a string the report would otherwise still name. The description lock
+ * keeps that from happening while the copies are made.
  *
- * The node name is the one string the block does not outlive. vlib_node_rename
- * exchanges it under the description lock, retires the previous one, and a
- * later rename frees the retired names while it holds the same lock, so a
- * pointer to a node name is read under the lock but not formatted past it. The
- * report therefore copies the name, once for each node it lists, into its own
- * buffer, and the entries of that node name the copy by offset. An offset
- * survives the buffer growing, which a pointer into it would not. */
+ * The node name is covered the same way. vlib_node_rename exchanges it under
+ * the description lock, retires the previous one, and a later rename frees the
+ * retired names while it holds the same lock, so the name is copied under the
+ * lock too. Each string is named by offset into a buffer of the snapshot, so
+ * that growing that buffer does not move what the entries point at. */
 typedef struct
 {
   /* Offset in the name buffer of the snapshot of the name of this counter's
    * node. The name ends in a NUL there. */
   u32 node_name_offset;
 
-  /* Name the registration gave the counter, which is the symbol of its stats
-   * entry. A legacy registration gives one error string, which becomes both the
-   * name and the reason of the counter. */
-  char *name;
+  /* Offset in the string buffer of the snapshot of the name the registration
+   * gave the counter, which is the symbol of its stats entry. A legacy
+   * registration gives one error string, which becomes both the name and the
+   * reason of the counter; name_is_desc records that, so the Counter column is
+   * left empty rather than print the string twice. */
+  u32 name_offset;
 
-  /* Reason the registration gave the counter. */
-  char *desc;
+  /* Offset in the string buffer of the snapshot of the reason the registration
+   * gave the counter. */
+  u32 desc_offset;
+
+  /* Whether the registration gave the counter a name of its own, which the
+   * Counter column shows. */
+  u8 name_is_desc;
 
   enum vl_counter_severity_e severity;
 } vlib_error_entry_t;
 
-/* Room the snapshot keeps for one node name, past which the copy is cut. This is
- * not the width of the Node column: the copy is formatted into a column of 35
+/* Room the snapshot keeps for one node name, and for one counter name or one
+ * reason, past which the copy is cut. Neither is the width of the column the
+ * string is formatted into: the node name is formatted into a column of 35
  * characters, and justify() (vppinfra/format.c) cuts a longer name there, so a
  * name of 35 characters or more shows its first 35. Seven registrations in the
  * tree exceed that, the longest being 52 characters, and two pairs of them share
  * their first 35 and so render alike; that is the column's behaviour and not a
- * bound this buffer sets. The buffer holds one copy per listed node, bounded by
- * the node count and not by the counters a node registers, and the room here is
- * wider than the column so that a name the column would show in full is copied
- * in full. */
+ * bound this buffer sets. The reason and the counter name are formatted into
+ * columns of 35 and 32 characters, and are cut here far past those widths. The
+ * room is per string copied, and the buffer holds one node name per listed node
+ * and the strings of its counters, so it is bounded by the counters the heap
+ * holds. */
 #define VLIB_ERROR_NODE_NAME_BYTES 64
+#define VLIB_ERROR_STRING_BYTES	   64
 
 /* Width of the Counter column, the trailing column that names the counter of a
  * line. It follows the Severity column, so the Node and Reason columns keep the
@@ -524,6 +530,42 @@ typedef struct
  * run past the room a line is given. */
 #define VLIB_ERROR_FORMAT_COUNTER_COLUMN 32
 
+/* The string at an offset of a buffer of the snapshot, or the empty string when
+ * the offset lies past it, which no entry the list wrote does. */
+static char *
+vlib_error_snapshot_string (u8 *buf, u32 offset)
+{
+  if (offset >= vec_len (buf))
+    return "";
+
+  return (char *) buf + offset;
+}
+
+/* Appends a NUL-terminated string a registration gave, cut at the room the
+ * snapshot keeps for one string, to the string buffer, and returns the offset
+ * it was written at. The caller has taken the room for every string it appends,
+ * so this writes within it and allocates nothing: the description lock thus
+ * covers the copy and not a grow of the buffer. A string that is NULL, which no
+ * registration in the tree passes, is copied as the empty string. */
+static u32
+vlib_error_snapshot_append (u8 **bufp, char *str)
+{
+  u8 *buf = *bufp;
+  u32 offset = vec_len (buf);
+  u32 bytes = 0;
+
+  if (str)
+    bytes = clib_min (strlen (str), VLIB_ERROR_STRING_BYTES - 1);
+
+  if (bytes)
+    vec_add (buf, str, bytes);
+  vec_add1 (buf, 0);
+
+  *bufp = buf;
+
+  return offset;
+}
+
 /* The counter name the report shows in its Counter column, or the empty string
  * when the name adds nothing to the reason. A legacy registration passes one
  * error string, which vlib_register_errors copies into both the name and the
@@ -531,12 +573,12 @@ typedef struct
  * A node registered with a table of counters names the symbol of its stats
  * entry, which its reason does not repeat. */
 static char *
-error_counter_name (vlib_error_entry_t *entry)
+error_counter_name (u8 *strings, vlib_error_entry_t *entry)
 {
-  if (entry->name == 0 || entry->desc == 0 || strcmp (entry->name, entry->desc) == 0)
+  if (entry->name_is_desc)
     return "";
 
-  return entry->name;
+  return vlib_error_snapshot_string (strings, entry->name_offset);
 }
 
 /* Room one line of a counter takes before it. The columns of a counter line are
@@ -553,12 +595,11 @@ error_counter_name (vlib_error_entry_t *entry)
 
 /* The counts the report shows, the nodes it shows them under, and the entries
  * of counters_heap the counters are read from. The report copies those entries
- * into a vector of its own, so that after vlib_error_counts_get returns it
- * holds no lock and names no block a registration can free, and a counter of it
- * costs a count, a sum and its own entry, not a copy of its name and of its
- * description. The node names are the one thing it copies out of the node
- * structures, because a rename frees them; each listed node contributes one
- * name to the buffer below, which the entries of that node share. */
+ * into a vector of its own, together with the strings they name, so that after
+ * vlib_error_counts_get returns it holds no lock and names no block or string a
+ * registration can free. That matters because the report formats the snapshot
+ * across several chunks of the main loop, and a registration or a rename that
+ * runs between two of them frees what it replaced. */
 typedef struct
 {
   /* Count of every error, over the threads, less the count a thread recorded
@@ -588,6 +629,10 @@ typedef struct
    * An entry names its node's name by offset here, so that growing the buffer
    * does not move what the entries point at. */
   u8 *node_names;
+
+  /* The counter names and reasons the entries name, each ending in a NUL. An
+   * entry names them by offset here, for the same reason. */
+  u8 *strings;
 } vlib_error_counts_t;
 
 static void
@@ -601,6 +646,7 @@ vlib_error_counts_free (vlib_error_counts_t *c)
   vec_free (c->n_errors);
   vec_free (c->error_heap_index);
   vec_free (c->node_names);
+  vec_free (c->strings);
 }
 
 /* True when every counter of the node at a position of the snapshot lies
@@ -876,9 +922,9 @@ vlib_error_counts_list (vlib_error_counts_t *c, vlib_node_main_t *nm, vlib_error
       if (at + code > vec_len (c->entries))
 	vec_set_len (c->entries, at + code);
 
-      /* The name is copied here because a rename may retire and free it once
-       * this lock is released, so the report keeps a copy of its own and the
-       * entries of the node share it by offset. It is appended to the name
+      /* The node name is copied here because a rename may retire and free it
+       * once this lock is released, so the report keeps a copy of its own and
+       * the entries of the node share it by offset. It is appended to the name
        * buffer, which the report holds room for, so the lock covers the copy and
        * not the growth: phase 1 takes the room for one name per listed node, and
        * phase 2 takes it again when the heap grew between the phases, so the
@@ -895,12 +941,21 @@ vlib_error_counts_list (vlib_error_counts_t *c, vlib_node_main_t *nm, vlib_error
       vec_add1 (c->n_errors, code);
       vec_add1 (c->error_heap_index, n->error_heap_index);
 
+      /* The name and the reason of the counter are copied for the same reason,
+       * and into the string buffer, whose room phase 1 and phase 2 take from the
+       * same measure as the name buffer: two strings of the room one has, for
+       * each counter the heap holds. The entry names them by offset, so the
+       * copies are made with the lock that excludes vlib_unregister_errors
+       * freeing the entries that point at them. */
       for (i = 0; i < code; i++)
 	{
 	  entry = vec_elt_at_index (c->entries, at + i);
 	  entry->node_name_offset = name_offset;
-	  entry->name = cd[i].name;
-	  entry->desc = cd[i].desc;
+	  entry->name_is_desc =
+	    cd[i].name == 0 || cd[i].desc == 0 || strcmp (cd[i].name, cd[i].desc) == 0;
+
+	  entry->name_offset = vlib_error_snapshot_append (&c->strings, cd[i].name);
+	  entry->desc_offset = vlib_error_snapshot_append (&c->strings, cd[i].desc);
 	  entry->severity = cd[i].severity;
 
 	  c->sums[n->error_heap_index + i] += c->counts[n->error_heap_index + i];
@@ -998,9 +1053,14 @@ vlib_error_counts_get (vlib_error_counts_t *c)
 	   * name of the full length and its NUL per node, so the appends the list
 	   * makes fit it whatever the names are, and the lock covers the copy and
 	   * not a growth of it. The length is reset, so the list appends to the
-	   * room this took. */
+	   * room this took. The strings a counter names are copied likewise, two
+	   * of them per counter of the heap, and the string buffer takes their
+	   * room the same way. */
 	  vec_validate (c->node_names, (n_heap + 1) * (VLIB_ERROR_NODE_NAME_BYTES + 1) - 1);
 	  vec_reset_length (c->node_names);
+
+	  vec_validate (c->strings, (n_heap + 1) * 2 * (VLIB_ERROR_STRING_BYTES + 1) - 1);
+	  vec_reset_length (c->strings);
 	}
 
       vlib_error_counts_read (c);
@@ -1090,6 +1150,11 @@ vlib_error_counts_get (vlib_error_counts_t *c)
 	vec_validate (c->node_names, (n_counters + 1) * (VLIB_ERROR_NODE_NAME_BYTES + 1) - 1);
 
       vec_reset_length (c->node_names);
+
+      if (vec_max_len (c->strings) < (n_counters + 1) * 2 * (VLIB_ERROR_STRING_BYTES + 1))
+	vec_validate (c->strings, (n_counters + 1) * 2 * (VLIB_ERROR_STRING_BYTES + 1) - 1);
+
+      vec_reset_length (c->strings);
     }
 
   vlib_error_counts_list (c, nm, em);
@@ -1110,12 +1175,23 @@ vlib_error_thread_name (u32 thread_index)
   return vlib_worker_threads[thread_index].name;
 }
 
-/* One thread of the report: its name, which is not locked, and an output
- * vector that carries the lines it has formatted and not printed. */
+/* One thread of the report: its name, which is not locked, an output vector
+ * that carries the lines it has formatted and not printed, and the work the
+ * current chunk of the report has done. */
 typedef struct
 {
   u8 *name;
+
   u8 *text;
+
+  /* The main loop the report hands back between two chunks. */
+  vlib_main_t *vm;
+
+  /* Lines formatted into the current chunk. */
+  u32 lines;
+
+  /* Time the current chunk started. */
+  f64 chunk_start;
 } vlib_error_thread_t;
 
 /* Number of formatted lines a thread formats between two prints, before the
@@ -1125,6 +1201,15 @@ typedef struct
 /* Room the thread line keeps for the name of a thread, past its fixed part. */
 #define VLIB_ERROR_FORMAT_THREAD_BYTES 256
 
+/* Number of lines the report formats into one chunk, and the time a chunk may
+ * take, measured between two reads of the clock that are this many lines
+ * apart. The report hands the main loop back after every chunk, so a report of
+ * a box with many nodes costs the dispatch loop one chunk of work at a time
+ * rather than the whole report. */
+#define VLIB_ERROR_REPORT_CHUNK_LINES	1024
+#define VLIB_ERROR_REPORT_CLOCK_LINES	32
+#define VLIB_ERROR_REPORT_CHUNK_SECONDS 2e-3
+
 /* Room the output vector of a thread holds, so that formatting a line of the
  * report adds no allocation. A print happens only after a line is written and
  * ends the vector there, so the vector holds BATCH lines, the line the print
@@ -1132,12 +1217,9 @@ typedef struct
  * VLIB_ERROR_FORMAT_LINE_BYTES before it is printed; a line longer than that
  * makes the print that follows it earlier rather than leave the line room. The
  * thread line is written first, and the name of its thread is not bounded
- * above, so it takes a margin of its own.
- *
- * The vector of the totals is not printed at a batch boundary: it takes the
- * total line of every counter the walk shows, up to the counters a node
- * registers, so it can outgrow this room. It grows by an allocation then,
- * which the format calls that fill it return and their caller keeps. */
+ * above, so it takes a margin of its own. The vector of the totals holds the
+ * same room and, like that of a thread, ends at a chunk boundary, so it never
+ * grows past it however many counters the walk shows. */
 #define VLIB_ERROR_FORMAT_ROOM                                                                     \
   ((VLIB_ERROR_FORMAT_BATCH + 1) * VLIB_ERROR_FORMAT_LINE_BYTES + VLIB_ERROR_FORMAT_THREAD_BYTES)
 
@@ -1162,10 +1244,16 @@ vlib_error_format_flush (vlib_main_t *vm, vlib_error_thread_t *t)
  * lines start empty and the first counter formats the first one. The space is
  * taken for both, because a report that formats a counter needs it either
  * way. The total line the command passes here is the header of its own vector,
- * which holds it in that room until a total line outgrows it. */
+ * which holds it in that room until a total line outgrows it. The work counter
+ * starts with the lines of this vector. */
 static void
-vlib_error_format_start (vlib_error_thread_t *t, u32 thread_index, int verbose, const char *line)
+vlib_error_format_start (vlib_error_thread_t *t, vlib_main_t *vm, u32 thread_index, int verbose,
+			 const char *line)
 {
+  t->vm = vm;
+  t->lines = 0;
+  t->chunk_start = vlib_time_now (vm);
+
   vec_validate (t->text, VLIB_ERROR_FORMAT_ROOM - 1);
   vec_reset_length (t->text);
 
@@ -1173,6 +1261,45 @@ vlib_error_format_start (vlib_error_thread_t *t, u32 thread_index, int verbose, 
     t->text = format (t->text, "%s", line);
   else if (verbose)
     t->text = format (t->text, "Thread %u (%v):\n", thread_index, t->name);
+}
+
+/* Prints the lines of the current chunk and hands the main loop back, so that
+ * the report of a box with many nodes costs the dispatch loop one chunk of its
+ * work at a time rather than the whole report. The report holds no lock here,
+ * so the yield leaves no spinlock a worker main loop waits on. A command runs
+ * on a process stack, and only a process can hand the main loop back; a caller
+ * outside one runs the report through without a yield. */
+static void
+vlib_error_format_yield (vlib_error_thread_t *t)
+{
+  vlib_error_format_flush (t->vm, t);
+
+  t->lines = 0;
+  t->chunk_start = vlib_time_now (t->vm);
+
+  if (!vlib_in_process_context (t->vm))
+    return;
+
+  vlib_process_yield (t->vm);
+}
+
+/* Accounts for the line just formatted, and hands the main loop back once the
+ * chunk has spent its lines or its time. The time is read once every
+ * VLIB_ERROR_REPORT_CLOCK_LINES lines rather than at each of them, so the
+ * clock of a report that runs out on its line budget alone is read rarely. */
+static void
+vlib_error_format_chunk (vlib_error_thread_t *t)
+{
+  if (++t->lines < VLIB_ERROR_REPORT_CHUNK_LINES)
+    {
+      if (t->lines % VLIB_ERROR_REPORT_CLOCK_LINES)
+	return;
+
+      if (vlib_time_now (t->vm) - t->chunk_start < VLIB_ERROR_REPORT_CHUNK_SECONDS)
+	return;
+    }
+
+  vlib_error_format_yield (t);
 }
 
 /* Formats the Counter column of a line: the symbol the registration gave the
@@ -1185,7 +1312,8 @@ static u8 *
 format_vlib_error_counter (u8 *s, va_list *va)
 {
   vlib_error_entry_t *entry = va_arg (*va, vlib_error_entry_t *);
-  char *name = error_counter_name (entry);
+  u8 *strings = va_arg (*va, u8 *);
+  char *name = error_counter_name (strings, entry);
 
   if (name[0] == 0)
     return s;
@@ -1208,10 +1336,12 @@ vlib_error_node_name (vlib_error_counts_t *c, vlib_error_entry_t *entry)
  * report holds no lock here: the line is added to the output vector of the
  * thread it shows, and the vector is printed once it holds a batch of lines,
  * so the lines reach vlib_cli_output in a few large pieces rather than one
- * piece each. The output is read when the command is done, so the batching
- * delays nothing that a reader waits for. A total line, which verbose alone
- * asks for, goes to the vector the caller prints once, so it is not printed
- * here.
+ * piece each. A chunk of the report ends at a print and a yield, so the
+ * dispatch loop runs between the chunks of a report rather than after it. The
+ * output is read when the command is done, so the batching delays nothing that
+ * a reader waits for. A total line, which verbose alone asks for, goes to the
+ * vector of the totals, which the command prints under its header, so it is
+ * handled as a line of the report like any other.
  *
  * The Node column is the node name the snapshot copied, which is a C string in
  * the snapshot's own buffer, so %s reads it and nothing past its NUL. The Index
@@ -1219,50 +1349,42 @@ vlib_error_node_name (vlib_error_counts_t *c, vlib_error_entry_t *entry)
  * the Counter column trails the line, so no line of a plain report loses the
  * header it had. */
 static void
-vlib_error_format (vlib_main_t *vm, vlib_error_thread_t *t, vlib_error_counts_t *c,
-		   vlib_error_entry_t *entry, u32 index, u64 count, int verbose, int total)
+vlib_error_format (vlib_error_thread_t *t, vlib_error_counts_t *c, vlib_error_entry_t *entry,
+		   u32 index, u64 count, int verbose, int total)
 {
   char *node_name = vlib_error_node_name (c, entry);
-  u8 *s = t->text;
+  char *desc = vlib_error_snapshot_string (c->strings, entry->desc_offset);
 
   /* format returns the vector it grew, which is another one when it had to
-   * allocate for the line, so the result is what the thread keeps. */
+   * allocate for the line, so the result is what the thread keeps. A total line
+   * is part of the verbose report alone, so it formats nothing otherwise. */
   if (total)
     {
-      /* The total line is part of the verbose report alone, and the caller
-       * prints the vector once with the header it started, so nothing is
-       * printed here. */
       if (verbose)
-	t->text = format (s, "%10lu%=40s%=20s%=10d%U\n", count, node_name, entry->desc, index,
-			  format_vlib_error_counter, entry);
-
-      return;
+	t->text = format (t->text, "%10lu%=40s%=20s%=10d%U\n", count, node_name, desc, index,
+			  format_vlib_error_counter, entry, c->strings);
     }
-
-  if (verbose)
-    s = format (s, "%10lu%=35s%=35s%=10s%=6d%U\n", count, node_name, entry->desc,
-		sev2str (entry->severity), index, format_vlib_error_counter, entry);
+  else if (verbose)
+    t->text =
+      format (t->text, "%10lu%=35s%=35s%=10s%=6d%U\n", count, node_name, desc,
+	      sev2str (entry->severity), index, format_vlib_error_counter, entry, c->strings);
   else
-    s = format (s, "%10lu%=35s%=35s%=10s%U\n", count, node_name, entry->desc,
-		sev2str (entry->severity), format_vlib_error_counter, entry);
+    t->text = format (t->text, "%10lu%=35s%=35s%=10s%U\n", count, node_name, desc,
+		      sev2str (entry->severity), format_vlib_error_counter, entry, c->strings);
 
-  t->text = s;
+  /* The room of the vector is that of a batch, and a line of the next batch
+   * past it, which every line that reaches here has. */
+  if (vec_len (t->text) >= VLIB_ERROR_FORMAT_BATCH * VLIB_ERROR_FORMAT_LINE_BYTES)
+    vlib_error_format_flush (t->vm, t);
 
-  if (vec_len (s) < VLIB_ERROR_FORMAT_BATCH * VLIB_ERROR_FORMAT_LINE_BYTES)
-    return;
-
-  /* The room of the vector is this much, and a line of the next batch past
-   * it, which every line that reaches here has. */
-  vlib_cli_output (vm, "%v", s);
-  vec_reset_length (s);
+  vlib_error_format_chunk (t);
 }
 
 /* Formats the counters of the node at a position of the snapshot as one
  * thread counted them, leaving out the counters that thread read as zero
  * unless verbose 2 asks for them. */
 static void
-vlib_error_format_thread (vlib_main_t *vm, vlib_error_thread_t *t, vlib_error_counts_t *c, u32 nj,
-			  int verbose)
+vlib_error_format_thread (vlib_error_thread_t *t, vlib_error_counts_t *c, u32 nj, int verbose)
 {
   vlib_error_entry_t *entry;
   u32 code, index;
@@ -1276,19 +1398,22 @@ vlib_error_format_thread (vlib_main_t *vm, vlib_error_thread_t *t, vlib_error_co
 
       entry = vlib_error_counting_entry (c, nj, code);
       if (entry)
-	vlib_error_format (vm, t, c, entry, index, c->counts[index], verbose, 0);
+	vlib_error_format (t, c, entry, index, c->counts[index], verbose, 0);
     }
 }
 
-/* Formats the count of the counters of every thread. They all go to the
- * vector of the last thread, under the total line. */
+/* Formats the count of the counters of every thread. They all go to the vector
+ * of the totals, under the total header the command starts. The total section
+ * belongs to the verbose report alone, so a plain report formats none of it. */
 static void
-vlib_error_format_total (vlib_main_t *vm, vlib_error_thread_t *t, vlib_error_counts_t *c,
-			 int verbose)
+vlib_error_format_total (vlib_error_thread_t *t, vlib_error_counts_t *c, int verbose)
 {
   vlib_error_entry_t *entry;
   u64 sum;
   u32 code, index;
+
+  if (!verbose)
+    return;
 
   for (u32 nj = 0; nj < vec_len (c->nodes); nj++)
     {
@@ -1302,7 +1427,7 @@ vlib_error_format_total (vlib_main_t *vm, vlib_error_thread_t *t, vlib_error_cou
 	  entry = vlib_error_counting_entry (c, nj, code);
 
 	  if (sum && entry)
-	    vlib_error_format (vm, t, c, entry, index, sum, verbose, 1);
+	    vlib_error_format (t, c, entry, index, sum, verbose, 1);
 	}
     }
 }
@@ -1310,7 +1435,9 @@ vlib_error_format_total (vlib_main_t *vm, vlib_error_thread_t *t, vlib_error_cou
 /* Formats the counters of one thread. A thread that shows no counter formats
  * no line, so it allocates nothing for one, and so does every thread of a
  * report that shows no node, which is the report of a VPP that registered no
- * error. */
+ * error. The chunk the report has done starts over with the first line of a
+ * thread, which is another point of the report at which the main loop can be
+ * handed back. */
 static void
 vlib_error_report_thread (vlib_main_t *vm, vlib_error_counts_t *c, u32 thread_index, int verbose)
 {
@@ -1322,9 +1449,9 @@ vlib_error_report_thread (vlib_main_t *vm, vlib_error_counts_t *c, u32 thread_in
 	continue;
 
       if (t.text == 0)
-	vlib_error_format_start (&t, thread_index, verbose, 0);
+	vlib_error_format_start (&t, vm, thread_index, verbose, 0);
 
-      vlib_error_format_thread (vm, &t, c, nj, verbose);
+      vlib_error_format_thread (&t, c, nj, verbose);
     }
 
   vlib_error_format_flush (vm, &t);
@@ -1346,7 +1473,10 @@ show_errors (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
   /* The walk copies the entry of every counter it shows into a vector of its
    * own, and returns with no lock held. The report formats and prints those
    * copies, so a registration that runs while it prints waits on no lock of
-   * this command, and frees nothing the report reads. */
+   * this command, and frees nothing the report reads. The walk is bounded by
+   * the counters a node registers, and the report below hands the main loop
+   * back as it goes, so neither part holds the main thread for the length of
+   * the whole report. */
   vlib_error_counts_get (&c);
 
   /* The header names the columns the lines below it fill, in the order they
@@ -1364,12 +1494,12 @@ show_errors (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
     vlib_error_report_thread (vm, &c, t, verbose);
 
   /* The total header starts the vector of the totals, and holds the room of a
-   * thread, which the format calls of the totals grow past when they need to
-   * and return the grown vector. */
+   * thread. The total lines end at a chunk boundary too, so the vector keeps
+   * that room however many counters the walk shows. */
   if (verbose)
-    vlib_error_format_start (&total, 0, 0, "Total:\n");
+    vlib_error_format_start (&total, vm, 0, 0, "Total:\n");
 
-  vlib_error_format_total (vm, &total, &c, verbose);
+  vlib_error_format_total (&total, &c, verbose);
 
   vlib_error_format_flush (vm, &total);
   vec_free (total.text);
