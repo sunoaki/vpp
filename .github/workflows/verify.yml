@@ -201,24 +201,25 @@ jobs:
           # names its suite.
           #
           # src/vlib has a module of its own, test/test_vlib.py, but no rule
-          # gives every file of it that module. Each rule below names the
-          # suite whose test drives the file, read from the tree: the docstring
-          # and the CLI commands of test_vlib.py, and the command the test
-          # module issues for that file.
+          # gives every file of it that module: the module covers the files
+          # listed below and nothing else. Each rule names the suite whose
+          # test module issues the command that reaches the file, read from
+          # the tree; several of those commands sit in the gcov-gated TestVlib
+          # class, and the pool-cache and timing-wheel classes are not gated.
           #
           # A src/vlib file named by no rule stays UNCOVERED and keeps the ip4
           # fallback, which is the failure mode of this table: a file added
           # later runs only the smoke suite until a rule names its suite.
-          # This tree has such files, and each was checked rather than left
-          # out: time.c holds the virtual-time node and `set clock adjust`,
-          # which only the shared asfframework.virtual_sleep helper drives for
-          # timing, not as a test of the file; file.c, init.c, log.c and
-          # threads_cli.c hold commands (`show files`, `show init-function`,
-          # `show logging`, `show threads`) that the suites mentioning them
-          # read for their own output, and threads.c holds the barrier the time
-          # suite drives through a header; node.c, handoff*.c, drop.c, lex.c,
-          # physmem.c, pool_cache.c (whose test is in the unittest plugin) and
-          # the whole of unix/, stats/, pci/, dma/ have no test in this tree.
+          # The files this tree leaves out, and why: file.c (`show files`),
+          # init.c (`show init-function`) and time.c (the virtual-time node and
+          # `set clock adjust`, which only asfframework.virtual_sleep drives)
+          # have no command any test module issues; log.c is read by the
+          # linux_cp and neighbor suites for the log lines they themselves
+          # write, and threads_cli.c by the quic_crypto suite in its setup,
+          # not as a test of the file; node*.c, handoff*.c, drop.c, lex.c,
+          # physmem.c, vlib.h and the headers included everywhere have no
+          # command of their own; and unix/, stats/, pci/, dma/, vmbus/ and
+          # freebsd/ have no test in this tree.
           suite_file_alias() {
             case "$1" in
               # A documentation file is not built into the suites it describes,
@@ -261,14 +262,27 @@ jobs:
               src/vlib/error.c|src/vlib/error.h|src/vlib/error_funcs.h)
                 printf '%s\n' vlib_errors
                 ;;
-              # The files test_vlib.py runs a coverage command for, in the
-              # docstring of the test method that runs it: "Vlib main.c",
-              # "Vlib node_cli.c" and "Vlib format.c". The assertions of those
-              # methods are skipped outside a --gcov run, so the suite they
-              # select covers other files of vlib in a plain run; the module is
-              # still the one this tree writes for these files.
+              # The files test_vlib.py names in the docstring of a coverage
+              # command: "Vlib main.c", "Vlib node_cli.c" and "Vlib format.c".
+              # Those methods belong to the TestVlib class, which is skipped
+              # outside a --gcov run, so this suite covers these files only
+              # under coverage; the rule still names the module written for
+              # them rather than a command that does not reach them.
               src/vlib/main.c|src/vlib/node_cli.c|src/vlib/format.c|\
                 src/vlib/format_funcs.h)
+                printf '%s\n' vlib
+                ;;
+              # TestVlibTimingWheel sends `test vlib timing-wheel`, and the
+              # command it reaches calls vlib_tw_timer_start, vlib_tw_timer_stop,
+              # vlib_tw_timer_expire_timers and vlib_tw_init, which are the
+              # inline bodies of tw_funcs.h. That class is not gcov-gated.
+              src/vlib/tw_funcs.h) printf '%s\n' vlib ;;
+              # TestPoolCache{2,4,8}Workers inherit test_multi_workers_pool,
+              # which sends `test pool-cache`; the command in the unittest
+              # plugin calls pool_cache_init_with_batch, pool_cache_get,
+              # pool_cache_put_index and pool_cache_free of pool_cache.c.
+              # Neither those classes nor the template is gcov-gated.
+              src/vlib/pool_cache.c|src/vlib/pool_cache.h)
                 printf '%s\n' vlib
                 ;;
               # test_vlib.py runs `show buffers` as its buffer.c coverage
@@ -684,19 +698,34 @@ jobs:
           # reports UNCOVERED and so must still fall back to ip4. This is the
           # "must not gain a suite" case: vtep.c has no test in the tree.
           expect_uncovered src/vnet/ip/vtep.c "test/test_ip.py or test/asf/test_ip.py"
-          # The src/vlib table. A ruled file selects its suite, a multi-suite
-          # file selects both, and a file of src/vlib that no rule names stays
-          # UNCOVERED with its own report, which is the "must not gain a
-          # suite" case: cli.c holds commands no suite calls, and the vlib
-          # module that exists must not be claimed for it.
+          # The src/vlib table, one assertion per rule member so that dropping
+          # a header from a pattern fails here rather than silently narrowing
+          # the rule. A file of src/vlib that no rule names stays UNCOVERED
+          # with its own report, which is the "must not gain a suite" case:
+          # cli.c holds commands no suite calls, and the vlib module that
+          # exists must not be claimed for it.
           expect_suite src/vlib/main.c vlib
           expect_suite src/vlib/node_cli.c vlib
+          expect_suite src/vlib/format.c vlib
           expect_suite src/vlib/format_funcs.h vlib
+          expect_suite src/vlib/tw_funcs.h vlib
+          expect_suite src/vlib/pool_cache.c vlib
+          expect_suite src/vlib/pool_cache.h vlib
           expect_suite src/vlib/counter.c counters
+          expect_suite src/vlib/counter.h counters
+          expect_suite src/vlib/counter_types.h counters
+          expect_suite src/vlib/punt.c punt
+          expect_suite src/vlib/punt.h punt
           expect_suite src/vlib/punt_node.c punt
           expect_suite src/vlib/trace.c trace_filter
+          expect_suite src/vlib/trace.h trace_filter
+          expect_suite src/vlib/trace_funcs.h trace_filter
+          expect_suite src/vlib/main.h time
+          expect_suite src/vlib/time.h time
           expect_suite src/vlib/threads.h time
+          expect_suite src/vlib/buffer_funcs.c buffers
           expect_suite src/vlib/buffer_funcs.h buffers
+          expect_suite src/vlib/buffer_node.h buffers
           # The buffer pool code is read by both the vlib suite's `show
           # buffers` coverage command and the buffer suite's pool assertions.
           expect_suite src/vlib/buffer.c "vlib buffers"
@@ -705,21 +734,33 @@ jobs:
           # A subdirectory has no directory rule either, so the nested form of
           # the path is resolved by the same table and reported the same way.
           expect_vlib_uncovered src/vlib/dma/dma.c
-          # test_vlib_errors.py is not in this tree, so the error rule must
-          # report the module it looked for and select nothing. The rule is
-          # asserted to fire in a fixture tree that has that module, so the
-          # day the module lands the derivation needs no change here.
-          expect_uncovered src/vlib/error.c \
-            "test/test_vlib_errors.py or test/asf/test_vlib_errors.py"
+          # The error rule is asserted for the tree it is run on, so this
+          # self-check passes whether or not test_vlib_errors.py has landed.
+          # The fixture below drives the same rule with that module present, so
+          # the mapping itself is covered on either tree.
+          if suite_module_exists vlib_errors; then
+            expect_suite src/vlib/error.c vlib_errors
+            expect_suite src/vlib/error.h vlib_errors
+            expect_suite src/vlib/error_funcs.h vlib_errors
+          else
+            expect_uncovered src/vlib/error.c \
+              "test/test_vlib_errors.py or test/asf/test_vlib_errors.py"
+            expect_uncovered src/vlib/error.h \
+              "test/test_vlib_errors.py or test/asf/test_vlib_errors.py"
+            expect_uncovered src/vlib/error_funcs.h \
+              "test/test_vlib_errors.py or test/asf/test_vlib_errors.py"
+          fi
           error_tree="${RUNNER_TEMP}/vlib-error-rule"
           mkdir -p "${error_tree}/src/vlib" "${error_tree}/test"
           : > "${error_tree}/test/test_vlib_errors.py"
-          derived_error=$(cd "${error_tree}" && \
-            derive_suite_for_path src/vlib/error.c || true)
-          if [ "${derived_error}" != "vlib_errors" ]; then
-            echo "::error::src/vlib/error.c with test_vlib_errors.py present: expected 'vlib_errors', derived '${derived_error}'"
-            failures=$((failures + 1))
-          fi
+          for member in src/vlib/error.c src/vlib/error.h src/vlib/error_funcs.h; do
+            derived_error=$(cd "${error_tree}" && \
+              derive_suite_for_path "${member}" || true)
+            if [ "${derived_error}" != "vlib_errors" ]; then
+              echo "::error::${member} with test_vlib_errors.py present: expected 'vlib_errors', derived '${derived_error}'"
+              failures=$((failures + 1))
+            fi
+          done
           # No package in this repository has both test_<pkg>.py and
           # test_<sub>.py, so the subdirectory-first order is unobservable in
           # the real tree. Assert it in a tree that has both.
