@@ -179,8 +179,21 @@ jobs:
           # Budget: each attempt polls the non-blocking connect for at most 5 s,
           # then takes one snapshot and one memory trace; 100 attempts stay far
           # below the 900 s harness TIMEOUT and the 20 min step limit below.
+          #
+          # USE_SMT=1 makes the framework count every logical CPU as its own
+          # core (test/config.py:546). This runner presents 4 vCPUs as 2
+          # physical cores, while the worker variant of this suite needs 3
+          # cores (main thread + 1 worker + 1 helper, test/asf/asfframework.py:325),
+          # so without the relaxation test/run_tests.py:1417 replaces the test
+          # body with skipTest("not enough cpus") and the suite silently never
+          # runs. The relaxation only lets VPP's main and worker threads land on
+          # hyperthread siblings of one physical core; this test asserts connect
+          # outcome and per-thread heap accounting, with every wait bounded at
+          # 5 s against a 900 s harness timeout, and measures no throughput, so
+          # sharing a core changes neither what it verifies nor whether it
+          # finishes.
           command=(make UNATTENDED=yes TEST_JOBS=1 FORCE_FOREGROUND=1
-            RETRIES=0 FAILFAST=0 SKIP_TESTS=
+            RETRIES=0 FAILFAST=0 SKIP_TESTS= USE_SMT=1
             VPP_EXCLUDED_PLUGINS= V=2 COREDUMP_SIZE=0 DECODE_PCAPS=none
             RND_SEED=48 TIMEOUT=900
             TMP_DIR="$EVIDENCE/tmp" FAILED_DIR="$EVIDENCE/failed"
@@ -193,6 +206,69 @@ jobs:
           set -e
           printf '%s\n' "$status" > "$EVIDENCE/test-exit.txt"
           test "$status" = 0
+          # A suite that needs more cores than the runner offers exits 0 with
+          # every test method replaced by skipTest("not enough cpus"), so the
+          # exit status alone does not say the test ran. Read the harness log
+          # first: report a core shortage as a core shortage instead of letting
+          # the result.json read below raise FileNotFoundError.
+          python3 - "$EVIDENCE/test.log" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          log_path = Path(sys.argv[1])
+          if not log_path.is_file():
+              sys.exit(f"::error::{log_path} does not exist; the harness wrote no log")
+          log = log_path.read_text()
+
+          shortage_markers = (
+              "not enough cpus",
+              "SOME TESTS WERE SKIPPED BECAUSE THERE ARE NOT"
+              " ENOUGH CPUS AVAILABLE",
+          )
+          if any(marker in log for marker in shortage_markers):
+              # The per-test title carries both counts
+              # (test/asf/asfframework.py:1492); the availability line
+              # (test/run_tests.py:1370) is the fallback for the second.
+              required = re.search(r"required=(\d+) cores", log)
+              available = re.search(r"available=(\d+) cores", log) or re.search(
+                  r"Using at most (\d+) physical cores for VPP threads", log
+              )
+              parts = []
+              if required:
+                  parts.append(f"needs {required.group(1)} cores")
+              if available:
+                  parts.append(f"runner offers {available.group(1)} cores")
+              detail = f": {' and '.join(parts)}" if parts else ""
+              sys.exit(
+                  "::error::the suite was skipped for lack of cores, not run"
+                  f"{detail}; the requirement is test/asf/asfframework.py:325"
+                  " and the skip is test/run_tests.py:1417"
+              )
+
+          # unittest's closing summary line, e.g. "OK" or "OK (skipped=1)".
+          summary = None
+          for line in log.splitlines():
+              match = re.match(r"^(OK|FAILED|NO TESTS RAN)\b(?: \((.*)\))?$", line.strip())
+              if match:
+                  summary = match
+          if summary is None:
+              sys.exit(
+                  f"::error::{log_path} has no unittest summary line;"
+                  " the selected test did not finish"
+              )
+          if summary.group(1) != "OK":
+              sys.exit(
+                  f"::error::the selected test did not pass:"
+                  f" {summary.group(0)!r} in {log_path}"
+              )
+          skipped = re.search(r"\bskipped=(\d+)", summary.group(2) or "")
+          if skipped and int(skipped.group(1)) != 0:
+              sys.exit(
+                  f"::error::the selected test did not run:"
+                  f" {summary.group(0)!r} in {log_path}"
+              )
+          PY
           python3 - <<'PY'
           import json
           import os
