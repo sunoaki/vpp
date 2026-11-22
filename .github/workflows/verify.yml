@@ -182,6 +182,59 @@ jobs:
             esac
           }
 
+          # src/vnet directories whose files belong to more than one test
+          # module, so the directory name cannot name the module that covers a
+          # file. Each rule prints the suites of one file, one per line; no
+          # rule matches a file outside its directory, and an empty result
+          # falls through to the directory rule.
+          #
+          # src/vnet/ip has no module of its own: there is no test/test_ip.py,
+          # so the directory rule reports every file of it UNCOVERED and the
+          # run falls back to ip4. The address family in the file name decides
+          # the family suite, the few files with a module of their own
+          # (reassembly, punt, the in/out ACL nodes, IGMP) select it, and the
+          # core both families build on selects both suites. The files with no
+          # test in this tree stay absent: vtep.c, ip_container_proxy.c, the
+          # source-and-port-range-check header and the vat-only ip_test.c.
+          # Such a file stays UNCOVERED, which is the failure mode of this
+          # table: a file added later runs only the ip4 fallback until a rule
+          # names its suite.
+          suite_file_alias() {
+            case "$1" in
+              # A documentation file is not built into the suites it describes,
+              # so it selects none and keeps the pre-existing behaviour of a
+              # doc-only change rather than running a whole suite for it.
+              *.rst|*.dox) : ;;
+              src/vnet/ip/reass/*) printf '%s\n' reassembly ;;
+              src/vnet/ip/punt*) printf '%s\n' punt ;;
+              src/vnet/ip/ip_in_out_acl.c) printf '%s\n' classifier ;;
+              # The IGMP packet definitions are the ones test_igmp.py drives
+              # through the igmp plugin; the vrrp tests include the same header
+              # but the igmp suite is the one written for these definitions.
+              src/vnet/ip/igmp_packet.h) printf '%s\n' igmp ;;
+              # The shared files come before the family globs, because the
+              # name ip46_address.c starts with ip4 and icmp46_packet.h starts
+              # with icmp4, and the glob would claim both for one family.
+              src/vnet/ip/icmp46_packet.h|src/vnet/ip/ip46_address.*|\
+                src/vnet/ip/ip46_cli.c|src/vnet/ip/format.*|\
+                src/vnet/ip/lookup.*|src/vnet/ip/ip.api|src/vnet/ip/ip_api.c|\
+                src/vnet/ip/ip.c|\
+                src/vnet/ip/ip.h|src/vnet/ip/ip_checksum.c|\
+                src/vnet/ip/ip_frag.*|src/vnet/ip/ip_format_fns.h|\
+                src/vnet/ip/ip_init.c|src/vnet/ip/ip_interface.*|\
+                src/vnet/ip/ip_inlines.h|src/vnet/ip/ip_packet.h|\
+                src/vnet/ip/ip_path_mtu*|src/vnet/ip/ip_psh_cksum.h|\
+                src/vnet/ip/ip_punt_drop.*|src/vnet/ip/ip_sas.*|\
+                src/vnet/ip/ip_table.h|src/vnet/ip/ip_types.*|\
+                src/vnet/ip/ip_types_api.*|src/vnet/ip/ip_flow_hash.h|\
+                src/vnet/ip/ports.def|src/vnet/ip/protocols.def)
+                printf '%s\n' ip4 ip6
+                ;;
+              src/vnet/ip/ip4*|src/vnet/ip/icmp4.*) printf '%s\n' ip4 ;;
+              src/vnet/ip/ip6*|src/vnet/ip/icmp6.*) printf '%s\n' ip6 ;;
+            esac
+          }
+
           report_uncovered() {
             local path="$1" candidate looked=""
             shift
@@ -194,7 +247,7 @@ jobs:
           # Print the module that covers one changed path and return success, or
           # print an UNCOVERED report on stderr and return failure.
           derive_suite_for_path() {
-            local path="$1" rest dir sub name
+            local path="$1" rest dir sub name found candidate
             local -a candidates=()
             case "${path}" in
               src/plugins/*/*)
@@ -223,6 +276,25 @@ jobs:
               src/vnet/*/*)
                 rest=${path#src/vnet/}
                 dir=${rest%%/*}
+                # A file-level rule of the directory is consulted first, so a
+                # directory whose files belong to several modules is resolved
+                # by file. Every suite such a rule names is printed, one per
+                # line, so one path can select more than one suite.
+                mapfile -t candidates < <(suite_file_alias "${path}")
+                if [ "${#candidates[@]}" -gt 0 ]; then
+                  found=0
+                  for candidate in "${candidates[@]}"; do
+                    if suite_module_exists "${candidate}"; then
+                      printf '%s\n' "${candidate}"
+                      found=1
+                    fi
+                  done
+                  if [ "${found}" -eq 1 ]; then
+                    return 0
+                  fi
+                  report_uncovered "${path}" "${candidates[@]}"
+                  return 1
+                fi
                 name=$(suite_module_alias "${dir}")
                 if [ -z "${name}" ]; then
                   name=${dir//-/_}
@@ -255,7 +327,10 @@ jobs:
                 suites="${suites} ${name}"
               fi
             done
-            suites=$(printf '%s\n' "${suites}" | tr ' ' '\n' | sed '/^$/d' | sort -u)
+            # One path can derive more than one suite, so the collected names
+            # are split on any whitespace, not on the space between paths.
+            suites=$(printf '%s\n' "${suites}" | tr -s '[:space:]' '\n' |
+                     sed '/^$/d' | sort -u)
             prioritized=""
             remaining=""
             for suite in ${suites}; do
@@ -409,7 +484,11 @@ jobs:
           failures=0
           expect_suite() {
             local path="$1" expected="$2" actual
-            actual=$(derive_suite_for_path "${path}" 2>/dev/null || true)
+            # One path can derive more than one suite, printed one per line.
+            # The comparison is on the space-separated form, so a single-suite
+            # expectation and a multi-suite one read the same way.
+            actual=$(derive_suite_for_path "${path}" 2>/dev/null | tr '\n' ' ')
+            actual=${actual% }
             if [ "${actual}" != "${expected}" ]; then
               echo "::error::${path}: expected suite '${expected}', derived '${actual}'"
               failures=$((failures + 1))
@@ -448,6 +527,24 @@ jobs:
           expect_suite src/plugins/linux-cp/lcp_node.c linux_cp
           expect_uncovered src/vnet/l2/l2_input.c "test/test_l2.py or test/asf/test_l2.py"
           expect_uncovered src/plugins/xdp/xdp_input.c "test/test_xdp.py or test/asf/test_xdp.py"
+          # The file-level rule of src/vnet/ip: a family file selects its own
+          # family suite, and the mission's ip6_forward.c case is asserted
+          # first because it is the change this rule exists for.
+          expect_suite src/vnet/ip/ip6_forward.c ip6
+          expect_suite src/vnet/ip/ip4_forward.c ip4
+          expect_suite src/vnet/ip/ip6_input.c ip6
+          expect_suite src/vnet/ip/ip6_link.c ip6
+          expect_suite src/vnet/ip/reass/ip6_full_reass.c reassembly
+          expect_suite src/vnet/ip/punt_node.c punt
+          # A shared file names both suites, and the file whose name starts
+          # with ip4 but belongs to both must not be claimed by the ip4 glob.
+          expect_suite src/vnet/ip/ip_interface.c "ip4 ip6"
+          expect_suite src/vnet/ip/ip46_address.c "ip4 ip6"
+          expect_suite src/vnet/ip/icmp46_packet.h "ip4 ip6"
+          # A file of that directory with no rule keeps the old behaviour: it
+          # reports UNCOVERED and so must still fall back to ip4. This is the
+          # "must not gain a suite" case: vtep.c has no test in the tree.
+          expect_uncovered src/vnet/ip/vtep.c "test/test_ip.py or test/asf/test_ip.py"
           # No package in this repository has both test_<pkg>.py and
           # test_<sub>.py, so the subdirectory-first order is unobservable in
           # the real tree. Assert it in a tree that has both.
@@ -469,6 +566,29 @@ jobs:
             src/vnet/ip-neighbor/ip6_neighbor.c src/vnet/fib/fib_table.c \
             src/vnet/mfib/mfib_table.c src/plugins/linux-cp/lcp_node.c
           expect_suites "ip4" src/vnet/l2/l2_input.c
+          # The aggregate over the file-level rule: ip6_forward.c alone selects
+          # ip6, and with test_ip6.py also changed it is the prioritized suite
+          # of a one-suite filter. vtep.c alone derives nothing and falls back
+          # to ip4, which is the "still falls back" case.
+          expect_suites "ip6" src/vnet/ip/ip6_forward.c
+          expect_suites "ip6" src/vnet/ip/ip6_forward.c test/test_ip6.py
+          expect_suites "ip4" src/vnet/ip/vtep.c
+          # A shared file selects both families at once, and both fit the cap.
+          expect_suites "ip4 ip6" src/vnet/ip/ip_interface.c
+          # Two family files and a changed test_ip6.py: ip6 is prioritized,
+          # ip4 follows alphabetically inside the remaining group.
+          expect_suites "ip6 ip4" \
+            src/vnet/ip/ip4_forward.c src/vnet/ip/ip6_forward.c test/test_ip6.py
+          # The cap still applies when a single path contributes two suites:
+          # ip4 and ip6 from ip_interface.c fill two of three slots, fib takes
+          # the third, and ip_mcast and neighbor are named as dropped.
+          capped_multi=$(printf '%s\n' src/vnet/ip/ip_interface.c \
+            src/vnet/fib/fib_table.c src/vnet/mfib/mfib_table.c \
+            src/vnet/ip-neighbor/ip6_neighbor.c | derive_test_suites 2>&1 >/dev/null)
+          if [ "${capped_multi}" != "Not selected: the suite cap of 3 drops ip_mcast neighbor" ]; then
+            echo "::error::the multi-suite cap report was wrong, got '${capped_multi}'"
+            failures=$((failures + 1))
+          fi
           # SUITE_CAP is three, but a suite it leaves out is named instead of
           # vanishing: this is the changed set of pull request 48, where the
           # ip-neighbor suite does not fit in the cap.
