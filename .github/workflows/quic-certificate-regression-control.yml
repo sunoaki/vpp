@@ -57,7 +57,7 @@ jobs:
       - name: Install base tools
         run: |
           timeout -k 30s 5m apt-get update -qq
-          timeout -k 30s 5m apt-get install -y -qq sudo make git bash openssl
+          timeout -k 30s 5m apt-get install -y -qq sudo make git bash openssl python3 procps
 
       - uses: actions/checkout@v4
         with:
