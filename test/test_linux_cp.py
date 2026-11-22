@@ -46,6 +46,8 @@ from vpp_ip_route import (
     VppIpRoute,
     VppIpTable,
     VppRoutePath,
+    find_mroute,
+    find_mroute_path,
     find_route,
 )
 from vpp_neighbor import VppNeighbor, find_nbr
@@ -1336,6 +1338,137 @@ class TestLinuxCPMulticastRoutes(TestLinuxCPNetNSBase):
 
 
 @unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
+@unittest.skipIf(
+    "linux-cp" in config.excluded_plugins or "linux-nl" in config.excluded_plugins,
+    "Exclude linux-cp route tests",
+)
+class TestLinuxCPMcastRoute(TestLinuxCPNetNSBase):
+    """Deleting a Linux multicast route removes it from the VPP MFIB"""
+
+    mcast_group = "239.1.1.1"
+    mcast_prefix = mcast_group + "/32"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.create_pg_interfaces(range(1))
+        cls.phy = cls.pg_interfaces[0]
+        cls.vapi.lcp_itf_pair_add_del_v3(
+            is_add=True,
+            sw_if_index=cls.phy.sw_if_index,
+            host_if_name="hmcast",
+            netns=cls.ns_name,
+        )
+        cls.phy.admin_up()
+        set_interface_up(cls.ns_name, "hmcast")
+
+    def _mfib_entry_present(self):
+        return find_mroute(self, self.mcast_group, "0.0.0.0", 32)
+
+    def test_linux_to_vpp_mcast_route_delete(self):
+        """Linux multicast route delete is synced to the MFIB
+
+        A multicast route is installed into the MFIB, not the unicast FIB, so
+        a delete that only removed unicast paths would leave the entry, and
+        every route the kernel deletes would accumulate there.
+        """
+        add_namespace_route(
+            self.ns_name, self.mcast_prefix, dev="hmcast", route_type="multicast"
+        )
+        try:
+            self.poll_for(
+                "multicast route present in VPP MFIB",
+                self._mfib_entry_present,
+                True,
+            )
+
+            del_namespace_route(self.ns_name, self.mcast_prefix)
+            self.poll_for(
+                "multicast route removed from VPP MFIB",
+                self._mfib_entry_present,
+                False,
+            )
+        finally:
+            del_namespace_route(self.ns_name, self.mcast_prefix, check=False)
+
+
+@unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
+@unittest.skipIf(
+    "linux-cp" in config.excluded_plugins or "linux-nl" in config.excluded_plugins,
+    "Exclude linux-cp route tests",
+)
+class TestLinuxCPPreExistingRoutes(TestLinuxCPNetNSBase):
+    """Routes linux-nl never installed must not remove the LCP table
+
+    Routes can exist in the host netns before lcp opens its netlink socket,
+    that is, before the first LCP pair is created. Such routes are never
+    installed into the VPP FIB, so only their RTM_DELROUTE notifications reach
+    the plugin, and deleting them must neither release a table reference nor
+    flush the interface's multicast Accept paths.
+
+    This guards the invariant rather than reproducing the failure that
+    motivated it. It passes on the code before the table-lifetime fix as well:
+    a route that was never installed took no reference to give back, and
+    fib_table_entry_path_remove2() treats a missing entry as a no-op, so the
+    reference count is unchanged either way. What it catches is a future change
+    that starts counting a delete it never counted an add for.
+    """
+
+    # Blackhole routes created in the host netns before the first LCP pair
+    pre_existing_routes = [f"192.0.2.{i}/32" for i in range(1, 5)]
+    host_prefix = "10.0.0.1/24"
+    barrier = "192.0.2.100/32"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.create_pg_interfaces(range(1))
+        cls.phy = cls.pg_interfaces[0]
+
+        for prefix in cls.pre_existing_routes:
+            add_namespace_route(cls.ns_name, prefix, route_type="blackhole")
+
+        cls.vapi.cli(f"lcp create {cls.phy.name} host-if hroute netns {cls.ns_name}")
+        cls.phy.admin_up()
+
+        add_namespace_address(cls.ns_name, "hroute", cls.host_prefix)
+        set_interface_up(cls.ns_name, "hroute")
+
+    def _accept_path_present(self):
+        accept = VppEnum.vl_api_mfib_itf_flags_t.MFIB_API_ITF_FLAG_ACCEPT
+        return find_mroute_path(
+            self, "0.0.0.0", "224.0.0.0", 24, self.phy.sw_if_index, accept
+        )
+
+    def test_delete_preexisting_routes(self):
+        """Deletes of routes not installed by linux-cp keep the Accept paths
+
+        A regression guard for the invariant, not a reproduction: see the
+        class docstring for why the pre-fix code passes it too.
+        """
+        self.poll_for("Accept path installed", self._accept_path_present, True)
+
+        for prefix in self.pre_existing_routes:
+            del_namespace_route(self.ns_name, prefix)
+
+        # Whether the deletes were processed cannot be told from their absence,
+        # so a route the plugin does install is used as a barrier: once it is
+        # in the table, every event before it has been read.
+        add_namespace_route(self.ns_name, self.barrier, route_type="blackhole")
+        try:
+            self.verify_paths(self.barrier, dict(type=FibPathType.FIB_PATH_TYPE_DROP))
+            del_namespace_route(self.ns_name, self.barrier)
+        finally:
+            del_namespace_route(self.ns_name, self.barrier, check=False)
+
+        self.assertTrue(
+            self._accept_path_present(),
+            "per-interface Accept path on (*,224.0.0.0/24) was flushed by "
+            "deletes of routes linux-cp never installed",
+        )
+
+
+@unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
 class TestLinuxCPRoutes(TestLinuxCPNetNSBase):
     """Linux CP Routes"""
 
@@ -2186,6 +2319,101 @@ class TestLinuxCPLinuxToVPP(TestLinuxCPNetNSBase):
             ),
             False,
         )
+
+
+@unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
+@unittest.skipIf(
+    "linux-cp" in config.excluded_plugins or "linux-nl" in config.excluded_plugins,
+    "Exclude linux-cp route tests",
+)
+class TestLinuxCPMplsRoute(TestLinuxCPNetNSBase):
+    """Deleting the last Linux MPLS route releases the lcp MPLS table
+
+    The check reads the plugin's table with `test lcp router`, which is a
+    command of the linux_cp_unittest plugin, not of linux-cp or linux-nl.
+    That plugin is default_disabled, so it has to be enabled for the command
+    to exist. It is enabled only here: turning it on for
+    TestLinuxCPLinuxToVPP instead would expose the fixture CLI to every other
+    test in that class.
+    """
+
+    extra_vpp_plugin_config = TestLinuxCPNetNSBase.extra_vpp_plugin_config + [
+        "plugin",
+        "linux_cp_unittest_plugin.so",
+        "{",
+        "enable",
+        "}",
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.create_loopback_interfaces(1)
+        cls.lo = cls.lo_interfaces[0]
+        cls.vapi.cli(f"lcp create loop0 host-if hloop0 netns {cls.ns_name}")
+        cls.vapi.sw_interface_add_del_address(
+            sw_if_index=cls.lo.sw_if_index, prefix="10.10.1.2/24"
+        )
+        cls.lo.admin_up()
+
+    def _mpls_labels(self):
+        """Labels the default MPLS table holds, from the plugin's own FIB."""
+        return {entry.mr_route.mr_label for entry in self.vapi.mpls_route_dump(0)}
+
+    def test_linux_to_vpp_mpls_route_delete(self):
+        """Deleting the last Linux MPLS route releases the lcp MPLS table
+
+        An lcp router table is made for every protocol a synced route uses,
+        MPLS among them. mfib_table_find_or_create_and_lock() answers ~0 for
+        FIB_PROTOCOL_MPLS, and mfib_table_get() has no MPLS table either, so a
+        delete that unlocks the MFIB it thinks it holds dereferences NULL. The
+        kernel has no mpls_router here unless the module is loaded, so the test
+        skips where the route cannot be added.
+        """
+        ns = ["ip", "netns", "exec", self.ns_name]
+        r = subprocess.run(
+            ns + ["sysctl", "-w", "net.mpls.platform_labels=1100"],
+            capture_output=True,
+        )
+        if r.returncode:
+            self.skipTest("kernel MPLS (mpls_router) not available")
+
+        label = 1001
+        route = [str(label), "via", "inet", "10.10.1.1", "dev", "hloop0"]
+        added = False
+        try:
+            subprocess.run(
+                ns + ["ip", "-f", "mpls", "route", "add"] + route, check=True
+            )
+            added = True
+            self.poll_for(
+                f"MPLS route {label} synced to VPP",
+                lambda: label in self._mpls_labels(),
+                True,
+            )
+
+            # The route is the last one in its MPLS table, so its delete drops
+            # the table reference, and an MPLS table has no MFIB to unlock.
+            subprocess.run(
+                ns + ["ip", "-f", "mpls", "route", "del", str(label)], check=True
+            )
+            added = False
+            self.poll_for(
+                f"MPLS route {label} removed from VPP",
+                lambda: label in self._mpls_labels(),
+                False,
+            )
+            # A VPP that faulted on the unlock is gone by now, so this command
+            # both proves the plugin survived and reports the released table.
+            self.assertNotIn(
+                "refs:", self.vapi.cli("test lcp router mpls table 0 state")
+            )
+        finally:
+            if added:
+                subprocess.run(
+                    ns + ["ip", "-f", "mpls", "route", "del", str(label)],
+                    capture_output=True,
+                )
 
 
 @unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")

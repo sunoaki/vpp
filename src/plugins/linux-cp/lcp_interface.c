@@ -372,6 +372,12 @@ lcp_netlink_add_link_vlan (int parent, u32 vlan, u16 proto, const char *name)
   int err;
 
   sk = nl_socket_alloc ();
+  if (!sk)
+    {
+      LCP_ITF_PAIR_ERR ("netlink_add_link_vlan: socket allocation failed");
+      return clib_error_return (NULL, "Unable to allocate netlink socket");
+    }
+
   if ((err = nl_connect (sk, NETLINK_ROUTE)) < 0)
     {
       LCP_ITF_PAIR_ERR ("netlink_add_link_vlan: connect error: %s",
@@ -381,6 +387,12 @@ lcp_netlink_add_link_vlan (int parent, u32 vlan, u16 proto, const char *name)
     }
 
   link = rtnl_link_vlan_alloc ();
+  if (!link)
+    {
+      LCP_ITF_PAIR_ERR ("netlink_add_link_vlan: link allocation failed");
+      error = clib_error_return (NULL, "Unable to allocate link %s", name);
+      goto done;
+    }
 
   rtnl_link_set_link (link, parent);
   rtnl_link_set_name (link, name);
@@ -414,6 +426,9 @@ lcp_netlink_del_link (const char *name)
   int err;
 
   sk = nl_socket_alloc ();
+  if (!sk)
+    return clib_error_return (NULL, "Unable to allocate netlink socket");
+
   if ((err = nl_connect (sk, NETLINK_ROUTE)) < 0)
     {
       error = clib_error_return (NULL, "Unable to connect socket: %d", err);
@@ -421,6 +436,12 @@ lcp_netlink_del_link (const char *name)
     }
 
   link = rtnl_link_alloc ();
+  if (!link)
+    {
+      error = clib_error_return (NULL, "Unable to allocate link %s", name);
+      goto done;
+    }
+
   rtnl_link_set_name (link, name);
 
   if ((err = rtnl_link_delete (sk, link)) < 0)

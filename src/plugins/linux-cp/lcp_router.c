@@ -1705,6 +1705,8 @@ static void lcp_router_table_special_punt_add_del (lcp_router_table_t *nlt, u8 i
 static void lcp_router_table_special_mfibs_add_del (lcp_router_table_t *nlt, u8 is_add);
 static void lcp_router_table_special_routes_del (lcp_router_table_t *nlt);
 static void lcp_router_table_mcast_release (lcp_router_table_t *nlt);
+static u32 lcp_router_table_source_count (const lcp_router_table_t *nlt, fib_source_t source);
+static void lcp_router_table_free_if_unused (lcp_router_table_t *nlt);
 
 /*
  * Take a record out of the database after giving up everything it holds: the
@@ -1731,6 +1733,7 @@ lcp_router_table_forget (lcp_router_table_t *nlt)
   if (nlt->nlt_mfib_index != ~0)
     mfib_table_unlock (nlt->nlt_mfib_index, nlt->nlt_proto, MFIB_SOURCE_PLUGIN_LOW);
 
+  vec_free (nlt->nlt_mcast_entries);
   vec_free (nlt->nlt_onlink_routes);
   hash_unset (lcp_router_table_db[nlt->nlt_proto], nlt->nlt_id);
   pool_put (lcp_router_table_pool, nlt);
@@ -1956,24 +1959,73 @@ lcp_router_table_add_or_lock (uint32_t id, fib_protocol_t fproto)
   return (nlt);
 }
 
+/*
+ * The routes the plugin holds in a table's FIB, under its two learned sources.
+ * A route the kernel already had before the plugin opened its netlink socket
+ * was never installed here, so only its delete reaches the plugin; the FIB is
+ * what says whether the table still has routes of the plugin's own, and each
+ * counted route owns one reference.
+ */
+static u32
+lcp_router_table_owned_routes (const lcp_router_table_t *nlt)
+{
+  return (lcp_router_table_source_count (nlt, lcp_rt_fib_src) +
+	  lcp_router_table_source_count (nlt, lcp_rt_fib_src_dynamic));
+}
+
+/*
+ * The multicast routes the plugin holds in a table's MFIB. MPLS has no MFIB:
+ * mfib_table_find_or_create_and_lock() answered ~0 for the protocol, and that
+ * is not an index anything can be counted at.
+ */
+static u32
+lcp_router_table_owned_mroutes (const lcp_router_table_t *nlt)
+{
+  if (FIB_PROTOCOL_MPLS == nlt->nlt_proto || ~0 == nlt->nlt_mfib_index)
+    return 0;
+
+  return vec_len (nlt->nlt_mcast_entries);
+}
+
+/*
+ * Free a record once nothing holds it. The reference count says whether a
+ * caller still holds the record, not whether the table is empty: a route the
+ * kernel had before the socket opened was never installed here, and a route
+ * the plugin installed keeps a reference that a flush or a sweep gives back
+ * only after the FIB has lost the route. The two are asked separately, so a
+ * deleted route that was never ours cannot take the table down under the
+ * routes that are.
+ */
+static void
+lcp_router_table_free_if_unused (lcp_router_table_t *nlt)
+{
+  if (nlt->nlt_refs > 0)
+    return;
+
+  if (lcp_router_table_owned_routes (nlt) > 0 || lcp_router_table_owned_mroutes (nlt) > 0)
+    return;
+
+  LCP_ROUTER_DBG ("table %u removed", nlt->nlt_id);
+
+  lcp_router_table_add_del_special_routes (nlt, 0);
+
+  fib_table_unlock (nlt->nlt_fib_index, nlt->nlt_proto, lcp_rt_fib_src);
+  if (nlt->nlt_mfib_index != ~0)
+    mfib_table_unlock (nlt->nlt_mfib_index, nlt->nlt_proto, MFIB_SOURCE_PLUGIN_LOW);
+
+  hash_unset (lcp_router_table_db[nlt->nlt_proto], nlt->nlt_id);
+  vec_free (nlt->nlt_mcast_entries);
+  vec_free (nlt->nlt_onlink_routes);
+  pool_put (lcp_router_table_pool, nlt);
+}
+
 static void
 lcp_router_table_unlock (lcp_router_table_t *nlt)
 {
   ASSERT (nlt->nlt_refs > 0);
   nlt->nlt_refs--;
 
-  if (0 == nlt->nlt_refs)
-    {
-      lcp_router_table_add_del_special_routes (nlt, 0);
-
-      fib_table_unlock (nlt->nlt_fib_index, nlt->nlt_proto, lcp_rt_fib_src);
-      if (nlt->nlt_mfib_index != ~0)
-	mfib_table_unlock (nlt->nlt_mfib_index, nlt->nlt_proto, MFIB_SOURCE_PLUGIN_LOW);
-
-      hash_unset (lcp_router_table_db[nlt->nlt_proto], nlt->nlt_id);
-      vec_free (nlt->nlt_onlink_routes);
-      pool_put (lcp_router_table_pool, nlt);
-    }
+  lcp_router_table_free_if_unused (nlt);
 }
 
 /*
