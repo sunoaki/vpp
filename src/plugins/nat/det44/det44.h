@@ -378,7 +378,7 @@ u32 icmp_match_in2out_det (vlib_node_runtime_t *node, u32 thread_index, vlib_buf
 			   ip4_address_t *created_addr, u8 *identity);
 u32 det44_icmp_in2out (vlib_buffer_t *b0, ip4_header_t *ip0, icmp46_header_t *icmp0,
 		       u32 sw_if_index0, u32 rx_fib_index0, vlib_node_runtime_t *node, u32 next0,
-		       u32 thread_index, void *d, void *e, u8 *session_accepted,
+		       u32 thread_index, void *d, void *e, u8 *session_created,
 		       ip4_address_t *created_addr, u8 *identity);
 u32 det44_icmp_out2in (vlib_buffer_t * b0, ip4_header_t * ip0,
 		       icmp46_header_t * icmp0, u32 sw_if_index0,
