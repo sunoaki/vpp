@@ -20,6 +20,24 @@ hsi_session_free (session_t *s)
   hsi_worker_proto_counter_inc (hsi_worker_get (thread_index), proto, cleanup_completed);
 }
 
+/*
+ * Hand a session back to the session layer, after which it is no longer hsi
+ * owned. The session layer frees it once the transport deletes the connection.
+ * The caller must have dropped the fifos already, and the app worker is not
+ * restored because hsi does not save it: cleanup notifications to apps are not
+ * enabled in this tree.
+ */
+void
+hsi_session_release (session_t *s)
+{
+  ASSERT (s->thread_index == vlib_get_thread_index ());
+  ASSERT (!s->rx_fifo && !s->tx_fifo);
+
+  hsi_worker_proto_counter_inc (hsi_worker_get (s->thread_index), session_get_transport_proto (s),
+				cleanup_completed);
+  s->session_state = SESSION_STATE_CLOSED;
+}
+
 static void
 hsi_session_transport_cleanup (session_t *s)
 {
@@ -110,7 +128,7 @@ void
 hsi_session_cleanup_fifos (session_t *s)
 {
   svm_fifo_t *rx_fifo, *tx_fifo;
-  u8 local_uses_remote_fifos;
+  clib_thread_index_t alloc_thread;
 
   ASSERT (s->thread_index == vlib_get_thread_index ());
 
@@ -122,12 +140,14 @@ hsi_session_cleanup_fifos (session_t *s)
 
   rx_fifo = s->rx_fifo;
   tx_fifo = s->tx_fifo;
+  alloc_thread = segment_manager_fifo_alloc_thread (rx_fifo);
+  ASSERT (alloc_thread == segment_manager_fifo_alloc_thread (tx_fifo));
 
-  local_uses_remote_fifos = hsi_session_uses_remote_fifos (s);
-  if (local_uses_remote_fifos && s->thread_index != rx_fifo->master_thread_index)
+  /* Only the thread that allocated the fifos can free them */
+  if (alloc_thread != s->thread_index)
     {
       hsi_session_clear_fifos (s);
-      hsi_session_send_fifos_cleanup_on_thread (rx_fifo->master_thread_index, rx_fifo, tx_fifo);
+      hsi_session_send_fifos_cleanup_on_thread (alloc_thread, rx_fifo, tx_fifo);
       return;
     }
 
@@ -141,6 +161,10 @@ hsi_session_cleanup (session_t *s)
   transport_proto_t proto;
 
   ASSERT (s->thread_index == vlib_get_thread_index ());
+
+  /* Already handed back to the session layer for cleanup */
+  if (!hsi_session_is_hsi_owned (s))
+    return;
 
   if (!hsi_session_is_cleanup_ready (s))
     return;
