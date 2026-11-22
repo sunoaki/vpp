@@ -28,7 +28,7 @@ hsi_tcp_session_cleanup_peer_handle (session_t *s)
   if (drain)
     return drain->peer_session_handle;
 
-  if (tc->state == TCP_STATE_CLOSED)
+  if (hsi_tcp_connection_is_committed (tc))
     return hsi_tcp_tracker_from_connection (tc)->peer_session_handle;
 
   return SESSION_INVALID_HANDLE;
@@ -171,9 +171,13 @@ hsi_tcp_session_cleanup_state (session_t *s)
   hsi_tcp_drain_stop (tc);
 }
 
+static int hsi_tcp_drain_transport_closed (session_t *s, tcp_connection_t *tc,
+					   hsi_tcp_drain_t *drain);
+
 static void
 hsi_tcp_track_abort_session (session_t *s)
 {
+  hsi_tcp_drain_t *drain;
   tcp_connection_t *tc;
 
   ASSERT (s->thread_index == vlib_get_thread_index ());
@@ -182,12 +186,23 @@ hsi_tcp_track_abort_session (session_t *s)
   if (!(tc->cfg_flags & TCP_CFG_F_TRACKED))
     return;
 
+  drain = hsi_tcp_drain_get (s->thread_index, hsi_session_conn_key_from_session (s));
+  if (drain && hsi_tcp_drain_transport_closed (s, tc, drain))
+    return;
+
   if (tc->state != TCP_STATE_CLOSED)
     {
       tcp_send_reset (tc);
       tcp_connection_timers_reset (tc);
       tcp_cong_recovery_off (tc);
       tcp_connection_set_state (tc, TCP_STATE_CLOSED);
+    }
+
+  /* Closed by hsi, not tcp */
+  if (drain)
+    {
+      drain->flags |= HSI_TCP_DRAIN_F_HSI_CLOSED;
+      drain->state = HSI_TCP_DRAIN_STATE_FAILED;
     }
 
   hsi_session_program_cleanup (s);
@@ -315,6 +330,9 @@ hsi_tcp_drain_flag_set (hsi_tcp_drain_t *drain, hsi_tcp_drain_flags_t flag, u8 i
 static_always_inline void
 hsi_tcp_drain_sample (session_t *s, tcp_connection_t *tc, hsi_tcp_drain_t *drain)
 {
+  /* Fifos of sessions owned by other workers can go away under us, see
+   * hsi_tcp_track_remote_peer_needs_drain */
+  ASSERT (s->thread_index == vlib_get_thread_index ());
   hsi_drain_sample_fifos (s, &drain->rx_deq, &drain->tx_deq);
   hsi_tcp_drain_flag_set (drain, HSI_TCP_DRAIN_F_RX_OOO, svm_fifo_has_ooo_data (s->rx_fifo));
   drain->snd_una = tc->snd_una;
@@ -381,6 +399,34 @@ hsi_tcp_track_needs_drain (session_t *s, tcp_connection_t *tc)
   return hsi_tcp_drain_sample_needs_drain (&sample);
 }
 
+/*
+ * Check if a peer owned by another worker still needs draining. Its worker
+ * frees its fifos when it's torn down, so treat a closed peer as not drained
+ * and load the fifos only once.
+ */
+static_always_inline int
+hsi_tcp_track_remote_peer_needs_drain (session_t *peer_s, tcp_connection_t *peer_tc)
+{
+  hsi_tcp_drain_t sample = {};
+  svm_fifo_t *rx_fifo, *tx_fifo;
+
+  if (clib_atomic_load_relax_n (&peer_s->session_state) >= SESSION_STATE_TRANSPORT_CLOSED)
+    return 1;
+
+  rx_fifo = clib_atomic_load_relax_n (&peer_s->rx_fifo);
+  tx_fifo = clib_atomic_load_relax_n (&peer_s->tx_fifo);
+  if (!rx_fifo || !tx_fifo)
+    return 1;
+
+  sample.rx_deq = svm_fifo_max_dequeue (rx_fifo);
+  sample.tx_deq = svm_fifo_max_dequeue_cons (tx_fifo);
+  hsi_tcp_drain_flag_set (&sample, HSI_TCP_DRAIN_F_RX_OOO, svm_fifo_has_ooo_data (rx_fifo));
+  sample.snd_una = peer_tc->snd_una;
+  sample.snd_nxt = peer_tc->snd_nxt;
+
+  return hsi_tcp_drain_sample_needs_drain (&sample);
+}
+
 static void
 hsi_tcp_drain_fail_pair (hsi_tcp_drain_t *drain)
 {
@@ -433,6 +479,7 @@ hsi_tcp_drain_start (session_t *s, session_t *peer_s, tcp_connection_t *tc,
   drain->flags |= HSI_TCP_DRAIN_F_WND_CLAMPED;
   hsi_worker_counter_inc (wrk, tcp_drain_started);
   hsi_tcp_drain_maybe_register_time_update (thread_index);
+  hsi_drain_program_tx (s);
 
   return drain;
 }
@@ -670,6 +717,7 @@ hsi_tcp_track_commit_connection (tcp_connection_t *tc, hsi_tcp_track_snapshot_t 
   hsi_tcp_tracker_init (hsi_tcp_tracker_from_connection (tc), tc, peer);
 
   tc->cfg_flags |= TCP_CFG_F_TRACKED;
+  tc->c_flags |= TRANSPORT_CONNECTION_F_SPLICED;
   tcp_connection_set_state (tc, TCP_STATE_CLOSED);
   hsi_tcp_drain_flush_cached_buffers (tc);
   if (hsi_tcp_drain_get (tc->c_thread_index, hsi_tcp_session_conn_key_from_connection (tc)))
@@ -680,14 +728,22 @@ hsi_tcp_track_commit_connection (tcp_connection_t *tc, hsi_tcp_track_snapshot_t 
 static void
 hsi_tcp_track_commit (session_t *s, hsi_tcp_track_snapshot_t *peer)
 {
+  hsi_tcp_drain_t *drain;
   tcp_connection_t *tc;
 
   ASSERT (s->thread_index == vlib_get_thread_index ());
 
   tc = hsi_tcp_connection_at_session (s);
+  if (hsi_tcp_connection_is_committed (tc))
+    return;
+
+  /* Closed while draining. If not by hsi, tcp closed it */
   if (tc->state == TCP_STATE_CLOSED)
     {
       ASSERT (tc->cfg_flags & TCP_CFG_F_TRACKED);
+      drain = hsi_tcp_drain_get (s->thread_index, hsi_session_conn_key_from_session (s));
+      if (drain)
+	hsi_tcp_drain_transport_closed (s, tc, drain);
       return;
     }
 
@@ -747,6 +803,31 @@ hsi_tcp_track_send_commit (session_t *peer_s, hsi_tcp_track_snapshot_t *peer)
   session_send_rpc_evt_to_thread (peer_s->thread_index, hsi_tcp_track_commit_rpc, a);
 }
 
+/*
+ * Draining connection closed but not by hsi, so tcp closed it, e.g., because
+ * it gave up retransmitting, and it will delete it. Abort the peer and hand the
+ * session back to the session layer, which frees it when tcp deletes the
+ * connection. Returns 1 if that was the case.
+ */
+static int
+hsi_tcp_drain_transport_closed (session_t *s, tcp_connection_t *tc, hsi_tcp_drain_t *drain)
+{
+  if (PREDICT_TRUE (tc->state != TCP_STATE_CLOSED) || hsi_tcp_connection_is_committed (tc) ||
+      hsi_tcp_drain_flag_is_set (drain, HSI_TCP_DRAIN_F_HSI_CLOSED))
+    return 0;
+
+  hsi_worker_counter_inc (hsi_worker_get (s->thread_index), tcp_drain_transport_closed);
+  if (!hsi_tcp_drain_flag_is_set (drain, HSI_TCP_DRAIN_F_ABORT_SENT))
+    hsi_tcp_track_send_abort (drain->peer_session_handle);
+  /* Session lingers until tcp deletes the connection, no tx without fifos */
+  hsi_tcp_track_cleanup_pending_tx (s, tc);
+  hsi_session_cleanup_fifos (s);
+  hsi_tcp_session_cleanup_state (s);
+  hsi_session_release (s);
+
+  return 1;
+}
+
 static int
 hsi_tcp_drain_try_complete (session_t *s, tcp_connection_t *tc, hsi_tcp_drain_t *drain, f64 now)
 {
@@ -762,8 +843,11 @@ hsi_tcp_drain_try_complete (session_t *s, tcp_connection_t *tc, hsi_tcp_drain_t 
   ASSERT (tc->c_thread_index == vlib_get_thread_index ());
   ASSERT (drain);
 
-  if (tc->state == TCP_STATE_CLOSED)
+  if (hsi_tcp_connection_is_committed (tc))
     return 1;
+
+  if (hsi_tcp_drain_transport_closed (s, tc, drain))
+    return -1;
 
   if (drain->state == HSI_TCP_DRAIN_STATE_FAILED)
     return -1;
@@ -808,14 +892,16 @@ hsi_tcp_drain_try_complete (session_t *s, tcp_connection_t *tc, hsi_tcp_drain_t 
 	    return 0;
 	}
     }
-  else if (peer_s->rx_fifo && peer_s->tx_fifo && hsi_tcp_track_needs_drain (peer_s, peer_tc))
-    return 0;
-
-  if (s->thread_index != peer_s->thread_index)
+  else
     {
+      /* Across workers, the session with the lower handle commits both and
+       * the other one waits for its commit rpc. Don't touch the committer's
+       * fifos while waiting, it frees them when it commits */
       if (drain->session_handle > drain->peer_session_handle)
 	return 0;
       if (hsi_tcp_drain_flag_is_set (drain, HSI_TCP_DRAIN_F_COMMIT_SENT))
+	return 0;
+      if (hsi_tcp_track_remote_peer_needs_drain (peer_s, peer_tc))
 	return 0;
       drain->flags |= HSI_TCP_DRAIN_F_COMMIT_SENT;
     }
@@ -850,7 +936,7 @@ hsi_tcp_drain_cache_buffer (vlib_main_t *vm, vlib_buffer_t *b, tcp_connection_t 
   u8 rst;
 
   ASSERT (tc->cfg_flags & TCP_CFG_F_TRACKED);
-  ASSERT (tc->state != TCP_STATE_CLOSED);
+  ASSERT (!hsi_tcp_connection_is_committed (tc));
   ASSERT (tc->c_thread_index == vm->thread_index);
 
   key = hsi_tcp_session_conn_key_from_connection (tc);
@@ -933,7 +1019,7 @@ hsi_tcp_try_complete_drain (vlib_main_t *vm, tcp_connection_t *tc)
   session_t *s;
 
   ASSERT (tc->cfg_flags & TCP_CFG_F_TRACKED);
-  ASSERT (tc->state != TCP_STATE_CLOSED);
+  ASSERT (!hsi_tcp_connection_is_committed (tc));
   ASSERT (tc->c_thread_index == vm->thread_index);
 
   drain = hsi_tcp_drain_get (tc->c_thread_index, hsi_tcp_session_conn_key_from_connection (tc));
@@ -980,7 +1066,7 @@ hsi_tcp_drain_update_time (f64 time_now, u8 thread_index)
       ASSERT (s->thread_index == thread_index);
 
       tc = hsi_tcp_connection_at_session (s);
-      if (!(tc->cfg_flags & TCP_CFG_F_TRACKED) || tc->state == TCP_STATE_CLOSED)
+      if (!(tc->cfg_flags & TCP_CFG_F_TRACKED) || hsi_tcp_connection_is_committed (tc))
 	continue;
 
       drain = hsi_tcp_drain_get (thread_index, hsi_session_conn_key_from_session (s));
@@ -1056,7 +1142,7 @@ hsi_tcp_track_schedule_cleanup_pair (tcp_connection_t *tc, hsi_tcp_tracker_t *tr
   u8 local_uses_remote_fifos, peer_uses_remote_fifos;
 
   ASSERT (tc->cfg_flags & TCP_CFG_F_TRACKED);
-  ASSERT (tc->state == TCP_STATE_CLOSED);
+  ASSERT (hsi_tcp_connection_is_committed (tc));
   ASSERT (trk->peer_session_handle != SESSION_INVALID_HANDLE);
 
   local_handle = session_make_handle (tc->c_s_index, tc->c_thread_index);
@@ -1066,7 +1152,7 @@ hsi_tcp_track_schedule_cleanup_pair (tcp_connection_t *tc, hsi_tcp_tracker_t *tr
     {
       peer_tc = hsi_tcp_connection_at_session (peer_s);
       ASSERT (peer_tc->cfg_flags & TCP_CFG_F_TRACKED);
-      if (peer_tc->state == TCP_STATE_CLOSED)
+      if (hsi_tcp_connection_is_committed (peer_tc))
 	peer_trk = hsi_tcp_tracker_from_connection (peer_tc);
     }
 
@@ -1149,7 +1235,7 @@ hsi_tcp_track_maybe_cleanup_pair (tcp_connection_t *tc, hsi_tcp_tracker_t *trk)
 
   peer_tc = hsi_tcp_connection_at_session (peer_s);
   ASSERT (peer_tc->cfg_flags & TCP_CFG_F_TRACKED);
-  if (peer_tc->state != TCP_STATE_CLOSED)
+  if (!hsi_tcp_connection_is_committed (peer_tc))
     return;
 
   peer_trk = hsi_tcp_tracker_from_connection (peer_tc);
@@ -1201,7 +1287,7 @@ hsi_tcp_fin_wait_update_time (f64 time_now, u8 thread_index)
 	}
 
       tc = hsi_tcp_connection_at_session (s);
-      if (!(tc->cfg_flags & TCP_CFG_F_TRACKED) || tc->state != TCP_STATE_CLOSED)
+      if (!(tc->cfg_flags & TCP_CFG_F_TRACKED) || !hsi_tcp_connection_is_committed (tc))
 	{
 	  hsi_tcp_fin_wait_del_key (thread_index, *keyp);
 	  continue;
@@ -1229,7 +1315,7 @@ hsi_tcp_fin_wait_update_time (f64 time_now, u8 thread_index)
 	}
 
       peer_tc = hsi_tcp_connection_at_session (peer_s);
-      if (!(peer_tc->cfg_flags & TCP_CFG_F_TRACKED) || peer_tc->state != TCP_STATE_CLOSED)
+      if (!(peer_tc->cfg_flags & TCP_CFG_F_TRACKED) || !hsi_tcp_connection_is_committed (peer_tc))
 	continue;
 
       peer_trk = hsi_tcp_tracker_from_connection (peer_tc);
@@ -1249,7 +1335,7 @@ hsi_tcp_mark_fin_acked (tcp_connection_t *tc, u32 ack)
   hsi_tcp_tracker_t *trk;
 
   ASSERT (tc->cfg_flags & TCP_CFG_F_TRACKED);
-  ASSERT (tc->state == TCP_STATE_CLOSED);
+  ASSERT (hsi_tcp_connection_is_committed (tc));
 
   trk = hsi_tcp_tracker_get (tc);
   if ((trk->flags & HSI_TRACKER_F_FIN_RCVD) && seq_geq (ack, tc->rcv_nxt))
@@ -1348,7 +1434,7 @@ hsi_tcp_mark_peer_fin_pending (tcp_connection_t *tc, u32 ack)
   hsi_tcp_tracker_t *trk;
 
   ASSERT (tc->cfg_flags & TCP_CFG_F_TRACKED);
-  ASSERT (tc->state == TCP_STATE_CLOSED);
+  ASSERT (hsi_tcp_connection_is_committed (tc));
 
   trk = hsi_tcp_tracker_get (tc);
   trk->peer_fin_ack = ack - trk->ack_delta;
@@ -1720,7 +1806,7 @@ hsi_tracker_show_tcp (vlib_main_t *vm, u32 i, hsi_worker_t *wrk, f64 now)
 
   pool_foreach (tc, tcp_main.wrk[i].connections)
     {
-      if (!(tc->cfg_flags & TCP_CFG_F_TRACKED) || tc->state != TCP_STATE_CLOSED)
+      if (!(tc->cfg_flags & TCP_CFG_F_TRACKED) || !hsi_tcp_connection_is_committed (tc))
 	continue;
 
       trk = hsi_tcp_tracker_from_connection (tc);

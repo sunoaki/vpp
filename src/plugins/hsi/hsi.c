@@ -234,7 +234,7 @@ hsi_tcp_lookup_handler (vlib_main_t *vm, vlib_buffer_t *b, void *ip_hdr, u32 *ne
 	{
 	  hsi_tcp_tracked_action_t action;
 
-	  if (!is_input && tc->state != TCP_STATE_CLOSED)
+	  if (!is_input && !hsi_tcp_connection_is_committed (tc))
 	    {
 	      vnet_feature_next (next, b);
 	      return HSI_LOOKUP_RESULT_PASS;
@@ -260,7 +260,8 @@ hsi_udp_tracked_lookup_handler (vlib_main_t *vm, vlib_buffer_t *b, session_t *s,
 
   if (uc->c_thread_index != vm->thread_index)
     {
-      if (hsi_udp_connection_is_draining (uc))
+      /* Owner's drain state is not safe to read, let owner decide */
+      if (!hsi_udp_connection_is_committed (uc))
 	{
 	  if (!is_input)
 	    {
