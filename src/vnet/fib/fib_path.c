@@ -1447,8 +1447,15 @@ fib_path_create_special (fib_node_index_t pl_index,
     }
     else if (FIB_PATH_CFG_FLAG_LOCAL & flags)
     {
+	/*
+	 * A LOCAL special path says the table receives the prefix. It is
+	 * not built from a route path, so no interface configured it and it
+	 * belongs to none: that is the interface value the RECEIVE readers
+	 * (fib_path_contribute_forwarding, fib_path_get_resolving_interface
+	 * and fib_path_encode) expect.
+	 */
 	path->fp_type = FIB_PATH_TYPE_RECEIVE;
-	path->attached.fp_interface = FIB_NODE_INDEX_INVALID;
+	path->receive.fp_interface = FIB_NODE_INDEX_INVALID;
     }
     else
     {

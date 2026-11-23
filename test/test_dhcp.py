@@ -6,7 +6,7 @@ import socket
 from framework import VppTestCase
 from asfframework import VppTestRunner, tag_run_solo
 from vpp_neighbor import VppNeighbor
-from vpp_ip_route import find_route, VppIpTable
+from vpp_ip_route import find_route, VppIpTable, FibPathType
 from util import mk_ll_addr
 import scapy.compat
 from scapy.layers.l2 import Ether, ARP, Dot1Q
@@ -855,6 +855,44 @@ class TestDHCP(VppTestCase):
         self.pg3.unconfig_ip4()
         self.pg4.unconfig_ip4()
         self.pg5.unconfig_ip4()
+
+    def test_dhcp_proxy_broadcast_entry_names_no_interface(self):
+        """The all-ones entry the proxy sources belongs to no interface
+
+        A proxy sources 255.255.255.255/32 in its rx table as a LOCAL
+        special path, saying that table receives the broadcast. Such a
+        path is not built from a route path, so no interface configured
+        it and it names none. A path that named an interface would carry
+        that interface's table, and the receive node refuses a receive in
+        a table the interface does not belong to, so the proxy would
+        never see the broadcast it is there to relay.
+        """
+        rx_table_id = 11
+        proxy = VppDHCPProxy(
+            self,
+            self.pg1.remote_ip4,
+            self.pg1.local_ip4,
+            rx_vrf_id=rx_table_id,
+            server_vrf_id=rx_table_id,
+        )
+        proxy.add_vpp_config()
+
+        paths = [
+            path
+            for entry in self.vapi.ip_route_dump(rx_table_id, False)
+            if str(entry.route.prefix) == "255.255.255.255/32"
+            for path in entry.route.paths
+        ]
+
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(paths[0].type, FibPathType.FIB_PATH_TYPE_LOCAL)
+        self.assertEqual(
+            paths[0].sw_if_index,
+            0xFFFFFFFF,
+            "the all-ones receive must name no interface",
+        )
+
+        proxy.remove_vpp_config()
 
     def test_dhcp6_proxy(self):
         """DHCPv6 Proxy"""
