@@ -1262,6 +1262,43 @@ ip_neighbor_entries (u32 sw_if_index, ip_address_family_t af, int (*sort) (void 
   return ipnis;
 }
 
+static walk_rc_t
+ip_neighbor_collect_index (index_t ipni, void *ctx)
+{
+  index_t **ipnis = ctx;
+
+  vec_add1 (*ipnis, ipni);
+  return WALK_CONTINUE;
+}
+
+static int
+ip_neighbor_sort_by_index (void *first, void *second)
+{
+  const index_t *first_index = first, *second_index = second;
+
+  return (*first_index > *second_index) - (*first_index < *second_index);
+}
+
+static index_t *
+ip_neighbor_interface_entries (u32 sw_if_index, ip_address_family_t af)
+{
+  index_t *ipnis = NULL;
+
+  if (af == N_AF)
+    {
+      ip_neighbor_walk (AF_IP4, sw_if_index, ip_neighbor_collect_index, &ipnis);
+      ip_neighbor_walk (AF_IP6, sw_if_index, ip_neighbor_collect_index, &ipnis);
+    }
+  else
+    ip_neighbor_walk (af, sw_if_index, ip_neighbor_collect_index, &ipnis);
+
+  /* The display comparator is not a total order. Give it the same ascending
+     pool-index input as the pool walk. */
+  vec_sort_with_function (ipnis, ip_neighbor_sort_by_index);
+  vec_sort_with_function (ipnis, ip_neighbor_sort);
+  return ipnis;
+}
+
 static int
 ip_neighbor_sort_by_age (void *a1, void *a2)
 {
@@ -1327,7 +1364,10 @@ ip_neighbor_show_i (vlib_main_t * vm,
   (void) unformat_user (input, unformat_vnet_sw_interface, vnet_get_main (),
 			&sw_if_index);
 
-  ipnis = ip_neighbor_entries (sw_if_index, af, ip_neighbor_sort);
+  if (sw_if_index == ~0)
+    ipnis = ip_neighbor_entries (sw_if_index, af, ip_neighbor_sort);
+  else
+    ipnis = ip_neighbor_interface_entries (sw_if_index, af);
   now = vlib_time_now (vm);
 
   if (ipnis)
