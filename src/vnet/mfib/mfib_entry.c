@@ -1503,6 +1503,18 @@ mfib_entry_get_fib_index (fib_node_index_t mfib_entry_index)
     return (mfib_entry->mfe_fib_index);
 }
 
+mfib_entry_flags_t
+mfib_entry_get_flags (fib_node_index_t mfib_entry_index)
+{
+  return mfib_entry_get (mfib_entry_index)->mfe_flags;
+}
+
+fib_rpf_id_t
+mfib_entry_get_rpf_id (fib_node_index_t mfib_entry_index)
+{
+  return mfib_entry_get (mfib_entry_index)->mfe_rpf_id;
+}
+
 const dpo_id_t*
 mfib_entry_contribute_ip_forwarding (fib_node_index_t mfib_entry_index)
 {

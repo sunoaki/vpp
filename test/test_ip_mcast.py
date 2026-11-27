@@ -56,6 +56,59 @@ class TestMFIB(VppTestCase):
             self.logger.critical(error)
         self.assertNotIn("Failed", error)
 
+    def test_mfib_entry_metadata_readback(self):
+        """Read back multicast entry flags and RPF ID without packets"""
+        flags = VppEnum.vl_api_mfib_entry_flags_t
+        no_flags = flags.MFIB_API_ENTRY_FLAG_NONE
+        accept = VppEnum.vl_api_mfib_itf_flags_t.MFIB_API_ITF_FLAG_ACCEPT
+        loopback = VppLoInterface(self)
+        self.addCleanup(loopback.remove_vpp_config)
+
+        for source, group, length, proto in (
+            ("0.0.0.0", "239.41.0.1", 32, FibPathProto.FIB_PATH_NH_PROTO_IP4),
+            ("::", "ff3e::41", 128, FibPathProto.FIB_PATH_NH_PROTO_IP6),
+        ):
+            path = VppMRoutePath(loopback.sw_if_index, accept, proto=proto)
+            route = VppIpMRoute(self, source, group, length, no_flags, [path])
+            is_ip6 = route.prefix.version == 6
+            self.vapi.ip_mroute_add_del(route=route.encode(), is_add=1)
+            self.addCleanup(route.remove_vpp_config)
+            metadata = route.encode(paths=[])
+            self.addCleanup(self.vapi.ip_mroute_add_del, route=metadata, is_add=1)
+
+            for entry_flags, rpf_id in (
+                (
+                    flags.MFIB_API_ENTRY_FLAG_SIGNAL
+                    | flags.MFIB_API_ENTRY_FLAG_CONNECTED,
+                    0x12345678,
+                ),
+                (
+                    flags.MFIB_API_ENTRY_FLAG_DROP
+                    | flags.MFIB_API_ENTRY_FLAG_ACCEPT_ALL_ITF,
+                    0x23456789,
+                ),
+                (no_flags, 0),
+            ):
+                with self.subTest(
+                    is_ip6=is_ip6, entry_flags=entry_flags, rpf_id=rpf_id
+                ):
+                    self.vapi.ip_mroute_add_del(
+                        route=dict(metadata, entry_flags=entry_flags, rpf_id=rpf_id),
+                        is_add=1,
+                    )
+                    matches = [
+                        entry.route
+                        for entry in self.vapi.ip_mroute_dump(route.table_id, is_ip6)
+                        if route.prefix == entry.route.prefix
+                    ]
+                    self.assertEqual(len(matches), 1)
+                    detail = matches[0]
+                    self.assertEqual(detail.entry_flags, entry_flags)
+                    self.assertEqual(detail.rpf_id, rpf_id)
+                    self.assertEqual(detail.n_paths, 1)
+                    self.assertEqual(detail.paths[0].path.sw_if_index, path.nh_itf)
+                    self.assertEqual(detail.paths[0].itf_flags, accept)
+
 
 @tag_fixme_vpp_workers
 class TestIPMcast(VppTestCase):

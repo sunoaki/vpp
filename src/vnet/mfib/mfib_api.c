@@ -66,6 +66,23 @@ mfib_api_path_itf_flags_decode (vl_api_mfib_itf_flags_t in,
         *out |= MFIB_ITF_FLAG_DONT_PRESERVE;
 }
 
+vl_api_mfib_entry_flags_t
+mfib_api_entry_flags_encode (mfib_entry_flags_t in)
+{
+  vl_api_mfib_entry_flags_t out = MFIB_API_ENTRY_FLAG_NONE;
+
+  if (in & MFIB_ENTRY_FLAG_SIGNAL)
+    out |= MFIB_API_ENTRY_FLAG_SIGNAL;
+  if (in & MFIB_ENTRY_FLAG_DROP)
+    out |= MFIB_API_ENTRY_FLAG_DROP;
+  if (in & MFIB_ENTRY_FLAG_CONNECTED)
+    out |= MFIB_API_ENTRY_FLAG_CONNECTED;
+  if (in & MFIB_ENTRY_FLAG_ACCEPT_ALL_ITF)
+    out |= MFIB_API_ENTRY_FLAG_ACCEPT_ALL_ITF;
+
+  return clib_host_to_net_u32 (out);
+}
+
 mfib_entry_flags_t
 mfib_api_path_entry_flags_decode (vl_api_mfib_entry_flags_t in)
 {
