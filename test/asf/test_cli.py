@@ -2,6 +2,8 @@
 """CLI functional tests"""
 
 import unittest
+from tempfile import NamedTemporaryFile
+from time import monotonic
 
 from vpp_papi import VPPIOError
 
@@ -85,6 +87,58 @@ class TestCLIExtendedVapiTimeout(VppAsfTestCase):
 
         # assume that the overhead of the measurement is not more that .5 sec.
         self.assertEqual(round(now - start), wait_secs)
+
+
+class TestCLIWait(VppAsfTestCase):
+    """CLI wait completion and worker progress"""
+
+    vpp_worker_count = 1
+
+    def test_wait_completion(self):
+        """A short wait returns its completion message after the interval."""
+        start = monotonic()
+        reply = self.vapi.cli("wait 0.250")
+        self.assertGreaterEqual(monotonic() - start, 0.240)
+        self.assertEqual(reply.strip(), "waited 0.250 sec.")
+
+    def test_wait_in_exec_allows_worker_progress(self):
+        """The worker generates packets between the script's enable and disable."""
+        self.assertIn("vpp_wk_0", self.vapi.cli("show threads"))
+        stream = "cli-wait"
+        packet_limit = 2000
+        self.vapi.cli(
+            "packet-generator new {\n"
+            f" name {stream} worker 0 node ethernet-input\n"
+            f" rate 200 limit {packet_limit} size 128-128\n"
+            " data {\n"
+            "   IP6: 00:d0:2d:5e:86:85 -> 00:0d:ea:d0:00:00\n"
+            "   ICMP: db00::1 -> db00::2\n"
+            "   incrementing 30\n"
+            " }\n"
+            "}"
+        )
+        self.addCleanup(self.vapi.cli, f"packet-generator delete {stream}")
+
+        with NamedTemporaryFile(mode="w", dir=self.tempdir) as script:
+            script.write(
+                f"packet-generator enable-stream {stream}\n"
+                "wait 1\n"
+                f"packet-generator disable-stream {stream}\n"
+            )
+            script.flush()
+            start = monotonic()
+            self.vapi.cli(f"exec {script.name}")
+            self.assertGreaterEqual(monotonic() - start, 0.990)
+
+        reply = self.vapi.cli("show packet-generator")
+        row = next(
+            (line.split() for line in reply.splitlines() if line.startswith(stream)),
+            [],
+        )
+        self.assertEqual(row[:2], [stream, "No"], reply)
+        generated = int(row[2])
+        self.assertGreaterEqual(generated, 50, reply)
+        self.assertLess(generated, packet_limit, reply)
 
 
 if __name__ == "__main__":
