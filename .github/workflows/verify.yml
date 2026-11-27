@@ -82,9 +82,24 @@ jobs:
         # and checksums and needs nothing installed beyond curl.
         run: extras/scripts/ci-lint-workflows.sh
 
-      - name: Install VPP checkstyle dependencies
+      # The Makefile defines DEB_DEPENDS, so changing it invalidates the cache.
+      - name: Hash the dependency list
+        id: deps
         run: |
           git config --global --add safe.directory "$PWD"
+          echo "hash=$(git hash-object Makefile)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore apt archive cache
+        id: apt-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-debian13-${{ runner.arch }}-${{ github.job }}-${{ steps.deps.outputs.hash }}
+          restore-keys: |
+            apt-debian13-${{ runner.arch }}-${{ github.job }}-
+
+      - name: Install VPP checkstyle dependencies
+        run: |
           # crcchecker.py refuses to run when a tracked file is modified, so
           # this step must not rewrite the Makefile.
           make UNATTENDED=yes install-dep
@@ -941,32 +956,6 @@ jobs:
             exit 1
           fi
           echo "The derivation self-check passed; the tree holds ${enumerated} suites"
-
-      # make install-dep installs $(DEB_DEPENDS), which is defined in the
-      # Makefile, so key the apt archive cache on that file: the key moves when
-      # the package list moves, and the run that first needs a new package is
-      # the run that stores it. The install step rewrites the Makefile
-      # afterwards, so the hash is taken into an output before that and both
-      # cache steps read the same value.
-      - name: Hash the dependency list
-        id: deps
-        run: |
-          git config --global --add safe.directory "$PWD"
-          echo "hash=$(git hash-object Makefile)" >> "$GITHUB_OUTPUT"
-
-      - name: Restore apt archive cache
-        id: apt-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: /var/cache/apt/archives
-          key: apt-debian13-${{ runner.arch }}-${{ github.job }}-${{ steps.deps.outputs.hash }}
-          restore-keys: |
-            apt-debian13-${{ runner.arch }}-${{ github.job }}-
-
-      - name: Install VPP build dependencies
-        run: |
-          sed -i '/^\s*git config commit\.template/s/^\(\s*\)/\1-/' Makefile
-          make UNATTENDED=yes install-dep
 
       # Saving is skipped when the exact key was restored: that entry already
       # holds what this run would store, and asking to save a key that exists
