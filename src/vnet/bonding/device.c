@@ -490,8 +490,16 @@ VNET_DEVICE_CLASS_TX_FN (bond_dev_class) (vlib_main_t * vm,
    * Take a snapshot of the active members as members may be freed
    * asynchronously
    */
-  vec_validate (ptd->active_members, vec_len (bif->active_members) - 1);
-  vec_copy (ptd->active_members, bif->active_members);
+  if (bif->lb == BOND_LB_AB)
+    {
+      vec_validate (ptd->active_members, 0);
+      ptd->active_members[0] = bif->active_members[0];
+    }
+  else
+    {
+      vec_validate (ptd->active_members, vec_len (bif->active_members) - 1);
+      vec_copy (ptd->active_members, bif->active_members);
+    }
   n_numa_members = bif->n_numa_members;
   clib_spinlock_unlock_if_init (&bif->lockp);
 
