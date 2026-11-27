@@ -4058,5 +4058,86 @@ class NeighborChurnTestCase(VppTestCase):
         self.assert_age_list_empty()
 
 
+class NeighborCLITestCase(VppTestCase):
+    """Interface-scoped neighbor listings"""
+
+    def neighbor_listing(self, command):
+        lines = self.vapi.cli(command).splitlines()
+        return lines[:1] + [line[12:] for line in lines[1:]]
+
+    def test_interface_listings(self):
+        """Scoped listings preserve global row order and isolate interfaces"""
+        self.create_pg_interfaces(range(2))
+        target, other = self.pg_interfaces
+        families = ("ip", "ip4", "ip6")
+
+        def scoped(family, alias="neighbors", interface=target):
+            return self.neighbor_listing(f"show {family} {alias} {interface.name}")
+
+        for family in families:
+            self.assertEqual(scoped(family), [])
+
+        fixtures = (
+            ("192.0.2.31", "02:00:00:00:00:31", False, "DN"),
+            ("2001:db8::42", "02:00:00:00:00:42", True, "SN"),
+            ("192.0.2.13", "02:00:00:00:00:13", True, "SN"),
+            ("2001:db8::24", "02:00:00:00:00:24", False, "DN"),
+        )
+        neighbors = []
+        for address, mac, static, _ in fixtures:
+            neighbors.append(
+                VppNeighbor(
+                    self, target.sw_if_index, mac, address, static, is_no_fib_entry=True
+                ).add_vpp_config()
+            )
+            if len(neighbors) == 1:
+                single = scoped("ip4")
+                self.assertEqual(scoped("ip"), single)
+                self.assertEqual(scoped("ip6"), [])
+
+        reference = {}
+        for family in families:
+            with self.subTest(family=family):
+                reference[family] = self.neighbor_listing(f"show {family} neighbors")
+                self.assertEqual(
+                    reference[family][0].split(),
+                    ["Age", "IP", "Flags", "Ethernet", "Interface"],
+                )
+                self.assertCountEqual(
+                    [row.split() for row in reference[family][1:]],
+                    [
+                        [address, flags, mac, target.name]
+                        for address, mac, _, flags in fixtures
+                        if family in ("ip", f"ip{ip_address(address).version}")
+                    ],
+                )
+                for alias in ("neighbor", "neighbors"):
+                    self.assertEqual(scoped(family, alias), reference[family])
+
+        duplicate = VppNeighbor(
+            self,
+            other.sw_if_index,
+            "02:00:00:00:01:31",
+            fixtures[0][0],
+            is_static=True,
+            is_no_fib_entry=True,
+        ).add_vpp_config()
+        for family in families:
+            self.assertEqual(scoped(family), reference[family])
+        for neighbor in reversed(neighbors[1:]):
+            neighbor.remove_vpp_config()
+        self.assertEqual(scoped("ip"), single)
+        self.assertEqual(scoped("ip4"), single)
+        self.assertEqual(scoped("ip6"), [])
+
+        neighbors[0].remove_vpp_config()
+        for family in families:
+            self.assertEqual(scoped(family), [])
+        self.assertEqual(
+            [row.split() for row in scoped("ip4", interface=other)[1:]],
+            [[duplicate.nbr_addr, "SN", duplicate.mac_addr, other.name]],
+        )
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=VppTestRunner)
