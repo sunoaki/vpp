@@ -1818,15 +1818,11 @@ VLIB_NODE_FN (ethernet_input_not_l2_node) (vlib_main_t * vm,
   return n_packets;
 }
 
-
-// Return the subinterface config struct for the given sw_if_index
-// Also return via parameter the appropriate match flags for the
-// configured number of tags.
-// On error (unsupported or not ethernet) return 0.
+// Return the subinterface config and its match flags for sw_if_index.
+// Allocate VLAN tables only when creating a match.
 static subint_config_t *
-ethernet_sw_interface_get_config (vnet_main_t * vnm,
-				  u32 sw_if_index,
-				  u32 * flags, u32 * unsupported)
+ethernet_sw_interface_get_config (vnet_main_t *vnm, u32 sw_if_index, bool is_create, u32 *flags,
+				  u32 *unsupported)
 {
   ethernet_main_t *em = &ethernet_main;
   vnet_hw_interface_t *hi;
@@ -1837,32 +1833,26 @@ ethernet_sw_interface_get_config (vnet_main_t * vnm,
   subint_config_t *subint = 0;
 
   hi = vnet_get_sup_hw_interface (vnm, sw_if_index);
+  if (!hi || hi->hw_class_index != ethernet_hw_interface_class.index)
+    return 0;
 
-  if (!hi || (hi->hw_class_index != ethernet_hw_interface_class.index))
-    {
-      *unsupported = 0;
-      goto done;		// non-ethernet interface
-    }
-
-  // ensure there's an entry for the main intf (shouldn't really be necessary)
-  vec_validate (em->main_intfs, hi->hw_if_index);
+  if (is_create)
+    vec_validate (em->main_intfs, hi->hw_if_index);
+  else if (hi->hw_if_index >= vec_len (em->main_intfs))
+    return 0;
   main_intf = vec_elt_at_index (em->main_intfs, hi->hw_if_index);
 
-  // Locate the subint for the given ethernet config
   si = vnet_get_sw_interface (vnm, sw_if_index);
-
   if (si->type == VNET_SW_INTERFACE_TYPE_P2P)
     {
       p2p_ethernet_main_t *p2pm = &p2p_main;
-      u32 p2pe_sw_if_index =
-	p2p_ethernet_lookup (hi->hw_if_index, si->p2p.client_mac);
-      if (p2pe_sw_if_index == ~0)
+      if (is_create && p2p_ethernet_lookup (hi->hw_if_index, si->p2p.client_mac) == ~0)
 	{
-	  pool_get (p2pm->p2p_subif_pool, subint);
+	  pool_get_zero (p2pm->p2p_subif_pool, subint);
 	  si->p2p.pool_index = subint - p2pm->p2p_subif_pool;
 	}
-      else
-	subint = vec_elt_at_index (p2pm->p2p_subif_pool, si->p2p.pool_index);
+      else if (!pool_is_free_index (p2pm->p2p_subif_pool, si->p2p.pool_index))
+	subint = pool_elt_at_index (p2pm->p2p_subif_pool, si->p2p.pool_index);
       *flags = SUBINT_CONFIG_P2P;
     }
   else if (si->type == VNET_SW_INTERFACE_TYPE_PIPE)
@@ -1888,277 +1878,160 @@ ethernet_sw_interface_get_config (vnet_main_t * vnm,
     }
   else
     {
-      // one or two tags
-      // first get the vlan table
-      if (si->sub.eth.flags.dot1ad)
+      u16 *vlan_table_id =
+	si->sub.eth.flags.dot1ad ? &main_intf->dot1ad_vlans : &main_intf->dot1q_vlans;
+
+      if (si->sub.eth.flags.outer_vlan_id_any &&
+	  (si->sub.eth.flags.one_tag || si->sub.eth.flags.inner_vlan_id_any))
 	{
-	  if (main_intf->dot1ad_vlans == 0)
-	    {
-	      // Allocate a vlan table from the pool
-	      pool_get (em->vlan_pool, vlan_table);
-	      main_intf->dot1ad_vlans = vlan_table - em->vlan_pool;
-	    }
-	  else
-	    {
-	      // Get ptr to existing vlan table
-	      vlan_table =
-		vec_elt_at_index (em->vlan_pool, main_intf->dot1ad_vlans);
-	    }
-	}
-      else
-	{			// dot1q
-	  if (main_intf->dot1q_vlans == 0)
-	    {
-	      // Allocate a vlan table from the pool
-	      pool_get (em->vlan_pool, vlan_table);
-	      main_intf->dot1q_vlans = vlan_table - em->vlan_pool;
-	    }
-	  else
-	    {
-	      // Get ptr to existing vlan table
-	      vlan_table =
-		vec_elt_at_index (em->vlan_pool, main_intf->dot1q_vlans);
-	    }
+	  *unsupported = 1;
+	  goto done;
 	}
 
+      if (*vlan_table_id == 0)
+	{
+	  if (!is_create)
+	    goto done;
+	  pool_get_zero (em->vlan_pool, vlan_table);
+	  *vlan_table_id = vlan_table - em->vlan_pool;
+	}
+      else
+	vlan_table = vec_elt_at_index (em->vlan_pool, *vlan_table_id);
+
+      vlan_intf_t *vlan = &vlan_table->vlans[si->sub.eth.outer_vlan_id];
       if (si->sub.eth.flags.one_tag)
 	{
-	  *flags = si->sub.eth.flags.exact_match ?
-	    SUBINT_CONFIG_MATCH_1_TAG :
-	    (SUBINT_CONFIG_MATCH_1_TAG |
-	     SUBINT_CONFIG_MATCH_2_TAG | SUBINT_CONFIG_MATCH_3_TAG);
+	  *flags = SUBINT_CONFIG_MATCH_1_TAG;
+	  if (!si->sub.eth.flags.exact_match)
+	    *flags |= SUBINT_CONFIG_MATCH_2_TAG | SUBINT_CONFIG_MATCH_3_TAG;
+	  return &vlan->single_tag_subint;
+	}
 
-	  if (si->sub.eth.flags.outer_vlan_id_any)
-	    {
-	      // not implemented yet
-	      *unsupported = 1;
-	      goto done;
-	    }
-	  else
-	    {
-	      // a single vlan, a common case
-	      subint =
-		&vlan_table->vlans[si->sub.eth.
-				   outer_vlan_id].single_tag_subint;
-	    }
+      *flags = SUBINT_CONFIG_MATCH_2_TAG;
+      if (!si->sub.eth.flags.exact_match)
+	*flags |= SUBINT_CONFIG_MATCH_3_TAG;
+      if (si->sub.eth.flags.inner_vlan_id_any)
+	return &vlan->inner_any_subint;
 
+      if (vlan->qinqs == 0)
+	{
+	  if (!is_create)
+	    return 0;
+	  pool_get_zero (em->qinq_pool, qinq_table);
+	  vlan->qinqs = qinq_table - em->qinq_pool;
 	}
       else
-	{
-	  // Two tags
-	  *flags = si->sub.eth.flags.exact_match ?
-	    SUBINT_CONFIG_MATCH_2_TAG :
-	    (SUBINT_CONFIG_MATCH_2_TAG | SUBINT_CONFIG_MATCH_3_TAG);
+	qinq_table = vec_elt_at_index (em->qinq_pool, vlan->qinqs);
 
-	  if (si->sub.eth.flags.outer_vlan_id_any
-	      && si->sub.eth.flags.inner_vlan_id_any)
-	    {
-	      // not implemented yet
-	      *unsupported = 1;
-	      goto done;
-	    }
-
-	  if (si->sub.eth.flags.inner_vlan_id_any)
-	    {
-	      // a specific outer and "any" inner
-	      // don't need a qinq table for this
-	      subint = &vlan_table->vlans[si->sub.eth.outer_vlan_id].inner_any_subint;
-	    }
-	  else
-	    {
-	      // a specific outer + specific innner vlan id, a common case
-
-	      // get the qinq table
-	      if (vlan_table->vlans[si->sub.eth.outer_vlan_id].qinqs == 0)
-		{
-		  // Allocate a qinq table from the pool
-		  pool_get (em->qinq_pool, qinq_table);
-		  vlan_table->vlans[si->sub.eth.outer_vlan_id].qinqs =
-		    qinq_table - em->qinq_pool;
-		}
-	      else
-		{
-		  // Get ptr to existing qinq table
-		  qinq_table =
-		    vec_elt_at_index (em->qinq_pool,
-				      vlan_table->vlans[si->sub.
-							eth.outer_vlan_id].
-				      qinqs);
-		}
-	      subint = &qinq_table->vlans[si->sub.eth.inner_vlan_id].subint;
-	    }
-	}
+      return &qinq_table->vlans[si->sub.eth.inner_vlan_id].subint;
     }
 
 done:
   return subint;
 }
 
-static clib_error_t *
-ethernet_sw_interface_up_down (vnet_main_t * vnm, u32 sw_if_index, u32 flags)
+static bool
+ethernet_sw_interface_owns_config (const subint_config_t *subint, u32 sw_if_index)
 {
-  subint_config_t *subint;
-  u32 placeholder_flags;
-  u32 placeholder_unsup;
-  clib_error_t *error = 0;
+  return subint && (subint->flags & SUBINT_CONFIG_VALID) &&
+	 subint->owner_sw_if_index == sw_if_index;
+}
 
-  // Find the config for this subinterface
-  subint =
-    ethernet_sw_interface_get_config (vnm, sw_if_index, &placeholder_flags,
-				      &placeholder_unsup);
+static subint_config_t *
+ethernet_sw_interface_get_owned_config (vnet_main_t *vnm, u32 sw_if_index)
+{
+  u32 match_flags, unsupported = 0;
+  subint_config_t *subint =
+    ethernet_sw_interface_get_config (vnm, sw_if_index, false, &match_flags, &unsupported);
 
-  if (subint == 0)
-    {
-      // not implemented yet or not ethernet
-      goto done;
-    }
+  return ethernet_sw_interface_owns_config (subint, sw_if_index) ? subint : 0;
+}
 
-  subint->sw_if_index =
-    ((flags & VNET_SW_INTERFACE_FLAG_ADMIN_UP) ? sw_if_index : ~0);
+static clib_error_t *
+ethernet_sw_interface_up_down (vnet_main_t *vnm, u32 sw_if_index, u32 flags)
+{
+  subint_config_t *subint = ethernet_sw_interface_get_owned_config (vnm, sw_if_index);
 
-done:
-  return error;
+  if (!subint)
+    return 0;
+
+  subint->admin_down = !(flags & VNET_SW_INTERFACE_FLAG_ADMIN_UP);
+
+  return 0;
 }
 
 VNET_SW_INTERFACE_ADMIN_UP_DOWN_FUNCTION (ethernet_sw_interface_up_down);
 
-
 #ifndef CLIB_MARCH_VARIANT
-// Set the L2/L3 mode for the subinterface
 void
-ethernet_sw_interface_set_l2_mode (vnet_main_t * vnm, u32 sw_if_index, u32 l2)
+ethernet_sw_interface_set_l2_mode (vnet_main_t *vnm, u32 sw_if_index, u32 l2)
 {
-  subint_config_t *subint;
-  u32 placeholder_flags;
-  u32 placeholder_unsup;
-  int is_port;
+  subint_config_t *subint = ethernet_sw_interface_get_owned_config (vnm, sw_if_index);
   vnet_sw_interface_t *sw = vnet_get_sw_interface (vnm, sw_if_index);
+  bool is_port = sw->type != VNET_SW_INTERFACE_TYPE_SUB;
 
-  is_port = !(sw->type == VNET_SW_INTERFACE_TYPE_SUB);
-
-  // Find the config for this subinterface
-  subint =
-    ethernet_sw_interface_get_config (vnm, sw_if_index, &placeholder_flags,
-				      &placeholder_unsup);
-
-  if (subint == 0)
-    {
-      // unimplemented or not ethernet
-      goto done;
-    }
-
-  // Double check that the config we found is for our interface (or the interface is down)
-  ASSERT ((subint->sw_if_index == sw_if_index) | (subint->sw_if_index == ~0));
+  if (!subint)
+    return;
 
   if (l2)
     {
       subint->flags |= SUBINT_CONFIG_L2;
       if (is_port)
-	subint->flags |=
-	  SUBINT_CONFIG_MATCH_0_TAG | SUBINT_CONFIG_MATCH_1_TAG
-	  | SUBINT_CONFIG_MATCH_2_TAG | SUBINT_CONFIG_MATCH_3_TAG;
+	subint->flags |= SUBINT_CONFIG_MATCH_0_TAG | SUBINT_CONFIG_MATCH_1_TAG |
+			 SUBINT_CONFIG_MATCH_2_TAG | SUBINT_CONFIG_MATCH_3_TAG;
     }
   else
     {
       subint->flags &= ~SUBINT_CONFIG_L2;
       if (is_port)
 	subint->flags &=
-	  ~(SUBINT_CONFIG_MATCH_1_TAG | SUBINT_CONFIG_MATCH_2_TAG
-	    | SUBINT_CONFIG_MATCH_3_TAG);
+	  ~(SUBINT_CONFIG_MATCH_1_TAG | SUBINT_CONFIG_MATCH_2_TAG | SUBINT_CONFIG_MATCH_3_TAG);
     }
-
-done:
-  return;
 }
 
-/*
- * Set the L2/L3 mode for the subinterface regardless of port
- */
 void
-ethernet_sw_interface_set_l2_mode_noport (vnet_main_t * vnm,
-					  u32 sw_if_index, u32 l2)
+ethernet_sw_interface_set_l2_mode_noport (vnet_main_t *vnm, u32 sw_if_index, u32 l2)
 {
-  subint_config_t *subint;
-  u32 placeholder_flags;
-  u32 placeholder_unsup;
+  subint_config_t *subint = ethernet_sw_interface_get_owned_config (vnm, sw_if_index);
 
-  /* Find the config for this subinterface */
-  subint =
-    ethernet_sw_interface_get_config (vnm, sw_if_index, &placeholder_flags,
-				      &placeholder_unsup);
-
-  if (subint == 0)
-    {
-      /* unimplemented or not ethernet */
-      goto done;
-    }
-
-  /*
-   * Double check that the config we found is for our interface (or the
-   * interface is down)
-   */
-  ASSERT ((subint->sw_if_index == sw_if_index) | (subint->sw_if_index == ~0));
+  if (!subint)
+    return;
 
   if (l2)
-    {
-      subint->flags |= SUBINT_CONFIG_L2;
-    }
+    subint->flags |= SUBINT_CONFIG_L2;
   else
-    {
-      subint->flags &= ~SUBINT_CONFIG_L2;
-    }
-
-done:
-  return;
+    subint->flags &= ~SUBINT_CONFIG_L2;
 }
 #endif
 
 static clib_error_t *
-ethernet_sw_interface_add_del (vnet_main_t * vnm,
-			       u32 sw_if_index, u32 is_create)
+ethernet_sw_interface_add_del (vnet_main_t *vnm, u32 sw_if_index, u32 is_create)
 {
-  clib_error_t *error = 0;
   subint_config_t *subint;
   u32 match_flags;
   u32 unsupported = 0;
 
-  // Find the config for this subinterface
-  subint =
-    ethernet_sw_interface_get_config (vnm, sw_if_index, &match_flags,
-				      &unsupported);
-
-  if (subint == 0)
-    {
-      // not implemented yet or not ethernet
-      if (unsupported)
-	{
-	  // this is the NYI case
-	  error = clib_error_return (0, "not implemented yet");
-	}
-      goto done;
-    }
-
   if (!is_create)
     {
-      subint->flags = 0;
-      return error;
+      subint = ethernet_sw_interface_get_owned_config (vnm, sw_if_index);
+      if (subint)
+	*subint = (subint_config_t) {};
+      return 0;
     }
 
-  // Initialize the subint
+  subint = ethernet_sw_interface_get_config (vnm, sw_if_index, true, &match_flags, &unsupported);
+  if (!subint)
+    return unsupported ? clib_error_return (0, "not implemented yet") : 0;
+
   if (subint->flags & SUBINT_CONFIG_VALID)
-    {
-      // Error vlan already in use
-      error = clib_error_return (0, "vlan is already in use");
-    }
-  else
-    {
-      // Note that config is L3 by default
-      subint->flags = SUBINT_CONFIG_VALID | match_flags;
-      subint->sw_if_index = ~0;	// because interfaces are initially down
-    }
+    return clib_error_return (0, "vlan is already in use");
 
-done:
-  return error;
+  *subint = (subint_config_t) {
+    .owner_sw_if_index = sw_if_index,
+    .flags = SUBINT_CONFIG_VALID | match_flags,
+    .admin_down = true,
+  };
+  return 0;
 }
 
 VNET_SW_INTERFACE_ADD_DEL_FUNCTION (ethernet_sw_interface_add_del);
