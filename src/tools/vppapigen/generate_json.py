@@ -102,7 +102,7 @@ def main():
                 {
                     "output": "%s/%s/%s.json"
                     % (
-                        output_path,
+                        output_dir,
                         output_dir_map[
                             f.as_posix().split("/")[
                                 src_dir_depth + BASE_DIR.count("/") - 1
@@ -112,7 +112,7 @@ def main():
                     ),
                     "outputdir": "%s/%s/"
                     % (
-                        output_path,
+                        output_dir,
                         output_dir_map[
                             f.as_posix().split("/")[
                                 src_dir_depth + BASE_DIR.count("/") - 1
