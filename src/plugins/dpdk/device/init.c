@@ -360,6 +360,22 @@ dpdk_lib_init (dpdk_main_t * dm)
 	  continue;
 	}
 
+      u16 n_rx_queues = dm->default_port_conf.n_rx_queues;
+      if (devconf->num_rx_queues > 1 && di.max_rx_queues >= devconf->num_rx_queues)
+	n_rx_queues = devconf->num_rx_queues;
+
+      if (devconf->workers)
+	{
+	  uword n_workers = clib_bitmap_count_set_bits (devconf->workers);
+	  if (n_workers != n_rx_queues || n_rx_queues > di.max_rx_queues)
+	    {
+	      dpdk_log_warn ("[%u] worker map requires %wu RX queues (effective %u, maximum %u). "
+			     "Skipping device.",
+			     port_id, n_workers, n_rx_queues, di.max_rx_queues);
+	      continue;
+	    }
+	}
+
       vec_add2_aligned (dm->devices, xd, 1, CLIB_CACHE_LINE_BYTES);
       xd->port_id = port_id;
       xd->device_index = xd - dm->devices;
@@ -367,6 +383,7 @@ dpdk_lib_init (dpdk_main_t * dm)
 
       clib_memcpy (&xd->conf, &dm->default_port_conf,
 		   sizeof (dpdk_port_conf_t));
+      xd->conf.n_rx_queues = n_rx_queues;
 
       /* find driver datea for this PMD */
       if ((dr = dpdk_driver_find (di.driver_name, &xd->if_desc)))
@@ -474,7 +491,7 @@ dpdk_lib_init (dpdk_main_t * dm)
 	  }
       }
 
-      /* number of RX and TX queues */
+      /* number of TX queues */
       if (devconf->num_tx_queues > 0)
 	{
 	  if (di.max_tx_queues < devconf->num_tx_queues)
@@ -486,10 +503,8 @@ dpdk_lib_init (dpdk_main_t * dm)
 
       xd->conf.n_tx_queues = clib_min (di.max_tx_queues, xd->conf.n_tx_queues);
 
-      if (devconf->num_rx_queues > 1 &&
-	  di.max_rx_queues >= devconf->num_rx_queues)
+      if (n_rx_queues > 1)
 	{
-	  xd->conf.n_rx_queues = devconf->num_rx_queues;
 	  if (devconf->rss_fn)
 	    {
 	      u64 unsupported_bits;
