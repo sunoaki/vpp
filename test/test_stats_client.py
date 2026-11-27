@@ -176,6 +176,28 @@ class StatsNodeRecycleTestCase(VppTestCase):
 
     extra_vpp_statseg_config = "per-node-counters on update-interval 0.05"
 
+    def test_show_statistics_segment(self):
+        """Test plain and verbose statistics listings followed by a named lookup"""
+        command = "show statistics segment"
+        counter_name = "/sys/vector_rate"
+
+        for verbose in (False, True):
+            with self.subTest(verbose=verbose):
+                output = self.vapi.cli(f"{command} verbose" if verbose else command)
+                listing, heap_marker, heap = output.partition("\nbase ")
+                header, *rows = listing.splitlines()
+                self.assertEqual(header.split(), ["Name", "Type", "Value"])
+                names = [row.rsplit(maxsplit=2)[0] for row in rows]
+                self.assertIn(counter_name, names)
+                self.assertEqual(names, sorted(names))
+                if verbose:
+                    self.assertIn("name 'stat segment'", heap)
+                else:
+                    self.assertEqual(heap_marker, "")
+
+        detail = self.vapi.cli(f"{command} {counter_name}")
+        self.assertIn(f"Entry: {counter_name} (type ", detail)
+
     def test_collector_heartbeat(self):
         """Test that the stats collector keeps updating the heartbeat"""
         initial_heartbeat = self.statistics.get_counter("/sys/heartbeat")
