@@ -97,6 +97,9 @@ typedef struct vlib_cli_command_t
 
   /* Hit counter */
   u32 hit_counter;
+
+  /* Optional callback for direct AF_UNIX sessions that can yield. */
+  clib_error_t *(*function_with_yield) (struct vlib_main_t *, unformat_input_t *);
 } vlib_cli_command_t;
 
 typedef void (vlib_cli_output_function_t) (uword arg,
@@ -165,6 +168,10 @@ int vlib_cli_input (struct vlib_main_t *vm,
 		    unformat_input_t * input,
 		    vlib_cli_output_function_t * function,
 		    uword function_arg);
+
+/* Process input owned by the current direct AF_UNIX session. */
+int vlib_cli_input_with_yield (struct vlib_main_t *vm, unformat_input_t *input,
+			       vlib_cli_output_function_t *function, uword function_arg);
 
 clib_error_t *vlib_cli_register (struct vlib_main_t *vm,
 				 vlib_cli_command_t * c);

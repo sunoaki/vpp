@@ -75,9 +75,9 @@
 #define UNIX_CLI_DEFAULT_TERMINAL_WIDTH 80
 
 /** Pending output above which a session is written to again.
- * Output that the descriptor would not take is buffered per session.  While a
- * command runs, the event loop that normally drains that buffer does not run,
- * so the buffer is written to from the output path itself.  This many bytes
+ * Output that the descriptor would not take is buffered per session. While a
+ * command is running without yielding, the event loop cannot drain that
+ * buffer, so the output path also attempts writes itself. This many bytes
  * are allowed to accumulate before the next such attempt, so a client that
  * reads costs one write attempt per megabyte instead of one per line.  The
  * attempt is also made at a fraction of the limit below, so that a small heap
@@ -226,6 +226,9 @@ typedef struct
 
   /** Whether the session is attached to a socket. */
   u8 is_socket;
+
+  /** Whether the session is attached to an AF_UNIX socket. */
+  u8 is_local_socket;
 
   /** If EPIPE has been detected, prevent further write-related
    * activity on the descriptor.
@@ -2842,29 +2845,23 @@ unix_cli_process_input (unix_cli_main_t * cm, uword cli_file_index)
   clib_file_t *uf;
   unix_cli_file_t *cf = pool_elt_at_index (cm->cli_file_pool, cli_file_index);
   unformat_input_t input;
-  int vlib_parse_eval (u8 *);
-
-  cm->current_input_file_index = cli_file_index;
 
 more:
-  /* Try vlibplex first.  Someday... */
-  if (0 && vlib_parse_eval (cf->input_vector) == 0)
-    goto done;
-
+  cm->current_input_file_index = cli_file_index;
 
   if (cf->line_mode)
     {
-      /* just treat whatever we got as a complete line of input */
+      if (!vec_len (cf->input_vector))
+	return;
       vec_free (cf->current_command);
       cf->current_command = cf->input_vector;
     }
-  else
-    {
-      /* Line edit, echo, etc. */
-      if (unix_cli_line_edit (cm, um, fm, cf))
-	/* want more input */
-	return;
-    }
+  else if (unix_cli_line_edit (cm, um, fm, cf))
+    return; /* want more input */
+
+  /* The read-ready callback may append to input_vector during dispatch. */
+  if (cf->line_mode)
+    cf->input_vector = 0;
 
   if (um->log_fd)
     {
@@ -2907,29 +2904,28 @@ more:
   cf->pager_start = 0;		/* start a new pager session */
 
   if (unformat_check_input (&input) != UNFORMAT_END_OF_INPUT)
-    vlib_cli_input (um->vlib_main, &input, unix_vlib_cli_output,
-		    cli_file_index);
+    {
+      /* No welcome process is scheduled when cli-line-mode is configured. */
+      if (cf->is_local_socket && (cf->started || um->cli_line_mode))
+	vlib_cli_input_with_yield (um->vlib_main, &input, unix_vlib_cli_output, cli_file_index);
+      else
+	vlib_cli_input (um->vlib_main, &input, unix_vlib_cli_output, cli_file_index);
+    }
 
-  /* Zero buffer since otherwise unformat_free will call vec_free on it. */
-  input.buffer = 0;
-
-  unformat_free (&input);
-
-  /* Re-fetch pointer since pool may have moved. */
+  /* The session process handles QUIT after dispatch. Its slot can move but
+   * cannot be freed while dispatch is suspended. */
   cf = pool_elt_at_index (cm->cli_file_pool, cli_file_index);
   uf = clib_file_get (fm, cf->clib_file_index);
 
-done:
-  /* reset vector; we'll re-use it later  */
-  if (cf->line_mode)
+  /* Keep command storage separate from queued reads and reuse it when idle. */
+  vec_reset_length (cf->current_command);
+  if (cf->line_mode && !cf->input_vector)
     {
-      vec_reset_length (cf->input_vector);
+      cf->input_vector = cf->current_command;
       cf->current_command = 0;
     }
-  else
-    {
-      vec_reset_length (cf->current_command);
-    }
+  input.buffer = 0;
+  unformat_free (&input);
 
   if (cf->no_pager == 2)
     {
@@ -2958,8 +2954,9 @@ done:
       unix_cli_pager_prompt (cf, uf);
     }
 
-  /* Any residual data in the input vector? */
-  if (vec_len (cf->input_vector))
+  /* In character mode this read may already contain the next keystroke.
+   * In line mode any new input arrived during dispatch and has its own event. */
+  if (!cf->line_mode && vec_len (cf->input_vector))
     goto more;
 
   /* For non-interactive sessions send a NUL byte.
@@ -3239,6 +3236,7 @@ unix_cli_listen_read_ready (clib_file_t * uf)
   cf_index = unix_cli_file_add (cm, client_name, client.fd);
   cf = pool_elt_at_index (cm->cli_file_pool, cf_index);
   cf->is_socket = 1;
+  cf->is_local_socket = client.peer.sin_family == AF_UNIX;
 
   /* No longer need CLIB version of socket. */
   clib_socket_free (&client);
