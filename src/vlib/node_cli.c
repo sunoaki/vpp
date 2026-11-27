@@ -12,6 +12,7 @@
 #include <vlib/threads.h>
 #include <vlib/stats/stats.h>
 #include <math.h>
+#include <stdbool.h>
 
 static int
 node_cmp (void *a1, void *a2)
@@ -297,308 +298,409 @@ VLIB_CLI_COMMAND (show_node_graphviz_command, static) = {
   .is_mp_safe = 1,
 };
 
-static u8 *
-format_vlib_node_state (u8 * s, va_list * va)
+static const char *
+node_runtime_state (const vlib_node_t *node, const vlib_process_t *process)
 {
-  vlib_main_t *vm = va_arg (*va, vlib_main_t *);
-  vlib_node_t *n = va_arg (*va, vlib_node_t *);
-  char *state;
-
-  state = "active";
-  if (n->type == VLIB_NODE_TYPE_PROCESS)
+  if (process)
     {
-      char *state_str[] = {
+      static const char *const states[] = {
 #define _(n, s) [VLIB_PROCESS_STATE_##n] = #s,
 	foreach_vlib_process_state
       };
-      vlib_process_t *p = vlib_get_process_from_node (vm, n);
-
-      if (p->state >= ARRAY_LEN (state_str) || state_str[p->state] == 0)
-	state = "unknown";
-      else
-	state = state_str[p->state];
-    }
-  else if (n->type != VLIB_NODE_TYPE_INTERNAL)
-    {
-      state = "polling";
-      if (n->state == VLIB_NODE_STATE_DISABLED)
-	state = "disabled";
-      else if (n->state == VLIB_NODE_STATE_INTERRUPT)
-	state = "interrupt wait";
+      if (process->state >= ARRAY_LEN (states) || !states[process->state])
+	return "unknown";
+      return states[process->state];
     }
 
-  return format (s, "%s", state);
+  if (node->type == VLIB_NODE_TYPE_INTERNAL)
+    return "active";
+  if (node->state == VLIB_NODE_STATE_DISABLED)
+    return "disabled";
+  if (node->state == VLIB_NODE_STATE_INTERRUPT)
+    return "interrupt wait";
+  return "polling";
 }
 
 static u8 *
-format_vlib_node_stats (u8 * s, va_list * va)
+format_vlib_node_state (u8 *s, va_list *va)
 {
   vlib_main_t *vm = va_arg (*va, vlib_main_t *);
-  vlib_node_t *n = va_arg (*va, vlib_node_t *);
+  vlib_node_t *node = va_arg (*va, vlib_node_t *);
+  vlib_process_t *process =
+    node->type == VLIB_NODE_TYPE_PROCESS ? vlib_get_process_from_node (vm, node) : 0;
+  return format (s, "%s", node_runtime_state (node, process));
+}
+
+typedef struct
+{
+  u8 *name;
+  const char *state;
+  u64 calls, vectors, clocks, suspends, max_clock;
+  u32 max_clock_n;
+  u16 flags;
+  vlib_node_type_t type;
+  bool events_pending;
+} node_runtime_row_t;
+
+typedef struct
+{
+  u64 input, output, drop, punt;
+} node_runtime_vectors_t;
+
+typedef struct
+{
+  node_runtime_row_t *rows;
+  u8 *name;
+  int cpu_id;
+  f64 vector_rate, loops_per_second, seconds_per_clock;
+  node_runtime_vectors_t vectors;
+} node_runtime_thread_t;
+
+typedef struct
+{
+  int brief, max, use_time, summary;
+} node_runtime_options_t;
+
+typedef struct
+{
+  f64 elapsed, update_interval;
+  bool show_threads;
+} node_runtime_report_t;
+
+static node_runtime_row_t
+node_runtime_read_row (vlib_main_t *vm, vlib_node_t *node)
+{
+  vlib_process_t *process =
+    node->type == VLIB_NODE_TYPE_PROCESS ? vlib_get_process_from_node (vm, node) : 0;
+  return (node_runtime_row_t) {
+    .name = node->name,
+    .state = node_runtime_state (node, process),
+    .calls = node->stats_total.calls - node->stats_last_clear.calls,
+    .vectors = node->stats_total.vectors - node->stats_last_clear.vectors,
+    .clocks = node->stats_total.clocks - node->stats_last_clear.clocks,
+    .suspends = node->stats_total.suspends - node->stats_last_clear.suspends,
+    .max_clock = node->stats_total.max_clock,
+    .max_clock_n = node->stats_total.max_clock_n,
+    .flags = node->flags,
+    .type = node->type,
+    .events_pending = process && !clib_bitmap_is_zero (process->non_empty_event_type_bitmap),
+  };
+}
+
+static u8 *
+format_node_runtime_header (u8 *s, va_list *va)
+{
   int max = va_arg (*va, int);
   int use_time = va_arg (*va, int);
-  f64 v;
-  u8 *ns;
-  u8 *misc_info = 0;
-  u64 c, p, l, d;
-  f64 x;
-  f64 maxc, maxcn;
-  u32 maxn;
-  u32 indent;
-
-  if (!n)
-    {
-      if (max)
-	{
-	  if (use_time)
-	    s = format (s, "%=30s%=17s%=16s%=16s%=16s%=16s", "Name",
-			"Max Node Clocks", "Vectors at Max", "Max Clocks",
-			"Avg Time (ns)", "Avg Vectors/Call");
-	  else
-	    s = format (s, "%=30s%=17s%=16s%=16s%=16s%=16s", "Name",
-			"Max Node Clocks", "Vectors at Max", "Max Clocks",
-			"Avg Clocks", "Avg Vectors/Call");
-	}
-      else
-	{
-	  if (use_time)
-	    s = format (s, "%=30s%=12s%=16s%=16s%=16s%=16s%=16s", "Name",
-			"State", "Calls", "Vectors", "Suspends", "Packet-Time",
-			"Vectors/Call");
-	  else
-	    s = format (s, "%=30s%=12s%=16s%=16s%=16s%=16s%=16s", "Name",
-			"State", "Calls", "Vectors", "Suspends",
-			"Packet-Clocks", "Vectors/Call");
-	}
-      return s;
-    }
-
-  indent = format_get_indent (s);
-
-  l = n->stats_total.clocks - n->stats_last_clear.clocks;
-  c = n->stats_total.calls - n->stats_last_clear.calls;
-  p = n->stats_total.vectors - n->stats_last_clear.vectors;
-  d = n->stats_total.suspends - n->stats_last_clear.suspends;
-  maxc = (f64) n->stats_total.max_clock;
-  maxn = n->stats_total.max_clock_n;
-  if (n->stats_total.max_clock_n)
-    maxcn = (f64) n->stats_total.max_clock / (f64) maxn;
-  else
-    maxcn = 0.0;
-
-  /* Clocks per packet, per call or per suspend. */
-
-  if (use_time)
-    l *= 1e9 * vm->clib_time.seconds_per_clock;
-
-  x = 0;
-  if (p > 0)
-    x = (f64) l / (f64) p;
-  else if (c > 0)
-    x = (f64) l / (f64) c;
-  else if (d > 0)
-    x = (f64) l / (f64) d;
-
-  if (c > 0)
-    v = (double) p / (double) c;
-  else
-    v = 0;
-
-  if (n->type == VLIB_NODE_TYPE_PROCESS)
-    {
-      vlib_process_t *p = vlib_get_process_from_node (vm, n);
-
-      /* Show processes with events pending.  This helps spot bugs where events are not
-         being handled. */
-      if (!clib_bitmap_is_zero (p->non_empty_event_type_bitmap))
-	misc_info = format (misc_info, "events pending, ");
-    }
-  ns = n->name;
 
   if (max)
-    s = format (s, "%-30v%=17.2e%=16d%=16.2e%=16.2e%=16.2e",
-		ns, maxc, maxn, maxcn, x, v);
-  else
-    s = format (s, "%-30v%=12U%16Ld%16Ld%16Ld%16.2e%16.2f", ns,
-		format_vlib_node_state, vm, n, c, p, d, x, v);
+    return format (s, "%=30s%=17s%=16s%=16s%=16s%=16s", "Name", "Max Node Clocks", "Vectors at Max",
+		   "Max Clocks", use_time ? "Avg Time (ns)" : "Avg Clocks", "Avg Vectors/Call");
 
-  if (ns != n->name)
-    vec_free (ns);
+  return format (s, "%=30s%=12s%=16s%=16s%=16s%=16s%=16s", "Name", "State", "Calls", "Vectors",
+		 "Suspends", use_time ? "Packet-Time" : "Packet-Clocks", "Vectors/Call");
+}
 
-  if (misc_info)
+static u8 *
+format_node_runtime_row (u8 *s, va_list *va)
+{
+  node_runtime_row_t *row = va_arg (*va, node_runtime_row_t *);
+  f64 seconds_per_clock = va_arg (*va, f64);
+  int max = va_arg (*va, int);
+  int use_time = va_arg (*va, int);
+  u32 indent = format_get_indent (s);
+  u64 clocks = row->clocks;
+  u64 work = row->vectors ? row->vectors : row->calls ? row->calls : row->suspends;
+  f64 vectors_per_call = row->calls ? (f64) row->vectors / (f64) row->calls : 0;
+
+  if (use_time)
+    clocks *= 1e9 * seconds_per_clock;
+
+  f64 cost = work ? (f64) clocks / (f64) work : 0;
+  if (max)
     {
-      s = format (s, "\n%U%v", format_white_space, indent + 4, misc_info);
-      vec_free (misc_info);
+      f64 max_clock = (f64) row->max_clock;
+      f64 max_per_vector = row->max_clock_n ? max_clock / (f64) row->max_clock_n : 0;
+      s = format (s, "%-30v%=17.2e%=16d%=16.2e%=16.2e%=16.2e", row->name, max_clock,
+		  row->max_clock_n, max_per_vector, cost, vectors_per_call);
     }
+  else
+    s = format (s, "%-30v%=12s%16Ld%16Ld%16Ld%16.2e%16.2f", row->name, row->state, row->calls,
+		row->vectors, row->suspends, cost, vectors_per_call);
+
+  if (row->events_pending)
+    s = format (s, "\n%Uevents pending, ", format_white_space, indent + 4);
 
   return s;
 }
 
-static clib_error_t *
-show_node_runtime (vlib_main_t * vm,
-		   unformat_input_t * input, vlib_cli_command_t * cmd)
+static void
+node_runtime_add_vectors (node_runtime_vectors_t *counts, vlib_node_type_t type, u16 flags,
+			  u64 vectors)
 {
-  vlib_node_main_t *nm = &vm->node_main;
-  vlib_node_t *n;
-  f64 time_now;
-  u32 node_index;
-  vlib_node_t ***node_dups = 0;
-  f64 *internal_node_vector_rates = 0;
+  if (type == VLIB_NODE_TYPE_INPUT)
+    counts->input += vectors;
+  if (type != VLIB_NODE_TYPE_INTERNAL)
+    return;
 
-  time_now = vlib_time_now (vm);
+  if (flags & VLIB_NODE_FLAG_IS_HANDOFF)
+    counts->input += vectors;
+  if (flags & VLIB_NODE_FLAG_IS_OUTPUT)
+    counts->output += vectors;
+  if (flags & VLIB_NODE_FLAG_IS_DROP)
+    counts->drop += vectors;
+  if (flags & VLIB_NODE_FLAG_IS_PUNT)
+    counts->punt += vectors;
+}
+
+static void
+node_runtime_thread_header (vlib_main_t *vm, const node_runtime_report_t *report,
+			    const node_runtime_thread_t *thread, u32 index)
+{
+  if (report->show_threads)
+    {
+      if (index > 0)
+	vlib_cli_output (vm, "---------------");
+      if (thread->cpu_id > -1)
+	vlib_cli_output (vm, "Thread %d %s (lcore %u)", index, thread->name, thread->cpu_id);
+      else
+	vlib_cli_output (vm, "Thread %d %s", index, thread->name);
+    }
+
+  f64 dt = report->elapsed;
+  vlib_cli_output (vm,
+		   "Time %.1f, %f sec internal node vector rate %.2f loops/sec %.2f\n"
+		   "  vector rates in %.4e, out %.4e, drop %.4e, punt %.4e",
+		   dt, report->update_interval, thread->vector_rate, thread->loops_per_second,
+		   (f64) thread->vectors.input / dt, (f64) thread->vectors.output / dt,
+		   (f64) thread->vectors.drop / dt, (f64) thread->vectors.punt / dt);
+}
+
+static int
+node_runtime_row_cmp (void *first, void *second)
+{
+  node_runtime_row_t *left = first, *right = second;
+  return vec_cmp (left->name, right->name);
+}
+
+static node_runtime_thread_t *
+node_runtime_capture (vlib_main_t *vm, f64 time_now, node_runtime_report_t *report)
+{
+  node_runtime_thread_t *threads = 0;
+  u32 n_threads = vlib_get_n_threads ();
+  report->show_threads = n_threads > 1;
+
+  vlib_worker_thread_barrier_sync (vm);
+  for (u32 i = 0; i < n_threads; i++)
+    {
+      vlib_main_t *stat_vm = vlib_get_main_by_index (i);
+      if (!stat_vm)
+	continue;
+
+      vlib_node_main_t *nm = &stat_vm->node_main;
+      node_runtime_thread_t *thread;
+      vec_add2 (threads, thread, 1);
+      *thread = (node_runtime_thread_t) { .seconds_per_clock = stat_vm->clib_time.seconds_per_clock,
+					  .loops_per_second = stat_vm->loops_per_second };
+      if (report->show_threads)
+	{
+	  vlib_worker_thread_t *worker = vlib_worker_threads + (thread - threads);
+	  thread->name = vec_dup (worker->name);
+	  thread->cpu_id = worker->cpu_id;
+	}
+
+      if (vec_len (nm->nodes))
+	thread->rows = vec_new (node_runtime_row_t, vec_len (nm->nodes));
+      for (u32 j = 0; j < vec_len (nm->nodes); j++)
+	{
+	  vlib_node_t *node = nm->nodes[j];
+	  vlib_node_sync_stats (stat_vm, node);
+	  node_runtime_row_t *row = &thread->rows[j];
+	  *row = node_runtime_read_row (stat_vm, node);
+	  row->name = vec_dup (node->name);
+	}
+      thread->vector_rate = vlib_internal_node_vector_rate (stat_vm);
+      /* The last retained thread's clear baseline applies to every block. */
+      report->elapsed = time_now - nm->time_last_runtime_stats_clear;
+    }
+  vlib_worker_thread_barrier_release (vm);
+  report->update_interval = vlib_stats_get_segment_update_rate ();
+  return threads;
+}
+
+#define NODE_RUNTIME_ROWS_PER_BATCH 64
+
+static void
+node_runtime_emit (vlib_main_t *vm, node_runtime_thread_t *threads,
+		   const node_runtime_report_t *report, const node_runtime_options_t *options)
+{
+  node_runtime_thread_t *thread;
+  node_runtime_row_t *row;
+  uword remaining = 0;
+  vec_foreach (thread, threads)
+    {
+      remaining += vec_len (thread->rows);
+      vec_foreach (row, thread->rows)
+	node_runtime_add_vectors (&thread->vectors, row->type, row->flags, row->vectors);
+      vec_sort_with_function (thread->rows, node_runtime_row_cmp);
+    }
+
+  u32 batch = 0;
+  vec_foreach (thread, threads)
+    {
+      node_runtime_thread_header (vm, report, thread, thread - threads);
+      vlib_cli_output (vm, "%U", format_node_runtime_header, options->max, options->use_time);
+      vec_foreach (row, thread->rows)
+	{
+	  if (!options->brief || row->calls || row->suspends)
+	    vlib_cli_output (vm, "%U", format_node_runtime_row, row, thread->seconds_per_clock,
+			     options->max, options->use_time);
+	  vec_free (row->name);
+	  remaining--;
+	  if (++batch == NODE_RUNTIME_ROWS_PER_BATCH && remaining)
+	    {
+	      batch = 0;
+	      vlib_process_yield (vm);
+	    }
+	}
+      vec_free (thread->rows);
+      vec_free (thread->name);
+    }
+  vec_free (threads);
+}
+
+typedef struct
+{
+  vlib_main_t *vm;
+  vlib_node_t **nodes;
+  f64 vector_rate;
+} node_runtime_live_thread_t;
+
+static node_runtime_live_thread_t *
+node_runtime_scrape (vlib_main_t *vm, f64 time_now, node_runtime_report_t *report)
+{
+  node_runtime_live_thread_t *threads = 0;
+  u32 n_threads = vlib_get_n_threads ();
+  report->show_threads = n_threads > 1;
+
+  vlib_worker_thread_barrier_sync (vm);
+  for (u32 i = 0; i < n_threads; i++)
+    {
+      vlib_main_t *stat_vm = vlib_get_main_by_index (i);
+      if (!stat_vm)
+	continue;
+
+      vlib_node_main_t *nm = &stat_vm->node_main;
+      vlib_node_t *node;
+      vec_foreach_pointer (node, nm->nodes)
+	vlib_node_sync_stats (stat_vm, node);
+
+      node_runtime_live_thread_t thread = {
+	.vm = stat_vm,
+	.nodes = vec_dup (nm->nodes),
+	.vector_rate = vlib_internal_node_vector_rate (stat_vm),
+      };
+      vec_add1 (threads, thread);
+      report->elapsed = time_now - nm->time_last_runtime_stats_clear;
+    }
+  vlib_worker_thread_barrier_release (vm);
+  report->update_interval = vlib_stats_get_segment_update_rate ();
+  return threads;
+}
+
+static void
+node_runtime_display_sync (vlib_main_t *vm, f64 time_now, const node_runtime_options_t *options)
+{
+  node_runtime_report_t report = {};
+  node_runtime_live_thread_t *threads = node_runtime_scrape (vm, time_now, &report);
+  node_runtime_live_thread_t *live;
+
+  vec_foreach (live, threads)
+    {
+      vlib_node_t *node;
+      u32 index = live - threads;
+      node_runtime_thread_t thread = { .vector_rate = live->vector_rate,
+				       .loops_per_second = live->vm->loops_per_second };
+      if (report.show_threads)
+	{
+	  thread.name = vlib_worker_threads[index].name;
+	  thread.cpu_id = vlib_worker_threads[index].cpu_id;
+	}
+
+      vec_sort_with_function (live->nodes, node_cmp);
+      vec_foreach_pointer (node, live->nodes)
+	node_runtime_add_vectors (&thread.vectors, node->type, node->flags,
+				  node->stats_total.vectors - node->stats_last_clear.vectors);
+      node_runtime_thread_header (vm, &report, &thread, index);
+
+      if (!options->summary)
+	{
+	  vlib_cli_output (vm, "%U", format_node_runtime_header, options->max, options->use_time);
+	  vec_foreach_pointer (node, live->nodes)
+	    {
+	      node_runtime_row_t row = node_runtime_read_row (live->vm, node);
+	      if (!options->brief || row.calls || row.suspends)
+		vlib_cli_output (vm, "%U", format_node_runtime_row, &row,
+				 live->vm->clib_time.seconds_per_clock, options->max,
+				 options->use_time);
+	    }
+	}
+      vec_free (live->nodes);
+    }
+  vec_free (threads);
+}
+
+static clib_error_t *
+show_node_runtime_internal (vlib_main_t *vm, unformat_input_t *input, bool cooperative)
+{
+  u32 node_index;
+  f64 time_now = vlib_time_now (vm);
 
   if (unformat (input, "%U", unformat_vlib_node, vm, &node_index))
     {
-      n = vlib_get_node (vm, node_index);
-      vlib_node_sync_stats (vm, n);
-      vlib_cli_output (vm, "%U\n", format_vlib_node_stats, vm, 0, 0, 0);
-      vlib_cli_output (vm, "%U\n", format_vlib_node_stats, vm, n, 0, 0);
+      vlib_node_t *node = vlib_get_node (vm, node_index);
+      vlib_node_sync_stats (vm, node);
+      vlib_cli_output (vm, "%U\n", format_node_runtime_header, 0, 0);
+      node_runtime_row_t row = node_runtime_read_row (vm, node);
+      vlib_cli_output (vm, "%U\n", format_node_runtime_row, &row, vm->clib_time.seconds_per_clock,
+		       0, 0);
+      return 0;
+    }
+
+  node_runtime_options_t options = { .brief = 1 };
+  options.use_time = unformat (input, "time") || unformat (input, "t");
+  if (unformat (input, "brief") || unformat (input, "b"))
+    options.brief = 1;
+  if (unformat (input, "verbose") || unformat (input, "v"))
+    options.brief = 0;
+  options.max = unformat (input, "max") || unformat (input, "m");
+  options.summary =
+    unformat (input, "summary") || unformat (input, "sum") || unformat (input, "su");
+
+  /* Do not suspend an input that may still dispatch another command. */
+  if (cooperative && !options.summary && unformat (input, "%U", unformat_eof) &&
+      (vlib_get_n_threads () < 2 || !vlib_worker_thread_barrier_held ()))
+    {
+      node_runtime_report_t report = {};
+      node_runtime_thread_t *threads = node_runtime_capture (vm, time_now, &report);
+      node_runtime_emit (vm, threads, &report, &options);
     }
   else
-    {
-      vlib_node_t **nodes;
-      uword i, j;
-      f64 dt;
-      u64 n_input, n_output, n_drop, n_punt;
-      u64 n_clocks, l, v, c, d;
-      int brief = 1;
-      int summary = 0;
-      int max = 0;
-      int use_time = 0;
-      vlib_main_t **stat_vms = 0, *stat_vm;
-
-      if (unformat (input, "time") || unformat (input, "t"))
-	use_time = 1;
-      /* Suppress nodes with zero calls since last clear */
-      if (unformat (input, "brief") || unformat (input, "b"))
-	brief = 1;
-      if (unformat (input, "verbose") || unformat (input, "v"))
-	brief = 0;
-      if (unformat (input, "max") || unformat (input, "m"))
-	max = 1;
-      if (unformat (input, "summary") || unformat (input, "sum")
-	  || unformat (input, "su"))
-	summary = 1;
-
-      for (i = 0; i < vlib_get_n_threads (); i++)
-	{
-	  stat_vm = vlib_get_main_by_index (i);
-	  if (stat_vm)
-	    vec_add1 (stat_vms, stat_vm);
-	}
-
-      /*
-       * Barrier sync across stats scraping.
-       * Otherwise, the counts will be grossly inaccurate.
-       */
-      vlib_worker_thread_barrier_sync (vm);
-
-      for (j = 0; j < vec_len (stat_vms); j++)
-	{
-	  stat_vm = stat_vms[j];
-	  nm = &stat_vm->node_main;
-
-	  for (i = 0; i < vec_len (nm->nodes); i++)
-	    {
-	      n = nm->nodes[i];
-	      vlib_node_sync_stats (stat_vm, n);
-	    }
-
-	  nodes = vec_dup (nm->nodes);
-
-	  vec_add1 (node_dups, nodes);
-	  vec_add1 (internal_node_vector_rates,
-		    vlib_internal_node_vector_rate (stat_vm));
-	}
-      vlib_worker_thread_barrier_release (vm);
-
-
-      for (j = 0; j < vec_len (stat_vms); j++)
-	{
-	  stat_vm = stat_vms[j];
-	  nodes = node_dups[j];
-
-	  vec_sort_with_function (nodes, node_cmp);
-
-	  n_input = n_output = n_drop = n_punt = n_clocks = 0;
-	  for (i = 0; i < vec_len (nodes); i++)
-	    {
-	      n = nodes[i];
-
-	      l = n->stats_total.clocks - n->stats_last_clear.clocks;
-	      n_clocks += l;
-
-	      v = n->stats_total.vectors - n->stats_last_clear.vectors;
-
-	      switch (n->type)
-		{
-		default:
-		  continue;
-
-		case VLIB_NODE_TYPE_INTERNAL:
-		  n_output += (n->flags & VLIB_NODE_FLAG_IS_OUTPUT) ? v : 0;
-		  n_drop += (n->flags & VLIB_NODE_FLAG_IS_DROP) ? v : 0;
-		  n_punt += (n->flags & VLIB_NODE_FLAG_IS_PUNT) ? v : 0;
-		  if (n->flags & VLIB_NODE_FLAG_IS_HANDOFF)
-		    n_input += v;
-		  break;
-
-		case VLIB_NODE_TYPE_INPUT:
-		  n_input += v;
-		  break;
-		}
-	    }
-
-	  if (vlib_get_n_threads () > 1)
-	    {
-	      vlib_worker_thread_t *w = vlib_worker_threads + j;
-	      if (j > 0)
-		vlib_cli_output (vm, "---------------");
-
-	      if (w->cpu_id > -1)
-		vlib_cli_output (vm, "Thread %d %s (lcore %u)", j, w->name,
-				 w->cpu_id);
-	      else
-		vlib_cli_output (vm, "Thread %d %s", j, w->name);
-	    }
-
-	  dt = time_now - nm->time_last_runtime_stats_clear;
-	  vlib_cli_output (
-	    vm,
-	    "Time %.1f, %f sec internal node vector rate %.2f loops/sec %.2f\n"
-	    "  vector rates in %.4e, out %.4e, drop %.4e, punt %.4e",
-	    dt, vlib_stats_get_segment_update_rate (),
-	    internal_node_vector_rates[j], stat_vm->loops_per_second,
-	    (f64) n_input / dt, (f64) n_output / dt, (f64) n_drop / dt,
-	    (f64) n_punt / dt);
-
-	  if (summary == 0)
-	    {
-	      vlib_cli_output (vm, "%U", format_vlib_node_stats, stat_vm, 0,
-			       max, use_time);
-	      for (i = 0; i < vec_len (nodes); i++)
-		{
-		  c =
-		    nodes[i]->stats_total.calls -
-		    nodes[i]->stats_last_clear.calls;
-		  d =
-		    nodes[i]->stats_total.suspends -
-		    nodes[i]->stats_last_clear.suspends;
-		  if (c || d || !brief)
-		    {
-		      vlib_cli_output (vm, "%U", format_vlib_node_stats,
-				       stat_vm, nodes[i], max, use_time);
-		    }
-		}
-	    }
-	  vec_free (nodes);
-	}
-      vec_free (stat_vms);
-      vec_free (node_dups);
-      vec_free (internal_node_vector_rates);
-    }
+    node_runtime_display_sync (vm, time_now, &options);
 
   return 0;
+}
+
+static clib_error_t *
+show_node_runtime (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  return show_node_runtime_internal (vm, input, false);
+}
+
+static clib_error_t *
+show_node_runtime_with_yield (vlib_main_t *vm, unformat_input_t *input)
+{
+  return show_node_runtime_internal (vm, input, true);
 }
 
 VLIB_CLI_COMMAND (show_node_runtime_command, static) = {
@@ -606,6 +708,7 @@ VLIB_CLI_COMMAND (show_node_runtime_command, static) = {
   .short_help = "show runtime [time] [verbose] [max] [summary]",
   .function = show_node_runtime,
   .is_mp_safe = 1,
+  .function_with_yield = show_node_runtime_with_yield,
 };
 
 static clib_error_t *

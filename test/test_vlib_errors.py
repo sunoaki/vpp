@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 
+import re
 import socket
 import threading
 import time
@@ -30,14 +31,13 @@ class CliSession(object):
     SB = 0xFA
     SE = 0xF0
 
-    def __init__(self, path):
+    def __init__(self, path, terminal=b"vppctl"):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.connect(path)
         self.sock.settimeout(60.0)
         self.pending = b""
-        # Answer the terminal-type negotiation with the name VPP treats as a
-        # non-interactive client.
-        self.sock.sendall(b"\xff\xfa\x18\x00vppctl\xff\xf0")
+        self.output = b""
+        self.sock.sendall(b"\xff\xfa\x18\x00" + terminal + b"\xff\xf0")
 
     def _read(self):
         """Read more bytes and strip the telnet negotiation around the output.
@@ -78,15 +78,19 @@ class CliSession(object):
         self.pending = data[i:]
         return out
 
+    def read_until(self, marker):
+        while marker not in self.output:
+            self.output += self._read()
+        seen, _, self.output = self.output.partition(marker)
+        return seen.decode(errors="replace")
+
     def read_command(self, cmd):
         """Run a command and return its output once VPP said it finished."""
         start = time.monotonic()
         self.sock.sendall(cmd.encode() + b"\n")
-        seen = b""
-        while b"\0" not in seen:
-            seen += self._read()
+        seen = self.read_until(b"\0")
         self.last_took = time.monotonic() - start
-        return seen.split(b"\0", 1)[0].decode(errors="replace")
+        return seen
 
     def command(self, cmd):
         """Run a command and return the seconds until VPP said it finished."""
@@ -373,6 +377,157 @@ class TestVlibErrors(VppTestCase):
             f"between two of its {self.REPORT_CHUNK_LINES}-line chunks, so it "
             "should have risen the column once per chunk",
         )
+
+    def runtime_blocks(self, reply, columns):
+        self.assertNotIn("\0", reply)
+        blocks = re.split(r"(?m)^Thread (\d+) [^\n]*\n", reply)
+        self.assertEqual(blocks[0], "")
+        self.assertEqual(blocks[1::2], ["0", "1"])
+        self.assertEqual(reply.splitlines().count("---------------"), 1)
+        rows = []
+        for block in blocks[2::2]:
+            timing, rates, header, *body = block.splitlines()
+            self.assertRegex(
+                timing, r"^Time .+ sec internal node vector rate .+ loops/sec "
+            )
+            self.assertRegex(rates, r"^  vector rates in .+, out .+, drop .+, punt ")
+            widths = (
+                (30, 17, 16, 16, 16, 16) if len(columns) == 6 else (30, 12) + (16,) * 5
+            )
+            actual = []
+            offset = 0
+            for width in widths:
+                actual.append(header[offset : offset + width].strip())
+                offset += width
+            self.assertEqual(actual, columns)
+            rows.append([line for line in body if line and line[0] not in " -"])
+        return rows
+
+    def test_show_runtime_cli_output(self):
+        """Direct AF_UNIX and in-band reports preserve rows and completion."""
+        session = self.open_probe_session()
+        columns = [
+            "Name",
+            "State",
+            "Calls",
+            "Vectors",
+            "Suspends",
+            "Packet-Clocks",
+            "Vectors/Call",
+        ]
+        self.vapi.cli("clear runtime")
+        self.send_dropped_packets()
+
+        def names(rows):
+            return [[line[:30].rstrip() for line in thread] for thread in rows]
+
+        api_rows = self.runtime_blocks(self.cli_errors("show runtime verbose"), columns)
+        unix_rows = self.runtime_blocks(
+            session.read_command("show runtime verbose"), columns
+        )
+        self.assertEqual(names(unix_rows), names(api_rows))
+        for thread in names(unix_rows):
+            pg_rows = [name for name in thread if re.fullmatch(r"pg\d+-tx", name)]
+            self.assertEqual(
+                pg_rows, sorted(f"pg{i}-tx" for i in range(self.PG_INTERFACES))
+            )
+        for rows in (unix_rows, api_rows):
+            drops = [
+                line
+                for thread in rows
+                for line in thread
+                if line.startswith("null-node ")
+            ]
+            self.assertEqual(len(drops), 2)
+            self.assertEqual(sum(int(line[58:74]) for line in drops), self.N_PKTS)
+
+        max_columns = [
+            "Name",
+            "Max Node Clocks",
+            "Vectors at Max",
+            "Max Clocks",
+            "Avg Time (ns)",
+            "Avg Vectors/Call",
+        ]
+        max_rows = self.runtime_blocks(
+            session.read_command("show runtime time verbose max"), max_columns
+        )
+        self.assertEqual(names(max_rows), names(api_rows))
+
+        brief_rows = self.runtime_blocks(
+            session.read_command("show runtime brief"), columns
+        )
+        for thread in names(brief_rows):
+            self.assertNotIn("pg63-tx", thread)
+        named = session.read_command("show runtime null-node")
+        self.assertEqual(len(named.splitlines()), 2)
+        self.assertIn("null-node", named.splitlines()[1])
+        self.assertNotIn("Thread", named)
+        summary = session.read_command("show runtime summary")
+        self.assertEqual(summary.count("vector rates in "), 2)
+        self.assertNotIn("Packet-Clocks", summary)
+        self.assertIn("vpp", session.read_command("show version").lower())
+
+    def runtime_suspends(self, node):
+        reply = self.cli_errors(f"show runtime {node}")
+        rows = [line.split() for line in reply.splitlines()]
+        counts = [int(fields[-3]) for fields in rows if fields and fields[0] == node]
+        self.assertEqual(len(counts), 1, reply)
+        return counts[0]
+
+    def test_show_runtime_cli_yields(self):
+        """Only the direct detailed report raises the CLI process suspend count."""
+        session = self.open_probe_session()
+        terminal = session.read_command("show terminal")
+        node_match = re.search(
+            r"(?m)^Terminal node:\s+(unix-cli-process-\d+)$", terminal.replace("\r", "")
+        )
+        self.assertIsNotNone(node_match, terminal)
+        node = node_match.group(1)
+
+        before = self.runtime_suspends(node)
+        session.read_command("show version")
+        after = self.runtime_suspends(node)
+        idle = after - before
+
+        for command in (
+            "show runtime null-node",
+            "show runtime summary",
+            "uncomment { show runtime verbose }",
+        ):
+            with self.subTest(command=command):
+                session.read_command(command)
+                current = self.runtime_suspends(node)
+                self.assertEqual(current - after, idle)
+                after = current
+
+        verbose = session.read_command("show runtime verbose")
+        rows = [line for line in verbose.splitlines() if line and line[0] not in " -"]
+        self.assertGreater(len(rows), 3 * 64)
+        current = self.runtime_suspends(node)
+        self.assertGreaterEqual(current - after, idle + 2)
+
+        # A quiet brief report scans the same rows even though it skips most.
+        session.read_command("show runtime brief")
+        self.assertGreaterEqual(self.runtime_suspends(node) - current, idle + 2)
+
+    def test_show_runtime_cli_pager(self):
+        """An interactive AF_UNIX client can page the report and return to its prompt."""
+        session = CliSession(self.get_cli_sock_path(), terminal=b"dumb")
+        self.addCleanup(session.close)
+        prompt = b"vpp# "
+        session.read_until(prompt)
+        # Telnet NAWS: 160 columns, 24 rows.
+        session.sock.sendall(b"\xff\xfa\x1f\x00\xa0\x00\x18\xff\xf0")
+        session.sock.sendall(b"show runtime verbose\n")
+        first_page = session.read_until(b"-- more --")
+        self.assertIn("Thread 0", first_page)
+        self.assertIn("Packet-Clocks", first_page)
+        self.assertNotIn("Thread 1", first_page)
+        session.sock.sendall(b"q")
+        session.read_until(prompt)
+        session.sock.sendall(b"show version\n")
+        self.assertIn("vpp", session.read_until(prompt).lower())
 
 
 if __name__ == "__main__":
