@@ -172,9 +172,22 @@ class StatsClientTestCase(VppTestCase):
 
 
 class StatsNodeRecycleTestCase(VppTestCase):
-    """Test stats after interface node recycling, including debug builds"""
+    """Test stats collection and interface node recycling in debug builds too"""
 
     extra_vpp_statseg_config = "per-node-counters on update-interval 0.05"
+
+    def test_collector_heartbeat(self):
+        """Test that the stats collector keeps updating the heartbeat"""
+        initial_heartbeat = self.statistics.get_counter("/sys/heartbeat")
+
+        for _ in range(20):
+            self.sleep(0.05)
+            self.statistics.refresh()
+            heartbeat = self.statistics.get_counter("/sys/heartbeat")
+            if heartbeat > initial_heartbeat:
+                break
+
+        self.assertGreater(heartbeat, initial_heartbeat)
 
     def test_symlink_recycled_interface_nodes(self):
         """Test symlinks after interface node recycling"""

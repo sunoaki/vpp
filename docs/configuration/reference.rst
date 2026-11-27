@@ -856,7 +856,9 @@ Defaults to none
 update-interval <f64-seconds>
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Sets the segment scrape / update interval
+Sets the stats collector update interval in seconds. The default is 10 seconds.
+The interval must be finite and between 0.00001 and 42949.67295 seconds,
+inclusive. VPP rejects startup if the effective interval is outside this range.
 
 .. code-block:: console
 
