@@ -2032,8 +2032,8 @@ jobs:
                                    counts.get("Not Executed tests", 0) == scheduled - executed)
                           if valid and re.fullmatch(r"[0-9]+ attempt\(s\) left\.", line):
                               earlier_success |= successes > 0
-                          if (valid and line == "Test run was successful" and executed > 0
-                                  and successes + skipped == scheduled
+                          if (valid and line == "Test run was successful"
+                                  and 0 < executed == scheduled and successes + skipped == scheduled
                                   and not any(counts.get(label, 0) for label in FAILURE_COUNTS)):
                               outcome = "pass" if successes or earlier_success else "skipped"
                       counts = None
