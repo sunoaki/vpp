@@ -461,6 +461,12 @@ continue_reading:
   hdr = (struct nlmsghdr *) buf;
   while (nlmsg_ok (hdr, n_bytes))
     {
+      if (hdr->nlmsg_flags & NLM_F_DUMP_INTR)
+	{
+	  err = -NLE_DUMP_INTR;
+	  goto out;
+	}
+
       nlmsg_free (msg);
       msg = nlmsg_convert (hdr);
       if (!msg)

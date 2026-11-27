@@ -3598,12 +3598,10 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
     def _await_netlink_notifications(self):
         """Wait until the plugin is processing notifications on an open socket.
 
-        A kernel record reaches the plugin only while the notification socket
-        is open and the netlink process node is not inside a synchronization,
-        and lcp_nl.c:611-643 closes the socket, waits out the retry delay and
-        reopens it, all before the attempt is reported as complete. A test
-        that installs a kernel record and expects the plugin to count it has
-        to start from that state, so it is waited for rather than assumed.
+        The netlink process closes the notification socket during the retry
+        delay and queues notifications after reopening it, until the dump
+        completes. Wait for normal processing before installing any Linux
+        state the test expects to see through notifications.
         """
 
         def processing():
@@ -3687,7 +3685,7 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
             )
 
     def test_address_sweep_reports_its_delete(self):
-        """A swept address is reported, at a level readable without debug"""
+        """Recovery retains replayed addresses and reports swept ones"""
         interface = self.lo_interfaces[0]
         prefix = "10.10.9.2/24"
 
@@ -3700,11 +3698,12 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
             sw_if_index=interface.sw_if_index, prefix=prefix
         )
         self.addCleanup(self._del_vpp_address, interface.sw_if_index, prefix)
-        self.assertIn(prefix, self._vpp_ipv4_addresses(interface.sw_if_index))
-        self.assertNotIn(
-            _prefix_tuple(prefix),
-            get_interface_addresses(self.ns_name, "hloop0", family="inet"),
-        )
+        vpp_addresses = self._vpp_ipv4_addresses(interface.sw_if_index)
+        linux_addresses = get_interface_addresses(self.ns_name, "hloop0", family="inet")
+        self.assertIn(prefix, vpp_addresses)
+        self.assertNotIn(_prefix_tuple(prefix), linux_addresses)
+        self.assertIn(self.loop0_prefix_v4, vpp_addresses)
+        self.assertIn(_prefix_tuple(self.loop0_prefix_v4), linux_addresses)
 
         self._force_resync()
 
@@ -3714,6 +3713,11 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
             False,
             timeout=self.NETLINK_RECOVERY_TIMEOUT,
             interval=0.25,
+        )
+        self.assertIn(
+            self.loop0_prefix_v4,
+            self._vpp_ipv4_addresses(interface.sw_if_index),
+            "recovery swept an address still present in Linux",
         )
         # The notice level is the default, so the line has to be in the log
         # without a debug level being enabled.
@@ -3780,15 +3784,10 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
     def _force_resync(self):
         """Run a synchronization cycle and return once it is over.
 
-        The cycle closes the notification socket and discards the queue at
-        lcp_nl.c:611-612, then raises the attempt counter at lcp_nl.c:614 and
-        suspends for the retry delay at lcp_nl.c:623 before reopening the
-        socket at lcp_nl.c:643. Waiting on the attempt counter alone therefore
-        returns with the socket still closed, and a record the kernel reports
-        in that window is queued nowhere and never reaches the plugin. The
-        cycle is over when its completion counter rises and the state reads
-        back as notification processing, which is what _check_recovery waits
-        for.
+        The cycle is over when its completion counter rises and the state
+        returns to notification processing, which is what _check_recovery
+        waits for. The attempt counter rises before the retry delay and
+        before nl_route_process reopens the notification socket.
         """
         attempts_before = self._netlink_attempts()
         completed_before = self._netlink_completed()
