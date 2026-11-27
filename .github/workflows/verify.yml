@@ -1981,16 +1981,77 @@ jobs:
           cat > "${RUNNER_TEMP}/record-suite.py" <<'RECORDER'
           import json
           import os
+          import re
           import sys
           from datetime import datetime, timezone
           from pathlib import Path
 
+          REQUIRED_COUNTS = {"Scheduled tests", "Executed tests", "Passed tests"}
+          SKIP_COUNTS = ("Skipped tests", "Tests skipped due to lack of CPUS")
+          FAILURE_COUNTS = ("Failures", "Errors", "Unexpected passes")
+          COUNT_LABELS = REQUIRED_COUNTS | {
+              "Expected failures", "Not Executed tests", *SKIP_COUNTS, *FAILURE_COUNTS,
+          }
+
+          def classify_results(log):
+              counts = None
+              closed = False
+              earlier_success = False
+              outcome = "unknown"
+              # run_tests.py prints one TEST RESULTS table per attempt. Its
+              # Executed count includes skips, and a retry can cover only the
+              # failing classes, so keep successes from earlier attempts too.
+              for raw_line in log:
+                  line = re.sub(r"\x1b\[[0-9;]*m", "", raw_line).strip()
+                  if line == "TEST RESULTS:":
+                      counts = {}
+                      closed = False
+                      outcome = "unknown"
+                  elif counts is None:
+                      continue
+                  elif line == "=" * 100:
+                      closed = True
+                  elif not closed:
+                      label, _, value = line.partition(":")
+                      if label in COUNT_LABELS:
+                          value = value.strip()
+                          if label in counts or not re.fullmatch(r"[0-9]+", value):
+                              counts[label] = None
+                          else:
+                              try:
+                                  counts[label] = int(value)
+                              except ValueError:
+                                  counts[label] = None
+                  elif line:
+                      if REQUIRED_COUNTS <= counts.keys() and None not in counts.values():
+                          scheduled = counts["Scheduled tests"]
+                          executed = counts["Executed tests"]
+                          successes = counts["Passed tests"] + counts.get("Expected failures", 0)
+                          skipped = sum(counts.get(label, 0) for label in SKIP_COUNTS)
+                          valid = (successes <= executed <= scheduled and
+                                   counts.get("Not Executed tests", 0) == scheduled - executed)
+                          if valid and re.fullmatch(r"[0-9]+ attempt\(s\) left\.", line):
+                              earlier_success |= successes > 0
+                          if (valid and line == "Test run was successful"
+                                  and 0 < executed == scheduled and successes + skipped == scheduled
+                                  and not any(counts.get(label, 0) for label in FAILURE_COUNTS)):
+                              outcome = "pass" if successes or earlier_success else "skipped"
+                      counts = None
+              return outcome
+
           # argv: step output file, record file, trace file, suite name, exit
-          # status. The record states that the suite finished, so a fixer that
-          # reads it never has to infer the end from the step.
+          # status, harness output. The exit status still controls the shard gate.
           output_path, record_path = Path(sys.argv[1]), Path(sys.argv[2])
           trace_path = Path(sys.argv[3])
           suite, status = sys.argv[4], int(sys.argv[5])
+          harness_log = Path(sys.argv[6])
+          outcome = "fail"
+          if status == 0:
+              try:
+                  with harness_log.open(encoding="utf-8", errors="replace") as log:
+                      outcome = classify_results(log)
+              except OSError:
+                  outcome = "unknown"
           # The harness writes the failed test methods to one comma-separated
           # line under the directory test/Makefile:17 names. It rewrites that
           # file only on the last retry attempt, and leaves it alone when the
@@ -2019,7 +2080,7 @@ jobs:
               "test": suite,
               "lifecycle": "finished",
               "finished": True,
-              "outcome": "pass" if status == 0 else "fail",
+              "outcome": outcome,
               "exit_status": status,
               "monitor": "recorded" if recorded else "unavailable",
               "failed_tests": names[-50:],
@@ -2028,7 +2089,8 @@ jobs:
           record_path.write_text(json.dumps(record) + "\n")
           with output_path.open("a") as output:
               output.write(f"status={status}\n")
-          print(json.dumps(record))
+          print(json.dumps(record), file=sys.stderr)
+          print(f"{suite}: {outcome}")
           RECORDER
           cat > "${RUNNER_TEMP}/fix-suite.py" <<'FIXER'
           import json
@@ -2036,10 +2098,8 @@ jobs:
           from datetime import datetime, timezone
           from pathlib import Path
 
-          # argv: record file, step output file, suite name. A recorder line of
-          # `status=` is the only evidence of how the suite ended. An absent
-          # line leaves the outcome unknown: it is not a cancellation, because
-          # a cancelled runner usually runs no step at all.
+          # argv: record file, step output file, suite name. Without the
+          # recorder's counts, a nonzero `status=` still establishes failure.
           record_path, output_path = Path(sys.argv[1]), Path(sys.argv[2])
           suite = sys.argv[3]
           status = None
@@ -2058,8 +2118,7 @@ jobs:
                   "test": suite,
                   "lifecycle": "finished",
                   "finished": True,
-                  "outcome": ("pass" if status == "0" else
-                              "fail" if status else "unknown"),
+                  "outcome": "fail" if status and status != "0" else "unknown",
                   "exit_status": int(status) if status else None,
                   "monitor": "unavailable",
                   "failed_tests": record.get("failed_tests", []),
@@ -2254,8 +2313,15 @@ jobs:
               rm -f "${recovery_log}"
             fi
             set +e
-            make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST="${suite}" test-debug &
+            # Keep streaming output to the job log and wait for the capture to
+            # finish before reading it. The monitored child is still make.
+            harness_log="${RUNNER_TEMP}/suite-harness.log"
+            exec {capture_fd}> >(tee --output-error=warn "${harness_log}")
+            capture_pid=$!
+            make UNATTENDED=yes TEST_JOBS=auto RETRIES=2 TEST="${suite}" test-debug \
+              >&"${capture_fd}" 2>&1 &
             suite_pid=$!
+            exec {capture_fd}>&-
             monitor_pid=""
             if command -v strace >/dev/null 2>&1; then
               strace -f -qq -e trace=execve -o "${trace}" -p "${suite_pid}" \
@@ -2269,6 +2335,11 @@ jobs:
             if [ -n "${monitor_pid}" ]; then
               kill "${monitor_pid}" 2>/dev/null || true
               wait "${monitor_pid}" 2>/dev/null || true
+            fi
+            if ! wait "${capture_pid}"; then
+              echo "::warning::Could not capture the full output for TEST=${suite}"
+              rm -f "${harness_log}" || true
+              harness_log=""
             fi
             set +e
             if [ "${suite}" = ipsec_esp ] && [ "${TUNNEL_REGRESSION}" = true ]; then
@@ -2284,25 +2355,24 @@ jobs:
                 test_netlink_poll_error_recovery \
                 test_netlink_poll_error_invalid_fd || suite_status=1
             fi
-            # A suite that passed its make but failed one of the checks above is
-            # recorded as a failure, because those checks are part of its
-            # evidence.
-            python3 "${RUNNER_TEMP}/record-suite.py" \
+            # Result counts label the suite; only make and the checks above
+            # determine whether this shard fails.
+            if ! result=$(python3 "${RUNNER_TEMP}/record-suite.py" \
               "${records}/${suite}.status" "${records}/${suite}.json" \
-              "${trace}" "${suite}" "${suite_status}"
-            if [ "${suite_status}" = 0 ]; then
-              results+=("${suite}: pass")
-              echo "${suite}: pass" >> "${summary_file}"
-              echo "Suite result: ${suite}: pass"
-            else
-              results+=("${suite}: fail")
-              failed+=("${suite}")
-              echo "${suite}: fail" >> "${summary_file}"
-              echo "Suite result: ${suite}: fail"
+              "${trace}" "${suite}" "${suite_status}" "${harness_log}"); then
+              result="${suite}: unknown"
+              if [ "${suite_status}" -ne 0 ]; then
+                result="${suite}: fail"
+              fi
             fi
+            rm -f "${harness_log}"
+            results+=("${result}")
+            printf '%s\n' "${result}" >> "${summary_file}"
+            echo "Suite result: ${result}"
             SUITE="${suite}" OUTPUT="${SHARD_DIAGNOSTICS}/${suite}" \
               python3 "${RUNNER_TEMP}/collect-suite-evidence.py" || true
             if [ "${suite_status}" -ne 0 ]; then
+              failed+=("${suite}")
               echo "::error::TEST=${suite} failed; its evidence is in ${SHARD_DIAGNOSTICS}/${suite}"
             fi
           done
@@ -2313,7 +2383,7 @@ jobs:
             echo "::error::${#failed[@]} of ${#results[@]} suite(s) failed in this shard: ${failed[*]}"
             exit 1
           fi
-          echo "All ${#results[@]} suite(s) of this shard passed"
+          echo "No suite in this shard triggered the failure gate"
 
       # The run step can be stopped before its last suite ends, and a runner
       # can stop the step before its recorder reached that suite. This step
