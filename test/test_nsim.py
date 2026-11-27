@@ -5,7 +5,7 @@ import unittest
 import re
 import time
 
-from scapy.layers.l2 import Ether
+from scapy.layers.l2 import ARP, Ether
 from scapy.layers.inet import IP, UDP
 from scapy.packet import Raw
 from random import randint
@@ -156,6 +156,47 @@ class TestNsimCli(VppTestCase):
         self.pg1.enable_capture()
         self.pg_start()
         return self.pg1.get_capture(expected_count or count, timeout=timeout)
+
+    def test_trace_filter_quota(self):
+        """Apply node filters to captured traces with zero, filled and unfilled quotas."""
+        arp_request = Ether(src=self.pg0.remote_mac, dst=self.pg0.local_mac) / ARP(
+            op=1,
+            hwsrc=self.pg0.remote_mac,
+            psrc=self.pg0.remote_ip4,
+            pdst=self.pg0.local_ip4,
+        )
+        ip_packet = (
+            Ether(src=self.pg0.remote_mac, dst=self.pg0.local_mac)
+            / IP(src=self.pg0.remote_ip4, dst=self.pg1.remote_ip4)
+            / UDP(sport=49152, dport=5678)
+        )
+
+        def trace_counts():
+            reply = self.vapi.cli("show trace")
+            traces = re.split(r"(?m)^Packet \d+\n", reply)[1:]
+            arp_count = sum(
+                bool(re.search(r"(?m): arp-input$", trace)) for trace in traces
+            )
+            return arp_count, len(traces) - arp_count
+
+        self.addCleanup(self.vapi.cli, "trace filter none")
+        self.addCleanup(self.vapi.cli, "clear trace")
+        for mode, quota, expected in (
+            ("include", 0, (0, 0)),
+            ("include", 2, (2, 0)),
+            ("include", 8, (3, 0)),
+            ("exclude", 2, (0, 2)),
+            ("exclude", 8, (0, 3)),
+        ):
+            with self.subTest(mode=mode, quota=quota):
+                self.vapi.cli("trace filter none")
+                self.pg0.add_stream([ip_packet, arp_request] * 3)
+                self.pg_start()
+                self.assertEqual(trace_counts(), (3, 3))
+                self.vapi.cli(f"trace filter {mode} arp-input {quota}")
+                self.assertEqual(trace_counts(), expected)
+                self.vapi.cli("trace filter none")
+                self.assertEqual(trace_counts(), expected)
 
     def test_nsim_delay(self):
         """Add 100ms delay and serialize queued packets"""

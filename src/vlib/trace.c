@@ -239,25 +239,17 @@ trace_apply_filter (vlib_main_t * vm)
   u32 trace_index;
   u32 n_accepted;
 
-  u32 accept;
-
   if (tm->filter_flag == FILTER_FLAG_NONE)
     return;
 
-  /*
-   * Ideally we would retain the first N traces that pass the filter instead
-   * of any N traces.
-   */
   n_accepted = 0;
   pool_foreach (h, tm->trace_buffer_pool)
     {
-      accept = filter_accept(tm, h[0]);
-
-      if ((n_accepted == tm->filter_count) || !accept)
-          vec_add1 (traces_to_remove, h);
+      if (n_accepted == tm->filter_count || !filter_accept (tm, h[0]))
+	vec_add1 (traces_to_remove, h);
       else
-          n_accepted++;
-  }
+	n_accepted++;
+    }
 
   /* remove all traces that we don't want to keep */
   for (index = 0; index < vec_len (traces_to_remove); index++)
