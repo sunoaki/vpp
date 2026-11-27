@@ -202,6 +202,7 @@ show_stat_segment_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		       0 /* verbose */);
     }
 
+  vec_free (show_data);
   return 0;
 }
 
