@@ -4609,6 +4609,13 @@ fib_test_v4 (void)
     return (res);
 }
 
+static void
+fib_test_capture_cli_output (uword arg, u8 *buffer, uword buffer_bytes)
+{
+    u8 **output = (u8 **) arg;
+    vec_add(*output, buffer, buffer_bytes);
+}
+
 static int
 fib_test_v6 (void)
 {
@@ -5331,7 +5338,24 @@ fib_test_v6 (void)
      * not remove interfaces through which routes resolve, but
      * such things can happen. ALL affected routes will drop.
      */
+    u32 deleted_sw_if_index = tm->hw[0]->sw_if_index;
     vnet_delete_hw_interface(vnet_get_main(), tm->hw_if_indicies[0]);
+
+    fei = fib_table_lookup_exact_match(fib_index, &local_pfx);
+    FIB_TEST(FIB_NODE_INDEX_INVALID != fei, "attached route retained after interface deletion");
+    unformat_input_t show_input;
+    u8 *show_output = NULL;
+    unformat_init_vector(&show_input, format(NULL, "show fib entry %u", fei));
+    int show_rc = vlib_cli_input(vlib_get_main(), &show_input,
+                                 fib_test_capture_cli_output, (uword) &show_output);
+    unformat_free(&show_input);
+    vec_terminate_c_string(show_output);
+    u8 *expected = format(NULL, "if_index:%d\n%c", deleted_sw_if_index, 0);
+    int has_interface = strstr((char *) show_output, (char *) expected) != NULL;
+    vec_free(expected);
+    vec_free(show_output);
+    FIB_TEST(show_rc == 0 && has_interface,
+             "dropped attached path reports interface index %u", deleted_sw_if_index);
 
     fei = fib_table_lookup_exact_match(fib_index, &pfx_2001_b_s_64);
     FIB_TEST(load_balance_is_drop(fib_entry_contribute_ip_forwarding(fei)),
