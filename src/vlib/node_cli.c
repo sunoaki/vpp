@@ -591,7 +591,6 @@ node_runtime_scrape (vlib_main_t *vm, f64 time_now, node_runtime_report_t *repor
 	continue;
 
       vlib_node_main_t *nm = &stat_vm->node_main;
-      vlib_node_t *node;
       vec_foreach_pointer (node, nm->nodes)
 	vlib_node_sync_stats (stat_vm, node);
 
@@ -617,7 +616,6 @@ node_runtime_display_sync (vlib_main_t *vm, f64 time_now, const node_runtime_opt
 
   vec_foreach (live, threads)
     {
-      vlib_node_t *node;
       u32 index = live - threads;
       node_runtime_thread_t thread = { .vector_rate = live->vector_rate,
 				       .loops_per_second = live->vm->loops_per_second };
