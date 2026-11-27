@@ -4114,6 +4114,47 @@ class NeighborCLITestCase(VppTestCase):
                 for alias in ("neighbor", "neighbors"):
                     self.assertEqual(scoped(family, alias), reference[family])
 
+        # Keep later pool slots live. The next allocation takes the freed slot
+        # from the pool's LIFO free list, even though it is for another family.
+        neighbors[0].remove_vpp_config()
+        surviving_rows = [
+            [address, flags, mac, target.name]
+            for address, mac, _, flags in fixtures[1:]
+        ]
+
+        def check_isolated_rows(rows):
+            for family in families:
+                with self.subTest(family=family):
+                    expected = [
+                        row
+                        for row in rows
+                        if family in ("ip", f"ip{ip_address(row[0]).version}")
+                    ]
+                    # Only target has entries, so the global sort receives the
+                    # same input as the original scoped pool walk.
+                    global_rows = self.neighbor_listing(f"show {family} neighbors")
+                    self.assertCountEqual(
+                        [row.split() for row in global_rows[1:]], expected
+                    )
+                    self.assertEqual(scoped(family), global_rows)
+                    self.assertEqual(scoped(family, interface=other), [])
+
+        check_isolated_rows(surviving_rows)
+        replacement = VppNeighbor(
+            self,
+            target.sw_if_index,
+            "02:00:00:00:00:53",
+            "2001:db8::53",
+            is_static=True,
+            is_no_fib_entry=True,
+        ).add_vpp_config()
+        check_isolated_rows(
+            surviving_rows
+            + [[replacement.nbr_addr, "SN", replacement.mac_addr, target.name]]
+        )
+        replacement.remove_vpp_config()
+        neighbors[0].add_vpp_config()
+
         duplicate = VppNeighbor(
             self,
             other.sw_if_index,
