@@ -8,6 +8,8 @@
 #ifndef included_ethernet_h
 #define included_ethernet_h
 
+#include <stdbool.h>
+
 #include <vnet/vnet.h>
 #include <vnet/ethernet/packet.h>
 #include <vnet/ethernet/mac_address.h>
@@ -180,20 +182,19 @@ typedef enum
 
 typedef struct
 {
-  u32 sw_if_index;
-  u32 flags;
-  // config entry is-valid flag
-  // exact match flags (valid if packet has 0/1/2/3 tags)
-  // L2 vs L3 forwarding mode
-#define SUBINT_CONFIG_MATCH_0_TAG (1<<0)
-#define SUBINT_CONFIG_MATCH_1_TAG (1<<1)
-#define SUBINT_CONFIG_MATCH_2_TAG (1<<2)
-#define SUBINT_CONFIG_MATCH_3_TAG (1<<3)
-#define SUBINT_CONFIG_VALID       (1<<4)
-#define SUBINT_CONFIG_L2          (1<<5)
-#define SUBINT_CONFIG_P2P         (1<<6)
-
+  u32 owner_sw_if_index;
+  u16 flags;
+  bool admin_down;
+#define SUBINT_CONFIG_MATCH_0_TAG (1 << 0)
+#define SUBINT_CONFIG_MATCH_1_TAG (1 << 1)
+#define SUBINT_CONFIG_MATCH_2_TAG (1 << 2)
+#define SUBINT_CONFIG_MATCH_3_TAG (1 << 3)
+#define SUBINT_CONFIG_VALID	  (1 << 4)
+#define SUBINT_CONFIG_L2	  (1 << 5)
+#define SUBINT_CONFIG_P2P	  (1 << 6)
 } subint_config_t;
+
+STATIC_ASSERT_SIZEOF (subint_config_t, 8);
 
 always_inline u32
 eth_create_valid_subint_match_flags (u32 num_tags)
@@ -524,7 +525,7 @@ eth_identify_subint (vnet_hw_interface_t * hi,
   return 0;
 
 matched:
-  *new_sw_if_index = subint->sw_if_index;
+  *new_sw_if_index = subint->admin_down ? ~0 : subint->owner_sw_if_index;
   *is_l2 = subint->flags & SUBINT_CONFIG_L2;
   return 1;
 }
