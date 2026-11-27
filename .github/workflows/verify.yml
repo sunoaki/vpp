@@ -2492,9 +2492,8 @@ jobs:
 
   # This job needs the test job, so it starts after the last shard has
   # stopped, and it runs under `always()` so it also starts when a shard
-  # failed. It downloads every shard's own summary artifact and prints the
-  # union table in the job summary and in one log, instead of a reader opening
-  # twelve jobs.
+  # failed. It combines the downloaded shard summaries with the planned suites
+  # so the job summary and log include suites with no recorded result.
   #
   # When the whole run is cancelled this job never starts, because nothing
   # starts after a cancel. The table then lives in the per-shard artifact
@@ -2511,51 +2510,56 @@ jobs:
       run:
         shell: bash
     steps:
-      # A run whose shards all failed before uploading has nothing to fetch,
-      # and the absence of a summary is itself the report, so the download is
-      # allowed to find nothing.
+      # A shard may stop before uploading. On a partial rerun, artifacts from
+      # earlier attempts must not count as results of the current attempt.
       - name: Download the shard summaries
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          pattern: vpp-suite-summary-*
+          pattern: vpp-suite-summary-batch*-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/shard-summaries
           merge-multiple: false
 
       - name: Print the union table
+        env:
+          SHARDS: ${{ needs.test-plan.outputs.shards }}
         run: |
-          set -eu
-          output="${RUNNER_TEMP}/run-summary.txt"
-          : > "${output}"
-          # One suite-bearing matrix, and the shard number in each name is
-          # unique, so every suite occurs in one family only.
-          top=0
-          shopt -s nullglob
-          for family in "${RUNNER_TEMP}"/shard-summaries/*; do
-            [ -d "${family}" ] || continue
-            file="${family}/suite-summary.txt"
-            if [ ! -s "${file}" ]; then
-              echo "No summary from $(basename "${family}")" >> "${output}"
-              continue
-            fi
-            while IFS= read -r line; do
-              [ -n "${line}" ] || continue
-              echo "$(basename "${family}"): ${line}" >> "${output}"
-            done < "${file}"
-            top=$((top + 1))
-          done
-          if [ "${top}" -eq 0 ]; then
-            echo "No shard reported a summary" >> "${output}"
-          fi
-          {
-            echo "## Test results of this run"
-            echo
-            echo '```'
-            sort "${output}"
-            echo '```'
-          } > "${RUNNER_TEMP}/step-summary.txt"
-          cat "${RUNNER_TEMP}/step-summary.txt" >> "$GITHUB_STEP_SUMMARY"
-          cat "${output}"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          run_id = os.environ["GITHUB_RUN_ID"]
+          attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+          heading = f"Test results for run {run_id}, attempt {attempt} (current attempt only)"
+          rows = []
+          any_summary = False
+          for shard in json.loads(os.environ["SHARDS"] or "[]"):
+              artifact = f"vpp-suite-summary-batch{shard['batch']}-{run_id}-{attempt}"
+              summary = root / "shard-summaries" / artifact / "suite-summary.txt"
+              recorded = set()
+              if summary.is_file():
+                  for line in summary.read_text().splitlines():
+                      if not line.strip():
+                          continue
+                      any_summary = True
+                      rows.append(f"{artifact}: {line}")
+                      suite, _, status = line.partition(": ")
+                      if status.strip():
+                          recorded.add(suite)
+              for suite in shard["suites"].split():
+                  if suite not in recorded:
+                      rows.append(f"{artifact}: {suite}: unknown (no result recorded)")
+          if not any_summary:
+              rows.insert(0, "No shard reported a summary")
+          body = "\n".join(rows)
+          report = f"{heading}\n{body}\n"
+          (root / "run-summary.txt").write_text(report)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"## {heading}\n\n```\n{body}\n```\n")
+          print(report, end="")
+          PY
 
       - name: Upload the run summary
         if: always()
