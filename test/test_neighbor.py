@@ -366,6 +366,37 @@ class ARPTestCase(VppTestCase):
             )
         )
 
+    def test_nd_link_local_no_fib_entry(self):
+        """A static link-local neighbor can withdraw and restore its route"""
+        nbr_addr = "fe80::1234"
+        prefix = f"{nbr_addr}/128"
+        nbr = VppNeighbor(
+            self,
+            self.pg1.sw_if_index,
+            self.pg1.remote_mac,
+            nbr_addr,
+            is_static=True,
+        ).add_vpp_config()
+        self.assertIn(prefix, self.vapi.cli("show ip6-ll").split())
+
+        flags = VppEnum.vl_api_ip_neighbor_flags_t
+        self.vapi.ip_neighbor_add_del(
+            nbr.sw_if_index,
+            nbr.mac_addr,
+            nbr_addr,
+            flags=flags.IP_API_NEIGHBOR_FLAG_STATIC
+            | flags.IP_API_NEIGHBOR_FLAG_NO_FIB_ENTRY,
+        )
+        self.assertTrue(nbr.query_vpp_config())
+        self.assertNotIn(prefix, self.vapi.cli("show ip6-ll").split())
+
+        nbr.add_vpp_config()
+        self.assertIn(prefix, self.vapi.cli("show ip6-ll").split())
+
+        nbr.remove_vpp_config()
+        self.assertFalse(nbr.query_vpp_config())
+        self.assertNotIn(prefix, self.vapi.cli("show ip6-ll").split())
+
     def ip_table_ids(self):
         """The IPv4 table ids the FIB has a table for"""
         return [

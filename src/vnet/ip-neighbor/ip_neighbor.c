@@ -524,6 +524,7 @@ ip_neighbor_adj_fib_remove (ip_neighbor_t *ipn)
 	    .ilp_addr = ip_addr_v6 (&ipn->ipn_key->ipnk_ip),
 	    .ilp_sw_if_index = ipn->ipn_key->ipnk_sw_if_index,
 	  };
+	  ipn->ipn_fib_entry_index = FIB_NODE_INDEX_INVALID;
 	  ip6_ll_table_entry_delete (&pfx);
 	}
       else
