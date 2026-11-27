@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 
+import json
 import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from vppapigen import VPPAPI, Option, ParseError, Union, foldup_crcs, global_types
@@ -32,6 +37,65 @@ class TestDependencies(unittest.TestCase):
             with open(dependency_file, encoding="utf8") as f:
                 expected = f"output.h: \\\n {input_file}\n"
                 self.assertEqual(f.read(), expected)
+
+
+class TestGenerateJSON(unittest.TestCase):
+    release_dir = Path("build-root/install-vpp-native/vpp/share/vpp/api")
+    debug_dir = Path("build-root/install-vpp_debug-native/vpp/share/vpp/api")
+    explicit_dir = Path("custom-api")
+
+    def check_output(self, output_dir, *options):
+        tool_dir = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True, timeout=10)
+            api_dir = root / "src/vlibmemory"
+            api_dir.mkdir(parents=True)
+            api_file = tool_dir.parents[1] / "vlibmemory/memclnt.api"
+            shutil.copyfile(api_file, api_dir / api_file.name)
+            (root / self.release_dir / "core").mkdir(parents=True)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(tool_dir / "generate_json.py"),
+                    "--parallel",
+                    "1",
+                    *options,
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            json_file = root / output_dir / "core/memclnt.api.json"
+            header_file = root / output_dir / "core/memclnt.api_json.h"
+            self.assertCountEqual(
+                [*root.rglob("*.api.json"), *root.rglob("*.api_json.h")],
+                [json_file, header_file],
+            )
+            self.assertEqual(
+                json.loads(json_file.read_text(encoding="utf8"))["module"], "memclnt"
+            )
+            self.assertIn(
+                "json_api_repr_memclnt", header_file.read_text(encoding="utf8")
+            )
+
+    def test_default_output(self):
+        self.check_output(self.release_dir)
+
+    def test_debug_output(self):
+        self.check_output(self.debug_dir, "--debug-target")
+
+    def test_explicit_output(self):
+        self.check_output(self.explicit_dir, "--output", str(self.explicit_dir))
+
+    def test_explicit_output_overrides_debug(self):
+        self.check_output(
+            self.explicit_dir, "--debug-target", "--output", str(self.explicit_dir)
+        )
 
 
 class TestUnion(unittest.TestCase):
