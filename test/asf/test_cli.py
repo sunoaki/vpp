@@ -102,7 +102,7 @@ class TestCLIWait(VppAsfTestCase):
         start = monotonic()
         reply = self.vapi.cli("wait 0.250")
         self.assertGreaterEqual(monotonic() - start, 0.240)
-        self.assertEqual(reply.strip(), "waited 0.250 sec.")
+        self.assertEqual(reply.strip(), "waited .250 sec.")
 
     def wait_script_hits(self):
         hits = dict(
