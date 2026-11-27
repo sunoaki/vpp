@@ -138,6 +138,10 @@ static clib_error_t *
 statseg_config (vlib_main_t *vm, unformat_input_t *input)
 {
   vlib_stats_segment_t *sm = vlib_stats_get_segment ();
+  const f64 min_interval = 1 / VLIB_TW_TICKS_PER_SECOND;
+  /* Leave headroom for the wheel to add the delay to its u64 current tick. */
+  const f64 max_interval = CLIB_U32_MAX / VLIB_TW_TICKS_PER_SECOND;
+
   sm->update_interval = 10.0;
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
@@ -163,6 +167,10 @@ statseg_config (vlib_main_t *vm, unformat_input_t *input)
 	return clib_error_return (0, "unknown input `%U'",
 				  format_unformat_error, input);
     }
+
+  if (!(sm->update_interval >= min_interval && sm->update_interval <= max_interval))
+    return clib_error_return (0, "statseg update-interval must be between %.5f and %.5f seconds",
+			      min_interval, max_interval);
 
   /*
    * NULL-terminate socket name string
