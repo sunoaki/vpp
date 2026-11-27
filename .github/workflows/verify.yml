@@ -242,10 +242,6 @@ jobs:
           # linux/ and freebsd/ has no test in this tree.
           suite_file_alias() {
             case "$1" in
-              # A documentation file is not built into the suites it describes,
-              # so it selects none and keeps the pre-existing behaviour of a
-              # doc-only change rather than running a whole suite for it.
-              *.rst|*.dox) : ;;
               src/vnet/ip/reass/*) printf '%s\n' reassembly ;;
               src/vnet/ip/punt*) printf '%s\n' punt ;;
               src/vnet/ip/ip_in_out_acl.c) printf '%s\n' classifier ;;
@@ -273,21 +269,14 @@ jobs:
                 ;;
               src/vnet/ip/ip4*|src/vnet/ip/icmp4.*) printf '%s\n' ip4 ;;
               src/vnet/ip/ip6*|src/vnet/ip/icmp6.*) printf '%s\n' ip6 ;;
-              # The error counters and the `show errors` and `clear errors`
-              # commands that report them. test/test_vlib_errors.py drives
-              # those commands and reads their columns and totals; it lives on
-              # the change that makes the report yield, so it is absent from
-              # the tree this table was written against and the rule reports
-              # UNCOVERED until that change lands.
+              # test/test_vlib_errors.py drives `show errors` and `clear errors`
+              # and checks the reported counters, totals and the yielding report.
               src/vlib/error.c|src/vlib/error.h|src/vlib/error_funcs.h)
                 printf '%s\n' vlib_errors
                 ;;
-              # The files test_vlib.py names in the docstring of a coverage
-              # command: "Vlib main.c", "Vlib node_cli.c" and "Vlib format.c".
-              # Those methods belong to the TestVlib class, which is skipped
-              # outside a --gcov run, so this suite covers these files only
-              # under coverage; the rule still names the module written for
-              # them rather than a command that does not reach them.
+              # TestVlibFrameLeak checks main.c's frame-allocation counters
+              # across a worker refork. It requires the ping plugin but not
+              # --gcov, which gates the node_cli.c and format coverage tests.
               src/vlib/main.c|src/vlib/node_cli.c|src/vlib/format.c|\
                 src/vlib/format_funcs.h)
                 printf '%s\n' vlib
@@ -394,12 +383,13 @@ jobs:
             return 1
           }
 
-          # Print the module that covers one changed path and return success, or
-          # print an UNCOVERED report on stderr and return failure.
+          # Print the suites that cover a changed source path. Report an
+          # unmatched source path as UNCOVERED and ignore documentation paths.
           derive_suite_for_path() {
             local path="$1" rest dir sub name candidate alias_status
             local -a candidates=()
             case "${path}" in
+              *.rst|*.dox) return 1 ;;
               src/plugins/*/*)
                 rest=${path#src/plugins/}
                 dir=${rest%%/*}
@@ -691,6 +681,23 @@ jobs:
               failures=$((failures + 1))
             fi
           }
+          # Documentation never selects a suite or produces an UNCOVERED report.
+          docs_paths=(
+            src/vnet/bfd/bfd_doc.rst src/vnet/bfd/dir.dox
+            src/vnet/ip/reass/reassembly.rst
+            src/plugins/nat/nat64/nat64_doc.rst src/plugins/vxlan/dir.dox
+            src/vlib/dma/dma.rst src/vlib/dir.dox
+          )
+          for path in "${docs_paths[@]}"; do
+            if output=$(derive_suite_for_path "${path}" 2>&1) || [ -n "${output}" ]; then
+              echo "::error::${path}: expected silent suite exclusion, got '${output}'"
+              failures=$((failures + 1))
+            fi
+          done
+          expect_suites ip4 "${docs_paths[@]}"
+          expect_suites "ip6 fib" "${docs_paths[@]}" \
+            src/vnet/fib/fib_table.c src/vnet/ip/ip6_forward.c test/test_ip6.py
+          expect_suites ip4 test/test_dhcp.py
           # One fixture per rule: the src/vnet alias table, the plain directory
           # rule, the plugin subdirectory candidate, the plugin package-name
           # fallback, and directories that have no module of their own.
@@ -759,10 +766,8 @@ jobs:
           # A subdirectory has no directory rule either, so the nested form of
           # the path is resolved by the same table and reported the same way.
           expect_vlib_uncovered src/vlib/dma/dma.c
-          # The error rule is asserted for the tree it is run on, so this
-          # self-check passes whether or not test_vlib_errors.py has landed.
-          # The fixture below drives the same rule with that module present, so
-          # the mapping itself is covered on either tree.
+          # Check error rule resolution against the current tree. The fixture
+          # below checks the mapping even on a tree without the module.
           if suite_module_exists vlib_errors; then
             expect_suite src/vlib/error.c vlib_errors
             expect_suite src/vlib/error.h vlib_errors
