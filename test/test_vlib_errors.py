@@ -151,11 +151,10 @@ class TestVlibErrors(VppTestCase):
     def send_dropped_packets(self):
         """Send packets the FIB drops for want of a route.
 
-        The destination is in a prefix no route covers, so the forwarding
-        lookup answers with the drop adjacency every miss shares, and each
-        packet is counted against the error that adjacency names. That counter
-        is registered by vlib rather than by this test, so it is present on any
-        build and no plugin has to be enabled for it.
+        The destination has no more specific route than the default drop
+        entry. The packets pass through ip4-drop and the terminal drop node,
+        which counts their default buffer error (null-node / blackholed
+        packets). No plugin is needed.
         """
         packets = [
             Ether(src=self.pg0.remote_mac, dst=self.pg0.local_mac)
@@ -431,15 +430,18 @@ class TestVlibErrors(VppTestCase):
             self.assertEqual(
                 pg_rows, sorted(f"pg{i}-tx" for i in range(self.PG_INTERFACES))
             )
-        for rows in (unix_rows, api_rows):
-            drops = [
-                line
-                for thread in rows
-                for line in thread
-                if line.startswith("null-node ")
-            ]
-            self.assertEqual(len(drops), 2)
-            self.assertEqual(sum(int(line[58:74]) for line in drops), self.N_PKTS)
+        # The IPv4 drop path dispatches ip4-drop. The null-node label in
+        # show errors identifies the buffer's error, not a node it visited.
+        drop_vectors = {}
+        for transport, rows in (("AF_UNIX", unix_rows), ("API", api_rows)):
+            vectors = []
+            for index, thread in enumerate(rows):
+                drops = [line for line in thread if line.startswith("ip4-drop ")]
+                self.assertEqual(len(drops), 1, f"{transport} thread {index}: {drops}")
+                vectors.append(int(drops[0][58:74]))
+            self.assertEqual(sum(vectors), self.N_PKTS, f"{transport}: {vectors}")
+            drop_vectors[transport] = vectors
+        self.assertEqual(drop_vectors["AF_UNIX"], drop_vectors["API"])
 
         max_columns = [
             "Name",
