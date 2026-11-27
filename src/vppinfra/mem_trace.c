@@ -193,30 +193,36 @@ clib_mem_trace_sort (const void *_t1, const void *_t2)
   return 0;
 }
 
+/* The caller must suppress tracing while allocating the snapshot. */
+static clib_mem_trace_t *
+clib_mem_trace_snapshot (clib_mem_trace_main_t *tm, const clib_mem_heap_t *heap)
+{
+  clib_mem_trace_t *traces_copy = 0;
+
+  CLIB_SPINLOCK_LOCK (tm->lock);
+  if (heap == tm->current_traced_heap)
+    traces_copy = vec_dup (tm->traces);
+  CLIB_SPINLOCK_UNLOCK (tm->lock);
+
+  if (traces_copy)
+    qsort (traces_copy, vec_len (traces_copy), sizeof (traces_copy[0]), clib_mem_trace_sort);
+  return traces_copy;
+}
+
 u8 *
 format_clib_mem_trace (u8 *s, va_list *va)
 {
   clib_mem_trace_main_t *tm = va_arg (*va, clib_mem_trace_main_t *);
   int verbose = va_arg (*va, int);
-  int have_traces = 0;
+  uword was_enabled = clib_mem_trace_enable_disable (0);
+  clib_mem_trace_t *traces_copy = clib_mem_trace_snapshot (tm, clib_mem_get_heap ());
   int n = 0;
 
-  CLIB_SPINLOCK_LOCK (tm->lock);
-  if (vec_len (tm->traces) > 0 &&
-      clib_mem_get_heap () == tm->current_traced_heap)
+  if (traces_copy)
     {
-      have_traces = 1;
+      clib_mem_trace_t *t;
+      u64 total_objects_traced = 0;
 
-      /* Make a copy of traces since we'll be sorting them. */
-      clib_mem_trace_t *t, *traces_copy;
-      u64 total_objects_traced;
-
-      traces_copy = vec_dup (tm->traces);
-
-      qsort (traces_copy, vec_len (traces_copy), sizeof (traces_copy[0]),
-	     clib_mem_trace_sort);
-
-      total_objects_traced = 0;
       s = format (s, "\n");
       vec_foreach (t, traces_copy)
 	{
@@ -242,10 +248,10 @@ format_clib_mem_trace (u8 *s, va_list *va)
 
       vec_free (traces_copy);
     }
-  CLIB_SPINLOCK_UNLOCK (tm->lock);
-  if (have_traces == 0)
+  else
     s = format (s, "no traced allocations\n");
 
+  clib_mem_trace_enable_disable (was_enabled);
   return s;
 }
 
@@ -295,17 +301,10 @@ clib_mem_trace_enable_disable (uword enable)
 __clib_export clib_mem_trace_t *
 clib_mem_trace_dup (clib_mem_heap_t *heap)
 {
-  clib_mem_trace_main_t *tm = &clib_mem_trace_main;
-  clib_mem_trace_t *traces_copy = 0;
+  uword was_enabled = clib_mem_trace_enable_disable (0);
+  clib_mem_trace_t *traces_copy = clib_mem_trace_snapshot (&clib_mem_trace_main, heap);
 
-  CLIB_SPINLOCK_LOCK (tm->lock);
-  if (vec_len (tm->traces) > 0 && heap == tm->current_traced_heap)
-    {
-      traces_copy = vec_dup (tm->traces);
-      qsort (traces_copy, vec_len (traces_copy), sizeof (traces_copy[0]),
-	     clib_mem_trace_sort);
-    }
-  CLIB_SPINLOCK_UNLOCK (tm->lock);
+  clib_mem_trace_enable_disable (was_enabled);
   return traces_copy;
 }
 
