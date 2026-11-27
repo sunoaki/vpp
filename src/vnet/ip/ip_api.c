@@ -386,6 +386,8 @@ send_ip_mroute_details (vpe_api_main_t * am,
   mp->route.table_id =
     htonl (mfib_table_get_table_id
 	   (mfib_entry_get_fib_index (mfib_entry_index), pfx->fp_proto));
+  mp->route.entry_flags = mfib_api_entry_flags_encode (mfib_entry_get_flags (mfib_entry_index));
+  mp->route.rpf_id = clib_host_to_net_u32 (mfib_entry_get_rpf_id (mfib_entry_index));
   mp->route.n_paths = path_count;
   fp = mp->route.paths;
   vec_foreach (rpath, rpaths)

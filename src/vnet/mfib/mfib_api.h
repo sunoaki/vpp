@@ -22,6 +22,7 @@ extern void mfib_api_path_encode(const fib_route_path_t *in,
 extern int mfib_api_path_decode(vl_api_mfib_path_t *in,
                                 fib_route_path_t *out);
 
+extern vl_api_mfib_entry_flags_t mfib_api_entry_flags_encode (mfib_entry_flags_t in);
 extern mfib_entry_flags_t mfib_api_path_entry_flags_decode (vl_api_mfib_entry_flags_t in);
 
 extern int mfib_api_table_id_decode(fib_protocol_t fproto,
