@@ -192,7 +192,7 @@ class TestVlib(VppTestCase):
                 else:
                     self.logger.info(cmd + " FAIL retval " + str(r.retval))
 
-    def test_vlib_main_unittest(self):
+    def test_vlib_private_binary_api_segment(self):
         """Private Binary API Segment Test (takes 70 seconds)"""
 
         vat_path = config.vpp + "_api_test"
