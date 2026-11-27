@@ -8,6 +8,8 @@
 #ifndef included_ethernet_h
 #define included_ethernet_h
 
+#include <stdbool.h>
+
 #include <vnet/vnet.h>
 #include <vnet/ethernet/packet.h>
 #include <vnet/ethernet/mac_address.h>
