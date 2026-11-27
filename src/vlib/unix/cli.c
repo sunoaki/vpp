@@ -4210,7 +4210,7 @@ unix_wait_cmd (vlib_main_t * vm,
     return clib_error_return (0,
 			      "<sec> must be a positive value and less than 86400 (one day) with no more than msec precision.");
 
-  vlib_process_wait_for_event_or_clock (vm, sec);
+  vlib_process_suspend (vm, sec);
   vlib_cli_output (vm, "waited %.3f sec.", sec);
 
   unformat_free (line_input);
@@ -4220,6 +4220,7 @@ VLIB_CLI_COMMAND (cli_unix_wait_cmd, static) = {
   .path = "wait",
   .short_help = "wait <sec>",
   .function = unix_wait_cmd,
+  .is_mp_safe = 1,
 };
 
 static clib_error_t *
