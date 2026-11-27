@@ -515,7 +515,7 @@ format_fib_path (u8 * s, va_list * args)
     case FIB_PATH_TYPE_ATTACHED:
 	if (path->fp_oper_flags & FIB_PATH_OPER_FLAG_DROP)
 	{
-	    s = format (s, "if_index:%d", path->attached_next_hop.fp_interface);
+	    s = format (s, "if_index:%d", path->attached.fp_interface);
 	}
 	else
 	{
