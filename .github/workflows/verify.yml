@@ -1765,7 +1765,6 @@ jobs:
       # monitor's availability is what the record reports on.
       - name: Install the suite monitor
         run: |
-          apt-get update -qq
           apt-get install -y -qq strace
 
       - name: Check out the pull request
