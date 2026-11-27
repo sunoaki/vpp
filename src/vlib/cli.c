@@ -15,6 +15,7 @@
 #include <vppinfra/cJSON.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <stdbool.h>
 
 /** \file src/vlib/cli.c Debug CLI Implementation
  */
@@ -403,10 +404,8 @@ vlib_cli_cmp_command (void *a1, void *a2)
 }
 
 static clib_error_t *
-vlib_cli_dispatch_sub_commands (vlib_main_t * vm,
-				vlib_cli_main_t * cm,
-				unformat_input_t * input,
-				uword parent_command_index)
+vlib_cli_dispatch_sub_commands (vlib_main_t *vm, vlib_cli_main_t *cm, unformat_input_t *input,
+				uword parent_command_index, bool allow_yield)
 {
   vlib_global_main_t *vgm = vlib_get_global_main ();
   vlib_cli_command_t *parent, *c;
@@ -513,9 +512,7 @@ vlib_cli_dispatch_sub_commands (vlib_main_t * vm,
   else if (unformat (input, "uncomment %U",
 		     unformat_vlib_cli_sub_input, &sub_input))
     {
-      error =
-	vlib_cli_dispatch_sub_commands (vm, cm, &sub_input,
-					parent_command_index);
+      error = vlib_cli_dispatch_sub_commands (vm, cm, &sub_input, parent_command_index, false);
       unformat_free (&sub_input);
     }
   else if (unformat (input, "leak-check %U",
@@ -531,9 +528,7 @@ vlib_cli_dispatch_sub_commands (vlib_main_t * vm,
 	  current_traced_heap = 0;
 	}
       clib_mem_trace (1);
-      error =
-	vlib_cli_dispatch_sub_commands (vm, cm, &sub_input,
-					parent_command_index);
+      error = vlib_cli_dispatch_sub_commands (vm, cm, &sub_input, parent_command_index, false);
       unformat_free (&sub_input);
 
       /* Otherwise, the clib_error_t shows up as a leak... */
@@ -556,15 +551,21 @@ vlib_cli_dispatch_sub_commands (vlib_main_t * vm,
     if (unformat_user (input, unformat_vlib_cli_sub_command, vm, parent, &c))
     {
       unformat_input_t *si;
-      uword has_sub_commands =
-	vec_len (c->sub_commands) + vec_len (c->sub_rules) > 0;
+      uword command_index = c - cm->commands;
+      uword has_sub_commands = vec_len (c->sub_commands) + vec_len (c->sub_rules) > 0;
 
       si = input;
       if (unformat_user (input, unformat_vlib_cli_sub_input, &sub_input))
-	si = &sub_input;
+	{
+	  si = &sub_input;
+	  allow_yield = false;
+	}
 
       if (has_sub_commands)
-	error = vlib_cli_dispatch_sub_commands (vm, cm, si, c - cm->commands);
+	{
+	  error = vlib_cli_dispatch_sub_commands (vm, cm, si, command_index, allow_yield);
+	  c = vec_elt_at_index (cm->commands, command_index);
+	}
 
       if (has_sub_commands && !error)
 	/* Found valid sub-command. */ ;
@@ -598,20 +599,29 @@ vlib_cli_dispatch_sub_commands (vlib_main_t * vm,
 		  ed->c = elog_string (vlib_get_elog_main (), "%v", c->path);
 		}
 
-	      if (!c->is_mp_safe)
+	      bool is_mp_safe = c->is_mp_safe;
+	      bool cooperative = allow_yield && c->function_with_yield && is_mp_safe &&
+				 !vec_len (cm->perf_counter_cbs);
+
+	      if (!is_mp_safe)
 		vlib_worker_thread_barrier_sync (vm);
 	      if (PREDICT_FALSE (vec_len (cm->perf_counter_cbs) != 0))
-		clib_call_callbacks (cm->perf_counter_cbs, cm,
-				     c - cm->commands, 0 /* before */ );
+		clib_call_callbacks (cm->perf_counter_cbs, cm, command_index, 0 /* before */);
 
+	      c = vec_elt_at_index (cm->commands, command_index);
 	      c->hit_counter++;
-	      c_error = c->function (vm, si, c);
+	      if (cooperative)
+		c_error = c->function_with_yield (vm, si);
+	      else
+		c_error = c->function (vm, si, c);
 
-	      if (PREDICT_FALSE (vec_len (cm->perf_counter_cbs) != 0))
-		clib_call_callbacks (cm->perf_counter_cbs, cm,
-				     c - cm->commands, 1 /* after */ );
-	      if (!c->is_mp_safe)
+	      if (!cooperative && PREDICT_FALSE (vec_len (cm->perf_counter_cbs) != 0))
+		clib_call_callbacks (cm->perf_counter_cbs, cm, command_index, 1 /* after */);
+	      if (!is_mp_safe)
 		vlib_worker_thread_barrier_release (vm);
+
+	      /* Registration may have moved the commands vector during dispatch. */
+	      c = vec_elt_at_index (cm->commands, command_index);
 
 	      if (PREDICT_FALSE (vm->elog_trace_cli_commands))
 		{
@@ -685,11 +695,9 @@ vlib_unix_error_report (vlib_main_t * vm, clib_error_t * error)
 {
 }
 
-/* Process CLI input. */
-int
-vlib_cli_input (vlib_main_t * vm,
-		unformat_input_t * input,
-		vlib_cli_output_function_t * function, uword function_arg)
+static int
+vlib_cli_input_internal (vlib_main_t *vm, unformat_input_t *input,
+			 vlib_cli_output_function_t *function, uword function_arg, bool allow_yield)
 {
   vlib_global_main_t *vgm = vlib_get_global_main ();
   vlib_process_t *cp = vlib_get_current_process (vm);
@@ -706,8 +714,7 @@ vlib_cli_input (vlib_main_t * vm,
 
   do
     {
-      error = vlib_cli_dispatch_sub_commands (vm, &vgm->cli_main, input,
-					      /* parent */ 0);
+      error = vlib_cli_dispatch_sub_commands (vm, &vgm->cli_main, input, 0, allow_yield);
     }
   while (!error && !unformat (input, "%U", unformat_eof));
 
@@ -724,6 +731,20 @@ vlib_cli_input (vlib_main_t * vm,
   cp->output_function = save_function;
   cp->output_function_arg = save_function_arg;
   return rv;
+}
+
+int
+vlib_cli_input (vlib_main_t *vm, unformat_input_t *input, vlib_cli_output_function_t *function,
+		uword function_arg)
+{
+  return vlib_cli_input_internal (vm, input, function, function_arg, false);
+}
+
+int
+vlib_cli_input_with_yield (vlib_main_t *vm, unformat_input_t *input,
+			   vlib_cli_output_function_t *function, uword function_arg)
+{
+  return vlib_cli_input_internal (vm, input, function, function_arg, true);
 }
 
 /* Output to current CLI connection. */
