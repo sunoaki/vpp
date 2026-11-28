@@ -3728,6 +3728,65 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
             logging,
         )
 
+    def test_address_sweep_ipv4_multicast_ownership(self):
+        """Recovery withdraws IPv4 multicast acceptance with the last address"""
+        sw_if_index = self.lo_interfaces[1].sw_if_index
+        host_if = "hloop1"
+        linux_prefix = "10.20.9.1/24"
+        stale_prefix = "10.20.10.1/24"
+        accept = VppEnum.vl_api_mfib_itf_flags_t.MFIB_API_ITF_FLAG_ACCEPT
+
+        def linux_addresses():
+            return get_interface_addresses(self.ns_name, host_if, family="inet")
+
+        def vpp_addresses():
+            return self._vpp_ipv4_addresses(sw_if_index)
+
+        def accept_path_present():
+            return find_mroute_path(
+                self, "0.0.0.0", "224.0.0.0", 24, sw_if_index, accept
+            )
+
+        def add_vpp_only_address():
+            self.vapi.sw_interface_add_del_address(
+                sw_if_index=sw_if_index, prefix=stale_prefix
+            )
+            self.assertIn(stale_prefix, vpp_addresses())
+            self.assertNotIn(_prefix_tuple(stale_prefix), linux_addresses())
+
+        self._await_netlink_notifications()
+        self.assertEqual(vpp_addresses(), [])
+        self.assertFalse(accept_path_present())
+        self.vapi.cli("lcp lcp-sync off")
+        self.addCleanup(self.vapi.cli, "lcp lcp-sync on")
+        self.addCleanup(self._del_vpp_address, sw_if_index, stale_prefix)
+        self.addCleanup(self._del_vpp_address, sw_if_index, linux_prefix)
+        add_namespace_address(self.ns_name, host_if, linux_prefix)
+        try:
+            self.poll_for("Linux address installed", vpp_addresses, [linux_prefix])
+            self.assertTrue(accept_path_present())
+            add_vpp_only_address()
+
+            self._force_resync()
+
+            self.assertEqual(vpp_addresses(), [linux_prefix])
+            self.assertIn(_prefix_tuple(linux_prefix), linux_addresses())
+            self.assertTrue(accept_path_present())
+
+            add_vpp_only_address()
+            del_namespace_address(self.ns_name, host_if, linux_prefix)
+            self.poll_for("Linux address withdrawn", vpp_addresses, [stale_prefix])
+            self.assertEqual(linux_addresses(), [])
+            self.assertTrue(accept_path_present())
+
+            self._force_resync()
+
+            self.assertEqual(vpp_addresses(), [])
+            self.assertFalse(accept_path_present())
+        finally:
+            if _prefix_tuple(linux_prefix) in linux_addresses():
+                del_namespace_address(self.ns_name, host_if, linux_prefix)
+
     def test_netlink_poll_error_recovery(self):
         """Netlink polling error callback triggers a recovery cycle"""
         stats = self._netlink_stats()
