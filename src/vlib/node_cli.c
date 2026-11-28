@@ -625,7 +625,8 @@ node_runtime_display_sync (vlib_main_t *vm, f64 time_now, const node_runtime_opt
 	  thread.cpu_id = vlib_worker_threads[index].cpu_id;
 	}
 
-      vec_sort_with_function (live->nodes, node_cmp);
+      if (!options->summary)
+	vec_sort_with_function (live->nodes, node_cmp);
       vec_foreach_pointer (node, live->nodes)
 	node_runtime_add_vectors (&thread.vectors, node->type, node->flags,
 				  node->stats_total.vectors - node->stats_last_clear.vectors);
