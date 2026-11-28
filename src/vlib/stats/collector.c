@@ -96,31 +96,27 @@ update_node_counters (vlib_stats_segment_t *sm)
     {
       vlib_node_t **nodes = node_dups[j];
 
-      for (i = 0; i < vec_len (nodes); i++)
+      if (vec_len (nodes))
 	{
 	  counter_t **counters;
-	  counter_t *c;
-	  vlib_node_t *n = nodes[i];
+	  counters = vlib_stats_get_entry_data_pointer (node_counters[NODE_CLOCKS].entry_index);
+	  counter_t *clocks = counters[j];
+	  counters = vlib_stats_get_entry_data_pointer (node_counters[NODE_VECTORS].entry_index);
+	  counter_t *vectors = counters[j];
+	  counters = vlib_stats_get_entry_data_pointer (node_counters[NODE_CALLS].entry_index);
+	  counter_t *calls = counters[j];
+	  counters = vlib_stats_get_entry_data_pointer (node_counters[NODE_SUSPENDS].entry_index);
+	  counter_t *suspends = counters[j];
 
-	  counters = vlib_stats_get_entry_data_pointer (
-	    node_counters[NODE_CLOCKS].entry_index);
-	  c = counters[j];
-	  c[n->index] = n->stats_total.clocks - n->stats_last_clear.clocks;
+	  for (i = 0; i < vec_len (nodes); i++)
+	    {
+	      vlib_node_t *n = nodes[i];
 
-	  counters = vlib_stats_get_entry_data_pointer (
-	    node_counters[NODE_VECTORS].entry_index);
-	  c = counters[j];
-	  c[n->index] = n->stats_total.vectors - n->stats_last_clear.vectors;
-
-	  counters = vlib_stats_get_entry_data_pointer (
-	    node_counters[NODE_CALLS].entry_index);
-	  c = counters[j];
-	  c[n->index] = n->stats_total.calls - n->stats_last_clear.calls;
-
-	  counters = vlib_stats_get_entry_data_pointer (
-	    node_counters[NODE_SUSPENDS].entry_index);
-	  c = counters[j];
-	  c[n->index] = n->stats_total.suspends - n->stats_last_clear.suspends;
+	      clocks[n->index] = n->stats_total.clocks - n->stats_last_clear.clocks;
+	      vectors[n->index] = n->stats_total.vectors - n->stats_last_clear.vectors;
+	      calls[n->index] = n->stats_total.calls - n->stats_last_clear.calls;
+	      suspends[n->index] = n->stats_total.suspends - n->stats_last_clear.suspends;
+	    }
 	}
       vec_free (node_dups[j]);
     }
