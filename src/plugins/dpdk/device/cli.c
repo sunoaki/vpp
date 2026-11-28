@@ -318,7 +318,7 @@ set_dpdk_if_desc (vlib_main_t * vm, unformat_input_t * input,
     ethernet_set_flags (vnm, xd->hw_if_index, ETHERNET_INTERFACE_FLAG_ACCEPT_ALL);
 
   if (vec_len (xd->errors))
-    return clib_error_return (0, "%U", format_dpdk_device_errors, xd);
+    error = clib_error_return (0, "%U", format_dpdk_device_errors, xd);
 
 done:
   unformat_free (line_input);
