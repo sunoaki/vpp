@@ -324,17 +324,16 @@ lcp_router_neigh_find (const ip_address_t *ip, u32 sw_if_index)
 static u8
 lcp_router_neigh_static_owned (const ip_address_t *ip, u32 sw_if_index)
 {
-  ip_neighbor_t *ipn;
-  mac_address_t recorded;
+  mac_address_t recorded, current;
+  ip_neighbor_flags_t current_flags;
 
   if (!lcp_router_neigh_static_recorded (ip, sw_if_index, &recorded))
     return 0;
 
-  ipn = lcp_router_neigh_find (ip, sw_if_index);
-  if (NULL == ipn)
+  if (!ip_neighbor_lookup (ip, sw_if_index, &current, &current_flags))
     return 0;
 
-  return (0 == mac_address_cmp (ip_neighbor_get_mac (ipn), &recorded));
+  return (0 == mac_address_cmp (&current, &recorded));
 }
 
 /*
@@ -350,23 +349,16 @@ static void
 lcp_router_neigh_static_reconcile (const ip_address_t *ip, u32 sw_if_index,
 				   ip_neighbor_flags_t flags)
 {
-  mac_address_t recorded;
-  ip_neighbor_t *ipn;
+  mac_address_t recorded, current;
+  ip_neighbor_flags_t current_flags;
 
-  /*
-   * The lookup walks the neighbours of the interface, so it is only done when
-   * a record can exist or be wanted. A dynamic add for a key the plugin never
-   * wrote has nothing to record and no record to drop, and walking for it
-   * would make a dump of a large table quadratic.
-   */
   if (!(flags & IP_NEIGHBOR_FLAG_STATIC) &&
       !lcp_router_neigh_static_recorded (ip, sw_if_index, &recorded))
     return;
 
-  ipn = lcp_router_neigh_find (ip, sw_if_index);
-
-  if (ipn && (ipn->ipn_flags & IP_NEIGHBOR_FLAG_STATIC))
-    lcp_router_neigh_static_record (ip, sw_if_index, ip_neighbor_get_mac (ipn));
+  if (ip_neighbor_lookup (ip, sw_if_index, &current, &current_flags) &&
+      (current_flags & IP_NEIGHBOR_FLAG_STATIC))
+    lcp_router_neigh_static_record (ip, sw_if_index, &current);
   else
     lcp_router_neigh_static_forget (ip, sw_if_index);
 }

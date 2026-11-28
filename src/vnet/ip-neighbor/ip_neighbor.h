@@ -22,6 +22,11 @@ __clib_export extern int ip_neighbor_add (const ip_address_t *ip, const mac_addr
 					  u32 *stats_index);
 __clib_export extern int ip_neighbor_del (const ip_address_t *ip, u32 sw_if_index);
 
+/* Main thread only. Look up a canonical IP on the exact interface. Both
+ * outputs are required and are written only when the neighbor is found. */
+__clib_export extern bool ip_neighbor_lookup (const ip_address_t *ip, u32 sw_if_index,
+					      mac_address_t *mac, ip_neighbor_flags_t *flags);
+
 /**
  * @brief Whether a neighbour on this interface is carried by an ethernet
  * header, i.e. whether ethernet_build_rewrite can build its rewrite.

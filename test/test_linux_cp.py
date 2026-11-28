@@ -3999,6 +3999,89 @@ class TestLinuxCPNetlinkRecovery(TestLinuxCPNetNSBase):
             "the kernel's MAC replaced the operator's static entry",
         )
 
+    def test_neigh_recorded_entry_with_operator_mac_is_preserved(self):
+        """A recorded key no longer authorizes replacement after a MAC rewrite"""
+        sw_if_index = self.lo_interfaces[0].sw_if_index
+        address = "10.10.1.114"
+        recorded_mac = "02:01:02:03:04:24"
+        operator_mac = "02:01:02:03:04:25"
+        kernel_mac = "02:01:02:03:04:26"
+        self.addCleanup(self._del_kernel_neighbor, address)
+
+        self.assertTrue(self._add_kernel_neighbor(address, recorded_mac, "permanent"))
+        self.poll_for(
+            f"{address} in VPP with {recorded_mac}",
+            lambda: find_nbr(self, sw_if_index, address, is_static=1, mac=recorded_mac),
+            True,
+        )
+        self.vapi.ip_neighbor_add_del(
+            sw_if_index,
+            operator_mac,
+            address,
+            is_add=1,
+            flags=VppEnum.vl_api_ip_neighbor_flags_t.IP_API_NEIGHBOR_FLAG_STATIC,
+        )
+        self.assertTrue(
+            find_nbr(self, sw_if_index, address, is_static=1, mac=operator_mac)
+        )
+
+        refused_before = self._neigh_totals()["refused"]
+        replaced_before = self._neigh_totals()["replaced"]
+        self.assertTrue(self._add_kernel_neighbor(address, kernel_mac, "reachable"))
+        self.poll_for(
+            "the refused sync was counted",
+            lambda: self._neigh_totals()["refused"] > refused_before,
+            True,
+        )
+        self.assertEqual(self._neigh_totals()["replaced"], replaced_before)
+        self.assertTrue(
+            find_nbr(self, sw_if_index, address, is_static=1, mac=operator_mac)
+        )
+
+    def test_neigh_same_address_on_another_interface_is_untouched(self):
+        """Owned static replacement uses only the neighbor on the paired interface"""
+        sw_if_index = self.lo_interfaces[0].sw_if_index
+        other_sw_if_index = self.lo_interfaces[1].sw_if_index
+        address = "10.10.1.116"
+        recorded_mac = "02:01:02:03:04:27"
+        kernel_mac = "02:01:02:03:04:28"
+        other_mac = "02:01:02:03:04:29"
+        self.addCleanup(self._del_kernel_neighbor, address)
+        other = VppNeighbor(
+            self,
+            other_sw_if_index,
+            other_mac,
+            address,
+            is_static=True,
+            is_no_fib_entry=True,
+        )
+        other.add_vpp_config()
+        self.assertTrue(other.query_vpp_config())
+
+        self.assertTrue(self._add_kernel_neighbor(address, recorded_mac, "permanent"))
+        self.poll_for(
+            f"{address} in VPP with {recorded_mac}",
+            lambda: find_nbr(self, sw_if_index, address, is_static=1, mac=recorded_mac),
+            True,
+        )
+        self.assertTrue(self._add_kernel_neighbor(address, kernel_mac, "reachable"))
+        self.poll_for(
+            f"{address} follows the kernel to {kernel_mac}",
+            lambda: find_nbr(self, sw_if_index, address, mac=kernel_mac),
+            True,
+        )
+        other_entries = self.vapi.ip_neighbor_dump(
+            sw_if_index=other_sw_if_index, af=ip_address(address).vapi_af
+        )
+        self.assertTrue(
+            any(
+                entry.neighbor.ip_address == ip_address(address)
+                and str(entry.neighbor.mac_address) == other_mac
+                and entry.neighbor.flags == other.flags
+                for entry in other_entries
+            )
+        )
+
     def test_neigh_kernel_replaced_static_entry_is_corrected(self):
         """A static entry the plugin installed follows the kernel's new MAC"""
         sw_if_index = self.lo_interfaces[0].sw_if_index
