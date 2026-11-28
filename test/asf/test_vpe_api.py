@@ -52,3 +52,42 @@ class TestVpeApi(VppAsfTestCase):
         if enable_print:
             print("\n".join([str(v) for v in rv]))
             print("%r %s" % (rv.vpe_system_time, rv.vpe_system_time))
+
+
+class TestShowLogging(VppAsfTestCase):
+    """Test ordered show logging output"""
+
+    extra_vpp_config = [
+        "logging { size 4 default-log-level disabled "
+        "default-syslog-log-level disabled }"
+    ]
+
+    def check_logging(self, expected):
+        output = self.vapi.cli("show logging")
+        lines = output.splitlines(keepends=True)
+        self.assertEqual(len(lines), len(expected))
+        for line, sequence in zip(lines, expected):
+            self.assertRegex(
+                line,
+                rf"\A\d{{4}}/\d{{2}}/\d{{2}} \d{{2}}:\d{{2}}:\d{{2}}:\d{{3}}"
+                rf" +notice +fib/entry +snapshot entry {sequence}\n\Z",
+            )
+        self.assertEqual(self.vapi.cli("show logging"), output)
+
+    def test_show_logging_snapshot(self):
+        self.vapi.cli("set logging class log level disabled")
+        self.vapi.cli("set logging class fib level notice rate-limit 100")
+        self.vapi.cli("clear logging")
+        self.check_logging([])
+
+        for sequence in range(2):
+            self.vapi.cli(f"test log notice fib entry snapshot entry {sequence}")
+        self.check_logging([0, 1])
+
+        for sequence in range(2, 4):
+            self.vapi.cli(f"test log notice fib entry snapshot entry {sequence}")
+        self.check_logging([0, 1, 2, 3])
+
+        for sequence in range(4, 6):
+            self.vapi.cli(f"test log notice fib entry snapshot entry {sequence}")
+        self.check_logging([2, 3, 4, 5])
