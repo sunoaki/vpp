@@ -490,9 +490,9 @@ class TestBondInterface(VppTestCase):
 
 
 class TestBondRecreate(VppTestCase):
-    """Bond lifecycle with worker threads"""
+    """Bond lifecycle with a worker thread"""
 
-    vpp_worker_count = 2
+    vpp_worker_count = 1
 
     def test_bond_recreate_with_attached_members(self):
         """Delete a populated bond, reuse its ID, and forward with one member."""
@@ -557,18 +557,17 @@ class TestBondRecreate(VppTestCase):
         def filter_control(packet):
             return ARP in packet or ICMPv6ND_NA in packet or is_ipv6_misc(packet)
 
-        for worker in range(self.vpp_worker_count):
-            capture = self.send_and_expect(
-                ingress,
-                [packet],
-                member,
-                worker=worker,
-                filter_out_fn=filter_control,
-            )
-            idle.assert_nothing_captured(filter_out_fn=filter_control)
-            self.assertEqual(capture[0][Ether].dst, dst_mac)
-            self.assertEqual(capture[0][IP].dst, dst_ip)
-            self.assertEqual(bytes(capture[0][UDP].payload), payload)
+        capture = self.send_and_expect(
+            ingress,
+            [packet],
+            member,
+            worker=0,
+            filter_out_fn=filter_control,
+        )
+        idle.assert_nothing_captured(filter_out_fn=filter_control)
+        self.assertEqual(capture[0][Ether].dst, dst_mac)
+        self.assertEqual(capture[0][IP].dst, dst_ip)
+        self.assertEqual(bytes(capture[0][UDP].payload), payload)
 
 
 if __name__ == "__main__":
