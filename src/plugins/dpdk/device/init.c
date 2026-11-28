@@ -651,6 +651,11 @@ dpdk_lib_init (dpdk_main_t * dm)
 	xd->conf.enable_rxq_int = 0;
 
       dpdk_device_setup (xd);
+      if (vec_len (xd->errors))
+	{
+	  dpdk_log_err ("[%u] setup failed Errors:\n  %U", port_id, format_dpdk_device_errors, xd);
+	  continue;
+	}
 
       /* rss queues should be configured after dpdk_device_setup() */
       if (devconf->rss_queues)
@@ -660,9 +665,6 @@ dpdk_lib_init (dpdk_main_t * dm)
 	    dpdk_log_warn ("[%u] Failed to set rss queues", port_id);
 	}
 
-      if (vec_len (xd->errors))
-	dpdk_log_err ("[%u] setup failed Errors:\n  %U", port_id,
-		      format_dpdk_device_errors, xd);
       dpdk_counters_xstats_init (xd);
     }
 

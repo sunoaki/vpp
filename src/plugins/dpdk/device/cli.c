@@ -312,13 +312,15 @@ set_dpdk_if_desc (vlib_main_t * vm, unformat_input_t * input,
   u32 saved_promisc_flag = xd->flags & DPDK_DEVICE_FLAG_PROMISC;
 
   dpdk_device_setup (xd);
+  if (vec_len (xd->errors))
+    {
+      error = clib_error_return (0, "%U", format_dpdk_device_errors, xd);
+      goto done;
+    }
 
   /* Restore promiscuous mode using ethernet_set_flags */
   if (saved_promisc_flag)
     ethernet_set_flags (vnm, xd->hw_if_index, ETHERNET_INTERFACE_FLAG_ACCEPT_ALL);
-
-  if (vec_len (xd->errors))
-    return clib_error_return (0, "%U", format_dpdk_device_errors, xd);
 
 done:
   unformat_free (line_input);

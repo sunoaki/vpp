@@ -240,6 +240,11 @@ retry:
       conf.intr_conf.rxq = 0;
       goto retry;
     }
+  if (rv < 0)
+    {
+      dpdk_device_error (xd, "rte_eth_dev_configure", rv);
+      goto error;
+    }
 
   hi->max_frame_size = 0;
   vnet_hw_interface_set_max_frame_size (vnm, xd->hw_if_index, max_frame_size);
