@@ -345,6 +345,28 @@ ip_neighbor_db_find (const ip_neighbor_key_t * key)
   return (NULL);
 }
 
+bool
+ip_neighbor_lookup (const ip_address_t *ip, u32 sw_if_index, mac_address_t *mac,
+		    ip_neighbor_flags_t *flags)
+{
+  ASSERT (0 == vlib_get_thread_index ());
+
+  if (ip_addr_version (ip) != AF_IP4 && ip_addr_version (ip) != AF_IP6)
+    return false;
+
+  const ip_neighbor_key_t key = {
+    .ipnk_ip = *ip,
+    .ipnk_sw_if_index = sw_if_index,
+  };
+  const ip_neighbor_t *ipn = ip_neighbor_db_find (&key);
+  if (!ipn)
+    return false;
+
+  *mac = *ip_neighbor_get_mac (ipn);
+  *flags = ipn->ipn_flags;
+  return true;
+}
+
 /*
  * Find the neighbour for this address on any other interface that resolves
  * through the same FIB table. Only that combination competes: two such
