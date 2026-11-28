@@ -457,6 +457,9 @@ bond_delete_if (vlib_main_t * vm, u32 sw_if_index)
 
   ethernet_delete_interface (vnm, bif->hw_if_index);
 
+  vec_free (bif->members);
+  vec_free (bif->active_members);
+  clib_spinlock_free (&bif->lockp);
   clib_bitmap_free (bif->port_number_bitmap);
   hash_unset (bm->bond_by_sw_if_index, bif->sw_if_index);
   hash_unset (bm->id_used, bif->id);
