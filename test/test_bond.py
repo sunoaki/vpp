@@ -3,12 +3,16 @@
 import unittest
 
 from scapy.packet import Raw
-from scapy.layers.l2 import Ether
+from scapy.layers.l2 import ARP, Ether
 from scapy.layers.inet import IP, UDP
+from scapy.layers.inet6 import ICMPv6ND_NA
+
 
 from framework import VppTestCase
 from asfframework import VppTestRunner
 from vpp_bond_interface import VppBondInterface
+from vpp_pg_interface import is_ipv6_misc
+
 from vpp_papi import MACAddress, VppEnum
 from config import config
 
@@ -43,6 +47,67 @@ class TestBondInterface(VppTestCase):
 
     def show_commands_at_teardown(self):
         self.logger.info(self.vapi.ppcli("show interface"))
+
+    def test_bond_active_backup_traffic(self):
+        """Send UDP via the preferred member, fail over, and restore preference."""
+        preferred, backup, ingress = self.pg1, self.pg0, self.pg2
+        bond = VppBondInterface(
+            self, mode=VppEnum.vl_api_bond_mode_t.BOND_API_MODE_ACTIVE_BACKUP
+        )
+        bond.add_vpp_config()
+        self.addCleanup(bond.remove_vpp_config)
+        for member, weight in ((backup, 10), (preferred, 20)):
+            bond.add_member_vpp_bond_interface(sw_if_index=member.sw_if_index)
+            self.vapi.sw_interface_set_bond_weight(
+                sw_if_index=member.sw_if_index, weight=weight
+            )
+        bond.admin_up()
+        self.vapi.sw_interface_add_del_address(
+            sw_if_index=bond.sw_if_index, prefix="10.10.10.1/24"
+        )
+        ingress.config_ip4()
+        self.addCleanup(ingress.unconfig_ip4)
+        dst_ip = "10.10.10.12"
+        dst_mac = "02:00:00:00:00:12"
+        self.vapi.cli(f"set ip neighbor static {bond.name} {dst_ip} {dst_mac}")
+
+        def filter_control(packet):
+            return ARP in packet or ICMPv6ND_NA in packet or is_ipv6_misc(packet)
+
+        self.addCleanup(preferred.admin_up)
+        for phase, selected, idle in (
+            ("preferred", preferred, backup),
+            ("failover", backup, preferred),
+            ("restored", preferred, backup),
+        ):
+            with self.subTest(phase=phase):
+                if phase == "failover":
+                    preferred.admin_down()
+                elif phase == "restored":
+                    preferred.admin_up()
+                payloads = [
+                    f"{phase}:{seq:04d}".encode().ljust(64, b"\x00")
+                    for seq in range(17)
+                ]
+                ingress.add_stream(
+                    [
+                        Ether(src=ingress.remote_mac, dst=ingress.local_mac)
+                        / IP(src=ingress.remote_ip4, dst=dst_ip)
+                        / UDP(sport=1234, dport=5678)
+                        / Raw(payload)
+                        for payload in payloads
+                    ]
+                )
+                self.pg_enable_capture([preferred, backup])
+                self.pg_start()
+                capture = selected.get_capture(
+                    len(payloads), filter_out_fn=filter_control
+                )
+                self.assertEqual([bytes(pkt[UDP].payload) for pkt in capture], payloads)
+                for pkt in capture:
+                    self.assertEqual(pkt[Ether].dst, dst_mac)
+                    self.assertEqual(pkt[IP].dst, dst_ip)
+                idle.assert_nothing_captured(filter_out_fn=filter_control)
 
     def test_bond_traffic(self):
         """Bond traffic test"""
