@@ -2790,6 +2790,10 @@ fib_path_encode (fib_node_index_t path_list_index,
       case FIB_PATH_TYPE_RECURSIVE:
         rpath->frp_addr = path->recursive.fp_nh.fp_ip;
         rpath->frp_fib_index = path->recursive.fp_tbl_id;
+        if (path->fp_cfg_flags & FIB_PATH_CFG_FLAG_RESOLVE_HOST)
+            rpath->frp_flags |= FIB_ROUTE_PATH_RESOLVE_VIA_HOST;
+        if (path->fp_cfg_flags & FIB_PATH_CFG_FLAG_RESOLVE_ATTACHED)
+            rpath->frp_flags |= FIB_ROUTE_PATH_RESOLVE_VIA_ATTACHED;
         break;
       case FIB_PATH_TYPE_DVR:
           rpath->frp_sw_if_index = path->dvr.fp_interface;

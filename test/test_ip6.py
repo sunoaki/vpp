@@ -50,9 +50,11 @@ from vpp_ip_route import (
     VppMplsRoute,
     VppMplsTable,
     VppIpTable,
+    FibPathFlags,
     FibPathType,
     FibPathProto,
     VppIpInterfaceAddress,
+    VppIpInterfaceBind,
     find_route_in_dump,
     find_mroute_in_dump,
     VppIp6LinkLocalAddress,
@@ -1624,6 +1626,71 @@ class TestIPv6RouteLookup(VppTestCase):
         assert lpm_prefix == str(result.route.prefix)
 
         # Can't seem to delete the default route so no negative LPM test.
+
+    def test_recursive_route_flags_readback(self):
+        """Read back configured IPv6 recursive route flags"""
+        table = VppIpTable(self, 201, is_ip6=True).add_vpp_config()
+        self.create_pg_interfaces(range(1))
+        self.pg0.admin_up()
+        self.addCleanup(self.pg0.admin_down)
+        bind = VppIpInterfaceBind(self, self.pg0, table).add_vpp_config()
+        VppIpInterfaceAddress(
+            self, self.pg0, "2001:db8:1::1", 64, bind
+        ).add_vpp_config()
+        VppNeighbor(
+            self, self.pg0.sw_if_index, self.pg0.remote_mac, "2001:db8:1::2"
+        ).add_vpp_config()
+
+        cases = (
+            (
+                "2001:db8:2::1",
+                "2001:db8:1::2",
+                FibPathFlags.FIB_PATH_FLAG_RESOLVE_VIA_HOST,
+            ),
+            (
+                "2001:db8:2::2",
+                "2001:db8:1::3",
+                FibPathFlags.FIB_PATH_FLAG_RESOLVE_VIA_ATTACHED,
+            ),
+            ("2001:db8:2::3", "2001:db8:1::3", FibPathFlags.FIB_PATH_FLAG_NONE),
+        )
+        routes = [
+            VppIpRoute(
+                self,
+                destination,
+                128,
+                [
+                    VppRoutePath(
+                        next_hop, 0xFFFFFFFF, nh_table_id=table.table_id, flags=flags
+                    )
+                ],
+                table_id=table.table_id,
+            ).add_vpp_config()
+            for destination, next_hop, flags in cases
+        ]
+        dump = {
+            str(entry.route.prefix): entry.route
+            for entry in self.vapi.ip_route_dump(table.table_id, is_ip6=True)
+        }
+        for route, (_, next_hop, flags) in zip(routes, cases):
+            with self.subTest(prefix=route.prefix):
+                entry = dump[str(route.prefix)]
+                self.assertEqual(entry.table_id, table.table_id)
+                self.assertEqual(len(entry.paths), 1)
+                path = entry.paths[0]
+                self.assertEqual(path.flags, flags)
+                self.assertEqual(path.sw_if_index, 0xFFFFFFFF)
+                self.assertEqual(path.table_id, table.table_id)
+                self.assertEqual(str(path.nh.address.ip6), next_hop)
+
+        for route in routes:
+            route.remove_vpp_config()
+        remaining = {
+            str(entry.route.prefix)
+            for entry in self.vapi.ip_route_dump(table.table_id, is_ip6=True)
+        }
+        for route in routes:
+            self.assertNotIn(str(route.prefix), remaining)
 
 
 class TestIPv6IfAddrRoute(VppTestCase):
