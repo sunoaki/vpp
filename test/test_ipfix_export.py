@@ -68,8 +68,9 @@ class TestIpfixExporter(VppTestCase):
             self.assertEqual(self.capture_template_stream(), (1, 4739))
             self.vapi.set_ipfix_classify_stream(domain_id=10, src_port=4740)
             mask = b"\x00" * 26 + b"\xff" * 12 + b"\x00" * 10
+            table_args = dict(mask=mask, mask_len=len(mask), match_n_vectors=3)
             table = self.vapi.classify_add_del_table(
-                is_add=True, mask=mask, mask_len=len(mask), match_n_vectors=3
+                is_add=True, **table_args
             ).new_table_index
             try:
                 self.vapi.cli(f"ipfix classify table add {table} ip4 udp")
@@ -87,7 +88,9 @@ class TestIpfixExporter(VppTestCase):
                 finally:
                     self.vapi.cli(f"ipfix classify table del {table} ip4 udp")
             finally:
-                self.vapi.classify_add_del_table(is_add=False, table_index=table)
+                self.vapi.classify_add_del_table(
+                    is_add=False, table_index=table, **table_args
+                )
         finally:
             flowprobe.remove_vpp_config()
 
