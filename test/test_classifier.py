@@ -1603,6 +1603,52 @@ class TestClassifierIPTable(TestClassifier):
     def tearDownClass(cls):
         super(TestClassifierIPTable, cls).tearDownClass()
 
+    def test_table_readback_lifecycle(self):
+        """Read back live, deleted, and reused classifier table IDs."""
+        original_table_id = None
+        for mask, match, nbuckets, opaque_index in (
+            (b"\xff" * 16, b"\x11" * 16, 2, 17),
+            (b"\xf0" * 16, b"\x20" * 16, 4, 23),
+        ):
+            table = dict(mask=mask, mask_len=len(mask), match_n_vectors=1)
+            table_id = self.vapi.classify_add_del_table(
+                is_add=True, nbuckets=nbuckets, **table
+            ).new_table_index
+            try:
+                if original_table_id is None:
+                    original_table_id = table_id
+                self.assertEqual(table_id, original_table_id)
+                info = self.vapi.classify_table_info(table_id=table_id)
+                self.assertEqual(info.table_id, table_id)
+                self.assertEqual(info.nbuckets, nbuckets)
+                self.assertEqual(info.mask, mask)
+                self.assertEqual(info.active_sessions, 0)
+                self.assertEqual(self.vapi.classify_session_dump(table_id=table_id), [])
+
+                self.vapi.classify_add_del_session(
+                    is_add=True,
+                    table_index=table_id,
+                    opaque_index=opaque_index,
+                    match_len=len(match),
+                    match=match,
+                )
+                info = self.vapi.classify_table_info(table_id=table_id)
+                self.assertEqual(info.active_sessions, 1)
+                sessions = self.vapi.classify_session_dump(table_id=table_id)
+                self.assertEqual(len(sessions), 1)
+                self.assertEqual(sessions[0].table_id, table_id)
+                self.assertEqual(sessions[0].opaque_index, opaque_index)
+                self.assertEqual(sessions[0].match, match)
+            finally:
+                self.vapi.classify_add_del_table(
+                    is_add=False, table_index=table_id, **table
+                )
+
+            classify_table_not_found = -91
+            with self.vapi.assert_known_api_retval([classify_table_not_found]):
+                self.vapi.classify_table_info(table_id=table_id)
+            self.assertEqual(self.vapi.classify_session_dump(table_id=table_id), [])
+
     def test_ip_table_other_itf(self):
         """IP classify table on another interface
 
