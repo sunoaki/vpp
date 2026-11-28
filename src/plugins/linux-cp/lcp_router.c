@@ -1165,6 +1165,7 @@ lcp_router_address_sweep (u32 sw_if_index, u8 is_ip4)
   u32 *masks = 0;
   u32 *keys = 0;
   ip_interface_address_t *ia = 0;
+  bool removed_ip4 = false;
   int i;
 
   foreach_ip_interface_address (lm, ia, sw_if_index, 1 /* honor unnumbered */, ({
@@ -1223,6 +1224,7 @@ lcp_router_address_sweep (u32 sw_if_index, u8 is_ip4)
        */
       if (is_ip4)
 	{
+	  removed_ip4 = true;
 	  LCP_ROUTER_INFO ("address sweep: %U withdrew %U/%u, marked stale at "
 			   "begin and not re-announced by the replay",
 			   format_vnet_sw_if_index_name, vnet_get_main (), sw_if_index,
@@ -1236,6 +1238,9 @@ lcp_router_address_sweep (u32 sw_if_index, u8 is_ip4)
 			   format_ip6_address, &ip6_addrs[i], masks[i]);
 	}
     }
+
+  if (removed_ip4 && !lcp_router_count_interface_addresses (sw_if_index, AF_IP4))
+    lcp_router_ip4_mroutes_add_del (sw_if_index, 0);
 
   vec_free (ip4_addrs);
   vec_free (ip6_addrs);
