@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
-from framework import VppTestCase
+import unittest
 from ipaddress import IPv4Address
+
+from scapy.layers.inet import UDP
+
+from config import config
+from framework import VppTestCase
+from ipfix import IPFIX, Template
+from test_flowprobe import VppCFLOW
 
 
 class TestIpfixExporter(VppTestCase):
@@ -41,6 +48,51 @@ class TestIpfixExporter(VppTestCase):
         self.assert_equal(exp.collector_port, collector_port)
         self.assert_equal(exp.path_mtu, mtu)
         self.assert_equal(exp.template_interval, interval)
+
+    def capture_template_stream(self, timeout=5):
+        packet = self.pg0.wait_for_packet(
+            timeout=timeout, filter_out_fn=lambda packet: not packet.haslayer(Template)
+        )
+        return packet[IPFIX].observationDomainID, packet[UDP].sport
+
+    @unittest.skipIf(
+        "flowprobe" in config.excluded_plugins, "Exclude Flowprobe plugin tests"
+    )
+    def test_classify_stream_update(self):
+        """Changing the classify stream refreshes only its export template"""
+        self.pg_enable_capture([self.pg0])
+        template_interval = 15
+        flowprobe = VppCFLOW(test=self, layer="l2", timeout=template_interval)
+        flowprobe.add_vpp_config()
+        try:
+            self.assertEqual(self.capture_template_stream(), (1, 4739))
+            self.vapi.set_ipfix_classify_stream(domain_id=10, src_port=4740)
+            mask = b"\x00" * 26 + b"\xff" * 12 + b"\x00" * 10
+            table_args = dict(mask=mask, mask_len=len(mask), match_n_vectors=3)
+            table = self.vapi.classify_add_del_table(
+                is_add=True, **table_args
+            ).new_table_index
+            try:
+                self.vapi.cli(f"ipfix classify table add {table} ip4 udp")
+                try:
+                    self.vapi.cli("ipfix flush")
+                    self.assertEqual(self.capture_template_stream(), (10, 4740))
+
+                    self.vapi.set_ipfix_classify_stream(domain_id=20, src_port=4741)
+                    self.vapi.cli("ipfix flush")
+                    self.assertEqual(self.capture_template_stream(), (20, 4741))
+                    self.assertEqual(
+                        self.capture_template_stream(timeout=template_interval + 5),
+                        (1, 4739),
+                    )
+                finally:
+                    self.vapi.cli(f"ipfix classify table del {table} ip4 udp")
+            finally:
+                self.vapi.classify_add_del_table(
+                    is_add=False, table_index=table, **table_args
+                )
+        finally:
+            flowprobe.remove_vpp_config()
 
     def test_create_multipe_exporters(self):
         """test that we can create and dump multiple exporters"""

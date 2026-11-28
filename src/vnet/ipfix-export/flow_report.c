@@ -727,7 +727,7 @@ vnet_stream_reset (ipfix_exporter_t *exp, u32 stream_index)
   exp->streams[stream_index].sequence_number = 0;
 
   vec_foreach (fr, exp->reports)
-    if (exp->reports->stream_index == stream_index)
+    if (fr->stream_index == stream_index)
       {
 	fr->update_rewrite = 1;
 	fr->last_template_sent = 0;
