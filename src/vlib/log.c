@@ -415,9 +415,9 @@ show_log (vlib_main_t * vm,
 {
   clib_error_t *error = 0;
   vlib_log_main_t *lm = &log_main;
-  vlib_log_entry_t *e, *entries;
-  int i = last_log_entry ();
-  int count;
+  vlib_log_entry_t *e, *entries = 0;
+  int i, count, size, next;
+  bool ordered;
   f64 time_offset;
 
   time_offset = (f64) lm->time_zero_timeval.tv_sec
@@ -425,7 +425,33 @@ show_log (vlib_main_t * vm,
 
   CLIB_SPINLOCK_LOCK (lm->lock);
   count = lm->count;
-  entries = vec_dup (lm->entries);
+  if (count == 0)
+    {
+      CLIB_SPINLOCK_UNLOCK (lm->lock);
+      return error;
+    }
+
+  size = lm->size;
+  next = lm->next;
+  i = last_log_entry ();
+  ordered = size > 0 && (u32) size <= vec_len (lm->entries) && count > 0 && count <= size &&
+	    next >= 0 && next < size;
+  if (ordered)
+    {
+      int first_count = clib_min (count, size - i);
+
+      vec_validate (entries, count - 1);
+      clib_memcpy_fast (entries, lm->entries + i, first_count * sizeof (*entries));
+      if (first_count < count)
+	clib_memcpy_fast (entries + first_count, lm->entries,
+			  (count - first_count) * sizeof (*entries));
+      i = 0;
+    }
+  else
+    {
+      /* A live resize does not reset the cursor or count. Preserve the old traversal. */
+      entries = vec_dup (lm->entries);
+    }
   CLIB_SPINLOCK_UNLOCK (lm->lock);
 
   while (count--)
@@ -434,7 +460,7 @@ show_log (vlib_main_t * vm,
       vlib_cli_output (vm, "%U %-10U %-14U %v", format_time_float, NULL,
 		       e->timestamp + time_offset, format_vlib_log_level,
 		       e->level, format_vlib_log_class, e->class, e->string);
-      i = (i + 1) % lm->size;
+      i = ordered ? i + 1 : (i + 1) % size;
     }
 
   vec_free (entries);
