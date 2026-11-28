@@ -611,35 +611,27 @@ vl_api_classify_table_info_t_handler (vl_api_classify_table_info_t * mp)
   u32 table_id = ntohl (mp->table_id);
   vnet_classify_table_t *t;
 
-  pool_foreach (t, cm->tables)
+  if (!pool_is_free_index (cm->tables, table_id))
     {
-      if (table_id == t - cm->tables)
-	{
-	  rmp = vl_msg_api_alloc_as_if_client (
-	    sizeof (*rmp) + t->match_n_vectors * sizeof (u32x4));
-	  rmp->_vl_msg_id =
-	    ntohs (REPLY_MSG_ID_BASE + VL_API_CLASSIFY_TABLE_INFO_REPLY);
-	  rmp->context = mp->context;
-	  rmp->table_id = ntohl (table_id);
-	  rmp->nbuckets = ntohl (t->nbuckets);
-	  rmp->match_n_vectors = ntohl (t->match_n_vectors);
-	  rmp->skip_n_vectors = ntohl (t->skip_n_vectors);
-	  rmp->active_sessions = ntohl (t->active_elements);
-	  rmp->next_table_index = ntohl (t->next_table_index);
-	  rmp->miss_next_index = ntohl (t->miss_next_index);
-	  rmp->mask_length = ntohl (t->match_n_vectors * sizeof (u32x4));
-	  clib_memcpy (rmp->mask, t->mask,
-		       t->match_n_vectors * sizeof (u32x4));
-	  rmp->retval = 0;
-	  break;
-	}
+      t = pool_elt_at_index (cm->tables, table_id);
+      rmp = vl_msg_api_alloc_as_if_client (sizeof (*rmp) + t->match_n_vectors * sizeof (u32x4));
+      rmp->_vl_msg_id = ntohs (REPLY_MSG_ID_BASE + VL_API_CLASSIFY_TABLE_INFO_REPLY);
+      rmp->context = mp->context;
+      rmp->table_id = ntohl (table_id);
+      rmp->nbuckets = ntohl (t->nbuckets);
+      rmp->match_n_vectors = ntohl (t->match_n_vectors);
+      rmp->skip_n_vectors = ntohl (t->skip_n_vectors);
+      rmp->active_sessions = ntohl (t->active_elements);
+      rmp->next_table_index = ntohl (t->next_table_index);
+      rmp->miss_next_index = ntohl (t->miss_next_index);
+      rmp->mask_length = ntohl (t->match_n_vectors * sizeof (u32x4));
+      clib_memcpy (rmp->mask, t->mask, t->match_n_vectors * sizeof (u32x4));
+      rmp->retval = 0;
     }
-
-  if (rmp == 0)
+  else
     {
-      rmp = vl_msg_api_alloc (sizeof (*rmp));
-      rmp->_vl_msg_id =
-	ntohs (REPLY_MSG_ID_BASE + VL_API_CLASSIFY_TABLE_INFO_REPLY);
+      rmp = vl_msg_api_alloc_zero (sizeof (*rmp));
+      rmp->_vl_msg_id = ntohs (REPLY_MSG_ID_BASE + VL_API_CLASSIFY_TABLE_INFO_REPLY);
       rmp->context = mp->context;
       rmp->retval = ntohl (VNET_API_ERROR_CLASSIFY_TABLE_NOT_FOUND);
     }
@@ -683,39 +675,34 @@ vl_api_classify_session_dump_t_handler (vl_api_classify_session_dump_t * mp)
   if (!reg)
     return;
 
-  pool_foreach (t, cm->tables)
-   {
-    if (table_id == t - cm->tables)
-      {
-        vnet_classify_bucket_t * b;
-        vnet_classify_entry_t * v, * save_v;
-        int i, j, k;
+  if (pool_is_free_index (cm->tables, table_id))
+    return;
 
-        for (i = 0; i < t->nbuckets; i++)
-          {
-            b = &t->buckets [i];
-            if (b->offset == 0)
-              continue;
+  t = pool_elt_at_index (cm->tables, table_id);
+  vnet_classify_bucket_t *b;
+  vnet_classify_entry_t *v, *save_v;
+  int i, j, k;
 
-            save_v = vnet_classify_get_entry (t, b->offset);
-            for (j = 0; j < (1<<b->log2_pages); j++)
-              {
-                for (k = 0; k < t->entries_per_page; k++)
-                  {
-                    v = vnet_classify_entry_at_index
-                      (t, save_v, j*t->entries_per_page + k);
-                    if (vnet_classify_entry_is_free (v))
-                      continue;
+  for (i = 0; i < t->nbuckets; i++)
+    {
+      b = &t->buckets[i];
+      if (b->offset == 0)
+	continue;
 
-                    send_classify_session_details
-                      (reg, table_id, t->match_n_vectors * sizeof (u32x4),
-                       v, mp->context);
-                  }
-              }
-          }
-        break;
-      }
-  }
+      save_v = vnet_classify_get_entry (t, b->offset);
+      for (j = 0; j < (1 << b->log2_pages); j++)
+	{
+	  for (k = 0; k < t->entries_per_page; k++)
+	    {
+	      v = vnet_classify_entry_at_index (t, save_v, j * t->entries_per_page + k);
+	      if (vnet_classify_entry_is_free (v))
+		continue;
+
+	      send_classify_session_details (reg, table_id, t->match_n_vectors * sizeof (u32x4), v,
+					     mp->context);
+	    }
+	}
+    }
 }
 
 static void
