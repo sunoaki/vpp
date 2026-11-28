@@ -630,9 +630,8 @@ vl_api_classify_table_info_t_handler (vl_api_classify_table_info_t * mp)
     }
   else
     {
-      rmp = vl_msg_api_alloc (sizeof (*rmp));
-      rmp->_vl_msg_id =
-	ntohs (REPLY_MSG_ID_BASE + VL_API_CLASSIFY_TABLE_INFO_REPLY);
+      rmp = vl_msg_api_alloc_zero (sizeof (*rmp));
+      rmp->_vl_msg_id = ntohs (REPLY_MSG_ID_BASE + VL_API_CLASSIFY_TABLE_INFO_REPLY);
       rmp->context = mp->context;
       rmp->retval = ntohl (VNET_API_ERROR_CLASSIFY_TABLE_NOT_FOUND);
     }
