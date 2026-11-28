@@ -176,10 +176,25 @@ class TestSpan(VppTestCase):
             "%u != %u" % (len(cap1), len(cap2)),
         )
 
-        pkts1 = [(pkt[Ether] / pkt[IP] / pkt[UDP]) for pkt in cap1]
-        pkts2 = [(pkt[Ether] / pkt[IP] / pkt[UDP]) for pkt in cap2]
+        def packet_key(pkt):
+            ether = pkt[Ether]
+            ip = pkt[IP]
+            udp = ip[UDP]
+            return (
+                ether.src,
+                ether.dst,
+                ip.src,
+                ip.dst,
+                udp.sport,
+                udp.dport,
+                udp.len,
+                # The UDP length includes its 8-byte header, but not frame padding.
+                bytes(udp.payload)[: max(0, udp.len - 8)],
+            )
 
-        self.assertEqual(pkts1.sort(), pkts2.sort())
+        self.assertCountEqual(
+            [packet_key(pkt) for pkt in cap1], [packet_key(pkt) for pkt in cap2]
+        )
 
     def test_device_span(self):
         """SPAN device rx mirror"""
