@@ -489,5 +489,86 @@ class TestBondInterface(VppTestCase):
         bond0.remove_vpp_config()
 
 
+class TestBondRecreate(VppTestCase):
+    """Bond lifecycle with a worker thread"""
+
+    vpp_worker_count = 1
+
+    def test_bond_recreate_with_attached_members(self):
+        """Delete a populated bond, reuse its ID, and forward with one member."""
+        member, idle, ingress = self.create_pg_interfaces(range(3))
+        for interface in self.pg_interfaces:
+            interface.admin_up()
+
+        mode = VppEnum.vl_api_bond_mode_t.BOND_API_MODE_ACTIVE_BACKUP
+        bond_id = 42
+        bond = VppBondInterface(self, mode=mode, id=bond_id)
+        bond.add_vpp_config()
+        try:
+            bond.admin_up()
+            for interface in (member, idle):
+                bond.add_member_vpp_bond_interface(sw_if_index=interface.sw_if_index)
+            self.assertCountEqual(
+                [
+                    entry.sw_if_index
+                    for entry in self.vapi.sw_member_interface_dump(bond.sw_if_index)
+                ],
+                [member.sw_if_index, idle.sw_if_index],
+            )
+        finally:
+            bond.remove_vpp_config()
+
+        self.assertFalse(
+            bond.is_interface_config_in_dump(
+                self.vapi.sw_bond_interface_dump(sw_if_index=0xFFFFFFFF)
+            )
+        )
+        recreated = VppBondInterface(self, mode=mode, id=bond_id)
+        recreated.add_vpp_config()
+        self.addCleanup(recreated.remove_vpp_config)
+        self.assertEqual(recreated.name, f"BondEthernet{bond_id}")
+        self.assertFalse(self.vapi.sw_member_interface_dump(recreated.sw_if_index))
+        recreated.add_member_vpp_bond_interface(sw_if_index=member.sw_if_index)
+        self.assertEqual(
+            [
+                entry.sw_if_index
+                for entry in self.vapi.sw_member_interface_dump(recreated.sw_if_index)
+            ],
+            [member.sw_if_index],
+        )
+
+        recreated.admin_up()
+        ingress.config_ip4()
+        self.addCleanup(ingress.unconfig_ip4)
+        self.vapi.sw_interface_add_del_address(
+            sw_if_index=recreated.sw_if_index, prefix="10.10.42.1/24"
+        )
+        dst_ip = "10.10.42.2"
+        dst_mac = "02:00:00:00:00:42"
+        self.vapi.cli(f"set ip neighbor static {recreated.name} {dst_ip} {dst_mac}")
+        payload = b"after bond recreation"
+        packet = (
+            Ether(src=ingress.remote_mac, dst=ingress.local_mac)
+            / IP(src=ingress.remote_ip4, dst=dst_ip)
+            / UDP(sport=1234, dport=5678)
+            / Raw(payload)
+        )
+
+        def filter_control(packet):
+            return ARP in packet or ICMPv6ND_NA in packet or is_ipv6_misc(packet)
+
+        capture = self.send_and_expect(
+            ingress,
+            [packet],
+            member,
+            worker=0,
+            filter_out_fn=filter_control,
+        )
+        idle.assert_nothing_captured(filter_out_fn=filter_control)
+        self.assertEqual(capture[0][Ether].dst, dst_mac)
+        self.assertEqual(capture[0][IP].dst, dst_ip)
+        self.assertEqual(bytes(capture[0][UDP].payload), payload)
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=VppTestRunner)
